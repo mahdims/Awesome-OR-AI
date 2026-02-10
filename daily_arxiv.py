@@ -2,12 +2,19 @@ import os
 import re
 import json
 import time
-import arxiv
 import yaml
 import logging
 import argparse
 import datetime
 import requests
+import xml.etree.ElementTree as ET
+
+try:
+    from openai import OpenAI
+    from pydantic import BaseModel
+except ImportError:
+    OpenAI = None
+    BaseModel = None
 
 logging.basicConfig(format='[%(asctime)s %(levelname)s] %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
@@ -17,6 +24,102 @@ base_url = "https://arxiv.paperswithcode.com/api/v0/papers/"
 github_url = "https://api.github.com/search/repositories"
 arxiv_url = "http://arxiv.org/"
 semantic_scholar_url = "https://api.semanticscholar.org/graph/v1/paper/"
+
+MIN_YEAR = 2024
+RELEVANCE_THRESHOLD = 6
+SCORE_CACHE_PATH = './docs/relevance_cache.json'
+ARXIV_API_URL = "http://export.arxiv.org/api/query"
+ARXIV_NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "arxiv": "http://arxiv.org/schemas/atom",
+}
+
+def arxiv_search(query=None, id_list=None, max_results=10, sort_by="submittedDate", timeout=30):
+    """
+    Search arxiv via the API using requests with a hard timeout.
+    Returns a list of dicts with paper metadata.
+    """
+    params = {"max_results": max_results}
+    if query:
+        params["search_query"] = query
+        params["sortBy"] = sort_by
+        params["sortOrder"] = "descending"
+    if id_list:
+        params["id_list"] = ",".join(id_list) if isinstance(id_list, list) else id_list
+
+    for attempt in range(3):
+        try:
+            print(f"    [arxiv API] query={query or id_list}, max_results={max_results} (attempt {attempt+1}) ...", end=" ", flush=True)
+            t0 = time.time()
+            r = requests.get(ARXIV_API_URL, params=params, timeout=timeout)
+            r.raise_for_status()
+            elapsed = time.time() - t0
+            print(f"OK ({elapsed:.1f}s)", flush=True)
+            break
+        except requests.exceptions.Timeout:
+            print(f"TIMEOUT ({timeout}s)", flush=True)
+            if attempt < 2:
+                time.sleep(3)
+            else:
+                return []
+        except Exception as e:
+            print(f"ERROR: {e}", flush=True)
+            if attempt < 2:
+                time.sleep(3)
+            else:
+                return []
+
+    root = ET.fromstring(r.text)
+    results = []
+    for entry in root.findall("atom:entry", ARXIV_NS):
+        # Skip error entries (arxiv returns an entry with no title for bad IDs)
+        title_el = entry.find("atom:title", ARXIV_NS)
+        if title_el is None or not title_el.text or title_el.text.strip() == "Error":
+            continue
+
+        # Parse ID: http://arxiv.org/abs/2405.17743v1 -> 2405.17743v1
+        raw_id = entry.find("atom:id", ARXIV_NS).text.strip().split("/abs/")[-1]
+
+        authors = []
+        for a in entry.findall("atom:author", ARXIV_NS):
+            name_el = a.find("atom:name", ARXIV_NS)
+            if name_el is not None and name_el.text:
+                authors.append(name_el.text.strip())
+
+        summary_el = entry.find("atom:summary", ARXIV_NS)
+        summary = summary_el.text.replace("\n", " ").strip() if summary_el is not None and summary_el.text else ""
+
+        published_el = entry.find("atom:published", ARXIV_NS)
+        updated_el = entry.find("atom:updated", ARXIV_NS)
+
+        def parse_date(el):
+            if el is not None and el.text:
+                return datetime.date.fromisoformat(el.text.strip()[:10])
+            return None
+
+        primary_cat_el = entry.find("arxiv:primary_category", ARXIV_NS)
+        primary_category = primary_cat_el.get("term", "") if primary_cat_el is not None else ""
+
+        comment_el = entry.find("arxiv:comment", ARXIV_NS)
+        comment = comment_el.text.strip() if comment_el is not None and comment_el.text else None
+
+        journal_el = entry.find("arxiv:journal_ref", ARXIV_NS)
+        journal_ref = journal_el.text.strip() if journal_el is not None and journal_el.text else None
+
+        results.append({
+            "id": raw_id,
+            "title": title_el.text.strip(),
+            "summary": summary,
+            "authors": authors,
+            "primary_category": primary_category,
+            "published": parse_date(published_el),
+            "updated": parse_date(updated_el),
+            "comment": comment,
+            "journal_ref": journal_ref,
+        })
+
+    print(f"    [arxiv API] Got {len(results)} results", flush=True)
+    return results
 
 def load_config(config_file:str) -> dict:
     '''
@@ -34,9 +137,9 @@ def load_config(config_file:str) -> dict:
             for idx in range(0,len(filters)):
                 filter = filters[idx]
                 if len(filter.split()) > 1:
-                    ret += (EXCAPE + filter + EXCAPE)  
+                    ret += (EXCAPE + filter + EXCAPE)
                 else:
-                    ret += (QUOTA + filter + QUOTA)   
+                    ret += (QUOTA + filter + QUOTA)
                 if idx != len(filters) - 1:
                     ret += OR
             return ret
@@ -45,10 +148,10 @@ def load_config(config_file:str) -> dict:
                 keywords[k] = parse_filters(v['filters'])
         return keywords
     with open(config_file,'r') as f:
-        config = yaml.load(f,Loader=yaml.FullLoader) 
+        config = yaml.load(f,Loader=yaml.FullLoader)
         config['kv'] = pretty_filters(**config)
         logging.info(f'config = {config}')
-    return config 
+    return config
 
 def get_authors(authors, first_author = False):
     output = str()
@@ -57,138 +160,265 @@ def get_authors(authors, first_author = False):
     else:
         output = authors[0]
     return output
+
 def sort_papers(papers):
-    output = dict()
-    keys = list(papers.keys())
-    keys.sort(reverse=True)
-    for key in keys:
-        output[key] = papers[key]
-    return output    
-import requests
+    """Sort papers by date (newest first), parsing date from content string."""
+    def extract_date(item):
+        match = re.search(r'(\d{4}[-.]?\d{2}[-.]?\d{2})', str(item[1]))
+        if match:
+            date_str = match.group(1).replace('.', '-')
+            return date_str
+        return item[0]  # fallback to arxiv id
+    sorted_items = sorted(papers.items(), key=extract_date, reverse=True)
+    return dict(sorted_items)
 
 def get_code_link(qword:str) -> str:
     """
-    This short function was auto-generated by ChatGPT. 
-    I only renamed some params and added some comments.
+    Search GitHub for code repositories matching the query.
     @param qword: query string, eg. arxiv ids and paper titles
     @return paper_code in github: string, if not found, return None
     """
-    # query = f"arxiv:{arxiv_id}"
     query = f"{qword}"
     params = {
         "q": query,
         "sort": "stars",
         "order": "desc"
     }
-    r = requests.get(github_url, params=params)
-    results = r.json()
-    code_link = None
-    if results["total_count"] > 0:
-        code_link = results["items"][0]["html_url"]
-    return code_link
-  
-def get_daily_papers(topic,query="slam", max_results=2):
+    headers = {}
+    github_token = os.environ.get("GITHUB_TOKEN")
+    if github_token:
+        headers["Authorization"] = f"token {github_token}"
+    try:
+        r = requests.get(github_url, params=params, headers=headers, timeout=15)
+        results = r.json()
+        if results.get("total_count", 0) > 0:
+            return results["items"][0]["html_url"]
+    except Exception as e:
+        logging.warning(f"GitHub code search failed for '{qword}': {e}")
+    return None
+
+def load_score_cache(cache_path=SCORE_CACHE_PATH):
+    """Load the persistent relevance score cache from disk."""
+    try:
+        with open(cache_path, "r") as f:
+            content = f.read()
+            if content:
+                return json.loads(content)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.warning(f"Failed to load score cache: {e}")
+    return {}
+
+def save_score_cache(cache, cache_path=SCORE_CACHE_PATH):
+    """Save the relevance score cache to disk."""
+    try:
+        with open(cache_path, "w") as f:
+            json.dump(cache, f)
+    except Exception as e:
+        logging.warning(f"Failed to save score cache: {e}")
+
+class RelevanceScore(BaseModel):
+    score: int
+
+def get_relevance_score(paper_id, title, abstract, category, category_description="", client=None, score_cache=None):
+    """
+    Use lightweight LLM to score paper relevance to category (0-10).
+    Checks cache first (keyed by paper_id + category) to avoid repeat API calls.
+    Returns 10 (include) if no client available.
+    """
+    # Build a cache key: paper_id + category ensures same paper scored once per category
+    cache_key = f"{paper_id}::{category}"
+
+    # Check cache first
+    if score_cache is not None and cache_key in score_cache:
+        cached = score_cache[cache_key]
+        logging.info(f"Cache hit for {paper_id} in '{category}': score={cached}")
+        return cached
+
+    if client is None:
+        return 10
+
+    desc = category_description if category_description else category
+    prompt = f"""Rate how relevant this paper is to the research category "{category}" on a scale of 0 to 10.
+
+Category description: {desc}
+
+0 = completely unrelated, 10 = perfectly on-topic.
+
+Title: {title}
+Abstract: {abstract}"""
+
+    try:
+        response = client.chat.completions.parse(
+            model="gpt-5-nano",
+            messages=[{"role": "user", "content": prompt}],
+            response_format=RelevanceScore
+        )
+        result = response.choices[0].message.parsed
+        if result is None:
+            logging.warning(f"Empty LLM response for '{title}', defaulting to 10")
+            score = 10
+        else:
+            score = min(max(result.score, 0), 10)
+    except Exception as e:
+        logging.warning(f"Relevance scoring failed for '{title}': {e}")
+        score = 10  # include paper if scoring fails
+
+    # Store in cache
+    if score_cache is not None:
+        score_cache[cache_key] = score
+
+    return score
+
+def extract_venue(journal_ref=None, comment=None):
+    """Extract publication venue from arxiv metadata."""
+    if journal_ref:
+        return journal_ref
+    if comment:
+        venue_patterns = [
+            r'(?:accepted|published|appear(?:ing|s)?)\s+(?:at|in|by)\s+([^,.]+)',
+            r'(NeurIPS|ICML|ICLR|AAAI|IJCAI|ACL|EMNLP|CVPR|ICCV|ECCV|KDD|WWW|SIGIR|NAACL|COLING|AISTATS|UAI|COLT|SODA|FOCS|STOC|ICRA|IROS|RSS|CoRL)\s*\d{4}',
+        ]
+        for pattern in venue_patterns:
+            match = re.search(pattern, comment, re.IGNORECASE)
+            if match:
+                return match.group(1).strip() if match.lastindex else match.group(0).strip()
+    return ""
+
+def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, category_description="", score_cache=None):
     """
     @param topic: str
     @param query: str
+    @param max_results: int
+    @param llm_client: OpenAI client for relevance filtering (or None)
+    @param category_description: str for LLM relevance scoring
+    @param score_cache: dict - persistent cache of relevance scores
     @return paper_with_code: dict
     """
-    # output 
-    content = dict() 
+    content = dict()
     content_to_web = dict()
-    search_engine = arxiv.Search(
-        query = query,
-        max_results = max_results,
-        sort_by = arxiv.SortCriterion.SubmittedDate
-    )
 
-    for result in search_engine.results():
+    results = arxiv_search(query=query, max_results=max_results)
 
-        paper_id            = result.get_short_id()
-        paper_title         = result.title
-        paper_url           = result.entry_id
-        code_url            = base_url + paper_id #TODO
-        paper_abstract      = result.summary.replace("\n"," ")
-        paper_authors       = get_authors(result.authors)
-        paper_first_author  = get_authors(result.authors,first_author = True)
-        primary_category    = result.primary_category
-        publish_time        = result.published.date()
-        update_time         = result.updated.date()
-        comments            = result.comment
+    for idx, result in enumerate(results, 1):
+        paper_id            = result["id"]
+        paper_title         = result["title"]
+        paper_abstract      = result["summary"]
+        paper_authors       = ", ".join(result["authors"])
+        paper_first_author  = result["authors"][0] if result["authors"] else "Unknown"
+        primary_category    = result["primary_category"]
+        publish_time        = result["published"]
+        update_time         = result["updated"]
+        comments            = result["comment"]
+        journal_ref         = result["journal_ref"]
 
-        logging.info(f"Time = {update_time} title = {paper_title} author = {paper_first_author}")
+        # Year filter: skip papers before MIN_YEAR
+        if publish_time and publish_time.year < MIN_YEAR:
+            print(f"    [{idx}/{len(results)}] Skipping old paper ({publish_time.year}): {paper_title[:60]}", flush=True)
+            continue
 
         # eg: 2108.09112v1 -> 2108.09112
         ver_pos = paper_id.find('v')
         if ver_pos == -1:
             paper_key = paper_id
         else:
-            paper_key = paper_id[0:ver_pos]    
+            paper_key = paper_id[0:ver_pos]
         paper_url = arxiv_url + 'abs/' + paper_key
-        
+
+        # LLM relevance filtering (with cache lookup)
+        print(f"    [{idx}/{len(results)}] Scoring {paper_key} ...", end=" ", flush=True)
+        t0 = time.time()
+        score = get_relevance_score(paper_key, paper_title, paper_abstract, topic, category_description, llm_client, score_cache)
+        elapsed = time.time() - t0
+        if score < RELEVANCE_THRESHOLD:
+            print(f"FILTERED (score={score}, {elapsed:.1f}s): {paper_title[:50]}", flush=True)
+            continue
+        print(f"PASS (score={score}, {elapsed:.1f}s): {paper_title[:50]}", flush=True)
+
+        # Extract venue
+        venue = extract_venue(journal_ref, comments)
+
+        # Source code link - fix: use paper_key (without version) instead of paper_id
+        repo_url = None
         try:
-            # source code link
-            r = requests.get(code_url).json()
-            repo_url = None
+            code_api_url = base_url + paper_key
+            r = requests.get(code_api_url, timeout=15).json()
             if "official" in r and r["official"]:
                 repo_url = r["official"]["url"]
         except Exception as e:
-            logging.error(f"exception: {e} with id: {paper_key}")
-            repo_url = None
+            logging.error(f"Papers with Code exception: {e} with id: {paper_key}")
+
+        # Fallback: search GitHub
+        if repo_url is None:
+            repo_url = get_code_link(paper_title)
 
         if repo_url is not None:
-            content[paper_key] = "|**{}**|**{}**|{} et.al.|[{}]({})|**[link]({})**|\n".format(
-                   update_time,paper_title,paper_first_author,paper_key,paper_url,repo_url)
-            content_to_web[paper_key] = "- {}, **{}**, {} et.al., Paper: [{}]({}), Code: **[{}]({})**".format(
-                   update_time,paper_title,paper_first_author,paper_url,paper_url,repo_url,repo_url)
+            content[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|**[link]({})**|\n".format(
+                   update_time,paper_title,paper_first_author,venue,paper_key,paper_url,repo_url)
+            content_to_web[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|**[link]({})**|\n".format(
+                   update_time,paper_title,paper_first_author,venue,paper_key,paper_url,repo_url)
         else:
-            content[paper_key] = "|**{}**|**{}**|{} et.al.|[{}]({})|null|\n".format(
-                   update_time,paper_title,paper_first_author,paper_key,paper_url)
-            content_to_web[paper_key] = "- {}, **{}**, {} et.al., Paper: [{}]({})".format(
-                   update_time,paper_title,paper_first_author,paper_url,paper_url)
-
-        content_to_web[paper_key] += f"\n"
+            content[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|null|\n".format(
+                   update_time,paper_title,paper_first_author,venue,paper_key,paper_url)
+            content_to_web[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|null|\n".format(
+                   update_time,paper_title,paper_first_author,venue,paper_key,paper_url)
 
     data = {topic:content}
     data_web = {topic:content_to_web}
     return data,data_web
 
-def get_citation_papers(topic, seed_papers):
+def get_citation_papers(topic, seed_papers, llm_client=None, category_description="", score_cache=None):
     """
     Get papers that cite the given seed papers using Semantic Scholar API.
     @param topic: str - category name
     @param seed_papers: list of arxiv ids (e.g. ["2405.17743", "2310.06116"])
+    @param llm_client: OpenAI client for relevance filtering (or None)
+    @param category_description: str for LLM relevance scoring
+    @param score_cache: dict - persistent cache of relevance scores
     @return: (data, data_web) same format as get_daily_papers
     """
     content = dict()
     content_to_web = dict()
 
-    for seed_id in seed_papers:
-        logging.info(f"Fetching citations for seed paper: {seed_id}")
+    for si, seed_id in enumerate(seed_papers, 1):
+        print(f"    [Seed {si}/{len(seed_papers)}] Fetching citations for {seed_id} ...", flush=True)
         offset = 0
+        page = 0
         while True:
             api_url = f"{semantic_scholar_url}ArXiv:{seed_id}/citations"
             params = {
-                "fields": "title,externalIds,year,authors,publicationDate",
+                "fields": "title,externalIds,year,authors,publicationDate,abstract,venue",
                 "offset": offset,
                 "limit": 500
             }
+            page += 1
             try:
-                r = requests.get(api_url, params=params)
+                print(f"      [S2 API] page {page}, offset={offset} ...", end=" ", flush=True)
+                t0 = time.time()
+                r = requests.get(api_url, params=params, timeout=30)
+                elapsed = time.time() - t0
                 if r.status_code == 429:
-                    logging.warning("Semantic Scholar rate limit hit, waiting 5s...")
+                    print(f"RATE LIMITED ({elapsed:.1f}s), waiting 5s ...", flush=True)
                     time.sleep(5)
                     continue
                 r.raise_for_status()
                 result = r.json()
+                print(f"OK ({elapsed:.1f}s)", flush=True)
+            except requests.exceptions.Timeout:
+                print(f"TIMEOUT (30s)", flush=True)
+                break
             except Exception as e:
-                logging.error(f"Error fetching citations for {seed_id}: {e}")
+                print(f"ERROR: {e}", flush=True)
                 break
 
             citations = result.get("data", [])
             if not citations:
+                print(f"      No more citations", flush=True)
                 break
 
+            print(f"      Processing {len(citations)} citations ...", flush=True)
+            scored_count = 0
             for item in citations:
                 paper = item.get("citingPaper", {})
                 ext_ids = paper.get("externalIds", {})
@@ -203,33 +433,60 @@ def get_citation_papers(topic, seed_papers):
                 authors = paper.get("authors", [])
                 first_author = authors[0]["name"] if authors else "Unknown"
                 pub_date = paper.get("publicationDate", "")
+                paper_abstract = paper.get("abstract", "") or ""
+                venue = paper.get("venue", "") or ""
+                paper_year = paper.get("year")
                 paper_url = arxiv_url + "abs/" + arxiv_id
                 paper_key = arxiv_id
 
-                logging.info(f"Citation: {pub_date} {paper_title} by {first_author}")
+                # Year filter: skip papers before MIN_YEAR
+                if paper_year and paper_year < MIN_YEAR:
+                    continue
+                # Also check pub_date if year not available
+                if not paper_year and pub_date:
+                    try:
+                        if int(pub_date[:4]) < MIN_YEAR:
+                            continue
+                    except (ValueError, IndexError):
+                        pass
 
-                # Try to get code link
-                code_url = base_url + arxiv_id
+                # LLM relevance filtering (with cache lookup)
+                scored_count += 1
+                print(f"        Scoring citation {paper_key} ...", end=" ", flush=True)
+                t0 = time.time()
+                score = get_relevance_score(paper_key, paper_title, paper_abstract, topic, category_description, llm_client, score_cache)
+                elapsed = time.time() - t0
+                if score < RELEVANCE_THRESHOLD:
+                    print(f"FILTERED (score={score}, {elapsed:.1f}s): {paper_title[:50]}", flush=True)
+                    continue
+                print(f"PASS (score={score}, {elapsed:.1f}s): {paper_title[:50]}", flush=True)
+
+                # Try to get code link from Papers with Code
                 repo_url = None
                 try:
-                    cr = requests.get(code_url).json()
+                    code_api_url = base_url + arxiv_id
+                    cr = requests.get(code_api_url, timeout=15).json()
                     if "official" in cr and cr["official"]:
                         repo_url = cr["official"]["url"]
                 except Exception:
                     pass
 
-                if repo_url is not None:
-                    content[paper_key] = "|**{}**|**{}**|{} et.al.|[{}]({})|**[link]({})**|\n".format(
-                        pub_date, paper_title, first_author, paper_key, paper_url, repo_url)
-                    content_to_web[paper_key] = "- {}, **{}**, {} et.al., Paper: [{}]({}), Code: **[{}]({})**".format(
-                        pub_date, paper_title, first_author, paper_url, paper_url, repo_url, repo_url)
-                else:
-                    content[paper_key] = "|**{}**|**{}**|{} et.al.|[{}]({})|null|\n".format(
-                        pub_date, paper_title, first_author, paper_key, paper_url)
-                    content_to_web[paper_key] = "- {}, **{}**, {} et.al., Paper: [{}]({})".format(
-                        pub_date, paper_title, first_author, paper_url, paper_url)
+                # Fallback: search GitHub
+                if repo_url is None:
+                    repo_url = get_code_link(paper_title)
 
-                content_to_web[paper_key] += "\n"
+                if repo_url is not None:
+                    content[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|**[link]({})**|\n".format(
+                        pub_date, paper_title, first_author, venue, paper_key, paper_url, repo_url)
+                    content_to_web[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|**[link]({})**|\n".format(
+                        pub_date, paper_title, first_author, venue, paper_key, paper_url, repo_url)
+                else:
+                    content[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|null|\n".format(
+                        pub_date, paper_title, first_author, venue, paper_key, paper_url)
+                    content_to_web[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|null|\n".format(
+                        pub_date, paper_title, first_author, venue, paper_key, paper_url)
+
+            print(f"      Scored {scored_count} papers from this page, {len(content)} total kept so far", flush=True)
 
             # Pagination
             if "next" in result:
@@ -240,24 +497,83 @@ def get_citation_papers(topic, seed_papers):
 
         time.sleep(2)  # pause between seed papers
 
-    logging.info(f"Found {len(content)} unique citing papers for topic: {topic}")
+    print(f"    Found {len(content)} unique citing papers for topic: {topic}", flush=True)
     data = {topic: content}
     data_web = {topic: content_to_web}
     return data, data_web
 
+def clean_json_data(filename):
+    """
+    Remove pre-2024 papers from JSON file and migrate old format entries
+    to include venue column.
+    """
+    with open(filename, "r") as f:
+        content = f.read()
+        if not content:
+            return
+        data = json.loads(content)
+
+    new_data = {}
+    removed_count = 0
+    migrated_count = 0
+
+    for topic, papers in data.items():
+        new_papers = {}
+        for paper_id, entry in papers.items():
+            entry = str(entry)
+            # Extract year from date in content
+            date_match = re.search(r'(\d{4})-(\d{2})-(\d{2})', entry)
+            if date_match:
+                year = int(date_match.group(1))
+                if year < MIN_YEAR:
+                    removed_count += 1
+                    continue
+
+            # Check if entry needs venue column migration (old format has 5 data fields = 6 pipes)
+            pipe_count = entry.count('|')
+            if pipe_count <= 6 and '|' in entry:
+                # Old format: |date|title|author|id|code|
+                # New format: |date|title|author|venue|id|code|
+                parts = entry.split('|')
+                # parts: ['', date, title, author, id, code, '\n'] (7 elements for old)
+                if len(parts) == 7:
+                    parts.insert(4, '')  # insert empty venue
+                    entry = '|'.join(parts)
+                    migrated_count += 1
+
+            new_papers[paper_id] = entry
+        new_data[topic] = new_papers
+
+    with open(filename, "w") as f:
+        json.dump(new_data, f)
+
+    logging.info(f"Cleaned {filename}: removed {removed_count} pre-{MIN_YEAR} papers, migrated {migrated_count} entries")
+
 def update_paper_links(filename):
     '''
-    weekly update paper links in json file 
+    weekly update paper links in json file
     '''
     def parse_arxiv_string(s):
         parts = s.split("|")
-        date = parts[1].strip()
-        title = parts[2].strip()
-        authors = parts[3].strip()
-        arxiv_id = parts[4].strip()
-        code = parts[5].strip()
+        # Handle both old (6 fields) and new (7 fields) format
+        if len(parts) >= 8:
+            # New format: |date|title|authors|venue|arxiv_id|code|
+            date = parts[1].strip()
+            title = parts[2].strip()
+            authors = parts[3].strip()
+            venue = parts[4].strip()
+            arxiv_id = parts[5].strip()
+            code = parts[6].strip()
+        else:
+            # Old format: |date|title|authors|arxiv_id|code|
+            date = parts[1].strip()
+            title = parts[2].strip()
+            authors = parts[3].strip()
+            venue = ''
+            arxiv_id = parts[4].strip()
+            code = parts[5].strip()
         arxiv_id = re.sub(r'v\d+', '', arxiv_id)
-        return date,title,authors,arxiv_id,code
+        return date,title,authors,venue,arxiv_id,code
 
     with open(filename,"r") as f:
         content = f.read()
@@ -265,39 +581,50 @@ def update_paper_links(filename):
             m = {}
         else:
             m = json.loads(content)
-            
-        json_data = m.copy() 
 
-        for keywords,v in json_data.items():
-            logging.info(f'keywords = {keywords}')
-            for paper_id,contents in v.items():
-                contents = str(contents)
+    json_data = m.copy()
 
-                update_time, paper_title, paper_first_author, paper_url, code_url = parse_arxiv_string(contents)
+    for keywords,v in json_data.items():
+        logging.info(f'keywords = {keywords}')
+        for paper_id,contents in v.items():
+            contents = str(contents)
 
-                contents = "|{}|{}|{}|{}|{}|\n".format(update_time,paper_title,paper_first_author,paper_url,code_url)
-                json_data[keywords][paper_id] = str(contents)
-                logging.info(f'paper_id = {paper_id}, contents = {contents}')
-                
-                valid_link = False if '|null|' in contents else True
-                if valid_link:
-                    continue
-                try:
-                    code_url = base_url + paper_id #TODO
-                    r = requests.get(code_url).json()
-                    repo_url = None
-                    if "official" in r and r["official"]:
-                        repo_url = r["official"]["url"]
-                        if repo_url is not None:
-                            new_cont = contents.replace('|null|',f'|**[link]({repo_url})**|')
-                            logging.info(f'ID = {paper_id}, contents = {new_cont}')
-                            json_data[keywords][paper_id] = str(new_cont)
+            update_time, paper_title, paper_first_author, venue, paper_url, code_url = parse_arxiv_string(contents)
 
-                except Exception as e:
-                    logging.error(f"exception: {e} with id: {paper_id}")
-        # dump to json file
-        with open(filename,"w") as f:
-            json.dump(json_data,f)
+            contents = "|{}|{}|{}|{}|{}|{}|\n".format(update_time,paper_title,paper_first_author,venue,paper_url,code_url)
+            json_data[keywords][paper_id] = str(contents)
+            logging.info(f'paper_id = {paper_id}, contents = {contents}')
+
+            valid_link = False if '|null|' in contents else True
+            if valid_link:
+                continue
+            try:
+                code_api_url = base_url + paper_id
+                r = requests.get(code_api_url, timeout=15).json()
+                repo_url = None
+                if "official" in r and r["official"]:
+                    repo_url = r["official"]["url"]
+                    if repo_url is not None:
+                        new_cont = contents.replace('|null|',f'|**[link]({repo_url})**|')
+                        logging.info(f'ID = {paper_id}, contents = {new_cont}')
+                        json_data[keywords][paper_id] = str(new_cont)
+
+                # Fallback: search GitHub if Papers with Code has no result
+                if repo_url is None:
+                    # Extract title text for GitHub search
+                    title_match = re.search(r'\*\*(.+?)\*\*', paper_title)
+                    search_term = title_match.group(1) if title_match else paper_id
+                    repo_url = get_code_link(search_term)
+                    if repo_url is not None:
+                        new_cont = contents.replace('|null|',f'|**[link]({repo_url})**|')
+                        logging.info(f'GitHub fallback ID = {paper_id}, contents = {new_cont}')
+                        json_data[keywords][paper_id] = str(new_cont)
+
+            except Exception as e:
+                logging.error(f"exception: {e} with id: {paper_id}")
+    # dump to json file
+    with open(filename,"w") as f:
+        json.dump(json_data,f)
 
 def update_json_file(filename,data_dict):
     '''
@@ -309,10 +636,10 @@ def update_json_file(filename,data_dict):
             m = {}
         else:
             m = json.loads(content)
-            
-    json_data = m.copy() 
-    
-    # update papers in each keywords         
+
+    json_data = m.copy()
+
+    # update papers in each keywords
     for data in data_dict:
         for keyword in data.keys():
             papers = data[keyword]
@@ -324,11 +651,11 @@ def update_json_file(filename,data_dict):
 
     with open(filename,"w") as f:
         json.dump(json_data,f)
-    
+
 def json_to_md(filename,md_filename,
                task = '',
-               to_web = False, 
-               use_title = True, 
+               to_web = False,
+               use_title = True,
                use_tc = True,
                use_b2t = True):
     """
@@ -343,17 +670,17 @@ def json_to_md(filename,md_filename,
             return s
         math_start,math_end = match.span()
         space_trail = space_leading = ''
-        if s[:math_start][-1] != ' ' and '*' != s[:math_start][-1]: space_trail = ' ' 
-        if s[math_end:][0] != ' ' and '*' != s[math_end:][0]: space_leading = ' ' 
-        ret += s[:math_start] 
-        ret += f'{space_trail}${match.group()[1:-1].strip()}${space_leading}' 
+        if s[:math_start][-1] != ' ' and '*' != s[:math_start][-1]: space_trail = ' '
+        if s[math_end:][0] != ' ' and '*' != s[math_end:][0]: space_leading = ' '
+        ret += s[:math_start]
+        ret += f'{space_trail}${match.group()[1:-1].strip()}${space_leading}'
         ret += s[math_end:]
         return ret
-  
+
     DateNow = datetime.date.today()
     DateNow = str(DateNow)
     DateNow = DateNow.replace('-','.')
-    
+
     with open(filename,"r") as f:
         content = f.read()
         if not content:
@@ -370,7 +697,7 @@ def json_to_md(filename,md_filename,
 
         if (use_title == True) and (to_web == True):
             f.write("---\n" + "layout: default\n" + "---\n\n")
-                
+
         if use_title == True:
             f.write("## Updated on " + DateNow + "\n")
         else:
@@ -385,11 +712,11 @@ def json_to_md(filename,md_filename,
                 day_content = data[keyword]
                 if not day_content:
                     continue
-                kw = keyword.replace(' ','-')      
+                kw = keyword.replace(' ','-')
                 f.write(f"    <li><a href=#{kw.lower()}>{keyword}</a></li>\n")
             f.write("  </ol>\n")
             f.write("</details>\n\n")
-        
+
         for keyword in data.keys():
             day_content = data[keyword]
             if not day_content:
@@ -399,91 +726,155 @@ def json_to_md(filename,md_filename,
 
             if use_title == True :
                 if to_web == False:
-                    f.write("|Publish Date|Title|Authors|PDF|Code|\n" + "|---|---|---|---|---|\n")
+                    f.write("|Publish Date|Title|Authors|Venue|PDF|Code|\n" + "|---|---|---|---|---|---|\n")
                 else:
-                    f.write("| Publish Date | Title | Authors | PDF | Code |\n")
-                    f.write("|:---------|:-----------------------|:---------|:------|:------|\n")
+                    f.write("| Publish Date | Title | Authors | Venue | PDF | Code |\n")
+                    f.write("|:---------|:-----------------------|:---------|:------|:------|:------|\n")
 
-            # sort papers by date
+            # sort papers by date (newest first)
             day_content = sort_papers(day_content)
-        
+
             for _,v in day_content.items():
                 if v is not None:
                     f.write(pretty_math(v)) # make latex pretty
 
             f.write(f"\n")
-            
+
             #Add: back to top
             if use_b2t:
                 top_info = f"#Updated on {DateNow}"
                 top_info = top_info.replace(' ','-').replace('.','')
                 f.write(f"<p align=right>(<a href={top_info.lower()}>back to top</a>)</p>\n\n")
-                
-    logging.info(f"{task} finished")        
+
+    logging.info(f"{task} finished")
 
 def demo(**config):
-    # TODO: use config
+    start_time = time.time()
     data_collector = []
     data_collector_web= []
-    
+
     keywords = config['kv']
     max_results = config['max_results']
     publish_readme = config['publish_readme']
     publish_gitpage = config['publish_gitpage']
 
+    # Initialize OpenAI client for relevance filtering
+    llm_client = None
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key and OpenAI is not None:
+        llm_client = OpenAI(api_key=api_key)
+        print("[1/6] OpenAI client initialized (LLM filtering ON)", flush=True)
+    else:
+        print("[1/6] No OPENAI_API_KEY set - LLM filtering OFF (all papers pass through)", flush=True)
+
+    # Load persistent relevance score cache
+    score_cache = load_score_cache()
+    print(f"[2/6] Loaded score cache: {len(score_cache)} previously scored papers", flush=True)
+
+    # Build category descriptions lookup
+    category_descriptions = {}
+    for topic, cfg in config['keywords'].items():
+        category_descriptions[topic] = cfg.get('description', topic)
+
     b_update = config['update_paper_links']
-    logging.info(f'Update Paper Link = {b_update}')
+
+    # Clean old papers from JSON files first
+    if publish_readme:
+        clean_json_data(config['json_readme_path'])
+    if publish_gitpage:
+        clean_json_data(config['json_gitpage_path'])
+
     if config['update_paper_links'] == False:
-        logging.info(f"GET daily papers begin")
+        print(f"[3/6] Starting paper retrieval (max {max_results} per query)...", flush=True)
+        total_found = 0
+        cache_before = len(score_cache)
+
         # keyword-based search
-        for topic, keyword in keywords.items():
-            logging.info(f"Keyword: {topic}")
-            data, data_web = get_daily_papers(topic, query = keyword,
-                                            max_results = max_results)
+        for i, (topic, keyword) in enumerate(keywords.items(), 1):
+            print(f"\n  [{i}/{len(keywords)}] Keyword search: '{topic}' ...", flush=True)
+            t0 = time.time()
+            data, data_web = get_daily_papers(topic, query=keyword,
+                                            max_results=max_results,
+                                            llm_client=llm_client,
+                                            category_description=category_descriptions.get(topic, topic),
+                                            score_cache=score_cache)
+            count = len(data.get(topic, {}))
+            total_found += count
+            elapsed = time.time() - t0
+            print(f"  [{i}/{len(keywords)}] '{topic}' done: {count} papers kept ({elapsed:.1f}s)", flush=True)
             data_collector.append(data)
             data_collector_web.append(data_web)
-            print("\n")
+
         # citation-based search
-        for topic, cfg in config['keywords'].items():
-            if 'seed_papers' in cfg:
-                logging.info(f"Citation search for: {topic}")
-                data, data_web = get_citation_papers(topic, cfg['seed_papers'])
-                data_collector.append(data)
-                data_collector_web.append(data_web)
-                print("\n")
-        logging.info(f"GET daily papers end")
+        citation_topics = [(t, c) for t, c in config['keywords'].items() if 'seed_papers' in c]
+        for i, (topic, cfg) in enumerate(citation_topics, 1):
+            seed_count = len(cfg['seed_papers'])
+            print(f"\n  [Citation {i}/{len(citation_topics)}] '{topic}' ({seed_count} seed papers) ...", flush=True)
+            t0 = time.time()
+            data, data_web = get_citation_papers(topic, cfg['seed_papers'],
+                                                 llm_client=llm_client,
+                                                 category_description=category_descriptions.get(topic, topic),
+                                                 score_cache=score_cache)
+            count = len(data.get(topic, {}))
+            total_found += count
+            elapsed = time.time() - t0
+            print(f"  [Citation {i}/{len(citation_topics)}] '{topic}' done: {count} papers kept ({elapsed:.1f}s)", flush=True)
+            data_collector.append(data)
+            data_collector_web.append(data_web)
+
+        new_scores = len(score_cache) - cache_before
+        print(f"\n[4/6] Retrieval done: {total_found} total papers, {new_scores} new LLM scores (cached: {cache_before})", flush=True)
+    else:
+        print("[3/6] Update mode: re-checking code links for existing papers...", flush=True)
+
+    # Save the updated score cache
+    save_score_cache(score_cache)
+    print(f"[5/6] Score cache saved ({len(score_cache)} entries)", flush=True)
 
     # 1. update README.md file
     if publish_readme:
+        print("  Updating README ...", end=" ", flush=True)
         json_file = config['json_readme_path']
         md_file   = config['md_readme_path']
-        # update paper links
         if config['update_paper_links']:
             update_paper_links(json_file)
-        else:    
-            # update json data
+        else:
             update_json_file(json_file,data_collector)
-        # json data to markdown
         json_to_md(json_file,md_file, task ='Update Readme')
+        print("done", flush=True)
 
     # 2. update docs/index.md file (to gitpage)
     if publish_gitpage:
+        print("  Updating GitPage ...", end=" ", flush=True)
         json_file = config['json_gitpage_path']
         md_file   = config['md_gitpage_path']
-        # TODO: duplicated update paper links!!!
         if config['update_paper_links']:
             update_paper_links(json_file)
-        else:    
-            update_json_file(json_file,data_collector)
+        else:
+            update_json_file(json_file,data_collector_web)
         json_to_md(json_file, md_file, task ='Update GitPage', \
             to_web = True, use_tc=False, use_b2t=False)
+        print("done", flush=True)
+
+    elapsed = time.time() - start_time
+    # Count total papers in output
+    total_papers = 0
+    try:
+        with open(config['json_readme_path'], 'r') as f:
+            content = f.read()
+            if content:
+                all_data = json.loads(content)
+                total_papers = sum(len(p) for p in all_data.values())
+    except Exception:
+        pass
+    print(f"[6/6] Done! {total_papers} papers in database. Elapsed: {elapsed:.1f}s", flush=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config_path',type=str, default='config.yaml',
                             help='configuration file path')
     parser.add_argument('--update_paper_links', default=False,
-                        action="store_true",help='whether to update paper links etc.')                        
+                        action="store_true",help='whether to update paper links etc.')
     args = parser.parse_args()
     config = load_config(args.config_path)
     config = {**config, 'update_paper_links':args.update_paper_links}
