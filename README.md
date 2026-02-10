@@ -68,89 +68,111 @@
 
 |Publish Date|Title|Authors|Venue|PDF|Code|
 |---|---|---|---|---|---|
-|**2026-02-05**|**Opt4GPTQ: Co-Optimizing Memory and Computation for 4-bit GPTQ Quantized LLM Inference on Heterogeneous Platforms**|Yaozheng Zhang et.al.||[2511.19438](http://arxiv.org/abs/2511.19438)|null|
-|**2026-02-03**|**NLI:Non-uniform Linear Interpolation Approximation of Nonlinear Operations for Efficient LLMs Inference**|Jiangyong Yu et.al.||[2602.02988](http://arxiv.org/abs/2602.02988)|null|
-|**2026-01-30**|**Continuum: Efficient and Robust Multi-Turn LLM Agent Scheduling with KV Cache Time-to-Live**|Hanchen Li et.al.||[2511.02230](http://arxiv.org/abs/2511.02230)|null|
-|**2026-01-19**|**SmallKV: Small Model Assisted Compensation of KV Cache Compression for Efficient LLM Inference**|Yi Zhao et.al.||[2508.02751](http://arxiv.org/abs/2508.02751)|null|
-|**2026-01-12**|**AdaSpec: Adaptive Speculative Decoding for Fast, SLO-Aware Large Language Model Serving**|Kaiyu Huang et.al.|In ACM Symposium on Cloud Computing (SoCC '25), November 19-21, 2025, Online, USA|[2503.05096](http://arxiv.org/abs/2503.05096)|null|
-|**2026-01-07**|**Hummingbird: SLO-Oriented GPU Preemption at Microsecond-scale**|Tiancheng Hu et.al.||[2601.04071](http://arxiv.org/abs/2601.04071)|null|
-|**2026-01-05**|**LoRA-Drop: Temporal LoRA Decoding for Efficient LLM Inference**|Hossein Rajabzadeh et.al.||[2601.02569](http://arxiv.org/abs/2601.02569)|null|
+|**2026-02-09**|**OSCAR: Optimization-Steered Agentic Planning for Composed Image Retrieval**|Teng Wang et.al.||[2602.08603](http://arxiv.org/abs/2602.08603)|null|
+|**2026-02-09**|**Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction**|Ziyao Tang et.al.||[2602.08585](http://arxiv.org/abs/2602.08585)|null|
+|**2026-02-08**|**Solver-in-the-Loop: MDP-Based Benchmarks for Self-Correction and Behavioral Rationality in Operations Research**|Ruicheng Ao et.al.||[2601.21008](http://arxiv.org/abs/2601.21008)|null|
+|**2026-02-07**|**A Two-Layer Framework for Joint Online Configuration Selection and Admission Control**|Owen Shen et.al.||[2602.07663](http://arxiv.org/abs/2602.07663)|null|
+|**2026-02-06**|**tLoRA: Efficient Multi-LoRA Training with Elastic Shared Super-Models**|Kevin Li et.al.||[2602.07263](http://arxiv.org/abs/2602.07263)|null|
+|**2026-02-04**|**MIRROR: A Multi-Agent Framework with Iterative Adaptive Revision and Hierarchical Retrieval for Optimization Modeling in Operations Research**|Yifan Shi et.al.||[2602.03318](http://arxiv.org/abs/2602.03318)|null|
+|**2026-02-03**|**Large-Scale LLM Inference with Heterogeneous Workloads: Prefill-Decode Contention and Asymptotically Optimal Control**|Ruihan Lin et.al.||[2602.02987](http://arxiv.org/abs/2602.02987)|null|
+|**2026-02-03**|**3D-Learning: Diffusion-Augmented Distributionally Robust Decision-Focused Learning**|Jiaqi Wen et.al.||[2602.02943](http://arxiv.org/abs/2602.02943)|null|
+|**2026-02-03**|**PROBE: Co-Balancing Computation and Communication in MoE Inference via Real-Time Predictive Prefetching**|Qianchao Zhu et.al.||[2602.00509](http://arxiv.org/abs/2602.00509)|null|
+|**2026-02-02**|**Distributed Hierarchical Machine Learning for Joint Resource Allocation and Slice Selection in In-Network Edge Systems**|Sulaiman Muhammad Rashid et.al.||[2511.13313](http://arxiv.org/abs/2511.13313)|null|
+|**2026-02-02**|**Canonical Intermediate Representation for LLM-based optimization problem formulation and code generation**|Zhongyuan Lyu et.al.||[2602.02029](http://arxiv.org/abs/2602.02029)|null|
+|**2026-02-01**|**SNIP: An Adaptive Mixed Precision Framework for Subbyte Large Language Model Training**|Yunjie Pan et.al.||[2602.01410](http://arxiv.org/abs/2602.01410)|**[link](https://github.com/pyjhzwh/SNIP)**|
+|**2026-02-01**|**EvoOpt-LLM: Evolving industrial optimization models with large language models**|Yiliu He et.al.||[2602.01082](http://arxiv.org/abs/2602.01082)|null|
+|**2026-02-01**|**SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models**|Xin Nie et.al.||[2602.01027](http://arxiv.org/abs/2602.01027)|null|
+|**2026-02-01**|**Predictive Scheduling for Efficient Inference-Time Reasoning in Large Language Models**|Katrina Brown et.al.||[2602.01237](http://arxiv.org/abs/2602.01237)|null|
+|**2026-02-01**|**Hard Constraints Meet Soft Generation: Guaranteed Feasibility for LLM-based Combinatorial Optimization**|Yang Liu et.al.||[2602.01090](http://arxiv.org/abs/2602.01090)|null|
+|**2026-01-30**|**Foundation Models for Logistics: Toward Certifiable, Conversational Planning Interfaces**|Yunhao Yang et.al.||[2507.11352](http://arxiv.org/abs/2507.11352)|null|
+|**2026-01-30**|**PerfGuard: A Performance-Aware Agent for Visual Content Generation**|Zhipeng Chen et.al.|ICLR 2026|[2601.22571](http://arxiv.org/abs/2601.22571)|**[link](https://github.com/FelixChan9527/PerfGuard)**|
+|**2026-01-29**|**DASH: Deterministic Attention Scheduling for High-throughput Reproducible LLM Training**|Xinwei Qiang et.al.||[2601.21824](http://arxiv.org/abs/2601.21824)|**[link](https://github.com/SJTU-Liquid/deterministic-FA3)**|
+|**2026-01-29**|**CORE:Toward Ubiquitous 6G Intelligence Through Collaborative Orchestration of Large Language Model Agents Over Hierarchical Edge**|Zitong Yu et.al.|IEEE Communications Magazine|[2601.21822](http://arxiv.org/abs/2601.21822)|null|
+|**2026-01-28**|**DCP-Bench-Open: Evaluating LLMs for Constraint Modelling of Discrete Combinatorial Problems**|Kostis Michailidis et.al.|ECAI25)|[2506.06052](http://arxiv.org/abs/2506.06052)|**[link](https://github.com/kostis-init/CP-Bench)**|
+|**2026-01-27**|**Modular Foundation Model Inference at the Edge: Network-Aware Microservice Optimization**|Juan Zhu et.al.||[2601.19563](http://arxiv.org/abs/2601.19563)|null|
+|**2026-01-23**|**Stochastic Modeling and Resource Dimensioning of Multi-Cellular Edge Intelligent Systems**|Jaume Anguera Peris et.al.||[2601.16848](http://arxiv.org/abs/2601.16848)|null|
+|**2026-01-18**|**Cross-reality Location Privacy Protection in 6G-enabled Vehicular Metaverses: An LLM-enhanced Hybrid Generative Diffusion Model-based Approach**|Xiaofeng Luo et.al.||[2601.12311](http://arxiv.org/abs/2601.12311)|null|
+|**2026-01-14**|**OptiMind: Teaching LLMs to Think Like Optimization Experts**|Xinzhi Zhang et.al.||[2509.22979](http://arxiv.org/abs/2509.22979)|null|
+|**2026-01-13**|**Hierarchical Online-Scheduling for Energy-Efficient Split Inference with Progressive Transmission**|Zengzipeng Tang et.al.||[2601.08135](http://arxiv.org/abs/2601.08135)|null|
+|**2026-01-13**|**Coordinated Cooling and Compute Management for AI Datacenters**|Nardos Belay Abera et.al.||[2601.08113](http://arxiv.org/abs/2601.08113)|null|
+|**2026-01-10**|**SkyNomad: On Using Multi-Region Spot Instances to Minimize AI Batch Job Cost**|Zhifei Li et.al.||[2601.06520](http://arxiv.org/abs/2601.06520)|null|
+|**2026-01-09**|**OPT-Engine: Benchmarking the Limits of LLMs in Optimization Modeling via Complexity Scaling**|Yitian Chen et.al.||[2601.19924](http://arxiv.org/abs/2601.19924)|**[link](https://github.com/Cardinal-Operations/OPTEngine)**|
 |**2026-01-05**|**Optimizing LLM Inference: Fluid-Guided Online Scheduling with Memory Constraints**|Ruicheng Ao et.al.||[2504.11320](http://arxiv.org/abs/2504.11320)|null|
-|**2025-12-28**|**Argus: Token Aware Distributed LLM Inference Optimization**|Panlong Wu et.al.||[2512.22925](http://arxiv.org/abs/2512.22925)|null|
+|**2025-12-31**|**Ask, Clarify, Optimize: Human-LLM Agent Collaboration for Smarter Inventory Control**|Yaqi Duan et.al.||[2601.00121](http://arxiv.org/abs/2601.00121)|null|
+|**2025-12-26**|**Optimizing Resource Allocation for Geographically-Distributed Inference by Large Language Models**|Tingyang Sun et.al.|Performance Evaluation, Vol. 170, pp. 102527, November 2025|[2512.21884](http://arxiv.org/abs/2512.21884)|null|
+|**2025-12-24**|**Deadline-Aware Online Scheduling for LLM Fine-Tuning with Spot Market Predictions**|Linggao Kong et.al.||[2512.20967](http://arxiv.org/abs/2512.20967)|null|
 |**2025-12-18**|**Staggered Batch Scheduling: Co-optimizing Time-to-First-Token and Throughput for High-Efficiency LLM Inference**|Jian Tian et.al.||[2512.16134](http://arxiv.org/abs/2512.16134)|null|
-|**2025-12-16**|**SemShareKV: Efficient KVCache Sharing for Semantically Similar Prompts via Token-Level LSH Matching**|Xinye Zhao et.al.||[2509.24832](http://arxiv.org/abs/2509.24832)|null|
-|**2025-12-16**|**FreeKV: Boosting KV Cache Retrieval for Efficient LLM Inference**|Guangda Liu et.al.||[2505.13109](http://arxiv.org/abs/2505.13109)|null|
-|**2025-12-12**|**Adaptive Soft Rolling KV Freeze with Entropy-Guided Recovery: Sublinear Memory Growth for Efficient LLM Inference**|Adilet Metinov et.al.||[2512.11221](http://arxiv.org/abs/2512.11221)|null|
-|**2025-12-11**|**Hybrid Learning and Optimization-Based Dynamic Scheduling for DL Workloads on Heterogeneous GPU Clusters**|Shruti Dongare et.al.||[2512.10271](http://arxiv.org/abs/2512.10271)|null|
-|**2025-12-08**|**H2EAL: Hybrid-Bonding Architecture with Hybrid Sparse Attention for Efficient Long-Context LLM Inference**|Zizhuo Fu et.al.||[2508.16653](http://arxiv.org/abs/2508.16653)|null|
-|**2025-12-07**|**KV-CAR: KV Cache Compression using Autoencoders and KV Reuse in Large Language Models**|Sourjya Roy et.al.||[2512.06727](http://arxiv.org/abs/2512.06727)|null|
-|**2025-12-01**|**KV Pareto: Systems-Level Optimization of KV Cache and Model Compression for Long Context Inference**|Sai Gokhale et.al.||[2512.01953](http://arxiv.org/abs/2512.01953)|null|
-|**2025-12-01**|**Optimal Scheduling Algorithms for LLM Inference: Theory and Practice**|Agrim Bari et.al.||[2508.01002](http://arxiv.org/abs/2508.01002)|null|
-|**2025-11-27**|**OmniInfer: System-Wide Acceleration Techniques for Optimizing LLM Serving Throughput and Latency**|Jun Wang et.al.||[2511.22481](http://arxiv.org/abs/2511.22481)|null|
-|**2025-11-27**|**KeepKV: Achieving Periodic Lossless KV Cache Compression for Efficient LLM Inference**|Yuxuan Tian et.al.||[2504.09936](http://arxiv.org/abs/2504.09936)|null|
-|**2025-11-24**|**An Online Fragmentation-Aware GPU Scheduler for Multi-Tenant MIG-based Clouds**|Marco Zambianco et.al.||[2511.18906](http://arxiv.org/abs/2511.18906)|null|
-|**2025-11-18**|**CLO: Efficient LLM Inference System with CPU-Light KVCache Offloading via Algorithm-System Co-Design**|Jiawei Yi et.al.||[2511.14510](http://arxiv.org/abs/2511.14510)|null|
-|**2025-11-17**|**T-SAR: A Full-Stack Co-design for CPU-Only Ternary LLM Inference via In-Place SIMD ALU Reorganization**|Hyunwoo Oh et.al.||[2511.13676](http://arxiv.org/abs/2511.13676)|null|
-|**2025-11-14**|**AccKV: Towards Efficient Audio-Video LLMs Inference via Adaptive-Focusing and Cross-Calibration KV Cache Optimization**|Zhonghua Jiang et.al.||[2511.11106](http://arxiv.org/abs/2511.11106)|null|
-|**2025-11-04**|**Optimal Singular Damage: Efficient LLM Inference in Low Storage Regimes**|Mohammadsajad Alipour et.al.||[2511.02681](http://arxiv.org/abs/2511.02681)|null|
-|**2025-11-03**|**Scaling Graph Chain-of-Thought Reasoning: A Multi-Agent Framework with Efficient LLM Serving**|Chengying Huan et.al.||[2511.01633](http://arxiv.org/abs/2511.01633)|null|
-|**2025-10-31**|**HELIOS: Adaptive Model And Early-Exit Selection for Efficient LLM Inference Serving**|Avinash Kumar et.al.||[2504.10724](http://arxiv.org/abs/2504.10724)|null|
-|**2025-10-30**|**PureKV: Plug-and-Play KV Cache Optimization with Spatial-Temporal Sparse Attention for Vision-Language Large Models**|Zhonghua Jiang et.al.||[2510.25600](http://arxiv.org/abs/2510.25600)|null|
-|**2025-10-30**|**DiffAdapt: Difficulty-Adaptive Reasoning for Token-Efficient LLM Inference**|Xiang Liu et.al.||[2510.19669](http://arxiv.org/abs/2510.19669)|null|
-|**2025-10-29**|**Oneiros: KV Cache Optimization through Parameter Remapping for Multi-tenant LLM Serving**|Ruihao Li et.al.||[2507.11507](http://arxiv.org/abs/2507.11507)|null|
-|**2025-10-19**|**Justitia: Fair and Efficient Scheduling for LLM Applications**|Mingyan Yang et.al.||[2510.17015](http://arxiv.org/abs/2510.17015)|null|
-|**2025-10-16**|**MX+: Pushing the Limits of Microscaling Formats for Efficient Large Language Model Serving**|Jungi Lee et.al.|the 58th International Symposium on Microarchitecture (MICRO 2025)|[2510.14557](http://arxiv.org/abs/2510.14557)|null|
-|**2025-10-13**|**Efficient LLM Inference over Heterogeneous Edge Networks with Speculative Decoding**|Bingjie Zhu et.al.||[2510.11331](http://arxiv.org/abs/2510.11331)|null|
-|**2025-10-10**|**FLRC: Fine-grained Low-Rank Compressor for Efficient LLM Inference**|Yu-Chen Lu et.al.|EMNLP 2025|[2510.09332](http://arxiv.org/abs/2510.09332)|null|
-|**2025-10-07**|**VecInfer: Efficient LLM Inference with Low-Bit KV Cache via Outlier-Suppressed Vector Quantization**|Dingyu Yao et.al.||[2510.06175](http://arxiv.org/abs/2510.06175)|null|
-|**2025-10-05**|**ZSMerge: Zero-Shot KV Cache Compression for Memory-Efficient Long-Context LLMs**|Xin Liu et.al.||[2503.10714](http://arxiv.org/abs/2503.10714)|null|
-|**2025-09-30**|**Parallax: Efficient LLM Inference Service over Decentralized Environment**|Chris Tong et.al.||[2509.26182](http://arxiv.org/abs/2509.26182)|null|
-|**2025-09-29**|**Speculative Verification: Exploiting Information Gain to Refine Speculative Decoding**|Sungkyun Kim et.al.||[2509.24328](http://arxiv.org/abs/2509.24328)|null|
-|**2025-09-29**|**METok: Multi-Stage Event-based Token Compression for Efficient Long Video Understanding**|Mengyue Wang et.al.|EMNLP|[2506.02850](http://arxiv.org/abs/2506.02850)|null|
-|**2025-09-29**|**SentenceKV: Efficient LLM Inference via Sentence-Level Semantic KV Caching**|Yuxuan Zhu et.al.||[2504.00970](http://arxiv.org/abs/2504.00970)|null|
-|**2025-09-27**|**READER: Retrieval-Assisted Drafter for Efficient LLM Inference**|Maxim Divilkovskiy et.al.||[2508.09072](http://arxiv.org/abs/2508.09072)|null|
-|**2025-09-26**|**Bridging Draft Policy Misalignment: Group Tree Optimization for Speculative Decoding**|Shijing Hu et.al.||[2509.22134](http://arxiv.org/abs/2509.22134)|null|
-|**2025-09-24**|**Gyges: Dynamic Cross-Instance Parallelism Transformation for Efficient LLM Inference**|Haoyu Chen et.al.||[2509.19729](http://arxiv.org/abs/2509.19729)|null|
-|**2025-09-22**|**Cronus: Efficient LLM inference on Heterogeneous GPU Clusters via Partially Disaggregated Prefill**|Yunzhao Liu et.al.||[2509.17357](http://arxiv.org/abs/2509.17357)|null|
-|**2025-09-16**|**InferLog: Accelerating LLM Inference for Online Log Parsing via ICL-oriented Prefix Caching**|Yilun Wang et.al.|ICSE '26 (The 48th IEEE/ACM International Conference on Software Engineering)|[2507.08523](http://arxiv.org/abs/2507.08523)|null|
-|**2025-09-12**|**MCBP: A Memory-Compute Efficient LLM Inference Accelerator Leveraging Bit-Slice-enabled Sparsity and Repetitiveness**|Huizheng Wang et.al.||[2509.10372](http://arxiv.org/abs/2509.10372)|null|
-|**2025-09-11**|**Towards Confidential and Efficient LLM Inference with Dual Privacy Protection**|Honglan Yu et.al.|DASFAA2025|[2509.09091](http://arxiv.org/abs/2509.09091)|null|
-|**2025-09-10**|**BitROM: Weight Reload-Free CiROM Architecture Towards Billion-Parameter 1.58-bit LLM Inference**|Wenlun Zhang et.al.||[2509.08542](http://arxiv.org/abs/2509.08542)|null|
-|**2025-09-01**|**Adaptively Robust LLM Inference Optimization under Prediction Uncertainty**|Zixi Chen et.al.||[2508.14544](http://arxiv.org/abs/2508.14544)|null|
-|**2025-08-31**|**LLM Serving Optimization with Variable Prefill and Decode Lengths**|Meixuan Wang et.al.||[2508.06133](http://arxiv.org/abs/2508.06133)|null|
-|**2025-08-16**|**OrthoRank: Token Selection via Sink Token Orthogonality for Efficient LLM inference**|Seungjun Shin et.al.|ICML|[2507.03865](http://arxiv.org/abs/2507.03865)|null|
-|**2025-08-08**|**KV Cache Compression for Inference Efficiency in LLMs: A Review**|Yanyu Liu et.al.||[2508.06297](http://arxiv.org/abs/2508.06297)|null|
-|**2025-08-06**|**EdgeInfinite-Instruct: Bridging SFT-Based Optimization and NPU-Level Efficiency for Edge Devices**|Jiyu Chen et.al.||[2508.00370](http://arxiv.org/abs/2508.00370)|null|
-|**2025-08-04**|**Prefill-Decode Aggregation or Disaggregation? Unifying Both for Goodput-Optimized LLM Serving**|Chao Wang et.al.||[2508.01989](http://arxiv.org/abs/2508.01989)|null|
-|**2025-08-03**|**AGFT: An Adaptive GPU Frequency Tuner for Real-Time LLM Inference Optimization**|Zicong Ye et.al.||[2508.01744](http://arxiv.org/abs/2508.01744)|null|
-|**2025-07-25**|**DeltaLLM: A Training-Free Framework Exploiting Temporal Sparsity for Efficient Edge LLM Inference**|Jiawen Qi et.al.||[2507.19608](http://arxiv.org/abs/2507.19608)|null|
-|**2025-07-23**|**BucketServe: Bucket-Based Dynamic Batching for Smart and Efficient LLM Inference Serving**|Wanyi Zheng et.al.|IEEE SmartData 2025|[2507.17120](http://arxiv.org/abs/2507.17120)|null|
-|**2025-07-16**|**IAM: Efficient Inference through Attention Mapping between Different-scale LLMs**|Yi Zhao et.al.|ACL|[2507.11953](http://arxiv.org/abs/2507.11953)|null|
-|**2025-07-14**|**LaCache: Ladder-Shaped KV Caching for Efficient Long-Context Modeling of Large Language Models**|Dachuan Shi et.al.|ICML|[2507.14204](http://arxiv.org/abs/2507.14204)|**[link](https://github.com/GATECH-EIC/LaCache)**|
-|**2025-07-09**|**Gradientsys: A Multi-Agent LLM Scheduler with ReAct Orchestration**|Xinyuan Song et.al.||[2507.06520](http://arxiv.org/abs/2507.06520)|null|
-|**2025-07-05**|**SparseMM: Head Sparsity Emerges from Visual Concept Responses in MLLMs**|Jiahui Wang et.al.|ICCV|[2506.05344](http://arxiv.org/abs/2506.05344)|null|
-|**2025-06-20**|**Towards AI Search Paradigm**|Yuchen Li et.al.||[2506.17188](http://arxiv.org/abs/2506.17188)|null|
-|**2025-06-12**|**Understanding the Performance and Power of LLM Inferencing on Edge Accelerators**|Mayank Arya et.al.|PAISE 2025: Mayank Arya and Yogesh Simmhan|[2506.09554](http://arxiv.org/abs/2506.09554)|null|
-|**2025-06-07**|**Robustifying Vision-Language Models via Dynamic Token Reweighting**|Tanqiu Jiang et.al.||[2505.17132](http://arxiv.org/abs/2505.17132)|null|
-|**2025-06-06**|**Towards Efficient Multi-LLM Inference: Characterization and Analysis of LLM Routing and Hierarchical Techniques**|Adarsh Prasad Behera et.al.||[2506.06579](http://arxiv.org/abs/2506.06579)|null|
-|**2025-05-29**|**Sustainable Carbon-Aware and Water-Efficient LLM Scheduling in Geo-Distributed Cloud Datacenters**|Hayden Moore et.al.||[2505.23554](http://arxiv.org/abs/2505.23554)|null|
-|**2025-05-27**|**TailorKV: A Hybrid Framework for Long-Context Inference via Tailored KV Cache Optimization**|Dingyu Yao et.al.||[2505.19586](http://arxiv.org/abs/2505.19586)|null|
-|**2025-05-23**|**DASH: Input-Aware Dynamic Layer Skipping for Efficient LLM Inference with Markov Decision Policies**|Ning Yang et.al.||[2505.17420](http://arxiv.org/abs/2505.17420)|null|
-|**2025-05-21**|**SpecOffload: Unlocking Latent GPU Capacity for LLM Inference on Resource-Constrained Devices**|Xiangwen Zhuge et.al.||[2505.10259](http://arxiv.org/abs/2505.10259)|null|
-|**2025-05-15**|**Collaborative Speculative Inference for Efficient LLM Inference Serving**|Luyao Gao et.al.||[2503.10325](http://arxiv.org/abs/2503.10325)|null|
-|**2025-05-14**|**ELIS: Efficient LLM Iterative Scheduling System with Response Length Predictor**|Seungbeom Choi et.al.||[2505.09142](http://arxiv.org/abs/2505.09142)|null|
-|**2025-05-08**|**Scaling Laws for Speculative Decoding**|Siyuan Yan et.al.||[2505.07858](http://arxiv.org/abs/2505.07858)|null|
-|**2025-04-28**|**Taming the Titans: A Survey of Efficient LLM Inference Serving**|Ranran Zhen et.al.||[2504.19720](http://arxiv.org/abs/2504.19720)|null|
-|**2025-04-28**|**R-Sparse: Rank-Aware Activation Sparsity for Efficient LLM Inference**|Zhenyu Zhang et.al.|ICLR|[2504.19449](http://arxiv.org/abs/2504.19449)|null|
-|**2025-04-24**|**On-Device Qwen2.5: Efficient LLM Inference with Model Compression and Hardware Acceleration**|Maoyang Xiang et.al.||[2504.17376](http://arxiv.org/abs/2504.17376)|null|
-|**2025-04-24**|**Throughput-Optimal Scheduling Algorithms for LLM Inference and AI Agents**|Yueying Li et.al.||[2504.07347](http://arxiv.org/abs/2504.07347)|null|
-|**2025-04-13**|**LoopLynx: A Scalable Dataflow Architecture for Efficient LLM Inference**|Jianing Zheng et.al.||[2504.09561](http://arxiv.org/abs/2504.09561)|null|
-|**2025-04-08**|**HybriMoE: Hybrid CPU-GPU Scheduling and Cache Management for Efficient MoE Inference**|Shuzhang Zhong et.al.|DAC 25|[2504.05897](http://arxiv.org/abs/2504.05897)|null|
-|**2025-03-28**|**EdgeInfinite: A Memory-Efficient Infinite-Context Transformer for Edge Devices**|Jiyu Chen et.al.||[2503.22196](http://arxiv.org/abs/2503.22196)|null|
-|**2025-03-27**|**WindowKV: Task-Adaptive Group-Wise KV Cache Window Selection for Efficient LLM Inference**|Youhui Zuo et.al.||[2503.17922](http://arxiv.org/abs/2503.17922)|null|
-|**2025-03-20**|**SPIN: Accelerating Large Language Model Inference with Heterogeneous Speculative Models**|Fahao Chen et.al.|INFOCOM 2025|[2503.15921](http://arxiv.org/abs/2503.15921)|null|
-|**2025-03-01**|**Tutorial Proposal: Speculative Decoding for Efficient LLM Inference**|Heming Xia et.al.|COLING|[2503.00491](http://arxiv.org/abs/2503.00491)|null|
-|**2025-02-24**|**Make LLM Inference Affordable to Everyone: Augmenting GPU Memory with NDP-DIMM**|Lian Liu et.al.|HPCA 2025|[2502.16963](http://arxiv.org/abs/2502.16963)|null|
+|**2025-12-18**|**Multiscale Aggregated Hierarchical Attention (MAHA): A Game Theoretic and Optimization Driven Approach to Efficient Contextual Modeling in Large Language Models**|Caner Erden et.al.||[2512.14925](http://arxiv.org/abs/2512.14925)|null|
+|**2025-12-02**|**Safety Game: Balancing Safe and Informative Conversations with Blackbox Agentic AI using LP Solvers**|Tuan Nguyen et.al.||[2510.09330](http://arxiv.org/abs/2510.09330)|null|
+|**2025-12-01**|**Hyperion: Hierarchical Scheduling for Parallel LLM Acceleration in Multi-tier Networks**|Mulei Ma et.al.||[2511.14450](http://arxiv.org/abs/2511.14450)|null|
+|**2025-11-26**|**BAMAS: Structuring Budget-Aware Multi-Agent Systems**|Liming Yang et.al.|AAAI 2026 (oral paper)|[2511.21572](http://arxiv.org/abs/2511.21572)|**[link](https://github.com/chunfenri/BAMAS)**|
+|**2025-11-19**|**Global Resolution: Optimal Multi-Draft Speculative Sampling via Convex Minimization**|Rahul Krishna Thomas et.al.||[2511.15898](http://arxiv.org/abs/2511.15898)|null|
+|**2025-11-16**|**Co-Layout: LLM-driven Co-optimization for Interior Layout**|Chucheng Xiang et.al.||[2511.12474](http://arxiv.org/abs/2511.12474)|null|
+|**2025-11-14**|**Constrained Network Slice Assignment via Large Language Models**|Sagar Sudhakara et.al.|NeurIPS 2025 Workshop on AI and ML for Next-Generation Wireless Communications and Networking (AI4NextG)|[2512.00040](http://arxiv.org/abs/2512.00040)|null|
+|**2025-11-13**|**LM4Opt-RA: A Multi-Candidate LLM Framework with Structured Ranking for Automating Network Resource Allocation**|Tasnim Ahmed et.al.||[2512.00039](http://arxiv.org/abs/2512.00039)|null|
+|**2025-11-12**|**Cost-Minimized Label-Flipping Poisoning Attack to LLM Alignment**|Shigeki Kusaka et.al.|AAAI|[2511.09105](http://arxiv.org/abs/2511.09105)|**[link](https://github.com/akimotolab/PoisoningCostMinimization)**|
+|**2025-11-12**|**OR-R1: Automating Modeling and Solving of Operations Research Optimization Problem via Test-Time Reinforcement Learning**|Zezhen Ding et.al.|AAAI|[2511.09092](http://arxiv.org/abs/2511.09092)|**[link](https://github.com/SCUTE-ZZ/OR-R1)**|
+|**2025-11-12**|**SageServe: Optimizing LLM Serving on Cloud Data Centers with Forecast Aware Auto-Scaling**|Shashwat Jaiswal et.al.|Proceedings of the ACM on Measurement and Analysis of Computing Systems, Vol. 9, No. 3, Article 61. December 2025|[2502.14617](http://arxiv.org/abs/2502.14617)|null|
+|**2025-11-11**|**Tool-Aided Evolutionary LLM for Generative Policy Toward Efficient Resource Management in Wireless Federated Learning**|Chongyang Tan et.al.||[2505.11570](http://arxiv.org/abs/2505.11570)|**[link](https://github.com/TCY-N/TELLM)**|
+|**2025-11-10**|**Understanding Forgetting in LLM Supervised Fine-Tuning and Preference Learning -- A Convex Optimization Perspective**|Heshan Fernando et.al.||[2410.15483](http://arxiv.org/abs/2410.15483)|null|
+|**2025-11-08**|**CoEdge-RAG: Optimizing Hierarchical Scheduling for Retrieval-Augmented LLMs in Collaborative Edge Computing**|Guihang Hong et.al.|RTSS 2025 (Real-Time Systems Symposium|[2511.05915](http://arxiv.org/abs/2511.05915)|null|
+|**2025-11-06**|**Question the Questions: Auditing Representation in Online Deliberative Processes**|Soham De et.al.||[2511.04588](http://arxiv.org/abs/2511.04588)|null|
+|**2025-11-05**|**Joint Optimization of DNN Model Caching and Request Routing in Mobile Edge Computing**|Shuting Qiu et.al.||[2511.03159](http://arxiv.org/abs/2511.03159)|null|
+|**2025-11-04**|**An LLM-powered MILP modelling engine for workforce scheduling guided by expert knowledge**|Qingyang Li et.al.||[2511.02364](http://arxiv.org/abs/2511.02364)|null|
+|**2025-10-30**|**Agentic AI Home Energy Management System: A Large Language Model Framework for Residential Load Scheduling**|Reda El Makroum et.al.||[2510.26603](http://arxiv.org/abs/2510.26603)|**[link](https://github.com/RedaElMakroum/agentic-ai-hems)**|
+|**2025-10-26**|**PIP-LLM: Integrating PDDL-Integer Programming with LLMs for Coordinating Multi-Robot Teams Using Natural Language**|Guangyao Shi et.al.||[2510.22784](http://arxiv.org/abs/2510.22784)|null|
+|**2025-10-14**|**Learning Adaptive and Temporally Causal Video Tokenization in a 1D Latent Space**|Yan Li et.al.||[2505.17011](http://arxiv.org/abs/2505.17011)|null|
+|**2025-10-13**|**MC#: Mixture Compressor for Mixture-of-Experts Large Models**|Wei Huang et.al.||[2510.10962](http://arxiv.org/abs/2510.10962)|null|
+|**2025-10-13**|**InstructSAM: A Training-Free Framework for Instruction-Oriented Remote Sensing Object Recognition**|Yijie Zheng et.al.|NeurIPS|[2505.15818](http://arxiv.org/abs/2505.15818)|**[link](https://github.com/VoyagerXvoyagerx/InstructSAM)**|
+|**2025-10-11**|**Efficient Onboard Vision-Language Inference in UAV-Enabled Low-Altitude Economy Networks via LLM-Enhanced Optimization**|Yang Li et.al.||[2510.10028](http://arxiv.org/abs/2510.10028)|null|
+|**2025-10-08**|**FLEET: Formal Language-Grounded Scheduling for Heterogeneous Robot Teams**|Corban Rivera et.al.||[2510.07417](http://arxiv.org/abs/2510.07417)|null|
+|**2025-10-07**|**ConstraintLLM: A Neuro-Symbolic Framework for Industrial-Level Constraint Programming**|Weichun Shi et.al.|Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing, pages 15999-16019|[2510.05774](http://arxiv.org/abs/2510.05774)|**[link](https://github.com/william4s/ConstraintLLM)**|
+|**2025-10-02**|**LLM-Enhanced, Data-Driven Personalized and Equitable Clinician Scheduling: A Predict-then-Optimize Approach**|Anjali Jha et.al.||[2510.02047](http://arxiv.org/abs/2510.02047)|null|
+|**2025-10-01**|**Logical Consistency Between Disagreeing Experts and Its Role in AI Safety**|Andrés Corrada-Emmanuel et.al.||[2510.00821](http://arxiv.org/abs/2510.00821)|null|
+|**2025-10-01**|**StepORLM: A Self-Evolving Framework With Generative Process Supervision For Operations Research Language Models**|Chenyu Zhou et.al.||[2509.22558](http://arxiv.org/abs/2509.22558)|null|
+|**2025-09-29**|**FMIP: Joint Continuous-Integer Flow For Mixed-Integer Linear Programming**|Hongpei Li et.al.||[2507.23390](http://arxiv.org/abs/2507.23390)|**[link](https://github.com/Lhongpei/FMIP)**|
+|**2025-09-29**|**Cascadia: An Efficient Cascade Serving System for Large Language Models**|Youhe Jiang et.al.||[2506.04203](http://arxiv.org/abs/2506.04203)|null|
+|**2025-09-27**|**Ask, Reason, Assist: Decentralized Robot Collaboration via Language and Logic**|Dan BW Choe et.al.||[2509.23506](http://arxiv.org/abs/2509.23506)|null|
+|**2025-09-27**|**Enhancing Delta Compression in LLMs via SVD-based Quantization Error Minimization**|Boya Xiong et.al.||[2506.11087](http://arxiv.org/abs/2506.11087)|null|
+|**2025-09-25**|**Best-of- $\infty$ -- Asymptotic Performance of Test-Time Compute**|Junpei Komiyama et.al.||[2509.21091](http://arxiv.org/abs/2509.21091)|null|
+|**2025-09-25**|**Task-Oriented Computation Offloading for Edge Inference: An Integrated Bayesian Optimization and Deep Reinforcement Learning Framework**|Xian Li et.al.||[2509.21090](http://arxiv.org/abs/2509.21090)|null|
+|**2025-09-24**|**Agentic AI for Low-Altitude Semantic Wireless Networks: An Energy Efficient Design**|Zhouxiang Zhao et.al.||[2509.19791](http://arxiv.org/abs/2509.19791)|null|
+|**2025-09-24**|**OR-Toolformer: Modeling and Solving Operations Research Problems with Tool Augmented Large Language Models**|Jianzhang Zhang et.al.||[2510.01253](http://arxiv.org/abs/2510.01253)|null|
+|**2025-09-19**|**Large Language Model-Empowered Decision Transformer for UAV-Enabled Data Collection**|Zhixion Chen et.al.||[2509.13934](http://arxiv.org/abs/2509.13934)|null|
+|**2025-09-10**|**No-Knowledge Alarms for Misaligned LLMs-as-Judges**|Andrés Corrada-Emmanuel et.al.||[2509.08593](http://arxiv.org/abs/2509.08593)|null|
+|**2025-09-05**|**A Federated Fine-Tuning Paradigm of Foundation Models in Heterogenous Wireless Networks**|Jingyi Wang et.al.||[2509.19306](http://arxiv.org/abs/2509.19306)|null|
+|**2025-08-26**|**HAP: Hybrid Adaptive Parallelism for Efficient Mixture-of-Experts Inference**|Haoran Lin et.al.||[2508.19373](http://arxiv.org/abs/2508.19373)|null|
+|**2025-08-18**|**Batching-Aware Joint Model Onloading and Offloading for Hierarchical Multi-Task Inference**|Seohyeon Cha et.al.||[2508.13380](http://arxiv.org/abs/2508.13380)|null|
+|**2025-08-16**|**EvoCut: Strengthening Integer Programs via Evolution-Guided Language Models**|Milad Yazdani et.al.||[2508.11850](http://arxiv.org/abs/2508.11850)|**[link](https://github.com/milad1378yz/EvoCut)**|
+|**2025-08-15**|**CSGO: Generalized Optimization for Cold Start in Wireless Collaborative Edge LLM Systems**|Xuran Liu et.al.||[2508.11287](http://arxiv.org/abs/2508.11287)|null|
+|**2025-08-12**|**Cluster Topology-Driven Placement of Experts Reduces Network Traffic in MoE Inference**|Danil Sivtsov et.al.||[2508.09229](http://arxiv.org/abs/2508.09229)|null|
+|**2025-08-11**|**Pareto Multi-Objective Alignment for Language Models**|Qiang He et.al.|ECML/PKDD 2025|[2508.07768](http://arxiv.org/abs/2508.07768)|null|
+|**2025-08-05**|**Toward a Trustworthy Optimization Modeling Agent via Verifiable Synthetic Data Generation**|Vinicius Lima et.al.||[2508.03117](http://arxiv.org/abs/2508.03117)|null|
+|**2025-08-05**|**Learning to Incentivize: LLM-Empowered Contract for AIGC Offloading in Teleoperation**|Zijun Zhan et.al.||[2508.03464](http://arxiv.org/abs/2508.03464)|null|
+|**2025-08-01**|**OR-LLM-Agent: Automating Modeling and Solving of Operations Research Optimization Problems with Reasoning LLM**|Bowen Zhang et.al.||[2503.10009](http://arxiv.org/abs/2503.10009)|**[link](https://github.com/bwz96sco/or_llm_agent)**|
+|**2025-07-30**|**Parametrized Multi-Agent Routing via Deep Attention Models**|Salar Basiri et.al.|AAAI|[2507.22338](http://arxiv.org/abs/2507.22338)|null|
+|**2025-07-21**|**DHEvo: Data-Algorithm Based Heuristic Evolution for Generalizable MILP Solving**|Zhihao Zhang et.al.||[2507.15615](http://arxiv.org/abs/2507.15615)|null|
+|**2025-07-13**|**Adaptive Federated LoRA in Heterogeneous Wireless Networks with Independent Sampling**|Yanzhao Hou et.al.||[2505.23555](http://arxiv.org/abs/2505.23555)|null|
+|**2025-07-05**|**Combining Graph Neural Networks and Mixed Integer Linear Programming for Molecular Inference under the Two-Layered Model**|Jianshen Zhu et.al.||[2507.03920](http://arxiv.org/abs/2507.03920)|null|
+|**2025-07-02**|**Efficient Split Federated Learning for Large Language Models over Communication Networks**|Kai Zhao et.al.||[2504.14667](http://arxiv.org/abs/2504.14667)|null|
+|**2025-06-30**|**Performance of LLMs on Stochastic Modeling Operations Research Problems: From Theory to Practice**|Akshit Kumar et.al.||[2506.23924](http://arxiv.org/abs/2506.23924)|null|
+|**2025-06-22**|**Integrating LLMs and Digital Twins for Adaptive Multi-Robot Task Allocation in Construction**|Min Deng et.al.||[2506.18178](http://arxiv.org/abs/2506.18178)|null|
+|**2025-06-06**|**BAQ: Efficient Bit Allocation Quantization for Large Language Models**|Chao Zhang et.al.||[2506.05664](http://arxiv.org/abs/2506.05664)|null|
+|**2025-06-05**|**Joint User Association and Beamforming Design for ISAC Networks with Large Language Models**|Haoyun Li et.al.||[2506.05637](http://arxiv.org/abs/2506.05637)|null|
+|**2025-06-05**|**Autoformulation of Mathematical Optimization Models Using LLMs**|Nicolás Astorga et.al.|ICML|[2411.01679](http://arxiv.org/abs/2411.01679)|null|
+|**2025-05-25**|**Lightweight Embeddings with Graph Rewiring for Collaborative Filtering**|Xurong Liang et.al.|TOIS'25|[2505.18999](http://arxiv.org/abs/2505.18999)|null|
+|**2025-04-04**|**ORLM: A Customizable Framework in Training Large Models for Automated Optimization Modeling**|Chenyu Huang et.al.|Operations Research (2025), published online ahead of print|[2405.17743](http://arxiv.org/abs/2405.17743)|**[link](https://github.com/cardinal-operations/orlm)**|
+|**2025-03-19**|**Communication-Efficient Distributed On-Device LLM Inference Over Wireless Networks**|Kai Zhang et.al.||[2503.14882](http://arxiv.org/abs/2503.14882)|null|
+|**2025-03-11**|**Robust Multi-Objective Controlled Decoding of Large Language Models**|Seongho Son et.al.||[2503.08796](http://arxiv.org/abs/2503.08796)|**[link](https://github.com/williambankes/robust-multi-objective-decoding)**|
+|**2025-03-05**|**Helix: Serving Large Language Models over Heterogeneous GPUs and Network via Max-Flow**|Yixuan Mei et.al.||[2406.01566](http://arxiv.org/abs/2406.01566)|**[link](https://github.com/Thesys-lab/Helix-ASPLOS25)**|
+|**2025-02-18**|**Distributed On-Device LLM Inference With Over-the-Air Computation**|Kai Zhang et.al.||[2502.12559](http://arxiv.org/abs/2502.12559)|null|
+|**2025-02-03**|**Relatively-Secure LLM-Based Steganography via Constrained Markov Decision Processes**|Yu-Shin Huang et.al.||[2502.01827](http://arxiv.org/abs/2502.01827)|**[link](https://github.com/Yu-Shin-Huang/Stega-via-CMDP)**|
+|**2025-01-02**|**Communication-and-Computation Efficient Split Federated Learning: Gradient Aggregation and Resource Management**|Yipeng Liang et.al.||[2501.01078](http://arxiv.org/abs/2501.01078)|null|
+|**2024-10-16**|**SplitLLM: Collaborative Inference of LLMs for Model Placement and Throughput Optimization**|Akrit Mudvari et.al.||[2410.10759](http://arxiv.org/abs/2410.10759)|null|
+|**2024-10-03**|**Foundations of Large Language Model Compression -- Part 1: Weight Quantization**|Sean I. Young et.al.||[2409.02026](http://arxiv.org/abs/2409.02026)|null|
+|**2024-08-07**|**A Convex-optimization-based Layer-wise Post-training Pruner for Large Language Models**|Pengxiang Zhao et.al.||[2408.03728](http://arxiv.org/abs/2408.03728)|null|
+|**2024-06-18**|**City-LEO: Toward Transparent City Management Using LLM with End-to-End Optimization**|Zihao Jiao et.al.||[2406.10958](http://arxiv.org/abs/2406.10958)|null|
+|**2024-05-12**|**Edge Intelligence Optimization for Large Language Model Inference with Batching and Quantization**|Xinyuan Zhang et.al.||[2405.07140](http://arxiv.org/abs/2405.07140)|null|
 
 <p align=right>(<a href=#updated-on-20260210>back to top</a>)</p>
 

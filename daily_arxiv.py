@@ -20,7 +20,7 @@ logging.basicConfig(format='[%(asctime)s %(levelname)s] %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
 
-base_url = "https://arxiv.paperswithcode.com/api/v0/papers/"
+huggingface_papers_url = "https://huggingface.co/api/papers/"
 github_url = "https://api.github.com/search/repositories"
 arxiv_url = "http://arxiv.org/"
 semantic_scholar_url = "https://api.semanticscholar.org/graph/v1/paper/"
@@ -34,50 +34,15 @@ ARXIV_NS = {
     "arxiv": "http://arxiv.org/schemas/atom",
 }
 
-def arxiv_search(query=None, id_list=None, max_results=10, sort_by="submittedDate", timeout=30):
-    """
-    Search arxiv via the API using requests with a hard timeout.
-    Returns a list of dicts with paper metadata.
-    """
-    params = {"max_results": max_results}
-    if query:
-        params["search_query"] = query
-        params["sortBy"] = sort_by
-        params["sortOrder"] = "descending"
-    if id_list:
-        params["id_list"] = ",".join(id_list) if isinstance(id_list, list) else id_list
-
-    for attempt in range(3):
-        try:
-            print(f"    [arxiv API] query={query or id_list}, max_results={max_results} (attempt {attempt+1}) ...", end=" ", flush=True)
-            t0 = time.time()
-            r = requests.get(ARXIV_API_URL, params=params, timeout=timeout)
-            r.raise_for_status()
-            elapsed = time.time() - t0
-            print(f"OK ({elapsed:.1f}s)", flush=True)
-            break
-        except requests.exceptions.Timeout:
-            print(f"TIMEOUT ({timeout}s)", flush=True)
-            if attempt < 2:
-                time.sleep(3)
-            else:
-                return []
-        except Exception as e:
-            print(f"ERROR: {e}", flush=True)
-            if attempt < 2:
-                time.sleep(3)
-            else:
-                return []
-
-    root = ET.fromstring(r.text)
+def _parse_arxiv_entries(xml_text):
+    """Parse arxiv API XML response into a list of paper dicts."""
+    root = ET.fromstring(xml_text)
     results = []
     for entry in root.findall("atom:entry", ARXIV_NS):
-        # Skip error entries (arxiv returns an entry with no title for bad IDs)
         title_el = entry.find("atom:title", ARXIV_NS)
         if title_el is None or not title_el.text or title_el.text.strip() == "Error":
             continue
 
-        # Parse ID: http://arxiv.org/abs/2405.17743v1 -> 2405.17743v1
         raw_id = entry.find("atom:id", ARXIV_NS).text.strip().split("/abs/")[-1]
 
         authors = []
@@ -117,9 +82,93 @@ def arxiv_search(query=None, id_list=None, max_results=10, sort_by="submittedDat
             "comment": comment,
             "journal_ref": journal_ref,
         })
-
-    print(f"    [arxiv API] Got {len(results)} results", flush=True)
     return results
+
+def _arxiv_api_call(params, timeout=30, max_retries=5):
+    """Single arxiv API call with retry and 429 handling. Returns parsed entries or []."""
+    query_short = (params.get("search_query") or params.get("id_list", ""))[:80]
+    for attempt in range(max_retries):
+        try:
+            print(f"    [arxiv API] {query_short}... (attempt {attempt+1}) ", end="", flush=True)
+            t0 = time.time()
+            r = requests.get(ARXIV_API_URL, params=params, timeout=timeout)
+            elapsed = time.time() - t0
+            if r.status_code == 429:
+                wait = min(10 * (attempt + 1), 60)
+                print(f"RATE LIMITED ({elapsed:.1f}s), waiting {wait}s ...", flush=True)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            print(f"OK ({elapsed:.1f}s)", flush=True)
+            return _parse_arxiv_entries(r.text)
+        except requests.exceptions.Timeout:
+            print(f"TIMEOUT ({timeout}s)", flush=True)
+            if attempt < max_retries - 1:
+                time.sleep(5)
+        except Exception as e:
+            print(f"ERROR: {e}", flush=True)
+            if attempt < max_retries - 1:
+                time.sleep(5)
+    return []
+
+# Max OR clauses per arxiv API call before splitting
+ARXIV_MAX_QUERY_CLAUSES = 8
+
+def arxiv_search(query=None, id_list=None, max_results=10, sort_by="submittedDate", timeout=30):
+    """
+    Search arxiv via the API using requests with a hard timeout.
+    Automatically splits long OR queries into smaller chunks to avoid
+    URL length issues and arxiv API errors.
+    Returns a list of dicts with paper metadata (deduplicated by ID).
+    """
+    if id_list:
+        params = {
+            "max_results": max_results,
+            "id_list": ",".join(id_list) if isinstance(id_list, list) else id_list,
+        }
+        return _arxiv_api_call(params, timeout=timeout)
+
+    if not query:
+        return []
+
+    # Split long OR queries into chunks
+    # Detect OR-separated clauses (handles both parenthesized and plain terms)
+    clauses = [c.strip() for c in re.split(r'\s+OR\s+', query)]
+
+    if len(clauses) <= ARXIV_MAX_QUERY_CLAUSES:
+        # Short enough to send as one request
+        params = {
+            "max_results": max_results,
+            "search_query": query,
+            "sortBy": sort_by,
+            "sortOrder": "descending",
+        }
+        return _arxiv_api_call(params, timeout=timeout)
+
+    # Split into chunks and merge results
+    print(f"    [arxiv] Query has {len(clauses)} clauses, splitting into chunks of {ARXIV_MAX_QUERY_CLAUSES} ...", flush=True)
+    seen_ids = set()
+    all_results = []
+    for i in range(0, len(clauses), ARXIV_MAX_QUERY_CLAUSES):
+        chunk = clauses[i:i + ARXIV_MAX_QUERY_CLAUSES]
+        chunk_query = " OR ".join(chunk)
+        print(f"    [arxiv] Chunk {i // ARXIV_MAX_QUERY_CLAUSES + 1}/{(len(clauses) + ARXIV_MAX_QUERY_CLAUSES - 1) // ARXIV_MAX_QUERY_CLAUSES}:", flush=True)
+        params = {
+            "max_results": max_results,
+            "search_query": chunk_query,
+            "sortBy": sort_by,
+            "sortOrder": "descending",
+        }
+        chunk_results = _arxiv_api_call(params, timeout=timeout)
+        for paper in chunk_results:
+            if paper["id"] not in seen_ids:
+                seen_ids.add(paper["id"])
+                all_results.append(paper)
+        # Respect rate limits between chunks
+        time.sleep(3)
+
+    print(f"    [arxiv API] Got {len(all_results)} unique results total", flush=True)
+    return all_results
 
 def load_config(config_file:str) -> dict:
     '''
@@ -129,20 +178,26 @@ def load_config(config_file:str) -> dict:
     # make filters pretty
     def pretty_filters(**config) -> dict:
         keywords = dict()
-        EXCAPE = '\"'
-        QUOTA = '' # NO-USE
-        OR = 'OR' # TODO
+        ESCAPE = '\"'
+        OR = ' OR '
+        AND = ' AND '
+        def make_term(t):
+            """Wrap multi-word terms in quotes for exact phrase match."""
+            t = t.strip()
+            if len(t.split()) > 1:
+                return ESCAPE + t + ESCAPE
+            return t
         def parse_filters(filters:list):
-            ret = ''
-            for idx in range(0,len(filters)):
-                filter = filters[idx]
-                if len(filter.split()) > 1:
-                    ret += (EXCAPE + filter + EXCAPE)
+            parts = []
+            for f in filters:
+                if isinstance(f, list):
+                    # List of terms: AND them together, e.g. ["integer programming", "LLM"]
+                    # becomes ("integer programming" AND LLM)
+                    and_part = AND.join(make_term(t) for t in f)
+                    parts.append('(' + and_part + ')')
                 else:
-                    ret += (QUOTA + filter + QUOTA)
-                if idx != len(filters) - 1:
-                    ret += OR
-            return ret
+                    parts.append(make_term(f))
+            return OR.join(parts)
         for k,v in config['keywords'].items():
             if 'filters' in v:
                 keywords[k] = parse_filters(v['filters'])
@@ -339,15 +394,16 @@ def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, catego
         # Extract venue
         venue = extract_venue(journal_ref, comments)
 
-        # Source code link - fix: use paper_key (without version) instead of paper_id
+        # Source code link via HuggingFace API (replaces broken PwC endpoint)
         repo_url = None
         try:
-            code_api_url = base_url + paper_key
-            r = requests.get(code_api_url, timeout=15).json()
-            if "official" in r and r["official"]:
-                repo_url = r["official"]["url"]
-        except Exception as e:
-            logging.error(f"Papers with Code exception: {e} with id: {paper_key}")
+            r = requests.get(huggingface_papers_url + paper_key, timeout=10)
+            if r.status_code == 200:
+                hf = r.json()
+                if hf.get("githubRepo"):
+                    repo_url = hf["githubRepo"]
+        except Exception:
+            pass
 
         # Fallback: search GitHub
         if repo_url is None:
@@ -461,13 +517,14 @@ def get_citation_papers(topic, seed_papers, llm_client=None, category_descriptio
                     continue
                 print(f"PASS (score={score}, {elapsed:.1f}s): {paper_title[:50]}", flush=True)
 
-                # Try to get code link from Papers with Code
+                # Try to get code link from HuggingFace API
                 repo_url = None
                 try:
-                    code_api_url = base_url + arxiv_id
-                    cr = requests.get(code_api_url, timeout=15).json()
-                    if "official" in cr and cr["official"]:
-                        repo_url = cr["official"]["url"]
+                    cr = requests.get(huggingface_papers_url + arxiv_id, timeout=10)
+                    if cr.status_code == 200:
+                        hf = cr.json()
+                        if hf.get("githubRepo"):
+                            repo_url = hf["githubRepo"]
                 except Exception:
                     pass
 
@@ -599,26 +656,24 @@ def update_paper_links(filename):
             if valid_link:
                 continue
             try:
-                code_api_url = base_url + paper_id
-                r = requests.get(code_api_url, timeout=15).json()
                 repo_url = None
-                if "official" in r and r["official"]:
-                    repo_url = r["official"]["url"]
-                    if repo_url is not None:
-                        new_cont = contents.replace('|null|',f'|**[link]({repo_url})**|')
-                        logging.info(f'ID = {paper_id}, contents = {new_cont}')
-                        json_data[keywords][paper_id] = str(new_cont)
+                # Try HuggingFace API first
+                cr = requests.get(huggingface_papers_url + paper_id, timeout=10)
+                if cr.status_code == 200:
+                    hf = cr.json()
+                    if hf.get("githubRepo"):
+                        repo_url = hf["githubRepo"]
 
-                # Fallback: search GitHub if Papers with Code has no result
+                # Fallback: search GitHub
                 if repo_url is None:
-                    # Extract title text for GitHub search
                     title_match = re.search(r'\*\*(.+?)\*\*', paper_title)
                     search_term = title_match.group(1) if title_match else paper_id
                     repo_url = get_code_link(search_term)
-                    if repo_url is not None:
-                        new_cont = contents.replace('|null|',f'|**[link]({repo_url})**|')
-                        logging.info(f'GitHub fallback ID = {paper_id}, contents = {new_cont}')
-                        json_data[keywords][paper_id] = str(new_cont)
+
+                if repo_url is not None:
+                    new_cont = contents.replace('|null|',f'|**[link]({repo_url})**|')
+                    logging.info(f'ID = {paper_id}, contents = {new_cont}')
+                    json_data[keywords][paper_id] = str(new_cont)
 
             except Exception as e:
                 logging.error(f"exception: {e} with id: {paper_id}")
@@ -869,13 +924,150 @@ def demo(**config):
         pass
     print(f"[6/6] Done! {total_papers} papers in database. Elapsed: {elapsed:.1f}s", flush=True)
 
+def clear_category_from_json(filename, category):
+    """Remove all papers for a given category from a JSON file."""
+    try:
+        with open(filename, "r") as f:
+            content = f.read()
+            data = json.loads(content) if content else {}
+    except FileNotFoundError:
+        return 0
+    removed = len(data.get(category, {}))
+    data[category] = {}
+    with open(filename, "w") as f:
+        json.dump(data, f)
+    return removed
+
+def clear_category_from_cache(category, cache_path=SCORE_CACHE_PATH):
+    """Remove all score cache entries for a given category."""
+    cache = load_score_cache(cache_path)
+    suffix = f"::{category}"
+    keys_to_remove = [k for k in cache if k.endswith(suffix)]
+    for k in keys_to_remove:
+        del cache[k]
+    save_score_cache(cache, cache_path)
+    return len(keys_to_remove)
+
+def redo_category(category_name, **config):
+    """Redo a single category from scratch: clear its data, re-fetch, and regenerate."""
+    start_time = time.time()
+
+    # Validate category exists
+    all_categories = list(config['keywords'].keys())
+    if category_name not in all_categories:
+        print(f"ERROR: Category '{category_name}' not found.", flush=True)
+        print(f"Available categories: {all_categories}", flush=True)
+        return
+
+    print(f"{'='*60}", flush=True)
+    print(f"REDO CATEGORY: '{category_name}'", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    keywords = config['kv']
+    max_results = config['max_results']
+    publish_readme = config['publish_readme']
+    publish_gitpage = config['publish_gitpage']
+    cfg = config['keywords'][category_name]
+    category_description = cfg.get('description', category_name)
+
+    # Step 1: Clear old data for this category
+    print(f"\n[1/5] Clearing old data for '{category_name}' ...", flush=True)
+    if publish_readme:
+        n = clear_category_from_json(config['json_readme_path'], category_name)
+        print(f"  Removed {n} papers from {config['json_readme_path']}", flush=True)
+    if publish_gitpage:
+        n = clear_category_from_json(config['json_gitpage_path'], category_name)
+        print(f"  Removed {n} papers from {config['json_gitpage_path']}", flush=True)
+    n = clear_category_from_cache(category_name)
+    print(f"  Removed {n} entries from score cache", flush=True)
+
+    # Step 2: Init LLM client
+    llm_client = None
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key and OpenAI is not None:
+        llm_client = OpenAI(api_key=api_key)
+        print("[2/5] OpenAI client initialized (LLM filtering ON)", flush=True)
+    else:
+        print("[2/5] No OPENAI_API_KEY set - LLM filtering OFF", flush=True)
+
+    score_cache = load_score_cache()
+
+    # Step 3: Re-fetch this category
+    print(f"\n[3/5] Re-fetching '{category_name}' from scratch ...", flush=True)
+    data_collector = []
+    data_collector_web = []
+
+    # Keyword-based search (if this category has filters)
+    if category_name in keywords:
+        keyword = keywords[category_name]
+        print(f"  Keyword search (max {max_results} results) ...", flush=True)
+        t0 = time.time()
+        data, data_web = get_daily_papers(category_name, query=keyword,
+                                          max_results=max_results,
+                                          llm_client=llm_client,
+                                          category_description=category_description,
+                                          score_cache=score_cache)
+        count = len(data.get(category_name, {}))
+        elapsed = time.time() - t0
+        print(f"  Keyword search done: {count} papers kept ({elapsed:.1f}s)", flush=True)
+        data_collector.append(data)
+        data_collector_web.append(data_web)
+
+    # Citation-based search (if this category has seed_papers)
+    if 'seed_papers' in cfg:
+        seed_count = len(cfg['seed_papers'])
+        print(f"  Citation search ({seed_count} seed papers) ...", flush=True)
+        t0 = time.time()
+        data, data_web = get_citation_papers(category_name, cfg['seed_papers'],
+                                              llm_client=llm_client,
+                                              category_description=category_description,
+                                              score_cache=score_cache)
+        count = len(data.get(category_name, {}))
+        elapsed = time.time() - t0
+        print(f"  Citation search done: {count} papers kept ({elapsed:.1f}s)", flush=True)
+        data_collector.append(data)
+        data_collector_web.append(data_web)
+
+    # Step 4: Save results (merge into existing JSON, replacing only this category)
+    print(f"\n[4/5] Saving results ...", flush=True)
+    if publish_readme:
+        update_json_file(config['json_readme_path'], data_collector)
+        json_to_md(config['json_readme_path'], config['md_readme_path'], task='Update Readme')
+        print(f"  README updated", flush=True)
+    if publish_gitpage:
+        update_json_file(config['json_gitpage_path'], data_collector_web)
+        json_to_md(config['json_gitpage_path'], config['md_gitpage_path'],
+                   task='Update GitPage', to_web=True, use_tc=False, use_b2t=False)
+        print(f"  GitPage updated", flush=True)
+
+    save_score_cache(score_cache)
+    print(f"  Score cache saved ({len(score_cache)} entries)", flush=True)
+
+    elapsed = time.time() - start_time
+    total_papers = 0
+    try:
+        with open(config['json_readme_path'], 'r') as f:
+            content = f.read()
+            if content:
+                all_data = json.loads(content)
+                total_papers = sum(len(p) for p in all_data.values())
+    except Exception:
+        pass
+    print(f"\n[5/5] Done! '{category_name}' rebuilt. {total_papers} total papers in database. Elapsed: {elapsed:.1f}s", flush=True)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config_path',type=str, default='config.yaml',
                             help='configuration file path')
     parser.add_argument('--update_paper_links', default=False,
                         action="store_true",help='whether to update paper links etc.')
+    parser.add_argument('--redo_category', type=str, default=None,
+                        help='Redo a single category from scratch (clear and re-fetch). Other categories are kept as-is.')
     args = parser.parse_args()
     config = load_config(args.config_path)
     config = {**config, 'update_paper_links':args.update_paper_links}
-    demo(**config)
+
+    if args.redo_category:
+        redo_category(args.redo_category, **config)
+    else:
+        demo(**config)
