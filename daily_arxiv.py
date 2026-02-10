@@ -341,7 +341,7 @@ def extract_venue(journal_ref=None, comment=None):
                 return match.group(1).strip() if match.lastindex else match.group(0).strip()
     return ""
 
-def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, category_description="", score_cache=None):
+def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, category_description="", score_cache=None, existing_ids=None):
     """
     @param topic: str
     @param query: str
@@ -349,13 +349,17 @@ def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, catego
     @param llm_client: OpenAI client for relevance filtering (or None)
     @param category_description: str for LLM relevance scoring
     @param score_cache: dict - persistent cache of relevance scores
+    @param existing_ids: set of paper IDs already in database (skip these)
     @return paper_with_code: dict
     """
     content = dict()
     content_to_web = dict()
+    if existing_ids is None:
+        existing_ids = set()
 
     results = arxiv_search(query=query, max_results=max_results)
 
+    skipped_existing = 0
     for idx, result in enumerate(results, 1):
         paper_id            = result["id"]
         paper_title         = result["title"]
@@ -370,7 +374,6 @@ def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, catego
 
         # Year filter: skip papers before MIN_YEAR
         if publish_time and publish_time.year < MIN_YEAR:
-            print(f"    [{idx}/{len(results)}] Skipping old paper ({publish_time.year}): {paper_title[:60]}", flush=True)
             continue
 
         # eg: 2108.09112v1 -> 2108.09112
@@ -379,6 +382,12 @@ def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, catego
             paper_key = paper_id
         else:
             paper_key = paper_id[0:ver_pos]
+
+        # Skip papers already in database
+        if paper_key in existing_ids:
+            skipped_existing += 1
+            continue
+
         paper_url = arxiv_url + 'abs/' + paper_key
 
         # LLM relevance filtering (with cache lookup)
@@ -420,11 +429,13 @@ def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, catego
             content_to_web[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|null|\n".format(
                    update_time,paper_title,paper_first_author,venue,paper_key,paper_url)
 
+    if skipped_existing:
+        print(f"    Skipped {skipped_existing} papers already in database", flush=True)
     data = {topic:content}
     data_web = {topic:content_to_web}
     return data,data_web
 
-def get_citation_papers(topic, seed_papers, llm_client=None, category_description="", score_cache=None):
+def get_citation_papers(topic, seed_papers, llm_client=None, category_description="", score_cache=None, existing_ids=None):
     """
     Get papers that cite the given seed papers using Semantic Scholar API.
     @param topic: str - category name
@@ -432,10 +443,13 @@ def get_citation_papers(topic, seed_papers, llm_client=None, category_descriptio
     @param llm_client: OpenAI client for relevance filtering (or None)
     @param category_description: str for LLM relevance scoring
     @param score_cache: dict - persistent cache of relevance scores
+    @param existing_ids: set of paper IDs already in database (skip these)
     @return: (data, data_web) same format as get_daily_papers
     """
     content = dict()
     content_to_web = dict()
+    if existing_ids is None:
+        existing_ids = set()
 
     for si, seed_id in enumerate(seed_papers, 1):
         print(f"    [Seed {si}/{len(seed_papers)}] Fetching citations for {seed_id} ...", flush=True)
@@ -483,6 +497,8 @@ def get_citation_papers(topic, seed_papers, llm_client=None, category_descriptio
                 if not arxiv_id:
                     continue
                 if arxiv_id in content:
+                    continue
+                if arxiv_id in existing_ids:
                     continue
 
                 paper_title = paper.get("title", "Unknown")
@@ -803,6 +819,20 @@ def json_to_md(filename,md_filename,
 
     logging.info(f"{task} finished")
 
+def _load_existing_ids(json_path):
+    """Load all paper IDs already in the JSON database."""
+    ids = set()
+    try:
+        with open(json_path, "r") as f:
+            content = f.read()
+            if content:
+                data = json.loads(content)
+                for topic_papers in data.values():
+                    ids.update(topic_papers.keys())
+    except FileNotFoundError:
+        pass
+    return ids
+
 def demo(**config):
     start_time = time.time()
     data_collector = []
@@ -840,7 +870,9 @@ def demo(**config):
         clean_json_data(config['json_gitpage_path'])
 
     if config['update_paper_links'] == False:
-        print(f"[3/6] Starting paper retrieval (max {max_results} per query)...", flush=True)
+        # Load existing paper IDs to skip re-processing
+        existing_ids = _load_existing_ids(config['json_readme_path'])
+        print(f"[3/6] Starting paper retrieval (max {max_results} per query, {len(existing_ids)} existing papers to skip)...", flush=True)
         total_found = 0
         cache_before = len(score_cache)
 
@@ -852,7 +884,8 @@ def demo(**config):
                                             max_results=max_results,
                                             llm_client=llm_client,
                                             category_description=category_descriptions.get(topic, topic),
-                                            score_cache=score_cache)
+                                            score_cache=score_cache,
+                                            existing_ids=existing_ids)
             count = len(data.get(topic, {}))
             total_found += count
             elapsed = time.time() - t0
@@ -869,7 +902,8 @@ def demo(**config):
             data, data_web = get_citation_papers(topic, cfg['seed_papers'],
                                                  llm_client=llm_client,
                                                  category_description=category_descriptions.get(topic, topic),
-                                                 score_cache=score_cache)
+                                                 score_cache=score_cache,
+                                                 existing_ids=existing_ids)
             count = len(data.get(topic, {}))
             total_found += count
             elapsed = time.time() - t0
