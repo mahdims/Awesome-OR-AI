@@ -1,4 +1,4 @@
-## Updated on 2026.02.10
+## Updated on 2026.02.11
 <details>
   <summary>Table of Contents</summary>
   <ol>
@@ -12,30 +12,49 @@
 
 |Publish Date|Title|Authors|Venue|PDF|Code|
 |---|---|---|---|---|---|
+|**2026-02-09**|**G-LNS: Generative Large Neighborhood Search for LLM-Based Automatic Heuristic Design**|Baoyun Zhao et.al.||[2602.08253](http://arxiv.org/abs/2602.08253)|**[link](https://github.com/ZBoyn/G-LNS)**|
+|**2026-02-09**|**Lyria: A Genetic Algorithm-Driven Neuro-Symbolic Reasoning Framework for LLMs**|Weizhi Tang et.al.||[2507.04034](http://arxiv.org/abs/2507.04034)|null|
+|**2026-02-05**|**Mining Generalizable Activation Functions**|Alex Vitvitskyi et.al.||[2602.05688](http://arxiv.org/abs/2602.05688)|**[link](https://github.com/Aastha2104/Parkinson-Disease-Prediction)**|
+|**2026-02-05**|**Learning to Discover at Test Time**|Mert Yuksekgonul et.al.||[2601.16175](http://arxiv.org/abs/2601.16175)|**[link](https://github.com/test-time-training/discover)**|
 |**2026-02-04**|**Landscape-aware Automated Algorithm Design: An Efficient Framework for Real-world Optimization**|Haoran Yin et.al.||[2602.04529](http://arxiv.org/abs/2602.04529)|null|
 |**2026-02-04**|**ProxyWar: Dynamic Assessment of LLM Code Generation in Game Arenas**|Wenjun Peng et.al.||[2602.04296](http://arxiv.org/abs/2602.04296)|**[link](https://github.com/xinke-wang/ProxyWar)**|
 |**2026-02-03**|**Contrastive Concept-Tree Search for LLM-Assisted Algorithm Discovery**|Timothee Leleu et.al.||[2602.03132](http://arxiv.org/abs/2602.03132)|null|
+|**2026-02-03**|**Persona Generators: Generating Diverse Synthetic Personas at Scale**|Davide Paglieri et.al.||[2602.03545](http://arxiv.org/abs/2602.03545)|null|
+|**2026-02-02**|**DeltaEvolve: Accelerating Scientific Discovery through Momentum-Driven Evolution**|Jiachen Jiang et.al.||[2602.02919](http://arxiv.org/abs/2602.02919)|null|
 |**2026-02-01**|**Evolving Interdependent Operators with Large Language Models for Multi-Objective Combinatorial Optimization**|Junhao Qiu et.al.||[2601.17899](http://arxiv.org/abs/2601.17899)|null|
 |**2026-01-29**|**READY: Reward Discovery for Meta-Black-Box Optimization**|Zechuan Huang et.al.||[2601.21847](http://arxiv.org/abs/2601.21847)|null|
 |**2026-01-29**|**LLaMEA-SAGE: Guiding Automated Algorithm Design with Structural Feedback from Explainable AI**|Niki van Stein et.al.||[2601.21511](http://arxiv.org/abs/2601.21511)|null|
 |**2026-01-29**|**TIDE: Tuning-Integrated Dynamic Evolution for LLM-Based Automated Heuristic Design**|Chentong Chen et.al.||[2601.21239](http://arxiv.org/abs/2601.21239)|null|
 |**2026-01-29**|**PathWise: Planning through World Model for Automated Heuristic Design via Self-Evolving LLMs**|Oguzhan Gungordu et.al.||[2601.20539](http://arxiv.org/abs/2601.20539)|null|
-|**2026-01-27**|**Algorithmic Prompt-Augmentation for Efficient LLM-Based Heuristic Design for A* Search**|Thomas Bˆmer et.al.|EvoStar conference; Code: https://github|[2601.19622](http://arxiv.org/abs/2601.19622)|null|
+|**2026-01-28**|**Magellan: Autonomous Discovery of Novel Compiler Optimization Heuristics with AlphaEvolve**|Hongzheng Chen et.al.||[2601.21096](http://arxiv.org/abs/2601.21096)|null|
+|**2026-01-27**|**Algorithmic Prompt-Augmentation for Efficient LLM-Based Heuristic Design for A* Search**|Thomas B√∂mer et.al.|EvoStar conference; Code: https://github|[2601.19622](http://arxiv.org/abs/2601.19622)|null|
+|**2026-01-23**|**The Art of Being Difficult: Combining Human and AI Strengths to Find Adversarial Instances for Heuristics**|Henri Nikoleit et.al.||[2601.16849](http://arxiv.org/abs/2601.16849)|null|
 |**2026-01-22**|**LLM-Assisted Automatic Dispatching Rule Design for Dynamic Flexible Assembly Flow Shop Scheduling**|Junhao Qiu et.al.||[2601.15738](http://arxiv.org/abs/2601.15738)|null|
 |**2026-01-15**|**Global Optimization for Combinatorial Geometry Problems Revisited in the Era of LLMs**|Timo Berthold et.al.||[2601.05943](http://arxiv.org/abs/2601.05943)|null|
 |**2026-01-09**|**Weights to Code: Extracting Interpretable Algorithms from the Discrete Transformer**|Yifan Zhang et.al.||[2601.05770](http://arxiv.org/abs/2601.05770)|null|
-|**2026-01-06**|**CodeEvolve: an open source evolutionary coding agent for algorithm discovery and optimization**|Henrique AssumpÁ„o et.al.||[2510.14150](http://arxiv.org/abs/2510.14150)|null|
+|**2026-01-06**|**CodeEvolve: an open source evolutionary coding agent for algorithm discovery and optimization**|Henrique Assump√ß√£o et.al.||[2510.14150](http://arxiv.org/abs/2510.14150)|null|
 |**2025-12-30**|**LoongFlow: Directed Evolutionary Search via a Cognitive Plan-Execute-Summarize Paradigm**|Chunhui Wan et.al.||[2512.24077](http://arxiv.org/abs/2512.24077)|null|
+|**2025-12-22**|**Mathematical exploration and discovery at scale**|Bogdan Georgiev et.al.||[2511.02864](http://arxiv.org/abs/2511.02864)|**[link](https://github.com/Aryia-Behroziuan/Robot-learning)**|
+|**2025-12-19**|**Reinforced Generation of Combinatorial Structures: Hardness of Approximation**|Ansh Nagda et.al.||[2509.18057](http://arxiv.org/abs/2509.18057)|null|
 |**2025-12-10**|**Beyond Algorithm Evolution: An LLM-Driven Framework for the Co-Evolution of Swarm Intelligence Optimization Algorithms and Prompts**|Shipeng Cen et.al.||[2512.09209](http://arxiv.org/abs/2512.09209)|null|
+|**2025-12-04**|**RoCo: Role-Based LLMs Collaboration for Automatic Heuristic Design**|Jiawei Xu et.al.||[2512.03762](http://arxiv.org/abs/2512.03762)|null|
+|**2025-11-28**|**ThetaEvolve: Test-time Learning on Open Problems**|Yiping Wang et.al.||[2511.23473](http://arxiv.org/abs/2511.23473)|**[link](https://github.com/ypwang61/ThetaEvolve)**|
+|**2025-11-26**|**Even with AI, Bijection Discovery is Still Hard: The Opportunities and Challenges of OpenEvolve for Novel Bijection Construction**|Davis Brown et.al.||[2511.20987](http://arxiv.org/abs/2511.20987)|null|
+|**2025-11-17**|**GigaEvo: An Open Source Optimization Framework Powered By LLMs And Evolution Algorithms**|Valentin Khrulkov et.al.||[2511.17592](http://arxiv.org/abs/2511.17592)|**[link](https://github.com/FusionBrainLab/gigaevo-core)**|
+|**2025-11-17**|**Fault2Flow: An AlphaEvolve-Optimized Human-in-the-Loop Multi-Agent System for Fault-to-Workflow Automation**|Yafang Wang et.al.||[2511.12916](http://arxiv.org/abs/2511.12916)|null|
 |**2025-11-16**|**Automated Algorithmic Discovery for Scientific Computing through LLM-Guided Evolutionary Search: A Case Study in Gravitational-Wave Detection**|He Wang et.al.||[2508.03661](http://arxiv.org/abs/2508.03661)|null|
 |**2025-11-16**|**From Euler to AI: Unifying Formulas for Mathematical Constants**|Tomer Raz et.al.|NeurIPS|[2502.17533](http://arxiv.org/abs/2502.17533)|null|
 |**2025-11-11**|**AlphaResearch: Accelerating New Algorithm Discovery with Language Models**|Zhaojian Yu et.al.||[2511.08522](http://arxiv.org/abs/2511.08522)|null|
 |**2025-11-10**|**Extending QAOA-GPT to Higher-Order Quantum Optimization Problems**|Leanto Sunny et.al.||[2511.07391](http://arxiv.org/abs/2511.07391)|null|
+|**2025-10-16**|**Programmatic Representation Learning with Language Models**|Gabriel Poesia et.al.||[2510.14825](http://arxiv.org/abs/2510.14825)|**[link](https://github.com/gpoesia/leapr)**|
 |**2025-10-13**|**Refining Hybrid Genetic Search for CVRP via Reinforcement Learning-Finetuned LLM**|Rongjie Zhu et.al.||[2510.11121](http://arxiv.org/abs/2510.11121)|null|
 |**2025-10-10**|**Barbarians at the Gate: How AI is Upending Systems Research**|Audrey Cheng et.al.||[2510.06189](http://arxiv.org/abs/2510.06189)|null|
+|**2025-10-09**|**Robust Heuristic Algorithm Design with LLMs**|Pantea Karimi et.al.||[2510.08755](http://arxiv.org/abs/2510.08755)|null|
 |**2025-10-07**|**Scientific Algorithm Discovery by Augmenting AlphaEvolve with Deep Research**|Gang Liu et.al.||[2510.06056](http://arxiv.org/abs/2510.06056)|null|
 |**2025-09-30**|**Experience-Guided Reflective Co-Evolution of Prompts and Heuristics for Automatic Algorithm Design**|Yihong Liu et.al.||[2509.24509](http://arxiv.org/abs/2509.24509)|null|
 |**2025-09-25**|**GeoEvolve: Automating Geospatial Model Discovery via Multi-Agent Large Language Models**|Peng Luo et.al.||[2509.21593](http://arxiv.org/abs/2509.21593)|null|
+|**2025-09-21**|**Out-of-Distribution Generalization in the ARC-AGI Domain: Comparing Execution-Guided Neural Program Synthesis and Test-Time Fine-Tuning**|Simon Ouellette et.al.||[2507.15877](http://arxiv.org/abs/2507.15877)|null|
+|**2025-09-09**|**Autonomous Code Evolution Meets NP-Completeness**|Cunxi Yu et.al.||[2509.07367](http://arxiv.org/abs/2509.07367)|null|
 |**2025-09-02**|**Re-evaluating LLM-based Heuristic Search: A Case Study on the 3D Packing Problem**|Guorui Quan et.al.||[2509.02297](http://arxiv.org/abs/2509.02297)|null|
 |**2025-08-25**|**Data-Driven Discovery of Interpretable Kalman Filter Variants through Large Language Models and Genetic Programming**|Vasileios Saketos et.al.||[2508.11703](http://arxiv.org/abs/2508.11703)|null|
 |**2025-08-20**|**EoH-S: Evolution of Heuristic Set using LLMs for Automated Heuristic Design**|Fei Liu et.al.||[2508.03082](http://arxiv.org/abs/2508.03082)|null|
@@ -43,31 +62,44 @@
 |**2025-08-04**|**Algorithm Discovery With LLMs: Evolutionary Search Meets Reinforcement Learning**|Anja Surina et.al.||[2504.05108](http://arxiv.org/abs/2504.05108)|null|
 |**2025-08-03**|**EvoVLMA: Evolutionary Vision-Language Model Adaptation**|Kun Ding et.al.|ACM Multimedia 2025 (ACM MM 2025)|[2508.01558](http://arxiv.org/abs/2508.01558)|null|
 |**2025-07-04**|**Behaviour Space Analysis of LLM-driven Meta-heuristic Discovery**|Niki van Stein et.al.||[2507.03605](http://arxiv.org/abs/2507.03605)|null|
+|**2025-06-23**|**Advanced For-Loop for QML algorithm search**|FuTe Wong et.al.||[2506.18260](http://arxiv.org/abs/2506.18260)|null|
 |**2025-06-16**|**AlphaEvolve: A coding agent for scientific and algorithmic discovery**|Alexander Novikov et.al.||[2506.13131](http://arxiv.org/abs/2506.13131)|null|
 |**2025-06-14**|**Automated Heuristic Design for Unit Commitment Using Large Language Models**|Junjin Lv et.al.||[2506.12495](http://arxiv.org/abs/2506.12495)|null|
 |**2025-06-10**|**Can Large Language Models Invent Algorithms to Improve Themselves?: Algorithm Discovery for Recursive Self-Improvement through Reinforcement Learning**|Yoichi Ishibashi et.al.|NAACL 2025 (main)|[2410.15639](http://arxiv.org/abs/2410.15639)|null|
 |**2025-06-03**|**LLM-Driven Instance-Specific Heuristic Generation and Selection**|Shaofeng Zhang et.al.||[2506.00490](http://arxiv.org/abs/2506.00490)|null|
 |**2025-05-22**|**STRCMP: Integrating Graph Structural Priors with Language Models for Combinatorial Optimization**|Xijun Li et.al.||[2506.11057](http://arxiv.org/abs/2506.11057)|null|
 |**2025-05-18**|**CALM: Co-evolution of Algorithms and Language Model for Automatic Heuristic Design**|Ziyao Huang et.al.||[2505.12285](http://arxiv.org/abs/2505.12285)|null|
+|**2025-05-12**|**Symbolic Regression with Multimodal Large Language Models and Kolmogorov Arnold Networks**|Thomas R. Harvey et.al.||[2505.07956](http://arxiv.org/abs/2505.07956)|null|
 |**2025-04-28**|**BLADE: Benchmark suite for LLM-driven Automated Design and Evolution of iterative optimisation heuristics**|Niki van Stein et.al.|GECCO Workshop 2025|[2504.20183](http://arxiv.org/abs/2504.20183)|null|
+|**2025-04-01**|**LLM-Guided Search for Deletion-Correcting Codes**|Franziska Weindel et.al.||[2504.00613](http://arxiv.org/abs/2504.00613)|null|
 |**2025-03-25**|**Optimizing Photonic Structures with Large Language Model Driven Algorithm Discovery**|Haoran Yin et.al.||[2503.19742](http://arxiv.org/abs/2503.19742)|null|
-|**2025-03-05**|**Leveraging Large Language Models to Develop Heuristics for Emerging Optimization Problems**|Thomas Bˆmer et.al.||[2503.03350](http://arxiv.org/abs/2503.03350)|null|
+|**2025-03-17**|**Generative Modeling for Mathematical Discovery**|Jordan S. Ellenberg et.al.||[2503.11061](http://arxiv.org/abs/2503.11061)|null|
+|**2025-03-13**|**From Understanding to Excelling: Template-Free Algorithm Design through Structural-Functional Co-Evolution**|Zhe Zhao et.al.||[2503.10721](http://arxiv.org/abs/2503.10721)|null|
+|**2025-03-05**|**Leveraging Large Language Models to Develop Heuristics for Emerging Optimization Problems**|Thomas B√∂mer et.al.||[2503.03350](http://arxiv.org/abs/2503.03350)|null|
+|**2025-02-21**|**QUBE: Enhancing Automatic Heuristic Design via Quality-Uncertainty Balanced Evolution**|Zijie Chen et.al.||[2412.20694](http://arxiv.org/abs/2412.20694)|**[link](https://github.com/zzjchen/QUBE_code)**|
+|**2025-02-13**|**Explainable AI-assisted Optimization for Feynman Integral Reduction**|Zhuo-Yang Song et.al.||[2502.09544](http://arxiv.org/abs/2502.09544)|null|
+|**2025-02-07**|**Refining Integration-by-Parts Reduction of Feynman Integrals with Machine Learning**|Matt von Hippel et.al.||[2502.05121](http://arxiv.org/abs/2502.05121)|null|
 |**2025-02-04**|**Multi-objective Evolution of Heuristic Using Large Language Model**|Shunyu Yao et.al.||[2409.16867](http://arxiv.org/abs/2409.16867)|null|
 |**2025-01-11**|**AlgoPilot: Fully Autonomous Program Synthesis Without Human-Written Programs**|Xiaoxin Yin et.al.||[2501.06423](http://arxiv.org/abs/2501.06423)|null|
+|**2024-12-19**|**HSEvo: Elevating Automatic Heuristic Design with Diversity-Driven Harmony Search and Genetic Algorithm Using LLMs**|Pham Vu Tuan Dat et.al.||[2412.14995](http://arxiv.org/abs/2412.14995)|**[link](https://github.com/datphamvn/HSEvo)**|
 |**2024-12-09**|**LLMs as Debate Partners: Utilizing Genetic Algorithms and Adversarial Search for Adaptive Arguments**|Prakash Aryan et.al.||[2412.06229](http://arxiv.org/abs/2412.06229)|null|
+|**2024-11-29**|**Amplifying human performance in combinatorial competitive programming**|Petar Veliƒçkoviƒá et.al.||[2411.19744](http://arxiv.org/abs/2411.19744)|null|
 |**2024-10-30**|**Automatic programming via large language models with population self-evolution for dynamic job shop scheduling problem**|Jin Huang et.al.||[2410.22657](http://arxiv.org/abs/2410.22657)|null|
+|**2024-10-14**|**ReEvo: Large Language Models as Hyper-Heuristics with Reflective Evolution**|Haoran Ye et.al.|NeurIPS 2024|[2402.01145](http://arxiv.org/abs/2402.01145)|**[link](https://github.com/ai4co/reevo)**|
 |**2024-07-15**|**Understanding the Importance of Evolutionary Search in Automated Heuristic Design with Large Language Models**|Rui Zhang et.al.|the 18th International Conference on Parallel Problem Solving From Nature (PPSN 2024)|[2407.10873](http://arxiv.org/abs/2407.10873)|null|
+|**2024-07-01**|**FunBO: Discovering Acquisition Functions for Bayesian Optimization with FunSearch**|Virginia Aglietti et.al.||[2406.04824](http://arxiv.org/abs/2406.04824)|null|
 |**2024-06-01**|**tnGPS: Discovering Unknown Tensor Network Structure Search Algorithms via Large Language Models (LLMs)**|Junhua Zeng et.al.|ICML2024|[2402.02456](http://arxiv.org/abs/2402.02456)|null|
 |**2024-06-01**|**Evolution of Heuristics: Towards Efficient Automatic Algorithm Design Using Large Language Model**|Fei Liu et.al.||[2401.02051](http://arxiv.org/abs/2401.02051)|null|
 |**2024-02-05**|**Open-Universe Indoor Scene Generation using LLM Program Synthesis and Uncurated Object Databases**|Rio Aguina-Kang et.al.||[2403.09675](http://arxiv.org/abs/2403.09675)|null|
 |**2024-01-22**|**Analyzing the Effectiveness of Large Language Models on Text-to-SQL Synthesis**|Richard Roberson et.al.||[2401.12379](http://arxiv.org/abs/2401.12379)|null|
 
-<p align=right>(<a href=#updated-on-20260210>back to top</a>)</p>
+<p align=right>(<a href=#updated-on-20260211>back to top</a>)</p>
 
 ## OR for Generative AI
 
 |Publish Date|Title|Authors|Venue|PDF|Code|
 |---|---|---|---|---|---|
+|**2026-02-10**|**Towards Poisoning Robustness Certification for Natural Language Generation**|Mihnea Ghitu et.al.||[2602.09757](http://arxiv.org/abs/2602.09757)|null|
 |**2026-02-09**|**OSCAR: Optimization-Steered Agentic Planning for Composed Image Retrieval**|Teng Wang et.al.||[2602.08603](http://arxiv.org/abs/2602.08603)|null|
 |**2026-02-09**|**Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction**|Ziyao Tang et.al.||[2602.08585](http://arxiv.org/abs/2602.08585)|null|
 |**2026-02-08**|**Solver-in-the-Loop: MDP-Based Benchmarks for Self-Correction and Behavioral Rationality in Operations Research**|Ruicheng Ao et.al.||[2601.21008](http://arxiv.org/abs/2601.21008)|null|
@@ -128,7 +160,7 @@
 |**2025-10-08**|**FLEET: Formal Language-Grounded Scheduling for Heterogeneous Robot Teams**|Corban Rivera et.al.||[2510.07417](http://arxiv.org/abs/2510.07417)|null|
 |**2025-10-07**|**ConstraintLLM: A Neuro-Symbolic Framework for Industrial-Level Constraint Programming**|Weichun Shi et.al.|Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing, pages 15999-16019|[2510.05774](http://arxiv.org/abs/2510.05774)|**[link](https://github.com/william4s/ConstraintLLM)**|
 |**2025-10-02**|**LLM-Enhanced, Data-Driven Personalized and Equitable Clinician Scheduling: A Predict-then-Optimize Approach**|Anjali Jha et.al.||[2510.02047](http://arxiv.org/abs/2510.02047)|null|
-|**2025-10-01**|**Logical Consistency Between Disagreeing Experts and Its Role in AI Safety**|AndrÈs Corrada-Emmanuel et.al.||[2510.00821](http://arxiv.org/abs/2510.00821)|null|
+|**2025-10-01**|**Logical Consistency Between Disagreeing Experts and Its Role in AI Safety**|Andr√©s Corrada-Emmanuel et.al.||[2510.00821](http://arxiv.org/abs/2510.00821)|null|
 |**2025-10-01**|**StepORLM: A Self-Evolving Framework With Generative Process Supervision For Operations Research Language Models**|Chenyu Zhou et.al.||[2509.22558](http://arxiv.org/abs/2509.22558)|null|
 |**2025-09-29**|**FMIP: Joint Continuous-Integer Flow For Mixed-Integer Linear Programming**|Hongpei Li et.al.||[2507.23390](http://arxiv.org/abs/2507.23390)|**[link](https://github.com/Lhongpei/FMIP)**|
 |**2025-09-29**|**Cascadia: An Efficient Cascade Serving System for Large Language Models**|Youhe Jiang et.al.||[2506.04203](http://arxiv.org/abs/2506.04203)|null|
@@ -139,7 +171,7 @@
 |**2025-09-24**|**Agentic AI for Low-Altitude Semantic Wireless Networks: An Energy Efficient Design**|Zhouxiang Zhao et.al.||[2509.19791](http://arxiv.org/abs/2509.19791)|null|
 |**2025-09-24**|**OR-Toolformer: Modeling and Solving Operations Research Problems with Tool Augmented Large Language Models**|Jianzhang Zhang et.al.||[2510.01253](http://arxiv.org/abs/2510.01253)|null|
 |**2025-09-19**|**Large Language Model-Empowered Decision Transformer for UAV-Enabled Data Collection**|Zhixion Chen et.al.||[2509.13934](http://arxiv.org/abs/2509.13934)|null|
-|**2025-09-10**|**No-Knowledge Alarms for Misaligned LLMs-as-Judges**|AndrÈs Corrada-Emmanuel et.al.||[2509.08593](http://arxiv.org/abs/2509.08593)|null|
+|**2025-09-10**|**No-Knowledge Alarms for Misaligned LLMs-as-Judges**|Andr√©s Corrada-Emmanuel et.al.||[2509.08593](http://arxiv.org/abs/2509.08593)|null|
 |**2025-09-05**|**A Federated Fine-Tuning Paradigm of Foundation Models in Heterogenous Wireless Networks**|Jingyi Wang et.al.||[2509.19306](http://arxiv.org/abs/2509.19306)|null|
 |**2025-08-26**|**HAP: Hybrid Adaptive Parallelism for Efficient Mixture-of-Experts Inference**|Haoran Lin et.al.||[2508.19373](http://arxiv.org/abs/2508.19373)|null|
 |**2025-08-18**|**Batching-Aware Joint Model Onloading and Offloading for Hierarchical Multi-Task Inference**|Seohyeon Cha et.al.||[2508.13380](http://arxiv.org/abs/2508.13380)|null|
@@ -159,7 +191,7 @@
 |**2025-06-22**|**Integrating LLMs and Digital Twins for Adaptive Multi-Robot Task Allocation in Construction**|Min Deng et.al.||[2506.18178](http://arxiv.org/abs/2506.18178)|null|
 |**2025-06-06**|**BAQ: Efficient Bit Allocation Quantization for Large Language Models**|Chao Zhang et.al.||[2506.05664](http://arxiv.org/abs/2506.05664)|null|
 |**2025-06-05**|**Joint User Association and Beamforming Design for ISAC Networks with Large Language Models**|Haoyun Li et.al.||[2506.05637](http://arxiv.org/abs/2506.05637)|null|
-|**2025-06-05**|**Autoformulation of Mathematical Optimization Models Using LLMs**|Nicol·s Astorga et.al.|ICML|[2411.01679](http://arxiv.org/abs/2411.01679)|null|
+|**2025-06-05**|**Autoformulation of Mathematical Optimization Models Using LLMs**|Nicol√°s Astorga et.al.|ICML|[2411.01679](http://arxiv.org/abs/2411.01679)|null|
 |**2025-05-25**|**Lightweight Embeddings with Graph Rewiring for Collaborative Filtering**|Xurong Liang et.al.|TOIS'25|[2505.18999](http://arxiv.org/abs/2505.18999)|null|
 |**2025-04-04**|**ORLM: A Customizable Framework in Training Large Models for Automated Optimization Modeling**|Chenyu Huang et.al.|Operations Research (2025), published online ahead of print|[2405.17743](http://arxiv.org/abs/2405.17743)|**[link](https://github.com/cardinal-operations/orlm)**|
 |**2025-03-19**|**Communication-Efficient Distributed On-Device LLM Inference Over Wireless Networks**|Kai Zhang et.al.||[2503.14882](http://arxiv.org/abs/2503.14882)|null|
@@ -174,7 +206,7 @@
 |**2024-06-18**|**City-LEO: Toward Transparent City Management Using LLM with End-to-End Optimization**|Zihao Jiao et.al.||[2406.10958](http://arxiv.org/abs/2406.10958)|null|
 |**2024-05-12**|**Edge Intelligence Optimization for Large Language Model Inference with Batching and Quantization**|Xinyuan Zhang et.al.||[2405.07140](http://arxiv.org/abs/2405.07140)|null|
 
-<p align=right>(<a href=#updated-on-20260210>back to top</a>)</p>
+<p align=right>(<a href=#updated-on-20260211>back to top</a>)</p>
 
 ## Generative AI for OR
 
@@ -258,7 +290,7 @@
 |**2025-01-14**|**OptiChat: Bridging Optimization Models and Practitioners with Large Language Models**|Hao Chen et.al.|INFORMS Journal on Data Science|[2501.08406](http://arxiv.org/abs/2501.08406)|null|
 |**2024-12-22**|**Evaluating LLM Reasoning in the Operations Research Domain with ORQA**|Mahdi Mostajabdaveh et.al.|arXiv.org|[2412.17874](http://arxiv.org/abs/2412.17874)|null|
 |**2024-11-26**|**BPP-Search: Enhancing Tree of Thought Reasoning for Mathematical Modeling Problem Solving**|Teng Wang et.al.|Annual Meeting of the Association for Computational Linguistics|[2411.17404](http://arxiv.org/abs/2411.17404)|null|
-|**2024-11-03**|**Autoformulation of Mathematical Optimization Models Using LLMs**|Nicol·s Astorga et.al.|International Conference on Machine Learning|[2411.01679](http://arxiv.org/abs/2411.01679)|null|
+|**2024-11-03**|**Autoformulation of Mathematical Optimization Models Using LLMs**|Nicol√°s Astorga et.al.|International Conference on Machine Learning|[2411.01679](http://arxiv.org/abs/2411.01679)|null|
 |**2024-10-29**|**Generalists vs. Specialists: Evaluating LLMs on Highly-Constrained Biophysical Sequence Optimization Tasks**|Angelica Chen et.al.|International Conference on Machine Learning|[2410.22296](http://arxiv.org/abs/2410.22296)|null|
 |**2024-10-28**|**Deep Insights into Automated Optimization with Large Language Models and Evolutionary Algorithms**|He Yu et.al.|arXiv.org|[2410.20848](http://arxiv.org/abs/2410.20848)|null|
 |**2024-10-23**|**AutoRNet: Automatically Optimizing Heuristics for Robust Network Design via Large Language Models**|He Yu et.al.|arXiv.org|[2410.17656](http://arxiv.org/abs/2410.17656)|null|
@@ -285,5 +317,5 @@
 |**2024-01-18**|**Evolutionary Computation in the Era of Large Language Model: Survey and Roadmap**|Xingyu Wu et.al.|IEEE Transactions on Evolutionary Computation|[2401.10034](http://arxiv.org/abs/2401.10034)|null|
 |**2024-01-06**|**Artificial Intelligence for Operations Research: Revolutionizing the Operations Research Process**|Zhenan Fan et.al.|arXiv.org|[2401.03244](http://arxiv.org/abs/2401.03244)|null|
 
-<p align=right>(<a href=#updated-on-20260210>back to top</a>)</p>
+<p align=right>(<a href=#updated-on-20260211>back to top</a>)</p>
 
