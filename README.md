@@ -12,6 +12,7 @@
 
 |Publish Date|Title|Authors|Venue|PDF|Code|
 |---|---|---|---|---|---|
+|**2026-02-10**|**ImprovEvolve: Ask AlphaEvolve to Improve the Input Solution and Then Improvise**|Alexey Kravatskiy et.al.||[2602.10233](http://arxiv.org/abs/2602.10233)|null|
 |**2026-02-09**|**G-LNS: Generative Large Neighborhood Search for LLM-Based Automatic Heuristic Design**|Baoyun Zhao et.al.||[2602.08253](http://arxiv.org/abs/2602.08253)|**[link](https://github.com/ZBoyn/G-LNS)**|
 |**2026-02-09**|**Lyria: A Genetic Algorithm-Driven Neuro-Symbolic Reasoning Framework for LLMs**|Weizhi Tang et.al.||[2507.04034](http://arxiv.org/abs/2507.04034)|null|
 |**2026-02-05**|**Mining Generalizable Activation Functions**|Alex Vitvitskyi et.al.||[2602.05688](http://arxiv.org/abs/2602.05688)|**[link](https://github.com/Aastha2104/Parkinson-Disease-Prediction)**|
@@ -212,6 +213,7 @@
 
 |Publish Date|Title|Authors|Venue|PDF|Code|
 |---|---|---|---|---|---|
+|**2026-02-11**|**Constructing Industrial-Scale Optimization Modeling Benchmark**|Zhong Li et.al.||[2602.10450](http://arxiv.org/abs/2602.10450)|null|
 |**2026-02-06**|**Evaluating LLM-persona Generated Distributions for Decision-making**|Jackie Baek et.al.||[2602.06357](http://arxiv.org/abs/2602.06357)|null|
 |**2026-02-03**|**MIRROR: A Multi-Agent Framework with Iterative Adaptive Revision and Hierarchical Retrieval for Optimization Modeling in Operations Research**|Yifan Shi et.al.||[2602.03318](http://arxiv.org/abs/2602.03318)|null|
 |**2026-02-03**|**ProOPF: Benchmarking and Improving LLMs for Professional-Grade Power Systems Optimization Modeling**|Chao Shen et.al.||[2602.03070](http://arxiv.org/abs/2602.03070)|null|
