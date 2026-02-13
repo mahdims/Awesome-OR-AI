@@ -222,6 +222,7 @@
 |**2026-02-01**|**EvoOpt-LLM: Evolving industrial optimization models with large language models**|Yiliu He et.al.||[2602.01082](http://arxiv.org/abs/2602.01082)|null|
 |**2026-01-29**|**NEMO: Execution-Aware Optimization Modeling via Autonomous Coding Agents**|Yang Song et.al.||[2601.21372](http://arxiv.org/abs/2601.21372)|null|
 |**2026-01-25**|**Grammar-Aware Literate Generative Mathematical Programming with Compiler-in-the-Loop**|Roberto Rossi et.al.||[2601.17670](http://arxiv.org/abs/2601.17670)|null|
+|**2026-01-17**|**Automated Optimization Modeling via a Localizable Error-Driven Perspective**|Weiting Liu et.al.||[2602.11164](http://arxiv.org/abs/2602.11164)|null|
 |**2026-01-10**|**SimLLM: Fine-Tuning Code LLMs for SimPy-Based Queueing System Simulation**|Jun-Qi Chen et.al.||[2601.06543](http://arxiv.org/abs/2601.06543)|null|
 |**2026-01-09**|**OPT-Engine: Benchmarking the Limits of LLMs in Optimization Modeling via Complexity Scaling**|Yitian Chen et.al.||[2601.19924](http://arxiv.org/abs/2601.19924)|null|
 |**2026-01-09**|**Global Optimization for Combinatorial Geometry Problems Revisited in the Era of LLMs**|Timo Berthold et.al.||[2601.05943](http://arxiv.org/abs/2601.05943)|null|
