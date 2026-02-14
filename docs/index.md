@@ -2,7 +2,7 @@
 layout: default
 ---
 
-## Updated on 2026.02.13
+## Updated on 2026.02.14
 ## LLMs for Algorithm Design
 
 | Publish Date | Title | Authors | Venue | PDF | Code |

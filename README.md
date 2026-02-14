@@ -1,4 +1,4 @@
-## Updated on 2026.02.13
+## Updated on 2026.02.14
 <details>
   <summary>Table of Contents</summary>
   <ol>
@@ -94,7 +94,7 @@
 |**2024-02-05**|**Open-Universe Indoor Scene Generation using LLM Program Synthesis and Uncurated Object Databases**|Rio Aguina-Kang et.al.||[2403.09675](http://arxiv.org/abs/2403.09675)|null|
 |**2024-01-22**|**Analyzing the Effectiveness of Large Language Models on Text-to-SQL Synthesis**|Richard Roberson et.al.||[2401.12379](http://arxiv.org/abs/2401.12379)|null|
 
-<p align=right>(<a href=#updated-on-20260213>back to top</a>)</p>
+<p align=right>(<a href=#updated-on-20260214>back to top</a>)</p>
 
 ## OR for Generative AI
 
@@ -207,7 +207,7 @@
 |**2024-06-18**|**City-LEO: Toward Transparent City Management Using LLM with End-to-End Optimization**|Zihao Jiao et.al.||[2406.10958](http://arxiv.org/abs/2406.10958)|null|
 |**2024-05-12**|**Edge Intelligence Optimization for Large Language Model Inference with Batching and Quantization**|Xinyuan Zhang et.al.||[2405.07140](http://arxiv.org/abs/2405.07140)|null|
 
-<p align=right>(<a href=#updated-on-20260213>back to top</a>)</p>
+<p align=right>(<a href=#updated-on-20260214>back to top</a>)</p>
 
 ## Generative AI for OR
 
@@ -320,5 +320,5 @@
 |**2024-01-18**|**Evolutionary Computation in the Era of Large Language Model: Survey and Roadmap**|Xingyu Wu et.al.|IEEE Transactions on Evolutionary Computation|[2401.10034](http://arxiv.org/abs/2401.10034)|null|
 |**2024-01-06**|**Artificial Intelligence for Operations Research: Revolutionizing the Operations Research Process**|Zhenan Fan et.al.|arXiv.org|[2401.03244](http://arxiv.org/abs/2401.03244)|null|
 
-<p align=right>(<a href=#updated-on-20260213>back to top</a>)</p>
+<p align=right>(<a href=#updated-on-20260214>back to top</a>)</p>
 
