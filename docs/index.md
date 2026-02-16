@@ -28,8 +28,8 @@ layout: default
 |**2026-01-22**|**LLM-Assisted Automatic Dispatching Rule Design for Dynamic Flexible Assembly Flow Shop Scheduling**|Junhao Qiu et.al.||[2601.15738](http://arxiv.org/abs/2601.15738)|null|
 |**2026-01-15**|**Global Optimization for Combinatorial Geometry Problems Revisited in the Era of LLMs**|Timo Berthold et.al.||[2601.05943](http://arxiv.org/abs/2601.05943)|null|
 |**2026-01-09**|**Weights to Code: Extracting Interpretable Algorithms from the Discrete Transformer**|Yifan Zhang et.al.||[2601.05770](http://arxiv.org/abs/2601.05770)|null|
-|**2026-01-06**|**CodeEvolve: an open source evolutionary coding agent for algorithm discovery and optimization**|Henrique Assumpção et.al.||[2510.14150](http://arxiv.org/abs/2510.14150)|null|
-|**2025-12-30**|**LoongFlow: Directed Evolutionary Search via a Cognitive Plan-Execute-Summarize Paradigm**|Chunhui Wan et.al.||[2512.24077](http://arxiv.org/abs/2512.24077)|null|
+|**2026-01-06**|**CodeEvolve: an open source evolutionary coding agent for algorithm discovery and optimization**|Henrique Assumpção et.al.||[2510.14150](http://arxiv.org/abs/2510.14150)|**[link](https://github.com/inter-co/science-codeevolve)**|
+|**2025-12-30**|**LoongFlow: Directed Evolutionary Search via a Cognitive Plan-Execute-Summarize Paradigm**|Chunhui Wan et.al.||[2512.24077](http://arxiv.org/abs/2512.24077)|**[link](https://github.com/baidu-baige/LoongFlow)**|
 |**2025-12-22**|**Mathematical exploration and discovery at scale**|Bogdan Georgiev et.al.||[2511.02864](http://arxiv.org/abs/2511.02864)|**[link](https://github.com/Aryia-Behroziuan/Robot-learning)**|
 |**2025-12-19**|**Reinforced Generation of Combinatorial Structures: Hardness of Approximation**|Ansh Nagda et.al.||[2509.18057](http://arxiv.org/abs/2509.18057)|null|
 |**2025-12-10**|**Beyond Algorithm Evolution: An LLM-Driven Framework for the Co-Evolution of Swarm Intelligence Optimization Algorithms and Prompts**|Shipeng Cen et.al.||[2512.09209](http://arxiv.org/abs/2512.09209)|null|
@@ -40,13 +40,13 @@ layout: default
 |**2025-11-17**|**Fault2Flow: An AlphaEvolve-Optimized Human-in-the-Loop Multi-Agent System for Fault-to-Workflow Automation**|Yafang Wang et.al.||[2511.12916](http://arxiv.org/abs/2511.12916)|null|
 |**2025-11-16**|**Automated Algorithmic Discovery for Scientific Computing through LLM-Guided Evolutionary Search: A Case Study in Gravitational-Wave Detection**|He Wang et.al.||[2508.03661](http://arxiv.org/abs/2508.03661)|null|
 |**2025-11-16**|**From Euler to AI: Unifying Formulas for Mathematical Constants**|Tomer Raz et.al.|NeurIPS|[2502.17533](http://arxiv.org/abs/2502.17533)|null|
-|**2025-11-11**|**AlphaResearch: Accelerating New Algorithm Discovery with Language Models**|Zhaojian Yu et.al.||[2511.08522](http://arxiv.org/abs/2511.08522)|null|
+|**2025-11-11**|**AlphaResearch: Accelerating New Algorithm Discovery with Language Models**|Zhaojian Yu et.al.||[2511.08522](http://arxiv.org/abs/2511.08522)|**[link](https://github.com/answers111/alpha-research)**|
 |**2025-11-10**|**Extending QAOA-GPT to Higher-Order Quantum Optimization Problems**|Leanto Sunny et.al.||[2511.07391](http://arxiv.org/abs/2511.07391)|null|
 |**2025-10-16**|**Programmatic Representation Learning with Language Models**|Gabriel Poesia et.al.||[2510.14825](http://arxiv.org/abs/2510.14825)|**[link](https://github.com/gpoesia/leapr)**|
 |**2025-10-13**|**Refining Hybrid Genetic Search for CVRP via Reinforcement Learning-Finetuned LLM**|Rongjie Zhu et.al.||[2510.11121](http://arxiv.org/abs/2510.11121)|null|
 |**2025-10-10**|**Barbarians at the Gate: How AI is Upending Systems Research**|Audrey Cheng et.al.||[2510.06189](http://arxiv.org/abs/2510.06189)|null|
 |**2025-10-09**|**Robust Heuristic Algorithm Design with LLMs**|Pantea Karimi et.al.||[2510.08755](http://arxiv.org/abs/2510.08755)|null|
-|**2025-10-07**|**Scientific Algorithm Discovery by Augmenting AlphaEvolve with Deep Research**|Gang Liu et.al.||[2510.06056](http://arxiv.org/abs/2510.06056)|null|
+|**2025-10-07**|**Scientific Algorithm Discovery by Augmenting AlphaEvolve with Deep Research**|Gang Liu et.al.||[2510.06056](http://arxiv.org/abs/2510.06056)|**[link](https://github.com/liugangcode/deepevolve)**|
 |**2025-09-30**|**Experience-Guided Reflective Co-Evolution of Prompts and Heuristics for Automatic Algorithm Design**|Yihong Liu et.al.||[2509.24509](http://arxiv.org/abs/2509.24509)|null|
 |**2025-09-25**|**GeoEvolve: Automating Geospatial Model Discovery via Multi-Agent Large Language Models**|Peng Luo et.al.||[2509.21593](http://arxiv.org/abs/2509.21593)|null|
 |**2025-09-21**|**Out-of-Distribution Generalization in the ARC-AGI Domain: Comparing Execution-Guided Neural Program Synthesis and Test-Time Fine-Tuning**|Simon Ouellette et.al.||[2507.15877](http://arxiv.org/abs/2507.15877)|null|
@@ -216,7 +216,7 @@ layout: default
 |**2026-01-25**|**Grammar-Aware Literate Generative Mathematical Programming with Compiler-in-the-Loop**|Roberto Rossi et.al.||[2601.17670](http://arxiv.org/abs/2601.17670)|null|
 |**2026-01-17**|**Automated Optimization Modeling via a Localizable Error-Driven Perspective**|Weiting Liu et.al.||[2602.11164](http://arxiv.org/abs/2602.11164)|null|
 |**2026-01-10**|**SimLLM: Fine-Tuning Code LLMs for SimPy-Based Queueing System Simulation**|Jun-Qi Chen et.al.||[2601.06543](http://arxiv.org/abs/2601.06543)|null|
-|**2026-01-09**|**OPT-Engine: Benchmarking the Limits of LLMs in Optimization Modeling via Complexity Scaling**|Yitian Chen et.al.||[2601.19924](http://arxiv.org/abs/2601.19924)|null|
+|**2026-01-09**|**OPT-Engine: Benchmarking the Limits of LLMs in Optimization Modeling via Complexity Scaling**|Yitian Chen et.al.||[2601.19924](http://arxiv.org/abs/2601.19924)|**[link](https://github.com/Cardinal-Operations/OPTEngine)**|
 |**2026-01-09**|**Global Optimization for Combinatorial Geometry Problems Revisited in the Era of LLMs**|Timo Berthold et.al.||[2601.05943](http://arxiv.org/abs/2601.05943)|null|
 |**2026-01-08**|**NC2C: Automated Convexification of Generic Non-Convex Optimization Problems**|Xinyue Peng et.al.||[2601.04789](http://arxiv.org/abs/2601.04789)|null|
 |**2026-01-02**|**LLM Agents for Combinatorial Efficient Frontiers: Investment Portfolio Optimization**|Simon Paquette-Greenbaum et.al.||[2601.00770](http://arxiv.org/abs/2601.00770)|null|
@@ -228,7 +228,7 @@ layout: default
 |**2025-11-04**|**An LLM-powered MILP modelling engine for workforce scheduling guided by expert knowledge**|Qingyang Li et.al.||[2511.02364](http://arxiv.org/abs/2511.02364)|null|
 |**2025-11-01**|**SOCRATES: Simulation Optimization with Correlated Replicas and Adaptive Trajectory Evaluations**|Haoting Zhang et.al.|arXiv.org|[2511.00685](http://arxiv.org/abs/2511.00685)|null|
 |**2025-10-31**|**ORGEval: Graph-Theoretic Evaluation of LLMs in Optimization Modeling**|Zhuohan Wang et.al.|arXiv.org|[2510.27610](http://arxiv.org/abs/2510.27610)|null|
-|**2025-10-21**|**AlphaOPT: Formulating Optimization Programs with Self-Improving LLM Experience Library**|Minwei Kong et.al.|arXiv.org|[2510.18428](http://arxiv.org/abs/2510.18428)|null|
+|**2025-10-21**|**AlphaOPT: Formulating Optimization Programs with Self-Improving LLM Experience Library**|Minwei Kong et.al.|arXiv.org|[2510.18428](http://arxiv.org/abs/2510.18428)|**[link](https://github.com/Minw913/AlphaOPT)**|
 |**2025-10-19**|**SolverLLM: Leveraging Test-Time Scaling for Optimization Problem via LLM-Guided Search**|Dong Li et.al.|arXiv.org|[2510.16916](http://arxiv.org/abs/2510.16916)|null|
 |**2025-10-12**|**LinearizeLLM: An Agent-Based Framework for LLM-Driven Exact Linear Reformulation of Nonlinear Optimization Problems**|Paul-Niklas Ken Kandora et.al.|arXiv.org|[2510.15969](http://arxiv.org/abs/2510.15969)|null|
 |**2025-10-05**|**CALM Before the STORM: Unlocking Native Reasoning for Optimization Modeling**|Zhengyang Tang et.al.|arXiv.org|[2510.04204](http://arxiv.org/abs/2510.04204)|null|
@@ -252,7 +252,7 @@ layout: default
 |**2025-08-21**|**R-ConstraintBench: Evaluating LLMs on NP-Complete Scheduling**|Raj Jain et.al.|arXiv.org|[2508.15204](http://arxiv.org/abs/2508.15204)|null|
 |**2025-08-20**|**Adaptively Robust LLM Inference Optimization under Prediction Uncertainty**|Zixi Chen et.al.|arXiv.org|[2508.14544](http://arxiv.org/abs/2508.14544)|null|
 |**2025-08-20**|**Automated Optimization Modeling through Expert-Guided Large Language Model Reasoning**|Beinuo Yang et.al.|arXiv.org|[2508.14410](http://arxiv.org/abs/2508.14410)|null|
-|**2025-08-16**|**EvoCut: Strengthening Integer Programs via Evolution-Guided Language Models**|M. Yazdani et.al.|arXiv.org|[2508.11850](http://arxiv.org/abs/2508.11850)|null|
+|**2025-08-16**|**EvoCut: Strengthening Integer Programs via Evolution-Guided Language Models**|M. Yazdani et.al.|arXiv.org|[2508.11850](http://arxiv.org/abs/2508.11850)|**[link](https://github.com/milad1378yz/EvoCut)**|
 |**2025-08-10**|**CP-Agent: Agentic Constraint Programming**|Stefan Szeider et.al.|arXiv.org|[2508.07468](http://arxiv.org/abs/2508.07468)|null|
 |**2025-08-05**|**Toward a Trustworthy Optimization Modeling Agent via Verifiable Synthetic Data Generation**|Vinicius Lima et.al.|arXiv.org|[2508.03117](http://arxiv.org/abs/2508.03117)|null|
 |**2025-07-23**|**SMARTAPS: Tool-augmented LLMs for Operations Management**|Timothy T. L. Yu et.al.|arXiv.org|[2507.17927](http://arxiv.org/abs/2507.17927)|null|
@@ -261,45 +261,45 @@ layout: default
 |**2025-07-13**|**Fine-tuning Large Language Model for Automated Algorithm Design**|Fei Liu et.al.|arXiv.org|[2507.10614](http://arxiv.org/abs/2507.10614)|null|
 |**2025-06-30**|**Performance of LLMS on Stochastic Modeling Operations Research Problems: From Theory to Practice**|Akshit Kumar et.al.|Online World Conference on Soft Computing in Industrial Applications|[2506.23924](http://arxiv.org/abs/2506.23924)|null|
 |**2025-06-09**|**REMoH: A Reflective Evolution of Multi-objective Heuristics approach via Large Language Models**|Diego Forni'es-Tabuenca et.al.|arXiv.org|[2506.07759](http://arxiv.org/abs/2506.07759)|null|
-|**2025-06-09**|**HeuriGym: An Agentic Benchmark for LLM-Crafted Heuristics in Combinatorial Optimization**|Hongzheng Chen et.al.|arXiv.org|[2506.07972](http://arxiv.org/abs/2506.07972)|null|
-|**2025-06-06**|**DCP-Bench-Open: Evaluating LLMs for Constraint Modelling of Discrete Combinatorial Problems**|Kostis Michailidis et.al.||[2506.06052](http://arxiv.org/abs/2506.06052)|null|
+|**2025-06-09**|**HeuriGym: An Agentic Benchmark for LLM-Crafted Heuristics in Combinatorial Optimization**|Hongzheng Chen et.al.|arXiv.org|[2506.07972](http://arxiv.org/abs/2506.07972)|**[link](https://github.com/cornell-zhang/heurigym)**|
+|**2025-06-06**|**DCP-Bench-Open: Evaluating LLMs for Constraint Modelling of Discrete Combinatorial Problems**|Kostis Michailidis et.al.||[2506.06052](http://arxiv.org/abs/2506.06052)|**[link](https://github.com/kostis-init/CP-Bench)**|
 |**2025-06-02**|**ORMind: A Cognitive-Inspired End-to-End Reasoning Framework for Operations Research**|Zhiyuan Wang et.al.|Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 6: Industry Track)|[2506.01326](http://arxiv.org/abs/2506.01326)|**[link](https://github.com/XiaoAI1989/ORMind)**|
 |**2025-05-27**|**DualSchool: How Reliable are LLMs for Optimization Education?**|Michael Klamkin et.al.|arXiv.org|[2505.21775](http://arxiv.org/abs/2505.21775)|null|
 |**2025-05-21**|**Collaborative Problem-Solving in an Optimization Game**|Isidora Jeknic et.al.|arXiv.org|[2505.15490](http://arxiv.org/abs/2505.15490)|null|
-|**2025-05-17**|**Solver-Informed RL: Grounding Large Language Models for Authentic Optimization Modeling**|Yitian Chen et.al.|arXiv.org|[2505.11792](http://arxiv.org/abs/2505.11792)|null|
+|**2025-05-17**|**Solver-Informed RL: Grounding Large Language Models for Authentic Optimization Modeling**|Yitian Chen et.al.|arXiv.org|[2505.11792](http://arxiv.org/abs/2505.11792)|**[link](https://github.com/Cardinal-Operations/SIRL)**|
 |**2025-05-15**|**Learning Virtual Machine Scheduling in Cloud Computing through Language Agents**|Jiehao Wu et.al.|arXiv.org|[2505.10117](http://arxiv.org/abs/2505.10117)|null|
 |**2025-05-10**|**RideAgent: An LLM-Enhanced Optimization Framework for Automated Taxi Fleet Operations**|Xinyu Jiang et.al.||[2505.06608](http://arxiv.org/abs/2505.06608)|null|
 |**2025-05-07**|**Optimization Problem Solving Can Transition to Evolutionary Agentic Workflows**|Wenhao Li et.al.|arXiv.org|[2505.04354](http://arxiv.org/abs/2505.04354)|null|
 |**2025-05-04**|**LLM-OptiRA: LLM-Driven Optimization of Resource Allocation for Non-Convex Problems in Wireless Communications**|Xinyue Peng et.al.|arXiv.org|[2505.02091](http://arxiv.org/abs/2505.02091)|null|
 |**2025-05-02**|**CHORUS: Zero-shot Hierarchical Retrieval and Orchestration for Generating Linear Programming Code**|Tasnim Ahmed et.al.|Learning and Intelligent Optimization|[2505.01485](http://arxiv.org/abs/2505.01485)|null|
 |**2025-04-23**|**OptimAI: Optimization from Natural Language Using LLM-Powered AI Agents**|Raghav Thind et.al.|arXiv.org|[2504.16918](http://arxiv.org/abs/2504.16918)|null|
-|**2025-04-06**|**CO-Bench: Benchmarking Language Model Agents in Algorithm Search for Combinatorial Optimization**|Weiwei Sun et.al.|arXiv.org|[2504.04310](http://arxiv.org/abs/2504.04310)|null|
+|**2025-04-06**|**CO-Bench: Benchmarking Language Model Agents in Algorithm Search for Combinatorial Optimization**|Weiwei Sun et.al.|arXiv.org|[2504.04310](http://arxiv.org/abs/2504.04310)|**[link](https://github.com/sunnweiwei/CO-Bench)**|
 |**2025-03-27**|**From User Preferences to Optimization Constraints Using Large Language Models**|Manuela Sanguinetti et.al.|arXiv.org|[2503.21360](http://arxiv.org/abs/2503.21360)|null|
 |**2025-03-18**|**Fully Automated Generation of Combinatorial Optimisation Systems Using Large Language Models**|Daniel Karapetyan et.al.|arXiv.org|[2503.15556](http://arxiv.org/abs/2503.15556)|null|
-|**2025-03-13**|**OR-LLM-Agent: Automating Modeling and Solving of Operations Research Optimization Problems with Reasoning LLM**|Bowen Zhang et.al.||[2503.10009](http://arxiv.org/abs/2503.10009)|null|
+|**2025-03-13**|**OR-LLM-Agent: Automating Modeling and Solving of Operations Research Optimization Problems with Reasoning LLM**|Bowen Zhang et.al.||[2503.10009](http://arxiv.org/abs/2503.10009)|**[link](https://github.com/bwz96sco/or_llm_agent)**|
 |**2025-02-22**|**Text2Zinc: A Cross-Domain Dataset for Modeling Optimization and Satisfaction Problems in MiniZinc**|Akash Singirikonda et.al.|arXiv.org|[2503.10642](http://arxiv.org/abs/2503.10642)|null|
-|**2025-02-20**|**EquivaMap: Leveraging LLMs for Automatic Equivalence Checking of Optimization Formulations**|Haotian Zhai et.al.|International Conference on Machine Learning|[2502.14760](http://arxiv.org/abs/2502.14760)|null|
+|**2025-02-20**|**EquivaMap: Leveraging LLMs for Automatic Equivalence Checking of Optimization Formulations**|Haotian Zhai et.al.|International Conference on Machine Learning|[2502.14760](http://arxiv.org/abs/2502.14760)|**[link](https://github.com/HumainLab/EquivaMap)**|
 |**2025-02-16**|**OptMATH: A Scalable Bidirectional Data Synthesis Framework for Optimization Modeling**|Hongliang Lu et.al.|International Conference on Machine Learning|[2502.11102](http://arxiv.org/abs/2502.11102)|null|
 |**2025-02-14**|**Decision Information Meets Large Language Models: The Future of Explainable Operations Research**|Yansen Zhang et.al.|International Conference on Learning Representations|[2502.09994](http://arxiv.org/abs/2502.09994)|null|
 |**2025-01-30**|**Leveraging LLM Agents for Automated Optimization Modeling for SASP Problems: A Graph-RAG Based Approach**|Tianpeng Pan et.al.|Cybersecurity and Cyberforensics Conference|[2501.18320](http://arxiv.org/abs/2501.18320)|null|
 |**2025-01-14**|**OptiChat: Bridging Optimization Models and Practitioners with Large Language Models**|Hao Chen et.al.|INFORMS Journal on Data Science|[2501.08406](http://arxiv.org/abs/2501.08406)|null|
-|**2024-12-22**|**Evaluating LLM Reasoning in the Operations Research Domain with ORQA**|Mahdi Mostajabdaveh et.al.|arXiv.org|[2412.17874](http://arxiv.org/abs/2412.17874)|null|
+|**2024-12-22**|**Evaluating LLM Reasoning in the Operations Research Domain with ORQA**|Mahdi Mostajabdaveh et.al.|arXiv.org|[2412.17874](http://arxiv.org/abs/2412.17874)|**[link](https://github.com/nl4opt/ORQA)**|
 |**2024-11-26**|**BPP-Search: Enhancing Tree of Thought Reasoning for Mathematical Modeling Problem Solving**|Teng Wang et.al.|Annual Meeting of the Association for Computational Linguistics|[2411.17404](http://arxiv.org/abs/2411.17404)|null|
 |**2024-11-03**|**Autoformulation of Mathematical Optimization Models Using LLMs**|Nicolás Astorga et.al.|International Conference on Machine Learning|[2411.01679](http://arxiv.org/abs/2411.01679)|null|
 |**2024-10-29**|**Generalists vs. Specialists: Evaluating LLMs on Highly-Constrained Biophysical Sequence Optimization Tasks**|Angelica Chen et.al.|International Conference on Machine Learning|[2410.22296](http://arxiv.org/abs/2410.22296)|null|
 |**2024-10-28**|**Deep Insights into Automated Optimization with Large Language Models and Evolutionary Algorithms**|He Yu et.al.|arXiv.org|[2410.20848](http://arxiv.org/abs/2410.20848)|null|
 |**2024-10-23**|**AutoRNet: Automatically Optimizing Heuristics for Robust Network Design via Large Language Models**|He Yu et.al.|arXiv.org|[2410.17656](http://arxiv.org/abs/2410.17656)|null|
-|**2024-10-17**|**LLMOPT: Learning to Define and Solve General Optimization Problems from Scratch**|Caigao Jiang et.al.|International Conference on Learning Representations|[2410.13213](http://arxiv.org/abs/2410.13213)|null|
+|**2024-10-17**|**LLMOPT: Learning to Define and Solve General Optimization Problems from Scratch**|Caigao Jiang et.al.|International Conference on Learning Representations|[2410.13213](http://arxiv.org/abs/2410.13213)|**[link](https://github.com/caigaojiang/llmopt)**|
 |**2024-10-11**|**A Systematic Survey on Large Language Models for Algorithm Design**|Fei Liu et.al.|ACM Computing Surveys|[2410.14716](http://arxiv.org/abs/2410.14716)|null|
 |**2024-09-03**|**Leveraging Large Language Models for Solving Rare MIP Challenges**|Teng Wang et.al.|arXiv.org|[2409.04464](http://arxiv.org/abs/2409.04464)|null|
 |**2024-08-01**|**A Survey of Optimization Modeling Meets LLMs: Progress and Future Directions**|Ziyang Xiao et.al.|International Joint Conference on Artificial Intelligence|[2508.10047](http://arxiv.org/abs/2508.10047)|null|
 |**2024-07-29**|**OptiMUS-0.3: Using Large Language Models to Model and Solve Optimization Problems at Scale**|Ali AhmadiTeshnizi et.al.|arXiv.org|[2407.19633](http://arxiv.org/abs/2407.19633)|null|
-|**2024-07-13**|**OptiBench Meets ReSocratic: Measure and Improve LLMs for Optimization Modeling**|Zhicheng YANG et.al.|International Conference on Learning Representations|[2407.09887](http://arxiv.org/abs/2407.09887)|null|
+|**2024-07-13**|**OptiBench Meets ReSocratic: Measure and Improve LLMs for Optimization Modeling**|Zhicheng YANG et.al.|International Conference on Learning Representations|[2407.09887](http://arxiv.org/abs/2407.09887)|**[link](https://github.com/yangzhch6/ReSocratic)**|
 |**2024-07-09**|**Solving General Natural-Language-Description Optimization Problems with Large Language Models**|Jihai Zhang et.al.|North American Chapter of the Association for Computational Linguistics|[2407.07924](http://arxiv.org/abs/2407.07924)|null|
-|**2024-06-23**|**Efficient Evolutionary Search Over Chemical Space with Large Language Models**|Haorui Wang et.al.|International Conference on Learning Representations|[2406.16976](http://arxiv.org/abs/2406.16976)|null|
+|**2024-06-23**|**Efficient Evolutionary Search Over Chemical Space with Large Language Models**|Haorui Wang et.al.|International Conference on Learning Representations|[2406.16976](http://arxiv.org/abs/2406.16976)|**[link](https://github.com/zoom-wang112358/molleo)**|
 |**2024-06-16**|**City-LEO: Toward Transparent City Management Using LLM with End-to-End Optimization**|Zihao Jiao et.al.|arXiv.org|[2406.10958](http://arxiv.org/abs/2406.10958)|null|
 |**2024-06-15**|**Large Language Models as Surrogate Models in Evolutionary Algorithms: A Preliminary Study**|Hao Hao et.al.|Swarm and Evolutionary Computation|[2406.10675](http://arxiv.org/abs/2406.10675)|null|
-|**2024-05-21**|**LLMs for Mathematical Modeling: Towards Bridging the Gap between Natural and Mathematical Languages**|Xuhan Huang et.al.|North American Chapter of the Association for Computational Linguistics|[2405.13144](http://arxiv.org/abs/2405.13144)|null|
+|**2024-05-21**|**LLMs for Mathematical Modeling: Towards Bridging the Gap between Natural and Mathematical Languages**|Xuhan Huang et.al.|North American Chapter of the Association for Computational Linguistics|[2405.13144](http://arxiv.org/abs/2405.13144)|**[link](https://github.com/freedomintelligence/mamo)**|
 |**2024-05-17**|**Large Language Model (LLM) for Telecommunications: A Comprehensive Survey on Principles, Key Techniques, and Opportunities**|Hao Zhou et.al.|IEEE Communications Surveys and Tutorials|[2405.10825](http://arxiv.org/abs/2405.10825)|null|
 |**2024-05-16**|**When Large Language Model Meets Optimization**|Sen Huang et.al.|Swarm and Evolutionary Computation|[2405.10098](http://arxiv.org/abs/2405.10098)|null|
 |**2024-05-08**|**Automated Conversion of Static to Dynamic Scheduler via Natural Language**|Paul Mingzheng Tang et.al.|arXiv.org|[2405.06697](http://arxiv.org/abs/2405.06697)|null|
@@ -308,7 +308,7 @@ layout: default
 |**2024-03-02**|**LM4OPT: Unveiling the potential of Large Language Models in formulating mathematical optimization problems**|Tasnim Ahmed et.al.|INFOR. Information systems and operational research|[2403.01342](http://arxiv.org/abs/2403.01342)|null|
 |**2024-02-26**|**From Large Language Models and Optimization to Decision Optimization CoPilot: A Research Manifesto**|S. Wasserkrug et.al.|arXiv.org|[2402.16269](http://arxiv.org/abs/2402.16269)|null|
 |**2024-02-15**|**OptiMUS: Scalable Optimization Modeling with (MI)LP Solvers and Large Language Models**|Ali AhmadiTeshnizi et.al.|International Conference on Machine Learning|[2402.10172](http://arxiv.org/abs/2402.10172)|null|
-|**2024-01-30**|**Synthetic Dialogue Dataset Generation using LLM Agents**|Yelaman Abdullin et.al.|IEEE Games Entertainment Media Conference|[2401.17461](http://arxiv.org/abs/2401.17461)|null|
+|**2024-01-30**|**Synthetic Dialogue Dataset Generation using LLM Agents**|Yelaman Abdullin et.al.|IEEE Games Entertainment Media Conference|[2401.17461](http://arxiv.org/abs/2401.17461)|**[link](https://github.com/eabdullin/optimouse-quest)**|
 |**2024-01-18**|**Evolutionary Computation in the Era of Large Language Model: Survey and Roadmap**|Xingyu Wu et.al.|IEEE Transactions on Evolutionary Computation|[2401.10034](http://arxiv.org/abs/2401.10034)|null|
 |**2024-01-06**|**Artificial Intelligence for Operations Research: Revolutionizing the Operations Research Process**|Zhenan Fan et.al.|arXiv.org|[2401.03244](http://arxiv.org/abs/2401.03244)|null|
 
