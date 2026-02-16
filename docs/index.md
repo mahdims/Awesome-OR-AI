@@ -2,7 +2,7 @@
 layout: default
 ---
 
-## Updated on 2026.02.15
+## Updated on 2026.02.16
 ## LLMs for Algorithm Design
 
 | Publish Date | Title | Authors | Venue | PDF | Code |
@@ -93,6 +93,7 @@ layout: default
 
 | Publish Date | Title | Authors | Venue | PDF | Code |
 |:---------|:-----------------------|:---------|:------|:------|:------|
+|**2026-02-13**|**AI Agents for Inventory Control: Human-LLM-OR Complementarity**|Jackie Baek et.al.||[2602.12631](http://arxiv.org/abs/2602.12631)|null|
 |**2026-02-10**|**Towards Poisoning Robustness Certification for Natural Language Generation**|Mihnea Ghitu et.al.||[2602.09757](http://arxiv.org/abs/2602.09757)|null|
 |**2026-02-09**|**OSCAR: Optimization-Steered Agentic Planning for Composed Image Retrieval**|Teng Wang et.al.||[2602.08603](http://arxiv.org/abs/2602.08603)|null|
 |**2026-02-09**|**Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction**|Ziyao Tang et.al.||[2602.08585](http://arxiv.org/abs/2602.08585)|null|
