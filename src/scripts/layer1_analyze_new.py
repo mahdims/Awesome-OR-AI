@@ -32,7 +32,10 @@ def parse_pipe_delimited_paper(content: str, arxiv_id: str) -> dict:
     """
     Parse pipe-delimited paper string from JSON.
 
-    Format: |date|title|authors|venue|arxiv_id|code_link|
+    Handles 3 format generations:
+      - Legacy:  |date|title|authors|arxiv_id|code|           (6 pipes)
+      - Current: |date|title|authors|venue|arxiv_id|code|     (8 pipes)
+      - Newest:  |date|title|authors|affiliation|venue|arxiv_id|code| (9 pipes)
     """
     parts = content.split('|')
 
@@ -41,9 +44,24 @@ def parse_pipe_delimited_paper(content: str, arxiv_id: str) -> dict:
         return None
 
     try:
-        date = parts[1].strip('*').strip()
-        title = parts[2].strip('*[]()').split('](')[0].strip()
-        authors_str = parts[3].strip()
+        if len(parts) >= 9:
+            # Newest: |date|title|authors|affiliation|venue|arxiv_id|code|
+            date = parts[1].strip('*').strip()
+            title = parts[2].strip('*[]()').split('](')[0].strip()
+            authors_str = parts[3].strip()
+            affiliation = parts[4].strip()
+        elif len(parts) >= 8:
+            # Current: |date|title|authors|venue|arxiv_id|code|
+            date = parts[1].strip('*').strip()
+            title = parts[2].strip('*[]()').split('](')[0].strip()
+            authors_str = parts[3].strip()
+            affiliation = ''
+        else:
+            # Legacy: |date|title|authors|arxiv_id|code|
+            date = parts[1].strip('*').strip()
+            title = parts[2].strip('*[]()').split('](')[0].strip()
+            authors_str = parts[3].strip()
+            affiliation = ''
 
         # Extract first author (simple approach)
         authors = [authors_str.split()[0]] if authors_str else ['Unknown']
@@ -52,6 +70,7 @@ def parse_pipe_delimited_paper(content: str, arxiv_id: str) -> dict:
             'arxiv_id': arxiv_id,
             'title': title,
             'authors': authors,
+            'affiliation': affiliation,
             'abstract': '',  # Will be extracted from PDF
             'published_date': date
         }

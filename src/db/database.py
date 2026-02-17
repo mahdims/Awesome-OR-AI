@@ -328,6 +328,35 @@ class Database:
             )
         self.commit()
 
+    # === Paper Metadata Enrichment ===
+
+    def update_paper_metadata(self, arxiv_id: str, affiliations: str = None,
+                               code_url: str = None):
+        """Update paper metadata fields (affiliations, code_url in artifacts)."""
+        if affiliations:
+            self.execute(
+                "UPDATE paper_analyses SET affiliations = ? WHERE arxiv_id = ? AND (affiliations IS NULL OR affiliations = '')",
+                (affiliations, arxiv_id)
+            )
+        if code_url:
+            # Update code_url inside artifacts JSON
+            row = self.fetchone(
+                "SELECT artifacts FROM paper_analyses WHERE arxiv_id = ?",
+                (arxiv_id,)
+            )
+            if row and row['artifacts']:
+                try:
+                    artifacts = json.loads(row['artifacts'])
+                    if not artifacts.get('code_url'):
+                        artifacts['code_url'] = code_url
+                        self.execute(
+                            "UPDATE paper_analyses SET artifacts = ? WHERE arxiv_id = ?",
+                            (json.dumps(artifacts), arxiv_id)
+                        )
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        self.commit()
+
     # === Review Updates ===
 
     def insert_review_update(self, category: str, update_type: str,

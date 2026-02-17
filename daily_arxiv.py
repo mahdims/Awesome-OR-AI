@@ -20,9 +20,12 @@ except ImportError:
     BaseModel = None
 
 try:
-    from db.database import Database as _Database
+    from src.db.database import Database as _Database
 except ImportError:
-    _Database = None
+    try:
+        from db.database import Database as _Database
+    except ImportError:
+        _Database = None
 
 logging.basicConfig(format='[%(asctime)s %(levelname)s] %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
@@ -259,6 +262,162 @@ def get_code_link(qword:str) -> str:
     except Exception as e:
         logging.warning(f"GitHub code search failed for '{qword}': {e}")
     return None
+
+def get_code_link_pwc(arxiv_id: str) -> str:
+    """
+    Search Papers with Code API for a code repository matching this arxiv paper.
+    @param arxiv_id: ArXiv paper ID (e.g., "2401.12345")
+    @return repo URL string, or None if not found
+    """
+    try:
+        url = f"https://paperswithcode.com/api/v1/papers/?arxiv_id={arxiv_id}"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            results = data.get("results", [])
+            if results:
+                # Get repositories for the first matching paper
+                paper_id = results[0].get("id")
+                if paper_id:
+                    repo_url = f"https://paperswithcode.com/api/v1/papers/{paper_id}/repositories/"
+                    rr = requests.get(repo_url, timeout=10)
+                    if rr.status_code == 200:
+                        repos = rr.json().get("results", [])
+                        if repos:
+                            # Pick highest-starred repo
+                            best = max(repos, key=lambda x: x.get("stars", 0))
+                            return best.get("url")
+    except Exception as e:
+        logging.debug(f"Papers with Code lookup failed for '{arxiv_id}': {e}")
+    return None
+
+
+def get_code_link_s2(s2_meta: dict) -> str:
+    """
+    Extract code/repo URL from Semantic Scholar paper metadata.
+    Checks externalIds for GitHub URLs and openAccessPdf.
+    @param s2_meta: dict from S2 batch API response
+    @return repo URL string, or None
+    """
+    if not s2_meta:
+        return None
+    # Check if S2 has a linked GitHub repo via externalIds
+    ext_ids = s2_meta.get("externalIds") or {}
+    github_id = ext_ids.get("GitHub")
+    if github_id:
+        return f"https://github.com/{github_id}"
+    return None
+
+
+def find_code_link_waterfall(arxiv_id: str, paper_title: str, s2_meta: dict = None) -> str:
+    """
+    Try multiple sources to find code for a paper, stopping at first hit.
+    Order: Papers with Code → HuggingFace → Semantic Scholar → GitHub search.
+    """
+    # 1. Papers with Code (most reliable for ML papers)
+    url = get_code_link_pwc(arxiv_id)
+    if url:
+        logging.info(f"  Code found via PwC: {arxiv_id}")
+        return url
+
+    # 2. HuggingFace API
+    try:
+        r = requests.get(huggingface_papers_url + arxiv_id, timeout=10)
+        if r.status_code == 200:
+            hf = r.json()
+            if hf.get("githubRepo"):
+                logging.info(f"  Code found via HuggingFace: {arxiv_id}")
+                return hf["githubRepo"]
+    except Exception:
+        pass
+
+    # 3. Semantic Scholar externalIds
+    url = get_code_link_s2(s2_meta)
+    if url:
+        logging.info(f"  Code found via S2: {arxiv_id}")
+        return url
+
+    # 4. GitHub search (least reliable, last resort)
+    title_clean = re.sub(r'\*+', '', paper_title).strip() if paper_title else arxiv_id
+    url = get_code_link(title_clean)
+    if url:
+        logging.info(f"  Code found via GitHub search: {arxiv_id}")
+        return url
+
+    return None
+
+
+def get_paper_metadata_s2(arxiv_ids: list) -> dict:
+    """
+    Batch-fetch paper metadata from Semantic Scholar for enrichment.
+    Returns dict keyed by arxiv_id with venue, affiliations, and code info.
+
+    @param arxiv_ids: list of ArXiv IDs (e.g., ["2401.12345", "2402.67890"])
+    @return dict: {arxiv_id: {venue, affiliation, code_url, ...}}
+    """
+    if not arxiv_ids:
+        return {}
+
+    s2_api_key = os.environ.get("S2_API_KEY")
+    headers = {"Content-Type": "application/json"}
+    if s2_api_key:
+        headers["x-api-key"] = s2_api_key
+
+    result = {}
+    # S2 batch API accepts up to 500 IDs per request
+    batch_size = 500
+    fields = "venue,externalIds,authors,authors.affiliations,openAccessPdf"
+
+    for i in range(0, len(arxiv_ids), batch_size):
+        batch = arxiv_ids[i:i + batch_size]
+        paper_ids = [f"ArXiv:{aid}" for aid in batch]
+
+        try:
+            url = f"https://api.semanticscholar.org/graph/v1/paper/batch?fields={fields}"
+            r = requests.post(url, json={"ids": paper_ids}, headers=headers, timeout=30)
+
+            if r.status_code == 429:
+                logging.warning("S2 rate limited, waiting 5s...")
+                time.sleep(5)
+                r = requests.post(url, json={"ids": paper_ids}, headers=headers, timeout=30)
+
+            if r.status_code == 200:
+                papers = r.json()
+                for aid, paper in zip(batch, papers):
+                    if paper is None:
+                        continue
+                    # Extract first author affiliation
+                    affiliation = ""
+                    authors = paper.get("authors") or []
+                    if authors:
+                        affiliations = authors[0].get("affiliations") or []
+                        if affiliations:
+                            affiliation = affiliations[0]
+
+                    # Extract venue
+                    venue = paper.get("venue") or ""
+
+                    # Extract code link from externalIds
+                    code_url = get_code_link_s2(paper)
+
+                    result[aid] = {
+                        "venue": venue,
+                        "affiliation": affiliation,
+                        "code_url": code_url,
+                        "raw": paper,
+                    }
+            else:
+                logging.warning(f"S2 batch API returned {r.status_code}")
+
+        except Exception as e:
+            logging.warning(f"S2 batch API failed: {e}")
+
+        if i + batch_size < len(arxiv_ids):
+            time.sleep(1)  # rate limit between batches
+
+    logging.info(f"S2 metadata fetched for {len(result)}/{len(arxiv_ids)} papers")
+    return result
+
 
 def load_score_cache(cache_path=SCORE_CACHE_PATH):
     """Load the persistent relevance score cache from disk."""
@@ -560,16 +719,12 @@ def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, catego
         if repo_url is None:
             repo_url = get_code_link(paper_title)
 
-        if repo_url is not None:
-            content[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|**[link]({})**|\n".format(
-                   update_time,paper_title,paper_first_author,venue,paper_key,paper_url,repo_url)
-            content_to_web[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|**[link]({})**|\n".format(
-                   update_time,paper_title,paper_first_author,venue,paper_key,paper_url,repo_url)
-        else:
-            content[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|null|\n".format(
-                   update_time,paper_title,paper_first_author,venue,paper_key,paper_url)
-            content_to_web[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|null|\n".format(
-                   update_time,paper_title,paper_first_author,venue,paper_key,paper_url)
+        code_str = f"**[link]({repo_url})**" if repo_url else "null"
+        entry = format_paper_string(
+            f"**{update_time}**", f"**{paper_title}**", f"{paper_first_author} et.al.",
+            "", venue, f"[{paper_key}]({paper_url})", code_str)
+        content[paper_key] = entry
+        content_to_web[paper_key] = entry
 
     if skipped_existing:
         print(f"    Skipped {skipped_existing} papers already in database", flush=True)
@@ -690,16 +845,12 @@ def get_citation_papers(topic, seed_papers, llm_client=None, category_descriptio
                 if repo_url is None:
                     repo_url = get_code_link(paper_title)
 
-                if repo_url is not None:
-                    content[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|**[link]({})**|\n".format(
-                        pub_date, paper_title, first_author, venue, paper_key, paper_url, repo_url)
-                    content_to_web[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|**[link]({})**|\n".format(
-                        pub_date, paper_title, first_author, venue, paper_key, paper_url, repo_url)
-                else:
-                    content[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|null|\n".format(
-                        pub_date, paper_title, first_author, venue, paper_key, paper_url)
-                    content_to_web[paper_key] = "|**{}**|**{}**|{} et.al.|{}|[{}]({})|null|\n".format(
-                        pub_date, paper_title, first_author, venue, paper_key, paper_url)
+                code_str = f"**[link]({repo_url})**" if repo_url else "null"
+                entry = format_paper_string(
+                    f"**{pub_date}**", f"**{paper_title}**", f"{first_author} et.al.",
+                    "", venue, f"[{paper_key}]({paper_url})", code_str)
+                content[paper_key] = entry
+                content_to_web[paper_key] = entry
 
             print(f"      Scored {scored_count} papers from this page, {len(content)} total kept so far", flush=True)
 
@@ -764,33 +915,56 @@ def clean_json_data(filename):
 
     logging.info(f"Cleaned {filename}: removed {removed_count} pre-{MIN_YEAR} papers, migrated {migrated_count} entries")
 
-def update_paper_links(filename):
-    '''
-    weekly update paper links in json file
-    '''
-    def parse_arxiv_string(s):
-        parts = s.split("|")
-        # Handle both old (6 fields) and new (7 fields) format
-        if len(parts) >= 8:
-            # New format: |date|title|authors|venue|arxiv_id|code|
-            date = parts[1].strip()
-            title = parts[2].strip()
-            authors = parts[3].strip()
-            venue = parts[4].strip()
-            arxiv_id = parts[5].strip()
-            code = parts[6].strip()
-        else:
-            # Old format: |date|title|authors|arxiv_id|code|
-            date = parts[1].strip()
-            title = parts[2].strip()
-            authors = parts[3].strip()
-            venue = ''
-            arxiv_id = parts[4].strip()
-            code = parts[5].strip()
-        arxiv_id = re.sub(r'v\d+', '', arxiv_id)
-        return date,title,authors,venue,arxiv_id,code
+def parse_arxiv_string(s):
+    """Parse pipe-delimited paper string, handling 3 format generations."""
+    parts = s.split("|")
+    if len(parts) >= 9:
+        # Newest: |date|title|authors|affiliation|venue|arxiv_id|code|
+        date = parts[1].strip()
+        title = parts[2].strip()
+        authors = parts[3].strip()
+        affiliation = parts[4].strip()
+        venue = parts[5].strip()
+        arxiv_id = parts[6].strip()
+        code = parts[7].strip()
+    elif len(parts) >= 8:
+        # Current: |date|title|authors|venue|arxiv_id|code|
+        date = parts[1].strip()
+        title = parts[2].strip()
+        authors = parts[3].strip()
+        affiliation = ''
+        venue = parts[4].strip()
+        arxiv_id = parts[5].strip()
+        code = parts[6].strip()
+    else:
+        # Legacy: |date|title|authors|arxiv_id|code|
+        date = parts[1].strip()
+        title = parts[2].strip()
+        authors = parts[3].strip()
+        affiliation = ''
+        venue = ''
+        arxiv_id = parts[4].strip()
+        code = parts[5].strip()
+    arxiv_id = re.sub(r'v\d+', '', arxiv_id)
+    return date, title, authors, affiliation, venue, arxiv_id, code
 
-    with open(filename,"r") as f:
+
+def format_paper_string(date, title, authors, affiliation, venue, arxiv_id, code):
+    """Build the 8-field pipe-delimited paper string."""
+    return "|{}|{}|{}|{}|{}|{}|{}|\n".format(
+        date, title, authors, affiliation, venue, arxiv_id, code)
+
+
+def update_paper_links(filename):
+    """
+    Weekly enrichment: update code links, affiliations, and venues in JSON file.
+
+    For each paper:
+      1. AFFILIATION: if empty → use Semantic Scholar first-author affiliation
+      2. VENUE: if empty → re-check ArXiv metadata + Semantic Scholar
+      3. CODE: if null → waterfall: PwC → HuggingFace → S2 → GitHub search
+    """
+    with open(filename, "r") as f:
         content = f.read()
         if not content:
             m = {}
@@ -799,45 +973,112 @@ def update_paper_links(filename):
 
     json_data = m.copy()
 
-    for keywords,v in json_data.items():
-        logging.info(f'keywords = {keywords}')
-        for paper_id,contents in v.items():
+    # Collect all paper IDs for batch S2 lookup
+    all_paper_ids = []
+    for keywords, v in json_data.items():
+        all_paper_ids.extend(v.keys())
+
+    # Batch-fetch metadata from Semantic Scholar (one API call for all papers)
+    logging.info(f"Fetching S2 metadata for {len(all_paper_ids)} papers...")
+    s2_metadata = get_paper_metadata_s2(all_paper_ids)
+
+    # Collect IDs that need venue re-check from ArXiv
+    needs_venue_arxiv = []
+    for keywords, v in json_data.items():
+        for paper_id, contents in v.items():
+            _, _, _, _, venue, _, _ = parse_arxiv_string(str(contents))
+            if not venue:
+                needs_venue_arxiv.append(paper_id)
+
+    # Batch-fetch ArXiv metadata for papers missing venue
+    arxiv_venue_map = {}
+    if needs_venue_arxiv:
+        logging.info(f"Re-checking ArXiv metadata for {len(needs_venue_arxiv)} papers missing venue...")
+        # ArXiv id_list lookup in batches of 50
+        for i in range(0, len(needs_venue_arxiv), 50):
+            batch = needs_venue_arxiv[i:i + 50]
+            id_list = ",".join(batch)
+            entries = _arxiv_api_call({"id_list": id_list, "max_results": len(batch)})
+            for entry in entries:
+                raw_id = re.sub(r'v\d+$', '', entry["id"])
+                venue = extract_venue(entry.get("journal_ref"), entry.get("comment"))
+                if venue:
+                    arxiv_venue_map[raw_id] = venue
+            time.sleep(1)
+
+    # Enrich each paper
+    stats = {"affiliation_updated": 0, "venue_updated": 0, "code_updated": 0}
+
+    for keywords, v in json_data.items():
+        logging.info(f'Enriching category: {keywords}')
+        for paper_id, contents in v.items():
             contents = str(contents)
+            date, title, authors, affiliation, venue, arxiv_link, code = parse_arxiv_string(contents)
 
-            update_time, paper_title, paper_first_author, venue, paper_url, code_url = parse_arxiv_string(contents)
+            s2 = s2_metadata.get(paper_id, {})
+            changed = False
 
-            contents = "|{}|{}|{}|{}|{}|{}|\n".format(update_time,paper_title,paper_first_author,venue,paper_url,code_url)
-            json_data[keywords][paper_id] = str(contents)
-            logging.info(f'paper_id = {paper_id}, contents = {contents}')
+            # 1. AFFILIATION: fill if empty
+            if not affiliation and s2.get("affiliation"):
+                affiliation = s2["affiliation"]
+                stats["affiliation_updated"] += 1
+                changed = True
 
-            valid_link = False if '|null|' in contents else True
-            if valid_link:
-                continue
-            try:
-                repo_url = None
-                # Try HuggingFace API first
-                cr = requests.get(huggingface_papers_url + paper_id, timeout=10)
-                if cr.status_code == 200:
-                    hf = cr.json()
-                    if hf.get("githubRepo"):
-                        repo_url = hf["githubRepo"]
+            # 2. VENUE: fill if empty
+            if not venue:
+                # Try ArXiv metadata first (more authoritative for journal refs)
+                if paper_id in arxiv_venue_map:
+                    venue = arxiv_venue_map[paper_id]
+                    stats["venue_updated"] += 1
+                    changed = True
+                elif s2.get("venue"):
+                    venue = s2["venue"]
+                    stats["venue_updated"] += 1
+                    changed = True
 
-                # Fallback: search GitHub
-                if repo_url is None:
-                    title_match = re.search(r'\*\*(.+?)\*\*', paper_title)
-                    search_term = title_match.group(1) if title_match else paper_id
-                    repo_url = get_code_link(search_term)
+            # 3. CODE: fill if null using waterfall
+            has_code = code and code != 'null' and 'null' not in code.lower()
+            if not has_code:
+                try:
+                    repo_url = find_code_link_waterfall(paper_id, title, s2.get("raw"))
+                    if repo_url:
+                        code = f"**[link]({repo_url})**"
+                        stats["code_updated"] += 1
+                        changed = True
+                except Exception as e:
+                    logging.error(f"Code link error for {paper_id}: {e}")
 
-                if repo_url is not None:
-                    new_cont = contents.replace('|null|',f'|**[link]({repo_url})**|')
-                    logging.info(f'ID = {paper_id}, contents = {new_cont}')
-                    json_data[keywords][paper_id] = str(new_cont)
+            # Reconstruct in 8-field format (always upgrade)
+            json_data[keywords][paper_id] = format_paper_string(
+                date, title, authors, affiliation, venue, arxiv_link, code)
 
-            except Exception as e:
-                logging.error(f"exception: {e} with id: {paper_id}")
-    # dump to json file
-    with open(filename,"w") as f:
-        json.dump(json_data,f)
+    logging.info(f"Enrichment complete: {stats}")
+
+    # Update database with enriched metadata (if DB module available)
+    if _Database is not None:
+        try:
+            db = _Database()
+            with db:
+                db_updates = 0
+                for keywords, v in json_data.items():
+                    for paper_id, contents in v.items():
+                        _, _, _, affiliation, _, _, code = parse_arxiv_string(str(contents))
+                        has_code = code and code != 'null' and 'null' not in code.lower()
+                        repo_url = None
+                        if has_code:
+                            url_match = re.search(r'\[link\]\((.+?)\)', code)
+                            if url_match:
+                                repo_url = url_match.group(1)
+                        if affiliation or repo_url:
+                            db.update_paper_metadata(paper_id, affiliations=affiliation, code_url=repo_url)
+                            db_updates += 1
+                logging.info(f"Database updated: {db_updates} papers enriched")
+        except Exception as e:
+            logging.warning(f"Database update skipped: {e}")
+
+    # Dump updated JSON
+    with open(filename, "w") as f:
+        json.dump(json_data, f)
 
 def update_json_file(filename,data_dict):
     '''
@@ -939,10 +1180,10 @@ def json_to_md(filename,md_filename,
 
             if use_title == True :
                 if to_web == False:
-                    f.write("|Publish Date|Title|Authors|Venue|PDF|Code|\n" + "|---|---|---|---|---|---|\n")
+                    f.write("|Publish Date|Title|Authors|Affiliation|Venue|PDF|Code|\n" + "|---|---|---|---|---|---|---|\n")
                 else:
-                    f.write("| Publish Date | Title | Authors | Venue | PDF | Code |\n")
-                    f.write("|:---------|:-----------------------|:---------|:------|:------|:------|\n")
+                    f.write("| Publish Date | Title | Authors | Affiliation | Venue | PDF | Code |\n")
+                    f.write("|:---------|:-----------------------|:---------|:---------|:------|:------|:------|\n")
 
             # sort papers by date (newest first)
             day_content = sort_papers(day_content)
