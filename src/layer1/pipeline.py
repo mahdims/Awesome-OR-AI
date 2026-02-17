@@ -53,7 +53,7 @@ class PaperAnalysisPipeline:
 
     def analyze_paper(self, arxiv_id: str, category: str,
                       title: str, authors: list, abstract: str,
-                      published_date: str) -> Optional[PaperAnalysis]:
+                      published_date: str, affiliation: str = "") -> Optional[PaperAnalysis]:
         """
         Run full 4-agent analysis pipeline for a single paper.
 
@@ -147,6 +147,9 @@ class PaperAnalysisPipeline:
             print(f"[DATABASE] Storing analysis...")
             with self.db as db:
                 db.insert_analysis(analysis.model_dump())
+                # Use S2/JSON affiliation as fallback if reader didn't extract one
+                if affiliation:
+                    db.update_paper_metadata(arxiv_id, affiliations=affiliation)
 
             print(f"\n{'='*70}")
             print(f"✓ ANALYSIS COMPLETE: {arxiv_id}")
