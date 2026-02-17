@@ -9,12 +9,20 @@ import datetime
 import requests
 import xml.etree.ElementTree as ET
 
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+
 try:
     from openai import OpenAI
     from pydantic import BaseModel
 except ImportError:
     OpenAI = None
     BaseModel = None
+
+try:
+    from db.database import Database as _Database
+except ImportError:
+    _Database = None
 
 logging.basicConfig(format='[%(asctime)s %(levelname)s] %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
@@ -276,6 +284,120 @@ def save_score_cache(cache, cache_path=SCORE_CACHE_PATH):
 class RelevanceScore(BaseModel):
     score: int
 
+# === Database-backed score + abstract storage ===
+
+def _init_score_db():
+    """Initialize DB connection and ensure rescore_cache table exists."""
+    if _Database is None:
+        return None
+    try:
+        db = _Database()
+        db.connect()
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS rescore_cache (
+                arxiv_id        TEXT NOT NULL,
+                category        TEXT NOT NULL,
+                title           TEXT,
+                abstract        TEXT,
+                score           INTEGER,
+                score_date      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (arxiv_id, category)
+            )
+        """)
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_rescore_category
+            ON rescore_cache(category)
+        """)
+        db.commit()
+        return db
+    except Exception as e:
+        logging.warning(f"Failed to init score DB: {e}")
+        return None
+
+_SCORE_DB = _init_score_db()
+
+def _store_score_to_db(paper_id, category, title, abstract, score):
+    """Persist score and abstract to the database."""
+    if _SCORE_DB is None:
+        return
+    try:
+        _SCORE_DB.execute(
+            """INSERT OR REPLACE INTO rescore_cache
+               (arxiv_id, category, title, abstract, score, score_date)
+               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            (paper_id, category, title, abstract, score)
+        )
+        _SCORE_DB.commit()
+    except Exception as e:
+        logging.warning(f"Failed to store score to DB: {e}")
+
+
+def _load_score_from_db(paper_id, category):
+    """Load a previously cached score from DB, or None if missing."""
+    if _SCORE_DB is None:
+        return None
+    try:
+        row = _SCORE_DB.fetchone(
+            "SELECT score FROM rescore_cache WHERE arxiv_id = ? AND category = ?",
+            (paper_id, category)
+        )
+        if row is None:
+            return None
+        score = row["score"]
+        if score is None:
+            return None
+        return int(score)
+    except Exception as e:
+        logging.warning(f"Failed to load score from DB: {e}")
+        return None
+
+RESEARCHER_PROFILE_PATH = os.path.join(os.path.dirname(__file__), 'src', 'layer1', 'prompts', 'researcher_profile.md')
+
+def _load_researcher_profile_sections():
+    """
+    Load researcher_profile.md and extract per-category sections.
+    Sections are delimited by ### [Category Name] headings.
+    Returns dict mapping category name -> section text.
+    """
+    try:
+        with open(RESEARCHER_PROFILE_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+    except FileNotFoundError:
+        logging.warning(f"Researcher profile not found at {RESEARCHER_PROFILE_PATH}")
+        return {}
+
+    sections = {}
+    current_category = None
+    current_lines = []
+
+    for line in content.split('\n'):
+        # Match ### [Category Name] with optional suffixes
+        if line.startswith('### ['):
+            # Save previous section
+            if current_category:
+                sections[current_category] = '\n'.join(current_lines).strip()
+            # Extract category name from ### [Category Name]
+            bracket_end = line.index(']')
+            current_category = line[5:bracket_end]
+            current_lines = [line]
+        elif current_category is not None:
+            # Stop collecting when we hit a non-category ## heading
+            if line.startswith('## ') and not line.startswith('### '):
+                sections[current_category] = '\n'.join(current_lines).strip()
+                current_category = None
+                current_lines = []
+            else:
+                current_lines.append(line)
+
+    # Save last section
+    if current_category:
+        sections[current_category] = '\n'.join(current_lines).strip()
+
+    return sections
+
+# Load once at module level
+_PROFILE_SECTIONS = _load_researcher_profile_sections()
+
 def get_relevance_score(paper_id, title, abstract, category, category_description="", client=None, score_cache=None):
     """
     Use lightweight LLM to score paper relevance to category (0-10).
@@ -291,15 +413,32 @@ def get_relevance_score(paper_id, title, abstract, category, category_descriptio
         logging.info(f"Cache hit for {paper_id} in '{category}': score={cached}")
         return cached
 
+    # Fallback to DB cache if JSON cache misses (e.g., file lost/corrupted).
+    db_cached = _load_score_from_db(paper_id, category)
+    if db_cached is not None:
+        logging.info(f"DB cache hit for {paper_id} in '{category}': score={db_cached}")
+        if score_cache is not None:
+            score_cache[cache_key] = db_cached
+        return db_cached
+
     if client is None:
         return 10
 
     desc = category_description if category_description else category
+    researcher_context = _PROFILE_SECTIONS.get(category, "")
+
     prompt = f"""Rate how relevant this paper is to the research category "{category}" on a scale of 0 to 10.
 
 Category description: {desc}
 
-0 = completely unrelated, 10 = perfectly on-topic.
+Researcher's active work and interests in this category:
+{researcher_context if researcher_context else "No specific researcher context available."}
+
+Scoring guide:
+- 8-10: Directly addresses the researcher's active projects, methods, or stated priorities
+- 5-7: Related to the category and potentially useful to the researcher's work
+- 2-4: Tangentially related, different focus or methods
+- 0-1: Completely unrelated
 
 Title: {title}
 Abstract: {abstract}"""
@@ -320,9 +459,12 @@ Abstract: {abstract}"""
         logging.warning(f"Relevance scoring failed for '{title}': {e}")
         score = 10  # include paper if scoring fails
 
-    # Store in cache
+    # Store in JSON cache
     if score_cache is not None:
         score_cache[cache_key] = score
+
+    # Store score + abstract in database
+    _store_score_to_db(paper_id, category, title, abstract, score)
 
     return score
 
@@ -973,14 +1115,28 @@ def clear_category_from_json(filename, category):
     return removed
 
 def clear_category_from_cache(category, cache_path=SCORE_CACHE_PATH):
-    """Remove all score cache entries for a given category."""
+    """Remove all score cache entries for a given category (JSON + DB)."""
     cache = load_score_cache(cache_path)
     suffix = f"::{category}"
     keys_to_remove = [k for k in cache if k.endswith(suffix)]
     for k in keys_to_remove:
         del cache[k]
     save_score_cache(cache, cache_path)
-    return len(keys_to_remove)
+
+    removed_db = 0
+    if _SCORE_DB is not None:
+        try:
+            cur = _SCORE_DB.execute(
+                "DELETE FROM rescore_cache WHERE category = ?",
+                (category,)
+            )
+            _SCORE_DB.commit()
+            if cur is not None and getattr(cur, "rowcount", None) is not None and cur.rowcount > 0:
+                removed_db = cur.rowcount
+        except Exception as e:
+            logging.warning(f"Failed to clear DB score cache for '{category}': {e}")
+
+    return len(keys_to_remove) + removed_db
 
 def redo_category(category_name, **config):
     """Redo a single category from scratch: clear its data, re-fetch, and regenerate."""
