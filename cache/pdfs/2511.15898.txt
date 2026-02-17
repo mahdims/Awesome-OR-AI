@@ -1,0 +1,3235 @@
+--- Page 1 ---
+GLOBAL RESOLUTION: OPTIMAL MULTI-DRAFT SPEC-
+ULATIVE SAMPLING VIA CONVEX MINIMIZATION
+Rahul Krishna Thomas1,2
+Arka Pal1
+{rahult, arka}@ritual.net
+1Ritual
+2Stanford University
+ABSTRACT
+Speculative sampling reduces the latency of autoregressive decoding for target
+model LLMs without sacrificing inference quality, by using a cheap draft model
+to suggest a candidate token and a verification criterion to accept or resample this
+token. To improve acceptance and decoding efficiency, recent work has explored
+the multi-draft extension, where at each step n draft tokens are generated, and the
+verification criterion is a distribution conditioned on these. When this criterion
+maximizes the probability of accepting some draft token, it is called the optimal
+transport (OT). However, finding the OT is difficult, as it is the solution of a linear
+program (OTLP) in over V n variables, with V being the vocabulary size. Two
+recent theoretical works have reframed the OTLP in terms of importance sampling
+or subset selection. In this work, we prove that these formulations are equivalent to
+an exponentially large relaxed OTLP, so it remains infeasible to solve. Then, we
+reverse engineer subset selection to formulate the OTLP as a max-flow problem.
+With a novel application of polymatroid theory, we reduce the exponentially large
+OTLP to a convex optimization problem in at most V variables. This allows us to
+devise an algorithm for optimal n-draft speculative sampling when the n tokens are
+chosen i.i.d. from a single draft model, which can be tuned to arbitrary accuracy.
+Finally, we measure acceptance rates and algorithm runtimes for various n and
+top-k draft sampling settings. Our findings give the first multi-draft algorithm with
+90% acceptance and under 100 ms of overhead per generated token with negligible
+deviation from the target model distribution.
+1
+INTRODUCTION
+Language models have demonstrated state-of-the-art performance over a wide variety of tasks, such as
+code generation, language processing, and complex reasoning (Zhu et al., 2024; Kasneci et al., 2023;
+Thirunavukarasu et al., 2023). Many transformer-based language model families, like GPT (Radford
+et al., 2018; 2019; Brown et al., 2020; OpenAI, 2023) and Llama (Touvron et al., 2023b;a), use
+autoregressive decoding, where tokens are generated sequentially. However, autoregressive decoding
+leads to significant computational bottlenecks. For LLMs with hundreds of billions of parameters,
+these bottlenecks are generally dominated by memory bandwidth, not raw FLOPs (Fu et al., 2024).
+Speculative sampling was proposed by Chen et al. (2023); Leviathan et al. (2023) to reduce the
+punitive costs of autoregressive decoding for an expensive target model. Motivated by speculative
+execution in compilers, this uses a light draft model to generate a draft sequence. Each token of the
+draft sequence is then accepted or resampled using a criterion, which ensures that the first resampled
+token and all prior accepted tokens follow the true target distribution. The greatest speedup is
+obtained by maximizing the acceptance probability, as accepted tokens are generated with essentially
+no inference overhead.
+Recent extensions of speculative sampling have fixed the draft sequence length to one (single-step)
+and focused on the theoretical properties of the multi-draft setting. In this setting, n ≥2 draft
+1
+arXiv:2511.15898v1  [cs.LG]  19 Nov 2025
+
+
+--- Page 2 ---
+tokens are generated at the single draft sequence position, for example by sampling from one or
+more draft models. The n corresponding target logits are efficiently computed in parallel, adding
+minimal overhead to a single target forward pass for reasonable batch sizes n. Finally, a conditional
+distribution over the n draft tokens (verification criterion) generates a verified token, which must
+respect the true target distribution. This conditional distribution is called the optimal transport (OT)
+when the verified token lies among the n draft tokens with maximal probability, thereby giving the
+optimal acceptance probability and speedup.
+The first theoretical work in the multi-draft setting was by Sun et al. (2023), who proved that the OT
+is a solution to an optimal transport linear program (OTLP). This LP has a number of variables
+exponential in the vocabulary size, so it is not even feasible to write down for large vocabularies.
+However, Khisti et al. (2025) recently compactified this into a two-step canonical decomposition:
+importance sampling and single-draft speculative sampling. When n = 2 draft tokens are sampled
+from one draft model, this leads to an explicit expression for the optimal acceptance probability.
+Concurrently, Hu et al. (2025) has reframed optimal acceptance as the solution to a subset selection
+problem, which matches this n = 2 expression and generalizes it to n ≥3 draft tokens.
+While these works can compute optimal acceptance for n ≥2, they do not solve the OTLP. There is
+therefore, to the best of our knowledge, no exact and efficient method to solve the OTLP and find the
+optimal verification criterion in multi-draft speculative sampling. The only known exact method is an
+LP solver, which has exponential time complexity for the OTLP. Existing approximation algorithms
+such as K-SEQ (Sun et al., 2023), MSS (Miao et al., 2024), RSD (Jeon et al., 2024), and LP and
+vocabulary truncation (Khisti et al., 2025) cannot guarantee near-optimal speedups: K-SEQ has a
+(1 −1/e)-approximation guarantee, but the others have no formal guarantees.
+Our main contribution is the first efficient algorithm to compute the OT to arbitrary accuracy
+when n ≥2 draft tokens are i.i.d. sampled from a draft model, in the single-step multi-draft
+setting. Our algorithm is fast for much larger vocabularies and choices of n than previous works,
+permitting higher acceptances rates. Altogether, our theoretical and experimental contributions are:
+• We show how the canonical decomposition (Khisti et al., 2025) of the OTLP is exactly
+equivalent to LP relaxation in the derivation of the subset selection formulation (Hu et al.,
+2025), unifying the current state-of-the-art in multi-draft theoretical literature.
+• We reverse the derivation in (Hu et al., 2025) to obtain a max-flow algorithm to compute the
+OT for arbitrary pdraft. While the max-flow network is enormous, one can compute feasible
+flows along source edges in near-linear time with a greedy polymatroid algorithm. With
+these flows set, the OT can be computed to arbitrary accuracy by solving a truncated convex
+minimization problem. This leads to our global resolution OT algorithm in the i.i.d. setting.
+• We compute optimal acceptance rates and algorithm runtimes for various choices of n and
+top-k sampling of the draft model in the i.i.d. setting. Our algorithm permits practical
+choices of k and n where acceptance rates are over 90% and average runtime is under 100
+ms/token, whereas generic OTLP solvers can only achieve 84% in the same limit. Thus, we
+obtain a new state-of-the-art in optimal multi-draft speculative sampling.
+2
+RELATED WORK
+To improve the number of accepted tokens, most theoretical extensions of speculative sampling have
+been split into multi-step and multi-draft, which alter the verification or drafting mechanisms.
+In the multi-step setting, which was outlined in the first few speculative sampling works (Chen et al.,
+2023; Leviathan et al., 2023), the draft model autoregressively generates a sequence of candidate
+tokens, and accepts the longest prefix of tokens that pass verification. Some work has fixed verification
+as independent single-step verification, and focused on improving acceptance through smarter drafting,
+such as database retrieval (He et al., 2023), cascading (Chen et al., 2024), hierarchial drafting (Sun
+et al., 2024a), knowledge distillation (Zhou et al., 2023b; Liu et al., 2023), layer skipping (Zhang
+et al., 2023; Elhoushi et al., 2024), or multi-token sampler heads Gloeckle et al. (2024); Samragh
+et al. (2025). Other work has developed new verification protocols, such as tree Monte Carlo (Hu &
+Huang, 2024) and block verification (Sun et al., 2024b), with the latter shown to be naturally optimal.
+2
+
+
+--- Page 3 ---
+While most multi-step works are based on single-draft speculative sampling, tree-based attention
+frameworks (Sun et al., 2023; Spector & Re, 2023; Cai et al., 2024; Li et al., 2024) extend to the
+multi-draft setting by creating a draft tree of token sequences. Our work instead focuses on the
+single-step, multi-draft setting, which is key to improving these frameworks. For example, SpecTr
+(Sun et al., 2023) can use any single-step, multi-draft method, e.g. an approximate OTLP solver like
+K-SEQ. By improving the single-step OTLP solver, we see efficiency gains in multi-step SpecTr.
+3
+BACKGROUND ON MULTI-DRAFT SPECULATIVE SAMPLING
+For a review of multi-draft speculative sampling, see Section A. Here, we review the theory of
+single-step multi-draft speculative sampling, which is primarily based on the OTLP (Sun et al., 2023)
+and its subset selection formulation (Hu et al., 2025).
+3.1
+THE OPTIMAL TRANSPORT LP
+Many multi-draft procedures respect the target model distribution (e.g. K-SEQ), but we are interested
+in the one with greatest speedup. In the single-step setting, the parameters of this optimal sampling
+procedure are solutions to an optimal transport linear program (OTLP) (Sun et al., 2023). In
+terms of the number of draft models n, the target model distribution p over the vocabulary V, and
+the n-token draft distribution pdraft over Vn, the OTLP has V n+1 nonnegative variables Ci,i for
+i ∈V, i ∈Vn and is written as:
+max
+C⪰0
+X
+i∈V
+X
+i∈Ai
+Ci,i
+s.t.
+X
+i∈Vn
+Ci,i = p(i)
+∀i ∈V,
+X
+i∈V
+Ci,i = pdraft(i)
+∀i ∈Vn.
+(1)
+Here, Ai = {i ∈Vn : i ∈set(i)} is the incidence set of each i ∈V over all drafted n-tuples. The
+optimal objective value is the optimal acceptance rate α∗, and the optimal parameters C∗give
+a joint distribution π(i, i) over V × Vn with marginals p, pdraft. The optimal transport (OT) is
+the induced conditional distribution π(i|i), which gives the probability of verifying i ∈V given n
+draft-sampled tokens i ∈Vn. Solving the OTLP in this form is infeasible due to its exponential size,
+even for n = 2 and V as small as 1000: see Section 7.
+3.2
+SUBSET SELECTION FORMULATION
+Computing the optimal objective of the OTLP can be far simpler than solving it. Hu et al. (2025)
+show this by reducing the optimal acceptance computation to subset selection (Equation (4)) for any
+pdraft. This allows them to bypass the OTLP and quickly solve for α∗for some choices of pdraft (see
+Section 5.1). To do this, they form a relaxed OTLP in nonnegative variables Si,i for i ∈V, i ∈Vn:
+max
+S⪰0
+X
+i∈V
+X
+i∈Vn
+Si,i
+s.t.
+X
+i∈Vn
+Si,i ≤p(i)
+∀i ∈V,
+X
+i∈V
+Si,i ≤pdraft(i)
+∀i ∈Vn,
+Si,i = 0
+∀i ∈V, i ̸∈Ai.
+(2)
+One can get an OTLP solution C∗from a relaxed OTLP solution S∗with residuals:
+C∗
+i,i = S∗
+i,i + pres(i)pres
+draft(i)
+P
+j∈V pres(j) ,
+pres(i) = p(i) −
+X
+i∈Vn
+S∗
+i,i,
+pres
+draft(i) = pdraft(i) −
+X
+i∈V
+S∗
+i,i.
+(3)
+They then dualize the relaxed OTLP and simplify it to the following. We defer details to Section E.
+Theorem 3.1 (Hu et al. (2025)). The optimal acceptance rate α∗can be computed as
+α∗= 1 + min
+H⊆V ψ(H),
+ψ(H) =
+X
+i∈H
+p(i) −
+X
+i∈Hn
+pdraft(i).
+(4)
+4
+CANONICAL DECOMPOSITION BY RELAXED LP
+The main result of Khisti et al. (2025) is the canonical decomposition of the OT: it can be split into
+importance sampling and single-draft speculative sampling. First, after sampling the n draft tokens
+3
+
+
+--- Page 4 ---
+i ∼pdraft, one samples a token in set(i) using an importance-weighted distribution β(i|i). Then,
+one applies single-draft speculative sampling from Chen et al. (2023); Leviathan et al. (2023) on i.
+Canonical decomposition thus computes the OT by solving a non-linear β-optimization problem.
+In this section, we prove that solving the β-optimization problem is mathematically equivalent to
+solving the relaxed OTLP from Equation (2). The optimal importance sampling parameters in the
+canonical decomposition can be formed by normalizing the optimal relaxed LP parameters S∗in
+non-degenerate cases, and choosing a uniform split in degenerate cases. The proof is in Section B.
+Theorem 4.1. Define D ⊆Vn to be the set of i ∈Vn where all S∗
+i,i = 0 in Equation (2). Then
+β(i|i) =
+
+
+
+
+
+
+
+
+
+S∗
+i,i
+P
+j∈V S∗
+j,i
+,
+i ̸∈D,
+1[i ∈set(i)]
+|set(i)|
+,
+i ∈D,
+(5)
+solve the importance sampling optimization problem in canonical decomposition.
+Thus, canonical decomposition provides no computational advantage over the relaxed OTLP.
+5
+OPTIMAL MULTI-DRAFT SPECULATIVE SAMPLING BY MAX-FLOW
+Much of the work by Hu et al. (2025) employs subset selection (Equation (4)) to efficiently compute
+the optimal acceptance α∗= 1 + ψ(H∗) for some pdraft schemes. However, they do not have a
+method for computing the OT efficiently from H∗. They only solve for the OT when pdraft is greedy
+(choose the top n −1 tokens in a draft model q and sample the last without replacement), by directly
+solving the OTLP 1. Excluding this pdraft, there is no known method which computes the OT for
+n ≥2 and is faster than directly solving the OTLP or relaxed OTLP with an LP solver; this includes
+canonical decomposition, since Theorem 4.1 shows it reduces to the relaxed OTLP.
+In this section, we formulate a more efficient method to solve the OT, using H∗. We first enumerate
+cases where efficient computation of H∗is possible, building on Hu et al. (2025). Then, we show how
+solving for S∗in the relaxed OTLP is a max-flow problem. Finally, we reverse the subset selection
+derivation using complementary slackness, to obtain a more compact feasibility max-flow problem
+that depends on H∗. This allows simplification of Equation (3) to a sparser form.
+5.1
+EFFICIENT RECOVERY OF H∗
+Computing α∗reduces to minimizing the set function ψ : 2V →R defined in Equation (4). While
+this is NP-hard for general ψ, there are polynomial-time approaches (Iwata, 2008; Orlin, 2009) when
+ψ is submodular. In their work, Hu et al. (2025) show submodularity holds if pdraft samples i.i.d.
+n times from a single draft distribution q. In Section C, we generalize their argument to pdraft that
+samples independently from any n draft distributions. These polynomial-time algorithms are often
+impractical for large V , but the use of top-p/k sampling on the draft model(s) can restrict the domain
+V and make this feasible. Also, when n = 2, minimizing ψ is submodular quadratic psuedo-boolean
+optimization (QBPO), where far more efficient algorithms exist: see Section D for more details.
+When pdraft samples i.i.d. from q, Hu et al. (2025) are able to improve on standard submodular
+algorithms to obtain an O(V log V ) approach. They show that it suffices to sort i ∈V in decreasing
+order of q(i)/p(i), and select the prefix of this list which minimizes ψ. We will mainly be concerned
+with this setting, rather than general submodular ψ setting, which we leave to future work.
+5.2
+MAX-FLOW REDUCTION OF RELAXED OTLP
+We now describe the relaxed OTLP (Equation (2)) as a max-flow problem. Max-flow solvers are
+much faster than general LP solvers here, as we empirically demonstrate in Section 7.
+Define a bipartite network Ωwith source s, left vertices V, right vertices Vn, and sink t. We draw
+edges s →i with capacity p(i) for i ∈V, edges i →i with capacity ∞for i ∈V, i ∈Ai, and edges
+1Here, only O(V ) possible draft n-tuples can be sampled, rather than V n, so the OTLP is feasible to solve.
+4
+
+
+--- Page 5 ---
+i →t with capacity pdraft(i) for i ∈Vn. Considering variables Si,i as flows along i →i, we see the
+capacity constraints exactly reduce to the inequalities in the relaxed OTLP, and the maximization
+objective is the same as maximizing the flow. The zero equality constraints are handled by the fact
+that we only draw edges i →i if i ∈Ai. Thus, S∗can be computed by running max-flow on Ω.
+5.3
+OPTIMIZING MAX-FLOW WITH COMPLEMENTARY SLACKNESS
+While the max-flow formulation is advantageous over a general LP solver, it can still be prohibitive
+for large Vn. Is there any way to use information like H∗to reduce the size of the network Ω? We
+find the answer is affirmative through complementary slackness, a method to reverse the dualization
+step in Section 3.2. For background on the dualization and the proof of below, see Section E.
+Theorem 5.1. Any nonnegative S∗defined over V × Vn satisfies the following system,
+X
+i̸∈(H∗)n
+S∗
+i,i ≤p(i)
+∀i ̸∈H∗,
+X
+i̸∈H∗
+S∗
+i,i = pdraft(i)
+∀i ̸∈(H∗)n,
+(6a)
+X
+i∈(H∗)n
+S∗
+i,i = p(i)
+∀i ∈H∗,
+X
+i∈H∗
+S∗
+i,i ≤pdraft(i)
+∀i ∈(H∗)n,
+(6b)
+S∗
+i,i = 0
+∀i ∈H∗, i ̸∈(H∗)n,
+S∗
+i,i = 0
+∀i ∈V, i ̸∈Ai,
+(6c)
+if and only if it is an optimal solution to the relaxed OTLP.
+Once we eliminate all zero variables in Equation (6c) from the top two lines, we call Equation (6a)
+the outer system and Equation (6b) the inner system. These are independent, as the former has
+terms with i ̸∈H∗, i ̸∈(H∗)n, i ∈Ai and the latter has terms with i ∈H∗, i ∈(H∗)n, i ∈Ai. In
+the same way as the relaxed OTLP, these represent max-flow problems over a bipartite network: see
+Section F for a proof of this equivalence. Thus, we can solve the outer and inner systems by creating
+corresponding flow networks, solving for the max-flow, and then recovering the variables along the
+∞-capacity edges. To form the flow network for the outer system, we restrict Ωfrom Section 5.2
+to left vertices V \ H∗and right vertices V n \ (H∗)n. For the inner system, we restrict Ωto left
+vertices H∗and right vertices (H∗)n. The complexity of these networks depends on H∗.
+Finally, to compute C∗from the full S∗given by the outer and inner system solutions, we use
+Equation (3). In fact, the equality conditions in Theorem 5.1 tell us some residuals are zero:
+pres(i) = 0
+∀i ∈H∗,
+pres
+draft(i) = 0
+∀i ̸∈(H∗)n,
+(7)
+Thus, when we sample the n-tuple of draft tokens ω ∈Vn, and aim to compute the slice of the OT
+π(·|ω) along this n-tuple, we only need to solve for the variables C∗
+i,ω for i ∈V, which simplify to
+C∗
+i,ω =
+
+
+
+
+
+
+
+
+
+S∗
+i,ω,
+i ∈set(ω),
+pres
+draft(ω)
+P
+j∈V pres(j) · pres(i),
+i ̸∈H∗, ω ∈(H∗)n,
+0,
+else,
+(8)
+by application of Equation (3). In fact, by independence of the outer and inner systems, examining
+the variables above, we only need to solve the outer system if ω ̸∈(H∗)n. When H∗is large, this
+is a significant speedup, as the outer system network is far smaller than the one in Section 5.2.
+6
+NEAR-LINEAR SAMPLING VIA GLOBAL RESOLUTION
+Our max-flow reduction of complementary slackness shows that for arbitrary pdraft, we should not
+expect to be able to compute C∗in less time than the max-flow approach. Across all flow networks
+we constructed, the capacities were p(i), pdraft(i) for i ∈V, i ∈Vn, which are essentially free
+parameters. Thus, a faster algorithm would likely require a faster general max-flow solver.
+However, when pdraft is formed by i.i.d. sampling from a draft model q, we can exploit additional
+structure to solve the complementary slackness system efficiently. First, we show how to compute
+feasible values of the outer residuals pres(i) for i ∈V \ H∗, using polymatroid theory. This turns
+5
+
+
+--- Page 6 ---
+all conditions in Theorem 5.1 involving p(i) into equalities. Once these are equalities, there exists a
+solution to the outer and inner systems parametrized by variables αi for i ∈V \ H∗and i ∈H∗, such
+that each row of the solution is a softmax over a slice of variables. These variables can be computed
+by minimizing associated convex functions. We call this approach global resolution. While this is
+not efficient for large V, by truncating the convex functions to a smaller subset of variables, we can
+solve an approximate optimization problem with negligible accuracy loss.
+Global resolution (Algorithm 1) follows three key steps. For discussion on non-i.i.d. extensions of
+these steps, such as to distinct independent drafts or sampling without replacement, see Section S.
+1. We solve for H∗⊆V. As per Section 5.1, existing methods (Hu et al., 2025) allow recovery
+of H∗in O(V log V ) time, so we take access to H∗for granted throughout this section.
+2. With H∗, we solve for the outer residuals pres(i) for i ∈V \ H∗in the outer system. This
+can be done in O(V log V ) time with polymatroid theory, as in Section 6.1. This allows us
+to replace the p(i) upper bounds in Equation (37a) with equalities to pi = p(i) −pres(i).
+3. We solve truncated convex minimization problems in Theorem 6.4 (requires pi from above)
+and Theorem 6.5 to find approximate global solutions to the outer and inner systems2. These
+problems are defined for general truncated variables sets T in Section 6.2. In Section 6.3,
+we show how to carefully choose T, and then compute the OT from the convex solutions, to
+get strong provable approximation guarantees. We also show in Section K how to keep the
+convex problems under O(|T|n/n!) variables and generally speed up minimization.
+Prior to our work, progress had only been made on step 1. Knowledge of only H∗allows computation
+of the optimal acceptance α∗= ψ(H∗), but not the optimal verification algorithm itself.
+Excluding step 3, our algorithm is O(V log V ). The runtime of step 3 is quite variable, and can
+depend significantly on the p and q distributions. In some cases, the minimum truncation size |T|
+required to achieve a good provable approximation is too large to run on the order of milliseconds, so
+we terminate global resolution early. Nevertheless, in practice (Table 1), this is not prohibitive.
+6.1
+OUTER RESIDUAL LP
+From Equation (7), there are two classes of nontrivial residuals: the outer residuals pres(i) for
+i ∈V \ H∗, and the inner residuals pres
+draft(i) for i ∈(H∗)n. While solving for the inner residuals is
+difficult3, we can compute outer residuals with the outer residual LP (Theorem 6.1, see Section G).
+Theorem 6.1 (Outer Residuals). We have 0 ≤pi ≤p(i) for i ∈V \ H∗are feasible in
+X
+i∈S
+pi ≤
+X
+i∈S
+p(i) + ψ(V \ S)
+∀S ⊆V \ H∗,
+(9)
+with equality at S = V \ H∗, if and only if pres(i) = p(i) −pi are feasible in the outer system.
+This LP has up to 2V constraints, so it is infeasible to even write down. Fortunately, most of these
+constraints are redundant when ψ is submodular. By applying polymatroid theory (see Section H),
+we get a closed-form solution by taking consecutive differences of minimums of ψ.
+Theorem 6.2. Suppose ψ is submodular. Fix any ordering {v1, . . . , vk} of V \ H∗. Then
+pvi = p(vi) +
+min
+T ⊇Hi+1 ψ(T) −min
+T ⊇Hi ψ(T)
+∀i ∈[k].
+(10)
+is a solution to Theorem 6.1, where Hi = H∗∪{vi, . . . , vk} for each i ∈[k].
+Computing the min ψ terms is extremely prohibitive, since there are O(V ) of them, so we could
+require up to V submodular minimization calls. However, for the i.i.d. pdraft construction, each
+call can be made O(V log V ) with a procedure that evaluates ψ across prefixes of a sorted list, by
+following the q-convexity approach in Section 4.2 of Hu et al. (2025) verbatim.
+2As mentioned at the end of Section 5.3, we only need to solve the outer system if ω ̸∈(H∗)n.
+3This is primarily due to the exponential number of inner residuals. Even if pdraft is i.i.d., it is not guaranteed
+that some pres
+draft admits a similar i.i.d. structure, without additional assumptions on p and q.
+6
+
+
+--- Page 7 ---
+Lemma 6.3. Suppose pdraft is formed by sampling i.i.d. from q. Fix subsets A ⊆B ⊆V. Then
+min
+A⊆S⊆B ψ(S) =
+min
+0≤i≤|B\A| ψ(Li ∪A),
+(11)
+where Li is the ith prefix of B \ A when its elements x are sorted by decreasing q(x)/p(x).
+We can further optimize this to a total runtime of O(V log V ) across all calls, by exploiting the fact
+that the ordering of V \ H∗in Theorem 6.2 is arbitrary. By selecting v1, . . . , vk in increasing order of
+q(·)/p(·), we know from Lemma 6.3 that each minT ⊇Hi ψ(T) lies among ψ(Hi), . . . , ψ(H1). Thus,
+using cumulative minimums, we can get all min ψ terms in O(V log V ).
+6.2
+TRUNCATED OUTER AND INNER CONVEX SOLVERS
+Once we have computed feasible values for the outer system residuals pres(i) = p(i) −pi for
+i ∈V \ H∗(Theorem 6.2), we can turn all p(i) upper bounds in the outer system (Equation (6a))
+into pi equality bounds. Our key observation is that as the outer system is feasible, it has some
+global low-dimensional solution parametrized over V \ H∗. The rows of this solution are formed by
+taking the softmax of slices of the parameters, and the parameter values can be computed to arbitrary
+accuracy by minimizing a truncated convex function as in Theorem 6.4 (proof in Section I),
+Theorem 6.4 (Outer Convex Solver). Fix ϵ > 0 and T ⊆V \ H∗. Define ΦT : RV\H∗→R by:
+ΦT ((αi)i∈V\H∗) =
+X
+i∈(H∗∪T )n\(H∗)n
+pdraft(i) log
+
+
+X
+i∈set(i)\H∗
+eαi
+
+−
+X
+i∈T
+piαi.
+(12)
+This is constant over αi for i ̸∈T. Then there is some (α∗
+i )i∈V\H∗such that
+∥∇ΦT ((α∗
+i )i∈V\H∗)∥1 ≤ϵ + ϵT ,
+ϵT = 1 −
+ 
+X
+i∈H∗∪T
+q(i)
+!n
+.
+(13)
+Furthermore, for any (αi)i∈V\H∗, the following variables solve the outer system,
+Si,i =
+eαi
+P
+j∈set(i)\H∗eαj · pdraft(i)
+∀i ∈set(i) \ H∗, i ∈Vn \ (H∗)n,
+(14)
+with at most ∥∇ΦT ((αi)i∈V\H∗)∥1 + 3ϵT total L1 deviation from the p(i) equality constraints.
+The inner system can be approached similarly, but the function now includes a slack term4, as we
+have not solved for the inner residuals pres
+draft(i). The proof can be found in Section J.
+Theorem 6.5 (Inner Convex Solver). Fix ϵ > 0 and T ⊆H∗. Define ΘT : RH∗→R by:
+ΘT ((αi)i∈H∗) =
+X
+i∈T n
+pdraft(i) log
+
+1 +
+X
+i∈set(i)
+eαi
+
+−
+X
+i∈T
+p(i)αi.
+(15)
+This is constant over αi for i ∈H∗\ T. Then there is some (α∗
+i )i∈H∗such that
+∥∇ΘT ((αi)i∈H∗)∥1 ≤ϵ + γT ,
+γT =
+ X
+i∈H∗
+q(i)
+!n
+−
+ X
+i∈T
+q(i)
+!n
+.
+(16)
+Furthermore, for any (αi)i∈H∗, the following variables solve the inner system,
+Si,i =
+eαi
+1 + P
+j∈set(i) eαj · pdraft(i)
+∀i ∈set(i), i ∈(H∗)n,
+(17)
+with at most ∥∇ΘT ((αi)i∈H∗)∥1 + 3γT total L1 deviation from the p(i) equality constraints.
+4We cannot do this for the outer system. This solver has one variable for each equality constraint. However,
+the outer system has exponentially many (|Vn \ (H∗)n|) equalities before outer residual computation. Thus, the
+polymatroid approach is necessary to make even a truncated convex solver practical for the outer system.
+7
+
+
+--- Page 8 ---
+Algorithm 1: Global Resolution
+Input: V, p, q, n, error threshold τ, draft count n, drafted n-tuple ω = (ω1, . . . , ωn) ∼q(·)
+Output: Optimal transport slice π(·|ω)
+1 Compute H∗from p, q, V, n as in Section 5.1
+2 Compute pi for all i ∈V \ H∗from p, q, V, n as in Theorem 6.2 and Lemma 6.3
+3 if ω1, . . . , ωn ∈H∗then
+4
+Choose minimal T ⊆H∗such that γT ≤τ
+5
+Find inner system variables Si,i using Theorem 6.5, stop at ∥∇ΘT ∥1 ≤5τ
+6
+return normalized C·,ω from Si,i and pi in Lemma 6.6
+7 Choose minimal T ⊆H∗such that ϵT ≤τ
+8 Find outer system variables Si,i using Theorem 6.4, stop at ∥∇ΦT ∥1 ≤5τ
+9 return normalized C·,ω from Si,i in Lemma 6.6
+In essence, solving for a global softmax solution in complementary slackness reduces to minimizing
+(finding a point with near-zero gradient) a convex function defined over variables in the truncated set
+T: this is ΦT for the outer system and ΘT for the inner system. When minimizing ΦT and ΘT , the
+total deviation from the p(i) equality constraints is guaranteed to fall under 5ϵT and 5γT , respectively,
+by setting ϵ = ϵT , γT in the solvers and using the gradient existence statements from the theorems.
+When we increase the size of T, the error bounds ϵT and γT (the tunable errors) approach zero. Thus,
+we can approximate the true complementary slackness solution to arbitrary accuracy. To prevent
+excessive runtime, we may terminate early if the size |T| of the convex minimization problem
+exceeds a preset threshold, or a maximum iteration count in the minimization algorithm is reached.
+Due to space constraints, we clarify these details and our minimization approach in Section K.
+6.3
+TRUNCATION SELECTION AND APPROXIMATION GUARANTEES
+Once we have used the outer and inner convex solvers to compute the approximation S to the real
+complementary slackness solution S∗(all variables not in these systems are zero), we plug in the
+former into Equation (3) to obtain an approximation C to the real optimal transport solution C∗:
+Ci,i =
+
+
+
+
+
+
+
+
+
+
+
+
+
+Si,i,
+i ∈set(i),
+p(i) −pi
+P
+j∈V\H∗(p(j) −pj) ·
+
+pdraft(i) −
+X
+i∈set(i)
+Si,i
+
+,
+i ̸∈H∗, i ∈(H∗)n,
+0,
+else,
+(18)
+The following lemma (proof in Section L) ensures that the tunable errors in Theorem 6.4 and
+Theorem 6.5 translate directly to bounds on deviations in the OTLP solution and acceptance rates.
+Lemma 6.6 (Approximation Guarantee). Solve for pi over i ∈V \ H∗as in Theorem 6.2. Using
+these values, let Si,i be defined as in Theorem 6.4 with L11 deviation α and Theorem 6.5 with L1
+deviation β. Then Ci,i as defined in Equation (18) satisfies the OTLP, with up to α + 2β total L1
+deviation in the p(i) equality constraints and α + β total deviation in the optimal acceptance rate.
+Using the guaranteed 5ϵT and 5γT deviations for the outer and inner solvers, we can therefore
+choose suitable T to ensure the tunable errors ϵT , γT do not exceed a specified error threshold τ, as
+Lemma 6.6 ensures that sampling from the OT induced by this approximate C will deviate by at most
+15τ from the true target distribution in L1 distance, and deviate from the optimal acceptance rate by
+at most 10τ. We present the full global resolution algorithm with the error threshold in Algorithm 1.
+7
+EXPERIMENTS
+In this section we empirically test the efficacy of our new algorithms for i.i.d. multi-draft, single-step
+setting. First, we show that optimal acceptance rates can substantially increase with a higher number
+of drafts n, and larger k in top-k sampling of the draft model. We then compare our algorithms’ solve
+8
+
+
+--- Page 9 ---
+times against a standard LP solver for various k, n. Our algorithms are practical for a much wider
+range of k, n, achieving state-of-the-art optimal acceptance rates in multi-draft speculative sampling.
+Details on our setup for both acceptance and solve time experiments are given in Section M.
+7.1
+OPTIMAL ACCEPTANCE FOR INCREASING k AND n
+For our target and draft models, we use the pairs Gemma-2 27B/2B and Llama-3 70B/8B (Touvron
+et al., 2023a; Team, 2024). We test n ≤10 and k ∈{10, 100, . . . , 10⌊log V ⌋, V }. Note that top-k
+sampling truncates the vocabulary V to size k in the relaxed OTLP, so that compute-heavy baseline
+approaches like LP and max-flow solvers remain feasible. For more detail, see Section N.
+Our results are shown in Figure 1. We observe significant improvements in acceptance as k increases
+from 10 to 1000: for example, a marginal increase from 0.8 to 0.95 means nearly 10% more tokens
+are generated at no extra cost. However, there are diminishing returns for k ≥10000. Thus, top-k
+sampling is a viable method to reduce OTLP complexity without sacrificing acceptance. There is also
+a steady improvement from increasing n for larger k, demonstrating the utility of higher draft counts.
+Figure 1: Optimal acceptance rates from n i.i.d drafts with top-k sampling with n with target/draft
+pairs of Gemma-2 27B/2B and Llama-3 70/8B. Increasing k improves acceptance rate significantly
+up to k = 1000, and increasing n also results in steady increase in optimal acceptance.
+Further, in Section O, we compare these acceptance rates to those for the greedy construction by Hu
+et al. (2025), described at the start of Section 5. For both Gemma-2 and Llama-3, we find that i.i.d.
+acceptance rates are higher than greedy for k ≥100, with improvements near 2% for larger k and n.
+(k, n)
+General LP
+Max-Flow
+Opt. Max-Flow
+G.R. (τ = 10−3)
+G.R. (τ = 10−4)
+(10, 2)
+4.07
+2.45
+2.51
+5.27 (98%)
+7.62 (93%)
+(10, 3)
+30.14
+3.80
+3.88
+17.35 (98%)
+23.95 (87%)
+(10, 4)
+4000+
+74.21
+74.37
+40.30 (97%)
+54.84 (86%)
+(10, 5)
+400000+
+10000+
+10000+
+70.75 (96%)
+94.79 (85%)
+(100, 2)
+4000+
+72.28
+63.03
+23.92 (38%)
+25.47 (23%)
+(100, 3)
+400000+
+200000+
+200000+
+30.52 (23%)
+38.44 (14%)
+(1000, 2)
+OOM
+400000+
+400000+
+34.94 (31%)
+47.46 (15%)
+Table 1: Average Llama-3 solve times (ms/token) over k, n, for the five i.i.d. OTLP solvers. General
+LP and max-flow are baselines, and optimized max-flow and global resolution (τ = 10−3, 10−4)
+are ours. Lower numbers are better. Red numbers are lower bounds from small scale tests due to
+excessive runtime. Global resolution can be 10,000+ times faster than others. Global resolution
+deviates from the target distribution by at most 15τ in L1 distance, and from optimal acceptance by
+at most 10τ. We include success rates for global resolution as it can terminate early sometimes.
+7.2
+OTLP SOLVE TIME EXPERIMENTS
+Here, we compute empirical average solve times (per token) for the relaxed OTLP across 40 random
+prompts from each dataset, for five methods: (1) a general LP solver, (2) a max-flow solver (Sec-
+tion 5.2), (3) an optimized max-flow solver (Section 5.3, but using normal max-flow when solving
+9
+
+
+--- Page 10 ---
+both inner and outer systems for stability), (4) global resolution (Section 6) with τ = 0.001, and (5)
+global resolution with τ = 0.0001. Lemma 6.6 ensures (4) and (5) deviate from the target distribution
+by at most 0.015 and 0.0015 in L1 distance, and are within 0.01 and 0.001 of optimal acceptance.
+Our compared average solve times for Llama-3 are shown in Table 1. For global resolution, we also
+include solve success rates, since it can terminate early. We only include (k, n) pairs where at least
+one of the first three solvers finishes in under ten minutes per token. We see that the global resolution
+solver is sometimes nearly ten thousand times faster than the other three methods, with runtimes
+always under 100 ms/token. In Section P, Gemma-2 results show a similar trend.
+Finally, in Table 2, we enforce average time limits of 10 and 100 ms/token, and compute the
+acceptance for each solver’s best (k, n) setting that adheres to the limit. Since global resolution can
+fail, we default to the best of solvers (1), (2), (3) in this case, and only keep settings whose aggregate
+average runtime falls under the time limit. For Llama-3, global resolution with τ = 0.001 and
+τ = 0.0001 achieve 1.03% and 0.47% higher acceptances than the other solvers for 100 ms/token,
+and 1.71% and 1.16% higher acceptances for 10 ms/token. While the improvements for Gemma-2
+are smaller, they are significant. Thus, global resolution is the state-of-the-art OTLP solver.
+Limit
+Llama-3
+Gemma-2
+(ms/tok)
+Gen. LP
+M.F.
+G.R.
+G.R.
+Gen. LP
+M.F
+G.R.
+G.R.
+τ = 10−3
+τ = 10−4
+τ = 10−3
+τ = 10−4
+10
+82.53%
+83.94%
+85.65%
+85.10%
+79.03%
+80.69%
+81.90%
+81.35%
+100
+83.94%
+89.01%
+90.04%
+89.46%
+80.69%
+85.83%
+86.60%
+86.07%
+Table 2: Best acceptance rates for baseline solvers (general LP) and ours (max-flow, optimized
+max-flow, global resolution with τ = 10−3, 10−4) on Llama-3 and Gemma-2 under average solve
+time limits of 10 and 100 ms/token. Optimized max-flow numbers are the same as max-flow.
+7.3
+TEMPERATURE EXPERIMENTS
+All results above are for the temperature 1 sampling of the target model. In Section Q, we extend
+our acceptance rate analysis to temperature 0.2, 0.4, 0.6, 0.8 target sampling on Gemma-27B/2B. We
+find that for temperatures below 0.8, increasing k from 10 rarely improves the optimal acceptance
+rate. This has the implication that approaches other than global resolution (general LP, max-flow,
+optimized max-flow) can be efficient and achieve high acceptance in low temperature settings.
+In Section Q, we also plot the solve time and success rate of global resolution with τ = 10−4 as
+temperature varies. We find that global resolution has significantly lower failure rates and solve times
+at low temperatures, because truncation can both be efficient and give a robust approximation for
+more concentrated distributions. In other words, our results use the worst setting for global resolution.
+7.4
+MULTI-STEP EXPERIMENTS
+We extend our method to the multi-step framework SpecTr (Sun et al., 2023) to evaluate the real-world
+latency of global resolution. Our results are shown in Section R, alongside theoretical explanations
+of how global resolution errors scale with draft block length in the multi-step setting. We see that
+global resolution is highly effective when integrated into multi-step frameworks, improving walltime
+decoding by nearly 2× compared to the baseline, even when using a naive OTLP heuristic in failure
+cases. By using better OTLP solvers, such as K-SEQ (Sun et al., 2023), in such failure cases, we
+expect further decoding improvements to materialize.
+8
+CONCLUSION
+Building on previous theoretical work in multi-draft speculative sampling, we derived a comple-
+mentary slackness system to solve for the optimal transport (OT) parameters. We showed how this
+could speed up max-flow OT solvers through an approach called global resolution. We empirically
+10
+
+
+--- Page 11 ---
+demonstrated our algorithm achieved high acceptance rates with little overhead. Future work could
+examine the efficacy of this algorithm in the multi-step setting, or extend it to non-i.i.d. draft settings.
+REPRODUCIBILITY STATEMENT
+The majority of work is theoretical, and can be verified through the in-depth proofs we have provided
+in Appendices B to J. While the details behind our convex minimization approach are not included
+in the main body due to space constraints, we provide all necessary information to reproduce the
+gradient descent approach for our convex solvers in Section K. This includes our simplification of the
+functions to minimize, how to efficiently compute gradient values, what open-source minimizer to
+use, what thresholds are set, and how many iterations to run. We also describe our precise machine
+setup, dataset composition, and LP and max-flow solvers for baseline approaches in Section M, and
+we describe our experimental approach in Section 7.
+REFERENCES
+Yuri Boykov and Vladimir Kolmogorov. An experimental comparison of min-cut/max-flow algorithms
+for energy minimization in vision. IEEE Transactions on Pattern Analysis and Machine Intelligence,
+26(9):1124–1137, 2004. doi: 10.1109/TPAMI.2004.60.
+Arne Brøndsted and Ralph Tyrrell Rockafellar. On the subdifferentiability of convex functions.
+Proceedings of the American Mathematical Society, 16(4):605–611, 1965.
+Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models
+are few-shot learners. In Advances in Neural Information Processing Systems, volume 33, pp.
+1877–1901, 2020.
+Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason D Lee, Deming Chen, and Tri Dao.
+Medusa: Simple llm inference acceleration framework with multiple decoding heads. arXiv
+preprint arXiv:2401.10774, 2024.
+Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, and John
+Jumper. Accelerating large language model decoding with speculative sampling. arXiv preprint
+arXiv:2302.01318, 2023.
+Mark Chen, Jerry Tworek, Heewoo Jun, et al. Evaluating large language models trained on code.
+arXiv preprint arXiv:2107.03374, 2021.
+Ziyi Chen, Xiaocong Yang, Jiacheng Lin, Chenkai Sun, Kevin Chang, and Jie Huang. Cascade
+speculative drafting for even faster llm inference. Advances in Neural Information Processing
+Systems, 37:86226–86242, 2024.
+Karl Cobbe, Vineet Kosaraju, Mohammad Ostendorf, et al. Training verifiers to solve math word
+problems. arXiv preprint arXiv:2110.14168, 2021.
+Mostafa Elhoushi, Akshat Shrivastava, Diana Liskovich, Basil Hosmer, Bram Wasti, Liangzhen Lai,
+Anas Mahmoud, Bilge Acun, Saurabh Agarwal, Ahmed Roman, et al. Layerskip: Enabling early
+exit inference and self-speculative decoding. arXiv preprint arXiv:2404.16710, 2024.
+Yichao Fu, Peter Bailis, Ion Stoica, and Hao Zhang. Break the sequential dependency of llm inference
+using lookahead decoding. arXiv preprint arXiv:2402.02057, 2024.
+David Gale. A theorem on flows in networks. In Classic Papers in Combinatorics, pp. 259–268.
+Springer, 1957.
+Fabian Gloeckle, Badr Youbi Idrissi, Baptiste Rozière, David Lopez-Paz, and Gabriel Synnaeve.
+Better & faster large language models via multi-token prediction. arXiv preprint arXiv:2404.19737,
+2024.
+Zhenyu He, Zexuan Zhong, Tianle Cai, Jason D Lee, and Di He. Rest: Retrieval-based speculative
+decoding. arXiv preprint arXiv:2311.08252, 2023.
+11
+
+
+--- Page 12 ---
+Alan J Hoffman and Joseph B Kruskal. Integral boundary points of convex polyhedra. In 50 Years
+of Integer Programming 1958-2008: From the Early Years to the State-of-the-Art, pp. 49–76.
+Springer, 2009.
+Zhengmian Hu and Heng Huang. Accelerated speculative sampling based on tree monte carlo. In
+Forty-first International Conference on Machine Learning, 2024.
+Zhengmian Hu, Tong Zheng, Vignesh Viswanathan, Ziyi Chen, Ryan A Rossi, Yihan Wu, Dinesh
+Manocha, and Heng Huang. Towards optimal multi-draft speculative decoding. arXiv preprint
+arXiv:2502.18779, 2025.
+Qi Huangfu and Julian AJ Hall. Parallelizing the dual revised simplex method. Mathematical
+Programming Computation, 10(1):119–142, 2018.
+Satoru Iwata. Submodular function minimization. Mathematical Programming, 112:45–64, 2008.
+Wonseok Jeon, Mukul Gagrani, Raghavv Goel, Junyoung Park, Mingu Lee, and Christopher Lott.
+Recursive speculative decoding: Accelerating llm inference via sampling without replacement.
+arXiv preprint arXiv:2402.14160, 2024.
+Enkelejda Kasneci, Kathrin Seßler, Stefan Küchemann, Maria Bannert, Daryna Dementieva, Frank
+Fischer, Urs Gasser, Georg Groh, Stephan Günnemann, Eyke Hüllermeier, Stephan Krusche, Gitta
+Kutyniok, Tilman Michaeli, Claudia Nerdel, Juergen Pfeffer, Oleksandra Poquet, Michael Sailer,
+Albrecht Schmidt, Tina Seidel, and Gjergji Kasneci. Chatgpt for good? on opportunities and
+challenges of large language models for education. Learning and Individual Differences, 103:
+102274, 01 2023. doi: 10.1016/j.lindif.2023.102274.
+Ashish J Khisti, MohammadReza Ebrahimi, Hassan Dbouk, Arash Behboodi, Roland Memisevic,
+and Christos Louizos. Multi-draft speculative sampling: Canonical decomposition and theoretical
+limits. In The Thirteenth International Conference on Learning Representations, 2025.
+Vladimir Kolmogorov and Ramin Zabih. What energy functions can be minimized via graph cuts?
+IEEE Transactions on Pattern Analysis and Machine Intelligence, 26(2):147–159, 2004. doi:
+10.1109/TPAMI.2004.1262177.
+Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative
+decoding. In International Conference on Machine Learning, pp. 19274–19286. PMLR, 2023.
+Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. Eagle: Speculative sampling requires
+rethinking feature uncertainty. arXiv preprint arXiv:2401.15077, 2024.
+Xiaoxuan Liu, Lanxiang Hu, Peter Bailis, Alvin Cheung, Zhijie Deng, Ion Stoica, and Hao Zhang.
+Online speculative decoding. arXiv preprint arXiv:2310.07177, 2023.
+Alex Mallen, Akari Asai, Victor Zhong, et al. When not to trust language models: Investigating
+effectiveness of parametric and non-parametric memories. arXiv preprint arXiv:2212.10511, 2022.
+Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Zeyu Wang, Zhengxin Zhang, Rae
+Ying Yee Wong, Alan Zhu, Lijie Yang, Xiaoxiang Shi, et al. Specinfer: Accelerating large
+language model serving with tree-based speculative inference and verification. In Proceedings of
+the 29th ACM International Conference on Architectural Support for Programming Languages
+and Operating Systems, Volume 3, pp. 932–949, 2024.
+OpenAI. Gpt-4 technical report. arXiv preprint arXiv:2303.08774, 2023.
+James B Orlin. A faster strongly polynomial time algorithm for submodular function minimization.
+Mathematical Programming, 118(2):237–251, 2009.
+Tiago P. Peixoto. The graph-tool python library. figshare, 2014. doi: 10.6084/m9.figshare.1164194.
+URL http://figshare.com/articles/graph_tool/1164194.
+Alec Radford, Karthik Narasimhan, Tim Salimans, and Ilya Sutskever. Improving language un-
+derstanding by generative pre-training. https://cdn.openai.com/research-covers/
+language-unsupervised/language_understanding_paper.pdf, 2018.
+12
+
+
+--- Page 13 ---
+Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever.
+Language
+models
+are
+unsupervised
+multitask
+learners.
+https://cdn.openai.
+com/better-language-models/language_models_are_unsupervised_
+multitask_learners.pdf, 2019.
+Mohammad Samragh, Arnav Kundu, David Harrison, Kumari Nishu, Devang Naik, Minsik Cho, and
+Mehrdad Farajtabar. Your llm knows the future: Uncovering its multi-token prediction potential.
+arXiv preprint arXiv:2507.11851, 2025.
+Alexander Schrijver et al. Combinatorial optimization: polyhedra and efficiency, volume 24. Springer,
+2003.
+Liwei Shen, Ruoxi Tao, Jinchang Ye, et al. Wildjailbreak: A dataset of adversarial chatbot jailbreak
+prompts. arXiv preprint arXiv:2406.18510, 2024.
+Benjamin Spector and Chris Re. Accelerating llm inference with staged speculative decoding. arXiv
+preprint arXiv:2308.04623, 2023.
+Hanshi Sun, Zhuoming Chen, Xinyu Yang, Yuandong Tian, and Beidi Chen. Triforce: Lossless
+acceleration of long sequence generation with hierarchical speculative decoding. arXiv preprint
+arXiv:2404.11912, 2024a.
+Ziteng Sun, Ananda Theertha Suresh, Jae Hun Ro, Ahmad Beirami, Himanshu Jain, and Felix
+Yu. Spectr: Fast speculative decoding via optimal transport. Advances in Neural Information
+Processing Systems, 36:30222–30242, 2023.
+Ziteng Sun, Uri Mendlovic, Yaniv Leviathan, Asaf Aharoni, Jae Hun Ro, Ahmad Beirami, and
+Ananda Theertha Suresh. Block verification accelerates speculative decoding. arXiv preprint
+arXiv:2403.10444, 2024b.
+Gemma Team. Gemma 2: Improving open language models at a practical size. arXiv preprint
+arXiv:2408.00118, 2024.
+Arun James Thirunavukarasu, Darren Shu Jeng Ting, Kabilan Elangovan, Laura Gutierrez, Ting Fang
+Tan, and Daniel Shu Wei Ting. Large language models in medicine. Nature Medicine, 29:
+1930–1940, 2023. doi: 10.1038/s41591-023-02459-w. URL https://www.nature.com/
+articles/s41591-023-02459-w. Review Article, Published: 17 July 2023.
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+Lacroix, Naman Goyal, Eric Hambro, Haoran Azhar, Alice Rodriguez, et al. Llama 2: Open
+foundation and fine-tuned chat models. arXiv preprint arXiv:2310.11387, 2023a.
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Haoran Azhar, et al. Llama: Open and
+efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023b.
+Pauli Virtanen, Ralf Gommers, Travis E Oliphant, Matt Haberland, Tyler Reddy, David Cournapeau,
+Evgeni Burovski, Pearu Peterson, Warren Weckesser, Jonathan Bright, et al. Scipy 1.0: fundamental
+algorithms for scientific computing in python. Nature Methods, 17(3):261–272, 2020.
+Jun Zhang, Jue Wang, Huan Li, Lidan Shou, Ke Chen, Gang Chen, and Sharad Mehrotra. Draft &
+verify: Lossless large language model acceleration via self-speculative decoding. arXiv preprint
+arXiv:2309.08168, 2023.
+Jeffrey Zhou, Tianjian Lu, Swaroop Mishra, et al. Instruction-following evaluation for large language
+models. arXiv preprint arXiv:2311.07911, 2023a.
+Yongchao Zhou, Kaifeng Lyu, Ankit Singh Rawat, Aditya Krishna Menon, Afshin Rostamizadeh,
+Sanjiv Kumar, Jean-François Kagy, and Rishabh Agarwal. Distillspec: Improving speculative
+decoding via knowledge distillation. arXiv preprint arXiv:2310.08461, 2023b.
+Wenhao Zhu, Hongyi Liu, Qingxiu Dong, Jingjing Xu, Shujian Huang, Lingpeng Kong, Jiajun Chen,
+and Lei Li. Multilingual machine translation with large language models: Empirical results and
+analysis, 2024. URL https://arxiv.org/abs/2304.04675.
+13
+
+
+--- Page 14 ---
+A
+REVIEW OF SINGLE-STEP SPECULATIVE SAMPLING
+Single-draft speculative sampling aims to accelerate the autoregressive decoding of an expensive
+target model Mp with a cheaper draft model Mq, which share a common vocabulary V of size V .
+In autoregressive decoding, the token context c induces target and draft distributions p(x|c), q(y|c).
+Note that top-p/k and temperature sampling simply change how p, q are computed from the logits
+Mp(c), Mq(c), so these can be plugged into any speculative sampling method.
+Now, a joint coupling π(x, y) of p, q is any joint distribution over V × V with marginal distributions
+p, q. Each coupling induces a transport π(x|y) from q to p, which is a conditional distribution where
+sampling y0 ∼q(y) and x0 ∼π(x|y0) is equivalent to sampling x0 ∼p(x). In speculative sampling,
+one samples a candidate token from the draft distribution q and passes it through the transport induced
+by some valid coupling π, to ensure the output matches the target distribution p.
+The full single-step procedure is as follows. The key assumption which allows speculative sampling
+to improve latency is that computing p(x|c), p(x|c, y0) in parallel is not much slower than computing
+p(x|c) alone, since LLM inference is often memory-bound rather than compute-bound.
+1. Given a context c, sample y0 ∼q(y|c) from the draft model.
+2. Compute target probabilities p(x|c), p(x|c, y0) in parallel.
+3. Sample x0 ∼π(x|y0) for some valid transport π, and append it to the context c.
+4. If x0 = y0, sample a token from p(y|c, x0) and append it to the context c.
+Thus, whenever x0 = y0 above, we generate two tokens (steps 3 and 4) at the cost of essentially
+one target forward pass, obtaining nearly a 2× speedup. This means to maximize the speedup and
+achieve optimal single-draft speculative sampling, one must maximize P(x0 = y0) = P
+x∈V π(x, x),
+achieved for the optimal transport π∗. This is called the acceptance rate, the probability that the
+q-sampled token is not altered by the transport. In the original speculative sampling work, Chen et al.
+(2023); Leviathan et al. (2023) computed a closed-form expression for π∗based on p(x|c), q(x|c).
+Sun et al. (2023) extended this procedure to single-step multi-draft, by replacing q(x|c) with a general
+n-token distribution pdraft(y|c) over y ∈Vn, which can be formed by i.i.d. sampling one draft
+model, independently sampling different draft models, or a variety of other methods. Now, a joint
+coupling π(x, y) of p, pdraft is a joint distribution over V × Vn with marginals p, pdraft, which induces
+a transport π(x|y) from pdraft to p. Here, the key assumption we make is slightly stronger: that
+computing p(x|c), p(x|c, y0), . . . , p(x|c, yn−1) is parallel is not much slower than computing p(x|c)
+alone. This is generally true as long as n is not too large. The procedure is:
+1. Given a context c, sample (y0, . . . , yn−1) ∼pdraft(y|c) from the draft scheme.
+2. Compute target probabilities p(x|c), p(x|c, y0), . . . , p(x|c, yn−1) in parallel.
+3. Sample x0 ∼π(x|y0, . . . , yn−1) for some valid transport π, and append it to the context c.
+4. If x0 ∈{y0, . . . , yn−1}, sample a token from p(y|c, x0) and append it to the context c.
+Similar to the single-draft case, we now get a nearly 2× speedup whenever x0 ∈{y0, . . . , yn−1}.
+Thus, we want to maximize the probability that x0 lies among the n sampled draft tokens, which is
+the multi-draft acceptance rate. Combined with the conditions necessary for π to be a valid joint
+coupling, this leads to the OTLP formulation.
+B
+EQUIVALENCE OF CANONICAL DECOMPOSITION AND RELAXED LP
+We first state canonical decomposition. Note that the β-optimization problem below is exponentially
+large and is not an LP, so it is infeasible to solve without truncating V, as Khisti et al. (2025) do.
+Theorem B.1. (Khisti et al., 2025) Define variables β(i|i) for i ∈Vn, i ∈V, set to zero for i ̸∈set(i).
+Then the β which solves the following gives the optimal importance sampling parameters:
+max
+β⪰0
+X
+i∈V
+min
+
+p(i),
+X
+i∈Vn
+β(i|i)pdraft(i)
+
+
+s.t.
+X
+i∈V
+β(i|i) = 1
+∀i ∈Vn.
+(19)
+14
+
+
+--- Page 15 ---
+In fact, the objective value achieved by this optimal β is the optimal acceptance rate α∗.
+Now, we prove Theorem 4.1, by showing that our defined S∗
+i,i satisfy the constraints above.
+Proof. We first show these satisfy the constraints of Theorem B.1. Indeed, these are all nonnegative.
+Also, by the relaxed LP constraints, we have S∗
+i,i = 0 for all i ̸∈Ai. Thus, by definition of the
+incidence set Ai, and considering the first and second cases in the β definition, we have β(i|i) = 0 if
+i ̸∈set(i). Furthermore, for all i ∈Vn, we see that
+X
+i∈V
+β(i|i) =
+X
+i∈V
+S∗
+i,i
+P
+j∈V S∗
+j,i
+= 1
+(20)
+in the case that i ̸∈D. We also see that
+X
+i∈V
+β(i|i) =
+X
+i∈set(i)
+|set(i)|−1 +
+X
+i̸∈set(i)
+0 = 1
+(21)
+if i ∈D. Thus, all constraints are satisfied.
+Now, we show that the objective value with these β in Theorem B.1 is at least the optimal objective
+value with S∗in the relaxed LP. This will complete the proof, as the optimal objective values in
+Theorem B.1 and the relaxed LP are both α∗. To show this, we use the other relaxed LP constraints.
+By the the second inequality constraint,
+X
+i∈Vn
+β(i|i)pdraft(i) ≥
+X
+i̸∈D
+β(i|i)pdraft(i) =
+X
+i̸∈D
+S∗
+i,i
+pdraft(i)
+P
+j∈V S∗
+j,i
+≥
+X
+i̸∈D
+S∗
+i,i
+(22)
+for all i ∈V. Furthermore, for all i ∈Vn, the first inequality constraint in the relaxed LP shows that
+min
+
+p(i),
+X
+i̸∈D
+S∗
+i,i
+
+=
+X
+i̸∈D
+S∗
+i,i.
+(23)
+Therefore, the objective in Theorem B.1 is at least
+X
+i∈V
+X
+i̸∈D
+S∗
+i,i =
+X
+i̸∈D
+X
+i∈V
+S∗
+i,i =
+X
+i∈Vn
+X
+i∈V
+S∗
+i,i = α∗.
+(24)
+This completes the proof that our defined β are optimal.
+C
+COMPUTING H∗FOR INDEPENDENT DRAFTS IS SUBMODULAR
+MINIMIZATION
+Here, we show that the subset selection problem α∗= 1 + minH⊆V ψ(H) is an instance of submod-
+ular minimization when pdraft is formed by independently sampling from q1, . . . , qn to get n tokens.
+This generalizes the work of Hu et al. (2025), who proved this in the case q1 = . . . = qn.
+Theorem C.1. When pdraft independently samples from q1, . . . , qn, the set function ψ in submodular.
+Proof. First, we can define ψ(H) = P(H) −Q(H), where
+P(H) =
+X
+i∈H
+p(i),
+Q(H) =
+X
+i∈Hn
+pdraft(i).
+(25)
+Then, because pdraft(i1, . . . , in) = q1(i1) · · · qn(in), we have
+Q(H) =
+X
+i1,...,in∈H
+n
+Y
+j=1
+qj(ij) =
+n
+Y
+j=1
+ X
+i∈H
+qj(i)
+!
+.
+(26)
+15
+
+
+--- Page 16 ---
+Note that P(H1 ∩H2) + P(H1 ∪H2) = P(H1) + P(H2) for any H1, H2 ⊆V, so P is a modular
+function. Thus, to show ψ = P −Q is submodular, it suffices to show that Q is supermodular.
+To this end, take any H1, H2 ⊆V. We want to show Q(H1 ∩H2)+Q(H1 ∪H2) ≥Q(H1)+Q(H2).
+For each j = 1, . . . , n, denote aj = P
+i∈H1 qj(i), bj = P
+i∈H2 qj(i), and cj = P
+i∈H1∩H2 qj(i).
+Then, we see aj + bj −cj = P
+i∈H1∪H2 qj(i), and aj, bj ≥cj ≥0 by nonnegativity of qj. The
+condition we want to show is equivalent to
+n
+Y
+j=1
+(aj + bj −cj) +
+n
+Y
+j=1
+cj ≥
+n
+Y
+j=1
+aj +
+n
+Y
+j=1
+bj.
+(27)
+Now, define the sums B and C as
+B =
+X
+A⊆[n],A̸=∅
+
+Y
+i∈A
+(aj −cj)
+Y
+i∈[n]\A
+bj
+
+,
+(28)
+C =
+X
+A⊆[n],A̸=∅
+
+Y
+i∈A
+(aj −cj)
+Y
+i∈[n]\A
+cj
+
+.
+(29)
+We can see B ≥C by comparing corresponding terms in the sum, since each bj ≥cj ≥0 and each
+aj −cj ≥0. Furthermore, we have the following identities by straightforward expansion of products
+of terms of the form aj −cj + ⋆:
+n
+Y
+j=1
+(aj −cj + bj) =
+n
+Y
+j=1
+bj + B,
+(30)
+n
+Y
+j=1
+(aj −cj + cj) =
+n
+Y
+j=1
+cj + C.
+(31)
+Subtracting these and using B ≥C gives
+n
+Y
+j=1
+(aj + bj −cj) −
+n
+Y
+j=1
+aj ≥
+n
+Y
+j=1
+bj −
+n
+Y
+j=1
+cj,
+(32)
+as desired, which completes the proof.
+D
+COMPUTING H∗FOR n = 2 INDEPENDENT DRAFTS IS SUBMODULAR
+QPBO
+Here, we describe the reduction of H∗computation to submodular quadratic psuedo-boolean opti-
+mization (QPBO) when pdraft samples independently from n = 2 draft models q1, q2. By writing
+ψ(H) in the same form as in Section C, but now for the case n = 2, we see
+ψ(H) =
+X
+i∈H
+p(i) −
+ X
+i∈H
+q1(i)
+!  X
+i∈H
+q2(i)
+!
+.
+(33)
+Denote the indicator vector x with xi = 1[i ∈H] for each i ∈V. Then this becomes
+ρ(x) =
+X
+i∈V
+p(i)xi +
+X
+i∈V
+X
+i∈V
+q1(i)q2(j)xixj.
+(34)
+Minimizing ψ(H) over all H ⊆V is thus equivalent to minimizing ρ(x) over all binary vectors
+x ∈{0, 1}V. This is precisely the form of QPBO, and we already know ψ is submodular from
+Section C, so it is indeed an instance of submodular QPBO.
+Our submodular QPBO instance is dense, with n = V variables and m = O(V 2) pairwise terms.
+By previous work, this reduces to a single s −t min-cut computation (Kolmogorov & Zabih, 2004).
+Using a max-flow algorithm, the theoretical runtime is O(m√n) = O(V 2.5). In fact, practical
+implementations like the push-relabel algorithm can achieve near-quadratic runtime (Boykov &
+Kolmogorov, 2004). This is far better than the general submodular minimization algorithm (Orlin,
+2009), which takes O(V 5E + V 6) = O(V 6) time, where E = O(V ) is the time complexity of
+evaluating ψ.
+16
+
+
+--- Page 17 ---
+E
+COMPLEMENTARY SLACKNESS DERIVATION
+We first review the details of dualization and simplification to subset selection, starting from the
+relaxed OTLP (Equation (2)). These details are necessary to formulate complementary slackness.
+Proof. Dualizing the relaxed OTLP gives the dual LP. The zero equality constraints correspond to
+eliminating entries of x, and can be ignored. So, to transform to the dual, one introduces a variable
+for each inequality constraint, say yi for constraints over i ∈V, and zi for constraints over i ∈Vn:
+min
+y,z⪰0
+
+X
+i∈V
+yip(i) +
+X
+i∈Vn
+zipdraft(i)
+
+
+s.t.
+yi + zi ≥1
+∀i ∈V, i ∈Ai.
+(35)
+Finally, to reduce the dual LP, Hu et al. (2025) observe that the inequality constraints form a TUM
+matrix. Any LP with integral inequality bounds and such constraints has an integral optimal solution
+(Hoffman & Kruskal, 2009). Also, any yi ≥2 or zi ≥2 can be reduced to 1 while upholding each
+constraint yi + zi ≥1 and not increasing the objective value: this means that some optimal solution
+is binary. Then, denoting H = {i ∈V : yi = 1}, one can compute optimal y, z given fixed H as:
+yi =
+1
+i ∈H,
+0
+i ̸∈H,
+zi =
+1
+i ̸∈Hn,
+0
+i ∈Hn.
+(36)
+Putting this back into the dual LP and simplifying gives the subset selection formulation.
+Now, we provide a proof of Theorem 5.1, which makes use of the idea of complementary slackness.
+Primal and dual LPs have the same optimal objective value, and complementary slackness allows one
+to get from any optimal solution of the dual to some optimal solution of the primal. This asserts that
+the following two conditions are equivalent for any pair of feasible solutions (α∗, β∗) to the primal
+and dual LPs: (A) α∗is optimal in the primal LP and β∗is optimal in the dual LP, and (B) each
+variable in α∗, β∗is zero, or its corresponding inequality constraint in the other LP is an equality.
+In our case, considering the primal and dual LPs as the relaxed OTLP and its dual, we already have
+the optimal solution β∗to the dual from Equation (36) and the H∗computation. Thus, computing an
+optimal primal solution α∗is equivalent to jointly solving the complementary slackness constraints
+in (B) alongside the feasibility constraints for α∗in the primal LP.
+Proof. For the relaxed OTLP and its dual LP, complementary slackness constraints become:
+y∗
+i = 0
+or
+X
+i∈Vn
+S∗
+i,i = p(i)
+∀i ∈V,
+(37a)
+z∗
+i = 0
+or
+X
+i∈V
+S∗
+i,i = pdraft(i)
+∀i ∈Vn,
+(37b)
+S∗
+i,i = 0
+or
+y∗
+i + z∗
+i = 1
+∀i ∈V, i ∈Vn.
+(37c)
+Given the optimal solution y∗, z∗to the dual LP, we only need to solve this system, alongside the
+original constraints in the primal (relaxed) LP, to obtain the optimal solution S∗to the primal LP.
+This can be done by using the binary vector expressions for y∗, z∗in terms of H∗in Equation (36).
+First, for Equation (37a), observe that y∗
+i ̸= 0 if and only if i ∈H∗. Thus, it is equivalent to
+X
+i∈Vn
+S∗
+i,i = p(i)
+∀i ∈H∗.
+(38)
+Next, for Equation (37b), recall that z∗
+i ̸= 0 if and only if i ̸∈(H∗)n. So, this condition becomes
+X
+i∈V
+S∗
+i,i = pdraft(i)
+∀i ̸∈(H∗)n.
+(39)
+17
+
+
+--- Page 18 ---
+Finally, by observing the four joint cases for y∗
+i , z∗
+i , we have
+y∗
+i + z∗
+i =
+
+
+
+
+
+
+
+2
+i ∈H∗, i ̸∈(H∗)n,
+1
+i ∈H∗, i ∈(H∗)n,
+1
+i ̸∈H∗, i ̸∈(H∗)n,
+0
+i ̸∈H∗, i ∈(H∗)n,
+(40)
+so that Equation (37c) is equivalent to
+Si,i = 0
+∀i ∈H∗, i ̸∈(H∗)n,
+Si,i = 0
+∀i ̸∈H∗, i ∈(H∗)n.
+(41)
+The second of these can be eliminated, as it is redundant with the zero equality constraint in the
+relaxed OTLP: if i ̸∈H∗and i ∈(H∗)n, then i cannot lie in the incidence set Ai, so Si,i = 0 already.
+Finally, combining our three new conditions with the feasibility constraints in the relaxed OTLP, any
+solution to the following system is an optimal solution S∗in the relaxed OTLP, and vice versa:
+X
+i∈Vn
+S∗
+i,i ≤p(i)
+∀i ∈V,
+X
+i∈V
+S∗
+i,i ≤pdraft(i)
+∀i ∈Vn,
+X
+i∈Vn
+S∗
+i,i = p(i)
+∀i ∈H∗,
+X
+i∈V
+S∗
+i,i = pdraft(i)
+∀i ̸∈(H∗)n,
+S∗
+i,i = 0
+∀i ∈V, i ̸∈Ai,
+S∗
+i,i = 0
+∀i ∈H∗, i ̸∈(H∗)n.
+(42)
+Finally, note that some inequality constraints are redundant. We no longer require the p(i) inequalities
+for i ∈H∗, and we no longer require the pdraft(i) inequalities for i ̸∈(H∗)n. This directly reduces
+the above system, which is equivalent to the relaxed OTLP, to the desired system.
+F
+MAX-FLOW TRANSFORMATION DERIVATION
+Although it is a standard network reduction technique to reduce row and column sum constraints to
+max-flow over a bipartite network, we provide a proof of Lemma F.1 here for completeness.
+Lemma F.1 (Bipartite-Flow Equivalence). Let G = (A ∪B, E ⊆A × B) be a bipartite graph, with
+N(·) denoting neighborhoods. Let x ∈RA, y ∈RB, z ∈RE be nonnegative. Define a network
+Ωon nodes {s, t} ∪A ∪B, with capacity xa edges s →a for a ∈A, capacity yb edges b →t for
+b ∈B, and ∞-capacity edges a →b for (a, b) ∈E. Then these two conditions are equivalent:
+(1) P
+b∈N(a) z(a,b) = xa for all a ∈A and P
+a∈N(b) z(a,b) ≤yb for all b ∈B,
+(2) f(s →a) = xa, f(a →b) = z(a,b), f(b →t) = P
+a∈N(b) z(a,b) is a maximal flow in Ω.
+Proof. Suppose condition (1) holds. Then the flow assignment f in the second condition satisfies
+f(s →a) = xa =
+X
+b∈N(a)
+z(a,b) =
+X
+b∈N(a)
+f(a →b),
+(43)
+f(b →t) =
+X
+a∈N(b)
+z(a,b) =
+X
+a∈N(b)
+f(a →b).
+(44)
+This means flow conservation holds. Also, f(s →a) ≤xa for each a ∈A, and f(b →t) ≤yb for
+each b ∈B from the inequality constraints, so the capacity constraints hold. Thus, the assignment
+f is feasible. In fact, its value is P
+a∈A f(s →a) = P
+a∈A xa, and no flow assignment in Ωcan
+exceed this value since the total flow along edges s →a cannot exceed the sum of the capacities xa.
+This shows the f is indeed the maximal flow, so condition (2) is satisfied, as desired.
+Conversely, suppose condition (2) holds. Then flow conservation at each a ∈A shows
+xa = f(s →a) =
+X
+b∈N(a)
+f(a →b) =
+X
+b∈N(a)
+z(a,b).
+(45)
+Also, the capacity at b →t shows f(s →b) = P
+a∈N(b) z(a,b) ≤yb. Thus, condition (1) holds.
+18
+
+
+--- Page 19 ---
+G
+PROOFS OF RESIDUAL LPS
+In this appendix, we prove the reduction the outer residual LP. We will use the following lemma.
+Note that each xa and yb must be nonnegative, as per the requirements of Lemma F.1.
+Lemma G.1. From Lemma F.1, consider condition (1) as a system in nonnegative variables ze with
+xa-equality constraints and yb-inequality constraints. This is feasible if and only if
+X
+a∈S
+xa ≤
+X
+b∈N(S)
+yb
+∀S ⊆A.
+(46)
+When yb constraints are equalities, feasibility is equivalent to the above and P
+a∈A xa = P
+y∈B yb.
+Proof. The first part follows from the equivalence of conditions (1) and (2) in Lemma F.1, and Gale’s
+feasibility theorem for bipartite supply-demand networks applied to condition (2) (Gale, 1957). The
+second part holds as P
+a∈A xa = P
+b∈B yb combines with condition (1),
+X
+a∈A
+xa =
+X
+a∈A
+X
+b∈N(a)
+z(a,b) =
+X
+(a,b)∈E
+z(a,b) =
+X
+b∈B
+X
+a∈N(b)
+z(a,b) ≤
+X
+b∈B
+yb,
+(47)
+to force the equalities P
+a∈N(b) z(a,b) = yb for b ∈B, as required.
+Now, we prove the reduced LP for outer system residuals pres(i) in Theorem 6.1.
+Proof. To solve for the residuals in the outer system, we need to find 0 ≤pi ≤p(i) where
+X
+i∈Vn\(H∗)n
+S∗
+i,i = pi
+∀i ∈V \ H∗,
+X
+i∈V\H∗
+S∗
+i,i = pdraft(i)
+∀i ∈Vn \ (H∗)n,
+(48)
+is feasible for nonnegative S∗. When this system is feasible, its solution S∗will also be a solution
+to the outer system, so we can simply recover the residuals as pres(i) = p(i) −pi. Since all pi are
+nonnegative, we can use Lemma G.1, to show that the above system is feasible if and only if:
+X
+i∈V\H∗
+pi =
+X
+i∈Vn\(H∗)n
+pdraft(i),
+X
+i∈S
+pi ≤
+X
+i∈N(S)
+pdraft(i)
+∀S ⊆V \ H∗,
+(49)
+where N(S) ⊆Vn \ (H∗)n denotes the neighborhood of S ⊆V \ H∗in the bipartite graph with
+left vertices V \ H∗, right vertices Vn \ (H∗)n, and edges (i, i) with i ∈set(i). Note N(S) contains
+precisely the n-tuples in Vn with at least one element in S. Therefore, we can write
+X
+i∈N(S)
+pdraft(i) −
+X
+i∈S
+p(i) = 1 −
+X
+i∈S
+p(i) −
+X
+i∈(V\S)n
+pdraft(i) = ψ(V \ S).
+(50)
+Substituting this back and simplifying with ψ, our condition becomes:
+X
+i∈V\H∗
+pi =
+X
+i∈V\H∗
+p(i) + ψ(H∗),
+X
+i∈S
+pi ≤
+X
+i∈S
+p(i) + ψ(V \ S)
+∀S ⊆V \ H∗.
+(51)
+Including the original constraints 0 ≤pi ≤p(i) completes the proof.
+H
+GREEDY POLYMATROID ALGORITHM FOR OUTER RESIDUAL LP
+Here, we prove Theorem 6.2 by using polymatroids. Polymatroids are subsets of Euclidean spaces
+associated with submodular functions: they defined as the feasibility set of subset sum inequality
+constraints with bounds being evaluations of the submodular function. Thus, they are directly related
+to the outer residual LP. In our proof, we refer only to standard polymatroid theory from Chapter 44
+in Schrijver et al. (2003).
+19
+
+
+--- Page 20 ---
+Proof. Because ψ(S) is submodular in S, and P
+i∈S p(i) is modular (additive) in S, then
+ϕ(S) =
+X
+i∈S
+p(i) + ψ(V \ S) = 1 −
+X
+i∈(V\S)n
+pdraft(i)
+(52)
+is submodular in S. Therefore, solving Theorem 6.1 amounts to finding x ∈EPϕ ∩Bp with x ⪰0
+and 1 · x = ϕ(V \ H∗), where Bp is the feasibility set of all constraints pi ≤p(i), and EPϕ is the
+extended polymatroid associated with the submodular function ϕ:
+EPϕ =
+(
+x :
+X
+i∈S
+xi ≤ϕ(S)
+∀S ⊆V \ H∗
+)
+.
+(53)
+By Equations 44.8 and 44.9 in Schrijver et al. (2003), the box-polymatroid intersection EPϕ ∩Bp is
+also an extended polymatroid EPϕ|p, associated with the following submodular function ϕ|p:
+(ϕ|p)(S) = min
+T ⊆S
+
+
+
+X
+i∈S\T
+p(i) + ϕ(T)
+
+
+=
+X
+i∈S
+p(i) + min
+V\S⊆T ψ(T).
+(54)
+Since our system is feasible, and has the inequality constraint 1 · x ≤ϕ(V \ H∗) and equality
+constraint 1 · x = ϕ(V \ H∗), we can replace the equality constraint with an objective max 1 · x.
+This turns Theorem 6.1 into the following extended polymatroid optimization problem:
+max 1 · x
+s.t
+x ∈EPϕ|p,
+x ⪰0.
+(55)
+We first ignore the nonnegativity constraint. To solve this simplified version, we can use the two-step
+greedy algorithm from Theorem 44.3 in Schrijver et al. (2003). First, we reorder V \ H∗in increasing
+order of the weights 1. This can be arbitrary, so we specify it as the given ordering {v1, . . . , vk}.
+Then, we compute consecutive differences xvi = (ϕ|p)(Si) −(ϕ|p)(Si−1), where Si = {v1, . . . , vi}
+is the ith prefix of V \ H∗. We can compute this explicitly as
+xvi =
+X
+i∈Si
+p(i) +
+min
+V\Si⊆T ψ(T) −
+X
+i∈Si−1
+p(i) −
+min
+V\Si−1⊆T ψ(T)
+(56)
+= p(vi) +
+min
+H∗∪{vi+1,...,vk}⊆T ψ(T) −
+min
+H∗∪{vi,...,vk}⊆T ψ(T)
+(57)
+= p(vi) +
+min
+Hi+1⊆T ψ(T) −min
+Hi⊆T ψ(T).
+(58)
+This matches the desired expression, so to complete the proof, it suffices to show x ⪰0, i.e. each
+xvi ≥0. Indeed, suppose T ∗⊇Hi+1 minimizes the first of the two min ψ terms above. Since
+Hi = Hi+1 ∪{vi}, we will have T ∗∪{vi} ⊇Hi, and thus
+min
+Hi⊆T ψ(T) ≤ψ(T ∗∪{vi})
+(59)
+=
+X
+x∈(T ∗∪{vi})
+p(x) −
+X
+i∈(T ∗∪{vi})n
+pdraft(i)
+(60)
+≤p(vi) +
+X
+x∈T ∗
+p(x) −
+X
+i∈(T ∗)n
+pdraft(i)
+(61)
+= p(vi) + ψ(T ∗) = p(vi) +
+min
+Hi+1⊆T ψ(T).
+(62)
+Rearranging this exactly gives xvi ≥0, as required.
+I
+GLOBAL OUTER SOLUTION
+Here, we prove Theorem 6.4. We will use the following lemma, which relates the minimization of
+feasibility of a transport system to the nonnegativity of an associated convex function.
+20
+
+
+--- Page 21 ---
+Lemma I.1 (Convex Transport Solver 1). Let G = (A ∪B, E ⊆A × B) be a bipartite graph
+without isolated points (each neighborhood is nonempty). Suppose the following system is feasible in
+nonnegative variables Sa,b for (a, b) ∈E:
+X
+b∈N(a)
+Sa,b = xa
+∀a ∈A,
+X
+a∈N(b)
+Sa,b = yb
+∀b ∈B.
+(63)
+Then the following function Φ : R|A| →R is convex and nonnegative:
+Φ((αa)a∈A) =
+X
+b∈B
+yb log
+
+X
+a∈N(b)
+eαa
+
+−
+X
+a∈A
+xaαa.
+(64)
+Furthermore, for any ϵ > 0, there exists (αa)a∈A with ∥∇Φ((αa)a∈A)∥1 ≤ϵ.
+Proof. We will use the Hall-type conditions from Lemma G.1. By feasibility of the system,
+X
+b∈N(S)
+yb ≥
+X
+a∈S
+xa
+∀S ⊆A,
+X
+b∈B
+yb =
+X
+a∈A
+xa.
+(65)
+Now, it is clear that Φ is convex in α since it is a linear combination of terms convex in α (LogSumExp
+and linear). To show it is nonnegative at a particular point α, relabel A = {1, 2, . . . , m} such that
+α1 ≥. . . ≥αm. For each b ∈B, we have the lower bound
+log
+
+X
+a∈N(b)
+eαa
+
+≥max
+a∈N(b) αa.
+(66)
+Now, let Nk = N({1, . . . , k}) \ N({1, . . . , k −1}) for each k ∈A. We have maxa∈N(b) αa = αk
+for each b ∈Nk, because k ∈N(b) and 1, . . . , k −1 ̸∈N(b). Furthermore, the sets N1, . . . , Nm
+are disjoint, with union N({1, . . . , m}) = B. Using this, we can lower bound
+Φ((αa)a∈A) ≥
+X
+b∈B
+yb max
+a∈N(b) αa −
+X
+a∈A
+xaαa
+(67)
+=
+m
+X
+k=1
+X
+b∈Nk
+ybαk −
+m
+X
+a=1
+xaαa
+(68)
+=
+m
+X
+a=1
+ X
+b∈Na
+yb −xa
+!
+αa.
+(69)
+Denote the coefficient of αa by ca. For any 1 ≤k ≤m, we see by applying the Hall conditions that
+k
+X
+a=1
+ca =
+X
+b∈N1∪...∪Nk
+yb −
+k
+X
+a=1
+xa
+(70)
+=
+X
+b∈N({1,...,k})
+yb −
+X
+a∈{1,...,k}
+xa ≥0,
+(71)
+with equality at k = m. Thus, as each αj ≥αj+1, we have the desired nonnegativity:
+Φ((αa)a∈A) ≥
+m
+X
+a=1
+caαa =
+m
+X
+a=1
+ca(αa −αm)
+(72)
+=
+m
+X
+a=1
+m
+X
+j=a+1
+ca(αj−1 −αj)
+(73)
+=
+m−1
+X
+j=1
+j
+X
+a=1
+ca(αj −αj+1)
+(74)
+=
+m−1
+X
+j=1
+ j
+X
+a=1
+ca
+!
+(αj −αj+1) ≥0.
+(75)
+21
+
+
+--- Page 22 ---
+Because Φ is convex and bounded below, by the Brøndsted–Rockafellar approximation theorem
+(Brøndsted & Rockafellar, 1965), there are points on Φ with arbitrarily small subgradients. As Φ is
+continuously differentiable, then for each ϵ > 0, some (αa)a∈A satisfies ∥∇Φ(α)∥1 ≤ϵ.
+For the outer system, we can apply Lemma I.1 with bipartite components A = V \ H∗and B =
+Vn \ (H∗)n, edges (a, b) ∈E if and only if a ∈set(b), and bounds xa = pa for all a ∈A
+and yb = pdraft(b) for all b ∈B. (Here, pa are the outer residual LP variables we solved for in
+Theorem 6.1, given by pa = p(a) −pres(a).) The key idea is that the gradient norm bound from the
+lemma bounds the total deviation from p(i) equality constraints in the outer system, which allows us
+to prove Theorem 6.4.
+Proof. We first show that ∥∇ΦT ∥1 ≤ϵ + ϵT is feasible. Define Φ : RV\H∗→R as in Lemma I.1:
+Φ((αi)i∈V\H∗) =
+X
+i∈Vn\(H∗)n
+pdraft(i) log
+
+
+X
+i∈set(i)\H∗
+eαi
+
+−
+X
+i∈V\H∗
+piαi.
+(76)
+By the lemma, there is some (α∗
+i )i∈V\H∗with ∥∇Φ((α∗
+i )i∈V\H∗)∥1 ≤ϵ. Thus,
+X
+i∈T
+
+∂Φ(α∗
+i )
+∂αi
+ ≤
+X
+i∈V\H∗
+
+∂Φ(α∗
+i )
+∂αi
+ ≤ϵ.
+(77)
+We can also compute the absolute difference in the ith partial derivatives of Φ, ΦT for any i ∈T as
+
+∂ΦT (α∗
+i )
+∂αi
+−∂Φ(α∗
+i )
+∂αi
+ =
+X
+i∈V n\(H∗∪T )n
+eα∗
+i · 1[i ∈set(i) \ H∗]
+P
+j∈set(i)\H∗eα∗
+j
+· pdraft(i).
+(78)
+Thus, summing the above over all i ∈T gives
+X
+i∈T
+
+∂ΦT (α∗
+i )
+∂αi
+−∂Φ(α∗
+i )
+∂αi
+ =
+X
+i∈Vn\(H∗∪T )n
+X
+i∈T
+eα∗
+i · 1[i ∈set(i) \ H∗]
+P
+j∈set(i)\H∗eα∗
+j
+· pdraft(i)
+(79)
+≤
+X
+i∈Vn\(H∗∪T )n
+pdraft(i) = 1 −
+ 
+X
+i∈H∗∪T
+q(i)
+!n
+= ϵT .
+(80)
+Because ΦT is constant over αi for i ̸∈T, and thus has zero partial derivative at these variables, the
+Triangle Inequality implies that ∥∇ΦT ∥1 falls below ϵ + ϵT at (α∗
+i )i∈V\H∗:
+∥∇ΦT ((α∗
+i )i∈V\H∗)∥1 ≤
+X
+i∈T
+
+∂Φ(α∗
+i )
+∂αi
+ +
+X
+i∈T
+
+∂ΦT (α∗
+i )
+∂αi
+−∂Φ(α∗
+i )
+∂αi
+ ≤ϵ + ϵT .
+(81)
+Now, we prove the second part of the theorem for arbitrary (αi)i∈V\H∗. First, we bound the sum of
+the partial derivatives of Φ over i ∈V \ (H∗∪T):
+X
+i∈V\(H∗∪T )
+
+∂Φ
+∂αi
+ =
+X
+i∈V\(H∗∪T )
+
+X
+i∈Vn\(H∗)n
+i∈set(i)\H∗
+eαi
+P
+j∈set(i)\H∗eαj · pdraft(i) −pi
+
+(82)
+≤
+X
+i∈V\(H∗∪T )
+
+
+
+
+
+X
+i∈Vn\(H∗∪T )n
+i∈set(i)\H∗
+eαi
+P
+j∈set(i)\H∗eαj · pdraft(i) + pi
+
+
+
+
+
+(83)
+≤
+X
+i∈Vn\(H∗∪T )n
+pdraft(i) +
+X
+i∈V \(H∗∪T )
+pi
+(84)
+≤2
+X
+i∈Vn\(H∗∪T )n
+pdraft(i) = 2ϵT ,
+(85)
+22
+
+
+--- Page 23 ---
+where the last inequality holds by Equation (49). Therefore, we have by the Triangle Inequality and
+Equation (80) (holds for any point) that
+∥∇Φ((αi)i∈V\H∗)∥1 =
+X
+i∈T
+
+∂Φ
+∂αi
+ +
+X
+i∈(V\H∗)\T
+
+∂Φ
+∂αi
+
+(86)
+≤∥∇ΦT ((αi)i∈V\H∗)∥1 +
+X
+i∈T
+
+∂ΦT (α∗
+i )
+∂αi
+−∂Φ(α∗
+i )
+∂αi
+ + 2ϵT
+(87)
+≤∥∇ΦT ((αi)i∈V\H∗)∥1 + 3ϵT .
+(88)
+Finally, using the explicit representation for partial derivatives of Φ, and substituting in Si,i from
+Equation (14), we get
+X
+i∈V\H∗
+
+X
+i∈Vn\(H∗)n
+i∈set(i)\H∗
+eαi
+P
+j∈set(i)\H∗eαj · pdraft(i) −pi
+
+=
+X
+i∈V\H∗
+
+X
+i∈Vn\(H∗)n
+i∈set(i)\H∗
+Si,i −pi
+
+(89)
+≤∥∇ΦT ((αi)i∈V\H∗)∥1 + 3ϵT ,
+(90)
+hence Si,i satisfy the pi equality constraints of the outer system with up to ∥∇ΦT ((αi)i∈V\H∗)∥1 +
+3ϵT total leeway. They also satisfy the pdraft(i) equality constraints exactly, as
+X
+i∈set(i)\H∗
+Si,i =
+X
+i∈set(i)\H∗
+eαi
+P
+j∈set(i)\H∗eαj · pdraft(i) = pdraft(i).
+(91)
+This completes the proof.
+J
+GLOBAL INNER SOLUTION
+Now, we prove Theorem 6.5. We will use the lemma below, which is quite similar to Lemma I.1
+in Section I, except that it contains an extra slack term in the LogSumExp to deal with a bipartite
+transport system with equalities on one side and inequalities on the other side.
+Lemma J.1 (Convex Transport Solver 2). Let G = (A ∪B, E ⊆A × B) be a bipartite graph
+without isolated points (each neighborhood is nonempty). Suppose the following system is feasible in
+nonnegative variables Sa,b for (a, b) ∈E:
+X
+b∈N(a)
+Sa,b = xa
+∀a ∈A,
+X
+a∈N(b)
+Sa,b ≤yb
+∀b ∈B.
+(92)
+Then the following function Θ : R|A| →R is convex and nonnegative:
+Θ((αa)a∈A) =
+X
+b∈B
+yb log
+
+1 +
+X
+a∈N(b)
+eαa
+
+−
+X
+a∈A
+xaαa.
+(93)
+Furthermore, for any ϵ > 0, there exists (αa)a∈A with ∥∇Θ((αa)a∈A)∥1 ≤ϵ.
+Proof. We add a vertex a0 to A ⊆G, with edges from a0 to all b ∈B, to form the graph G′ =
+(A ∪{a0} ∪B, E′). Now, let Sa,b for (a, b) ∈E satisfy the given system. We define S′
+a,b for
+(a, b) ∈E′, such that S′
+a,b = Sa,b for a ̸= a0 and S′
+a0,b = yb −P
+a∈N(b) Sa,b ≥0. Also, define
+x′
+a for all a ∈A ∪{a0} such that x′
+a = xa if a ̸= a0 and x′
+a0 = P
+b∈B yb −P
+a∈A xa ≥0, and
+define y′
+b for all b ∈B such that y′
+b = yb. Then we see the following, where N ′(·) now denotes
+G′-neighborhoods:
+X
+b∈N ′(a0)
+S′
+a0,b =
+X
+b∈B
+
+yb −
+X
+a∈N(b)
+Sa,b
+
+=
+X
+b∈B
+yb −
+X
+a∈A
+X
+b∈N(a)
+Sa,b = x′
+a0
+(94)
+23
+
+
+--- Page 24 ---
+and for each b ∈B, we have
+X
+a∈N′(b)
+S′
+a,b =
+X
+a∈N(b),a̸=a0
+Sa,b + Sa0,b = yb = y′
+b.
+(95)
+This shows the following system is feasible:
+X
+b∈N ′(a)
+S′
+a,b = x′
+a
+∀a ∈A ∪{a0},
+X
+a∈N′(b)
+S′
+a,b = y′
+b
+∀b ∈B.
+(96)
+Hence, we can apply Lemma I.1 to show that
+Φ((αa)a∈A∪{a0}) =
+X
+b∈B
+y′
+b log
+
+X
+a∈N′(b)
+eαa
+
+−
+X
+a∈A∪{a0}
+x′
+aαa
+(97)
+is convex and nonnegative. Restricting this to the slice αa0 = 0 gives Θ((αa)a∈A) as defined in the
+theorem, as each N ′(b) contains a0, corresponding to the +1 term in log, and the x′
+a0αa0 contribution
+cancels. Thus, Θ is also convex and nonnegative. The existence of arbitrarily small gradient norms
+then follows from the same argument as in the proof of Lemma I.1.
+For the inner system, we can apply Lemma J.1 with bipartite components A = H∗and B = (H∗)n,
+edges (a, b) ∈E if and only if a ∈set(b), and bounds xa = p(a) for all a ∈A and yb = pdraft(b) for
+all b ∈B. Once more, the gradient norm bound from the lemma bounds the total deviation from p(i)
+equality constraints in the inner system, proving Theorem 6.5.
+Proof. We first show that ∥∇ΘT ∥1 ≤ϵ + γT is feasible. Define Θ : RH∗→R as in Lemma J.1:
+Θ((αi)i∈H∗) =
+X
+i∈(H∗)n
+pdraft(i) log
+
+1 +
+X
+i∈set(i)
+eαi
+
+−
+X
+i∈H∗
+p(i)αi.
+(98)
+By the lemma, there is some (α∗
+i )i∈H∗with ∥∇Θ((α∗
+i )i∈H∗)∥1 ≤ϵ. Thus,
+X
+i∈T
+
+∂Θ(α∗
+i )
+∂αi
+ ≤
+X
+i∈H∗
+
+∂Θ(α∗
+i )
+∂αi
+ ≤ϵ.
+(99)
+We can also compute the absolute difference in the ith partial derivatives of Θ, ΘT for any i ∈T as
+
+∂ΘT (α∗
+i )
+∂αi
+−∂Θ(α∗
+i )
+∂αi
+ =
+X
+i∈(H∗)n\T n
+eα∗
+i · 1[i ∈set(i)]
+1 + P
+j∈set(i) eα∗
+j · pdraft(i).
+(100)
+Thus, summing the above over all i ∈T gives
+X
+i∈T
+
+∂ΘT (α∗
+i )
+∂αi
+−∂Θ(α∗
+i )
+∂αi
+ =
+X
+i∈(H∗)n\T n
+X
+i∈T
+eα∗
+i · 1[i ∈set(i)]
+1 + P
+j∈set(i) eα∗
+j · pdraft(i).
+(101)
+≤
+X
+i∈(H∗)n\T n
+pdraft(i) =
+ X
+i∈H∗
+q(i)
+!n
+−
+ X
+i∈T
+q(i)
+!n
+= γT . (102)
+Because ΘT is constant over αi for i ̸∈T, and thus has zero partial derivative at these variables, the
+Triangle Inequality implies that ∥∇ΘT ∥1 falls below ϵ + γT at (α∗
+i )i∈H∗:
+∥∇ΘT ((α∗
+i )i∈H∗)∥1 ≤
+X
+i∈T
+
+∂Θ(α∗
+i )
+∂αi
+ +
+X
+i∈T
+
+∂ΘT (α∗
+i )
+∂αi
+−∂Θ(α∗
+i )
+∂αi
+ ≤ϵ + γT .
+(103)
+24
+
+
+--- Page 25 ---
+Now, we prove the second part of the theorem for arbitrary (αi)i∈H∗. First, we bound the sum of the
+partial derivatives of Θ over i ∈H∗\ T:
+X
+i∈H∗\T
+
+∂Θ
+∂αi
+ =
+X
+i∈H∗\T
+
+X
+i∈(H∗)n
+i∈set(i)
+eαi
+1 + P
+j∈set(i) eαj · pdraft(i) −p(i)
+
+(104)
+≤
+X
+i∈H∗\T
+
+
+
+
+
+X
+i∈(H∗)n
+i∈set(i)
+eαi
+1 + P
+j∈set(i) eαj · pdraft(i) + p(i)
+
+
+
+
+
+(105)
+≤
+X
+i∈(H∗)n\T n
+pdraft(i) +
+X
+i∈H∗\T
+p(i)
+(106)
+≤2
+X
+i∈(H∗)n\T n
+pdraft(i) = 2γT ,
+(107)
+where the last inequality using the fact that ψ is minimized at H∗:
+0 ≤ψ(T) −ψ(H∗)
+(108)
+=
+X
+i∈T
+p(i) −
+X
+i∈T n
+pdraft(i) −
+X
+i∈H∗
+p(i) +
+X
+i∈(H∗)n
+pdraft(i)
+(109)
+=
+X
+i∈(H∗)n\T n
+pdraft(i) −
+X
+i∈H∗\T
+p(i) = γT −
+X
+i∈H∗\T
+p(i).
+(110)
+Therefore, we have by the Triangle Inequality and Equation (102) (holds for any point) that
+∥∇Θ((αi)i∈H∗)∥1 =
+X
+i∈T
+
+∂Θ
+∂αi
+ +
+X
+i∈H∗\T
+
+∂Θ
+∂αi
+
+(111)
+≤∥∇ΘT ((αi)i∈H∗)∥1 +
+X
+i∈T
+
+∂ΘT (α∗
+i )
+∂αi
+−∂Θ(α∗
+i )
+∂αi
+ + 2γT
+(112)
+≤∥∇ΘT ((αi)i∈H∗)∥1 + 3γT .
+(113)
+Finally, using the explicit representation for partial derivatives of Θ, and substituting in Si,i from
+Equation (17), we get
+X
+i∈H∗
+
+X
+i∈(H∗)n
+i∈set(i)
+eαi
+1 + P
+j∈set(i) eαj · pdraft(i) −p(i)
+
+=
+X
+i∈H∗
+
+X
+i∈(H∗)n
+i∈set(i)
+Si,i −p(i)
+
+(114)
+≤∥∇ΘT ((αi)i∈H∗)∥1 + 3γT ,
+(115)
+hence Si,i satisfy the pi equality constraints of the inner system with up to ∥∇ΘT ((αi)i∈H∗)∥1+3γT
+total leeway. They also satisfy the pdraft(i) inequality constraints, as
+X
+i∈set(i)
+Si,i =
+X
+i∈set(i)
+eαi
+1 + P
+j∈set(i) eαj · pdraft(i) ≤pdraft(i).
+(116)
+This completes the proof.
+K
+TRUNCATED SOLVER DETAILS
+In this section, we discuss the specific implementation details for convex minimization in our inner
+and outer solvers, including under what conditions our solver fails.
+25
+
+
+--- Page 26 ---
+The first step is to group coefficients of the same LogSumExp terms, to obtain a more compact
+representation of ΦT and ΘT . For ΦT in the outer system, the coefficient of a term containing
+precisely αi1, . . . , αik (none of i1, . . . , ik lie in H∗) is explicitly
+X
+i∈(H∗∪T )n\(H∗)n
+set(i)\H∗={i1,...,ik}
+pdraft(i) =
+X
+A⊆{i1,...,ik}
+(−1)k−|A|
+X
+i∈(H∗∪A)n
+pdraft(i)
+(117)
+=
+X
+A⊆{i1,...,ik}
+(−1)k−|A|
+ 
+X
+i∈H∗∪A
+q(i)
+!n
+.
+(118)
+The second expression is a consequence of the principle of inclusion and exclusion (PIE). The last
+expression can be computed efficiently using dynamic programming. Similarly, for ΘT in the inner
+system, the coefficient of a term containing precisely αi1, . . . , αik is
+X
+i∈T n
+set(i)={i1,...,ik}
+pdraft(i) =
+X
+A⊆{i1,...,ik}
+(−1)k−|A| X
+i∈An
+pdraft(i)
+(119)
+=
+X
+A⊆{i1,...,ik}
+(−1)k−|A|
+ X
+i∈A
+q(i)
+!n
+.
+(120)
+Again, this formula can be derived with PIE, and can be computed efficiently with dynamic program-
+ming. Once we have grouped coefficients, both ΦT , ΘT have at most
+n
+X
+i=1
+|T|
+i
+
+∼|T|n
+n!
+(121)
+terms. With this compact representation, one can quickly compute the gradients of ΦT and ΘT . We
+manually implement a function that returns the value of each of these functions and the corresponding
+gradient at an input point. Then, we use the the standard L-BFGS-B minimizer from SciPy (Virtanen
+et al., 2020) to run gradient descent, to converge to a point with near-zero gradient norm. This is
+an ideal algorithm for gradient descent because it converges quite fast for convex functions in few
+variables, and we require execution on the order of milliseconds. The SciPy API also returns the final
+gradient norm value, and allows early termination when the gradient norm falls below a threshold. To
+ensure our approach remains on the order of milliseconds, we limit L-BFGS-B to 25 iterations.
+Finally, we discuss the issue of early termination, i.e. solve failure. There are two situations to
+consider: (a) T is too large, (b) the gradient norm does not fall below the desired threshold. For (a),
+we have set the following hard limits on |T| through experimentation: 50 for n = 2, 20 for n = 3, 10
+for n = 4, and 10 for n = 5. Note that these numbers are quite conservative: future work could aim
+to improve runtime and reduce early terminations by using a non-fixed threshold, or an alternative
+gradient descent method that works better for larger T. For (b), because the SciPy API terminates
+when the threshold is reached, this can only occur if the maximum iterations are reached, and the
+gradient norm is too large. In practice, we find this is rarely the case: |T| being too large is usually
+the reason for failure.
+L
+APPROXIMATION GUARANTEES
+Here, we prove Lemma 6.6, which translates the inner and outer solver deviations into concrete
+bounds on deviations in the approximate OTLP solution.
+Proof. Define the row-wise sums p′
+i = P
+i∈set(i) Si,i. Also, denote the residuals r(i) = pdraft(i) −
+P
+i∈set(i) Si,i. From Theorem 6.5 and Theorem 6.4, we know that P
+i∈H∗|p′
+i −p(i)| ≤β and
+P
+i∈V\H∗|p′
+i −pi| ≤α. We first show that the pdraft(i) equalities in the OTLP hold. For i ∈(H∗)n,
+26
+
+
+--- Page 27 ---
+we have
+X
+i∈V
+Ci,i =
+X
+i∈set(i)
+Si,i +
+X
+i∈V\H∗
+p(i) −pi
+P
+j∈V\H∗(p(j) −pj) · r(i)
+(122)
+=
+X
+i∈set(i)
+Si,i + r(i) = pdraft(i).
+(123)
+Also, for i ̸∈(H∗)n, using the equality guarantee of the outer solver,
+X
+i∈V
+Ci,i =
+X
+i∈set(i)
+Si,i = pdraft(i).
+(124)
+Now, we bound the deviation from the p(i) equality constraints in the OTLP. We have for all i ∈H∗
+that
+X
+i∈Vn
+Ci,i =
+X
+i∈(H∗)n,i∈set(i)
+Si,i = p′
+i,
+(125)
+and we have for all i ̸∈H∗that
+X
+i∈Vn
+Ci,i =
+X
+i∈Vn\(H∗)n,i∈set(i)\H∗
+Si,i +
+X
+i∈(H∗)n
+p(i) −pi
+P
+j∈V\H∗(p(j) −pj) · r(i)
+(126)
+= p′
+i +
+p(i) −pi
+P
+j∈V\H∗(p(j) −pj) ·
+X
+i∈(H∗)n
+
+pdraft(i) −
+X
+j∈set(i)
+Sj,i
+
+
+(127)
+= p′
+i +
+p(i) −pi
+P
+j∈V\H∗(p(j) −pj) ·
+
+
+X
+i∈(H∗)n
+pdraft(i) −
+X
+j∈H∗
+p′
+j
+
+
+(128)
+= p′
+i + p(i) −pi
+−ψ(H∗) ·
+
+X
+j∈H∗
+(p(j) −p′
+j) −ψ(H∗)
+
+
+(129)
+= p(i) + (p′
+i −pi) + p(i) −pi
+−ψ(H∗) ·
+X
+j∈H∗
+(p(j) −p′
+j).
+(130)
+In the fourth equality, we used the equality condition of Theorem 6.1, and the definition of ψ. Since
+ψ(H∗) < 0 and pi ≤p(i), this allows us to bound the difference to p(i) for i ̸∈H∗as
+
+X
+i∈Vn
+Ci,i −p(i)
+
+≤|p′
+i −pi| + p(i) −pi
+−ψ(H∗) ·
+X
+j∈H∗
+|p′
+j −p(j)| ≤|p′
+i −pi| + p(i) −pi
+−ψ(H∗) · β.
+(131)
+Hence, summing over all i gives
+X
+i∈V
+
+X
+i∈Vn
+Ci,i −p(i)
+
+≤
+X
+i∈H∗
+|p′
+i −p(i)| +
+X
+i∈V\H∗
+|p′
+i −pi| +
+X
+i∈V\H∗
+p(i) −pi
+−ψ(H∗) · β
+(132)
+≤β + α + β = α + 2β.
+(133)
+In fact, each Ci,i is nonnegative as all Si,i are nonnegative, and each r(i) ≥0 (by the inequality
+constraint of the inner system, which is exactly satisfied even for the truncated solver) and p(i) ≥pi.
+Therefore, Ci,i represents a solution to the OTLP with total deviation at most α + 2β from the p(i)
+equality constraints. Finally, the acceptance, i.e. the objective value in the OTLP, is
+X
+i∈Vn
+X
+i∈set(i)
+Ci,i =
+X
+i∈Vn
+X
+i∈set(i)
+Si,i =
+X
+i∈V
+p′
+i.
+(134)
+By the Triangle Inequality, the fact that
+X
+i∈H∗
+p(i) +
+X
+i∈V\H∗
+pi = 1 +
+X
+i∈V\H∗
+(pi −p(i)) = 1 + ψ(H∗) = α∗
+(135)
+is the optimal objective in the OTLP, and the fact that P
+i∈H∗|p′
+i−p(i)| ≤β and P
+i∈V\H∗|p′
+i−pi| ≤
+α, this new objective value deviates by at most α + β from the optimal acceptance, as desired.
+27
+
+
+--- Page 28 ---
+M
+EXPERIMENTAL SETUP
+We run all experiments on Paperspace machines. For Llama-3 70/8B, we use a setup with 4xA6000
+and an Intel Xeon Gold 5315Y CPU (32 cores, 3.20 GHz). For Gemma-2 27/2B, we use a setup
+with an A100-80GB and an Intel Xeon Gold 6342 CPU (12 cores, 2.80 GHz). We use temperature 1
+sampling from the target and draft models in all settings.
+Our data consists of 500 random eval prompts from GSM8K, HumanEval (only 164 total), IfEval,
+PopQA, and WildJailbreak, five diverse benchmarks spanning math reasoning, coding, instruction
+following, knowledge retrieval, and safety (Chen et al., 2021; Zhou et al., 2023a; Cobbe et al.,
+2021; Shen et al., 2024; Mallen et al., 2022). We take prompts only from the eval split to avoid
+test set contamination. For acceptance experiments, we compute token-averaged acceptances per
+dataset, and perform a simple average across datasets. For solve time experiments, as times are fairly
+prompt-agnostic, we select 40 random prompts from each dataset.
+For our solve time experiments, we use the HiGHS LP solver (Huangfu & Hall, 2018) in SciPy’s
+optimization module (Virtanen et al., 2020). We also use graph-tools (Peixoto, 2014), a heavily
+optimized Python network analysis package with a C++ backend and OpenMP support, to solve
+max-flow. To solve the convex minimization problem, we use the L-BFGS-B solver from SciPy
+(Virtanen et al., 2020). All solvers are only run on the CPU with numpy arrays, to minimize the
+impact of GPU setup differences on solve times.
+N
+TOP-k SAMPLING FOR THE RELAXED OTLP
+Here, we formally describe how top-k sampling of the draft model q impacts the relaxed OTLP when
+pdraft is formed by i.i.d. sampling q. Suppose that the top k tokens of q form V0 ⊆V. This means
+pdraft(i) = 0 whenever i ̸∈Vn
+0 . Now, recall the relaxed OTLP is
+max
+S⪰0
+X
+i∈V
+X
+i∈Vn
+Si,i
+s.t.
+X
+i∈Vn
+Si,i ≤p(i)
+∀i ∈V,
+X
+i∈V
+Si,i ≤pdraft(i)
+∀i ∈Vn,
+Si,i = 0
+∀i ∈V, i ̸∈Ai.
+(136)
+For any i ∈V, i ̸∈Vn
+0 , the pdraft(i) = 0 upper bound constraint and nonnegativity of variables forces
+Si,i = 0. Furthermore, for any i ̸∈V0, i ∈Vn
+0 , because i ̸∈Ai (it cannot contain i as it has all
+elements in V0), the zero equality constraint above gives Si,i = 0. This means the only nonzero
+variables are those where i ∈V0, i ∈Vn
+0 . Plugging these into the above, simplifying the objective,
+and eliminating trivial constraints and variables we know to be zero, we get the following LP:
+max
+S⪰0
+X
+i∈V0
+X
+i∈Vn
+0
+Si,i
+s.t.
+X
+i∈Vn
+0
+Si,i ≤p(i)
+∀i ∈V0,
+X
+i∈V
+Si,i ≤pdraft(i)
+∀i ∈Vn
+0 ,
+Si,i = 0
+∀i ∈V0, i ∈Vn
+0 , i ∈set(i).
+(137)
+This is exactly the same as the original relaxed OTLP if V was replaced by V0, and p and
+pdraft were replaced by their slices along V0 and Vn
+0 . Thus, top-k sampling essentially reduces the
+problem to a smaller version of the relaxed OTLP, with kn+1 parameters rather than V n+1.
+O
+GREEDY VS. I.I.D. ACCEPTANCE RATES
+In Figure 2 and Figure 3, we compare acceptance rates for the i.i.d. and greedy pdraft construction
+across Gemma-2 and Llama-3. We find i.i.d. performs worse than greedy for k = 10, but does better
+for all k ≥100. In particular, it is nearly 2% better for most n ≥4 in the latter case. Interestingly,
+the i.i.d. advantage seems to decrease as n increases for higher k in Llama-3, but not in Gemma-2.
+Exploring these trends is an interesting avenue for future work.
+28
+
+
+--- Page 29 ---
+Figure 2: Comparison of i.i.d. versus greedy acceptance rates for Gemma-2 27B/2B across various
+choices of n and top-k sampling of the draft.
+Figure 3: Comparison of i.i.d. versus greedy acceptance rates for Llama-3 70B/8B across various
+choices of n and top-k sampling of the draft.
+29
+
+
+--- Page 30 ---
+P
+GEMMA-2 SOLVE TIME COMPARISON
+Here, in Table 3, we compare the four methods’ solver times for Gemma-2. Again, global resolution
+can hundreds of thousands times faster than the other methods. We also observe global resolution
+solve times for Gemma-2 are generally larger than those for Llama-3 (Table 1), but it is not clear how
+much of this is due to environment setup differences (CPU-only).
+(k, n)
+General LP
+Max-Flow
+Opt. Max-Flow
+G.R. (τ = 10−3)
+G.R. (τ = 10−4)
+(10, 2)
+7.85
+3.18
+3.26
+7.46 (98.87%)
+10.63 (92.75%)
+(10, 3)
+59.43
+5.05
+5.10
+24.64 (98.54%)
+33.95 (88.06%)
+(10, 4)
+4000+
+95.73
+94.21
+57.21 (98.31%)
+77.42 (86.21%)
+(10, 5)
+400000+
+10000+
+10000+
+98.10 (97.77%)
+130.68 (85.36%)
+(100, 2)
+4000+
+95.13
+82.94
+49.58 (36.64%)
+43.49 (18.58%)
+(100, 3)
+400000+
+200000+
+200000+
+107.65 (19.53%)
+32.81 (8.18%)
+(1000, 2)
+OOM
+400000+
+400000+
+60.05 (27.5%)
+141.25 (8.04%)
+Table 3: Average Gemma-2 solve times (ms/token) over k, n, for the five i.i.d. OTLP solvers. General
+LP and max-flow are baselines, and optimized max-flow and global resolution (τ = 10−3, 10−4)
+are ours. Lower numbers are better. Red numbers are lower bounds from small scale tests due to
+excessive runtime. Global resolution can be 10,000+ times faster than others. Global resolution
+deviates from the target distribution by at most 15τ in L1 distance, and from optimal acceptance by
+at most 10τ. We include success rates for global resolution as it can terminate early sometimes.
+Q
+TEMPERATURE ABLATIONS
+In this section, we extend our results to different settings of target model sampling. We use Gemma-
+27B/2B with the same aggregate dataset as our acceptance rate experiments, and test temperature
+0.2, 0.4, 0.6, 0.8 sampling from the target model. We do not change the temperature of the draft
+distribution, so it remains 1.0. Again, we test the effects of top-k draft sampling.
+Figure 4: Optimal acceptance rates from n i.i.d drafts with top-k sampling with n with the target/draft
+pair Gemma-2 27B/2B, for various target temperature settings (0.2, 0.4, 0.6, 0.8). Until temperature
+0.8, increasing k past 10 results in little acceptance gains for reasonable values of n.
+30
+
+
+--- Page 31 ---
+We begin by plotting the acceptance rates in Figure 4. We observe that for temperatures 0.2, 0.4,
+the k = 10 setting achieves essentially the highest acceptance rate for all values of n: increasing k
+does not lead to any noticeable acceptance gains. For temperature 0.6, k = 10 performs better until
+around n = 4, but afterwards k ≥100 performs better (although the difference is not significant). For
+temperature 0.8, k = 10 is significantly worse than other settings as n increases, although k = 100
+has comparable acceptances to k ≥1000. These results demonstrate that decreasing the temperature
+allows top-k sampling to achieve extremely high acceptance rates for small values of k, thereby
+making approaches which staunchly rely on it (e.g. LP and max-flow solvers) feasible and effective.
+Figure 5: Solve times and failure rates of global resolution with τ = 10−4 (Gemma-2 27B/2B) for
+choices of k ∈{10, 100, 1000, 10000} and n ∈{2, 3, 4, 5}, plotted over increasing temperature.
+We also examine the efficacy of global resolution with τ = 10−4 as temperature varies in Figure 5.
+For k > 10 (not the top left graphs), failure rates increase significantly with temperature: global
+resolution is most applicable at low temperature settings. Also, for all k and n, global resolution
+solve times increase until a certain temperature, and then decrease thereafter. Given the high success
+rate and low solve times at lower temperatures, global resolution shows great promise in this regime.
+31
+
+
+--- Page 32 ---
+R
+MULTI-STEP EXPERIMENTS
+Here, we implement global resolution in the framework SpecTr (Sun et al., 2023) to measure end-to-
+end latency in multi-step speculative decoding systems. SpecTr first drafts K i.i.d. paths of length L
+autoregressively from the draft model to form a draft tree, and then incrementally uses any OTLP
+solver (with n being set to the number of child nodes) to advance from the root of the tree to child
+nodes, until it lands off the tree. We use global resolution for our OTLP solver with k = 100 for top-k
+draft sampling, and when it fails, we resort to standard sampling from p. We run our experiments
+on Gemma-27B/2B with temperature 1.0 target sampling on the same dataset as our solve time
+experiments. Our results for K = 2, 3, 4 and L = 8 are shown in Table 4.
+K
+Block efficiency
+Walltime speedup
+(tokens/Mp call)
+(relative to vanilla)
+2
+2.23
+1.84
+3
+2.54
+1.89
+4
+2.65
+1.98
+Table 4: Block efficiency (number of decoded tokens per call to target model) in and walltime speedup
+(over vanilla autoregressive decoding) for SpecTr with global resolution under different values of K
+(number of i.i.d. paths). Experiments are run on Gemma-27B/2B with L = 8.
+Our walltime speedups in the best setting (K = 4) are nearly 2× better than vanilla decoding. We
+also emphasize that these numbers are highly conservative estimates. Unlike previous OTLP solvers
+used in the SpecTr framework, global resolution is situational: it is provably nearly optimal, but
+cannot always be used. This means the walltime and efficiency numbers above can be improved
+significantly by using other OTLP solvers like K-SEQ (Sun et al., 2023) or vocabulary truncation
+(Khisti et al., 2025) when global resolution fails, rather than our simple p-sampling heuristic (which
+is a valid OTLP solver, but has poor acceptances). Furthermore, by modifying the choice of k in
+top-k draft sampling, one might be able to use global resolution to get high acceptances in failure
+scenarios for other k. We leave such selection of OTLP solvers and their parameters to future work.
+We also theoretically examine the properties of error compounding in multi-step setups. We observe
+that the multi-step error scales approximately linearly with the draft block length L.
+Theorem R.1 (Multi-Step Error). Let pL(·) denote the distribution of the next L tokens, under
+autoregressive decoding from the target model. Let c
+pL(·) denote the same joint distribution, but now
+under decoding by global resolution with error tolerance τ. Then ∥pL −c
+pL∥1 ≤15Lτ.
+Proof. For each j = 0, . . . , L, define p(j)
+L to be the distribution of the next L tokens, under autore-
+gressive sampling from the target model for the first j tokens and then decoding by global resolution
+with tolerance τ thereafter. We use the shorthand notation a1:L to denote a sequence of L tokens
+(a1, . . . , aL) in VL, with a1:i denote the slice of the first i tokens and a1:0 = ∅. By applying the
+Triangle Inequality, it suffices to show for each j = 0, . . . , L −1 that
+p(j+1)
+L
+−p(j)
+L
+
+1 =
+X
+a1:L∈VL
+p(j+1)
+L
+(a1:L) −p(j)
+L (a1:L)
+ ≤15τ,
+(138)
+as then adding up these L inequalities gives the desired upper bound of 15τL.
+To prove this, observe for any a1:L that
+p(j+1)
+L
+(a1:L) −p(j)
+L (a1:L)
+
+(139)
+=
+
+jY
+i=0
+p(ai+1|a1:i)
+L−1
+Y
+i=j+1
+bp(ai+1|a1:i) −
+j−1
+Y
+i=0
+p(ai+1|a1:i)
+L−1
+Y
+i=j
+bp(ai+1|a1:i)
+
+(140)
+=
+
+
+j−1
+Y
+i=0
+p(ai+1|a1:i)
+L−1
+Y
+i=j+1
+bp(ai+1|a1:i)
+
+· |bp(aj+1|a1:j) −p(aj+1|a1:j)| ,
+(141)
+32
+
+
+--- Page 33 ---
+where p(·|·) and bp(·|·) are the conditional next-token distributions that induce the joint distributions
+pL, c
+pL. By the global resolution approximation guarantee on L1 target distribution error at the end of
+Section 6.3, we see that each ∥p(·|a1:i) −bp(·|a1:i)∥1 ≤15τ. Therefore, summing the above bound
+over all a1:L ∈VL gives the desired bound. Below, our sole inequality uses the L1 approximation
+bound, and the third line cancels out the summation of bp products over aj+2:L to one.
+X
+a1:L∈VL
+p(j+1)
+L
+(a1:L) −p(j)
+L (a1:L)
+
+(142)
+=
+X
+a1:L∈VL
+
+
+j−1
+Y
+i=0
+p(ai+1|a1:i)
+L−1
+Y
+i=j+1
+bp(ai+1|a1:i)
+
+· |bp(aj+1|a1:j) −p(aj+1|a1:j)|
+(143)
+=
+X
+a1:j+1∈Vj+1
+ j−1
+Y
+i=0
+p(ai+1|a1:i)
+!
+· |bp(aj+1|a1:j) −p(aj+1|a1:j)|
+(144)
+=
+X
+a1:j∈Vj+1
+
+
+j−1
+Y
+i=0
+p(ai+1|a1:i) ·
+
+X
+aj+1∈V
+|bp(aj+1|a1:j) −p(aj+1|a1:j)|
+
+
+
+
+(145)
+≤
+X
+a1:j∈Vj+1
+15τ
+j−1
+Y
+i=0
+p(ai+1|a1:i) = 15τ
+X
+a1:j∈Vj+1
+j−1
+Y
+i=0
+p(ai+1|a1:i) = 15τ.
+(146)
+This completes the proof of the multi-step compounding error.
+S
+GENERALIZING TO NON-IID DRAFTS
+Here, we describe the potential of extending global resolution to non-i.i.d. drafting frameworks.
+We consider three regimes: sampling from a single distribution without replacement, sampling
+n = 2 independent non-identical draft models, and sampling n ≥2 independent non-identical draft
+models. In Table 5, we examine the three-step breakdown of global resolution from the beginning of
+Section 6. For each of the three regimes, we classify its extension to each of the three steps under Yes
+(extension is immediate), Possible (extension is likely possible but requires additional work), and No
+(fundamental roadblock prevents the approach from going through).
+Drafting
+Step 1
+Step 2
+Step 3
+Sampling without replacement
+Yes
+Yes
+Possible
+n = 2 independent and distinct
+Yes
+Possible
+Possible
+n ≥3 independent and distinct
+No
+No
+Possible
+Table 5: Extending global resolution to three non-i.i.d. drafting regimes. Yes means the extension is
+immediate; Possible means it requires some work; No means there is a major obstacle.
+We first cover step 1: the computation of H∗. In sampling without replacement, this is straightforward
+by following the O(V log V + nV ) algorithm in Theorem 4 and Section 4.2.2 of Hu et al. (2025).
+For n = 2 distinct independent drafts, this is now possible following our reduction to QBPO in
+Section D. However, for n ≥3 distinct independent drafts, this QBPO reduction no longer holds.
+While our work in Section C shows this is still an instance of submodular minimization, the most
+efficient algorithms (Iwata, 2008) would require at least O(V 5 log V ) work, which is infeasible for
+most vocabularies. Approximating H∗is possible, but this is a totally separate direction of work, and
+ensuring that these H∗approximations give a strong bound on the final error may be difficult.
+Now, we cover step 2: the calculation of outer residuals pi. The key idea here is that the construction
+of the outer residual LP (Section G) and the greedy polymatroid algorithm to get pi (Section O) only
+rely on the fact that ψ is submodular, and then we can compute min ψ terms and take consecutive
+differences to get pi. For sampling without replacement, as in the above paragraph, the algorithm
+from Hu et al. (2025) facilitates the same approach and even allows the O(V log V ) optimization
+(cumulative minimums) at the end of Section 6.1 to hold. For n = 2 distinct independent drafts, the
+only roadblock is that computing consecutive differences of min ψ terms may be costly without an
+33
+
+
+--- Page 34 ---
+approach like cumulative minimums, so some additional work is required on this front. For n ≥3
+distinct independent drafts, the runtime concerns in the above paragraph again prevent us from even
+computing a single min ψ term, so this again appears an intractable roadblock.
+Finally, we cover step 3: the convex minimization approach. On their own, nothing from Theorem 6.4
+and Theorem 6.5 inherently relies on the structure of the drafts, once pi and H∗are solved for in steps
+1 and 2. The only dependence on drafting comes in computing provable error bounds and selecting
+the truncation set T. For all three drafting regimes, given that there is a simple form for the sum of
+pdraft over Cartesian products of sets (which are used in tunable error bounds), it seems highly likely
+that this approach could work with some modifications.
+To summarize, sampling without replacement seems almost immediately tractable for global reso-
+lution, and so does n = 2 independent distinct drafts with some additional work on outer residual
+computations. However, n ≥3 independent distinct drafts seems intractable due to the higher-degree
+submodular minimization bottleneck, and would likely require a different approach.
+We also note that while global resolution requires all three of these steps to go through, our other
+baseline solvers do not. General LP and max-flow solves require none of these steps, and optimized
+max-flow only requires step 1 (and none of these assume any information about the structure of pdraft).
+Thus, in all these drafting regimes, these methods can be used after top-k draft sampling reduces the
+OTLP size.
+34
