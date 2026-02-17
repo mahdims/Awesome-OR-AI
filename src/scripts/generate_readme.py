@@ -42,12 +42,23 @@ STATUS_EMOJI = {
     "declining": "📉",
     "merged":    "🔀",
     "split":     "🔀",
+    "new":       "🆕",
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _clean_id(arxiv_id: str) -> str:
-    return re.sub(r'v\d+$', '', arxiv_id.strip())
+    s = arxiv_id.strip()
+    # Strip markdown link format: [2602.04529](http://arxiv.org/abs/...)
+    m = re.match(r'\[([^\]]+)\]', s)
+    if m:
+        s = m.group(1)
+    return re.sub(r'v\d+$', '', s)
+
+
+def _readable_tag(tag: str) -> str:
+    """Convert snake_case internal tag to human-readable Title Case."""
+    return tag.replace("_", " ").title()
 
 
 def _parse(s: str):
@@ -232,8 +243,8 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
         lines.append("| Status | Front Name | Papers | Key Methods | Problems |")
         lines.append("|--------|-----------|--------|-------------|----------|")
         for f in fronts:
-            methods_str  = ", ".join(f["methods"])  if f["methods"]  else "—"
-            problems_str = ", ".join(f["problems"]) if f["problems"] else "—"
+            methods_str  = ", ".join(_readable_tag(m) for m in f["methods"])  if f["methods"]  else "—"
+            problems_str = ", ".join(_readable_tag(p) for p in f["problems"]) if f["problems"] else "—"
             lines.append(
                 f"| {f['status'].capitalize()} "
                 f"| {f['name']} | {f['size']} "
