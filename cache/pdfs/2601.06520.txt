@@ -1,0 +1,2046 @@
+--- Page 1 ---
+SkyNomad: On Using Multi-Region Spot Instances to
+Minimize AI Batch Job Cost
+Zhifei Li∗†, Tian Xia∗†, Ziming Mao†, Zihan Zhou¶, Ethan J. Jackson†, Jamison Kerney†, Zhanghao Wu†,
+Pratik Mishra§, Yi Xu†, Yifan Qiao†, Scott Shenker†,⋄, Ion Stoica†
+†UC Berkeley
+¶Shanghai Jiao Tong University
+§AMD
+⋄ICSI
+Abstract
+AI batch jobs such as model training, inference pipelines, and
+data analytics require substantial GPU resources and often
+need to finish before a deadline. Spot instances offer 3–10×
+lower cost than on-demand instances, but their unpredictable
+availability makes meeting deadlines difficult. Existing sys-
+tems either rely solely on spot instances and risk deadline vio-
+lations, or operate in simplified single-region settings. These
+approaches overlook substantial spatial and temporal hetero-
+geneity in spot availability, lifetimes, and prices. We show
+that exploiting such heterogeneity to access more spot capac-
+ity is the key to reduce the job execution cost.
+We present SkyNomad, a multi-region scheduling system
+that maximizes spot usage and minimizes cost while guar-
+anteeing deadlines. SkyNomad uses lightweight probing to
+estimate availability, predicts spot lifetimes, accounts for mi-
+gration cost, and unifies regional characteristics and deadline
+pressure into a monetary cost model that guides scheduling
+decisions. Our evaluation shows that SkyNomad achieves
+1.25–3.96× cost savings in real cloud deployments and per-
+forms within 10% cost differences of an optimal policy in
+simulation, while consistently meeting deadlines.
+1
+Introduction
+The emerging generative AI workloads demand unprece-
+dented computational capacity.
+Large-scale model train-
+ing, offline inference, and data analytics all require substan-
+tial GPU resources and often take hours or days to com-
+plete [9, 11, 20, 25, 44]. These long-running jobs, herein
+referred to as AI batch jobs, often need to be completed
+by a given deadline. Such deadlines arise naturally and are
+workload-dependent, for example, periodic data processing
+must complete within a fixed time window (e.g., minutes to
+hours) to ensure that downstream analytics or dashboards
+reflect real-time data.
+∗Equal Contributions.
+SkyNomad
+Spot
+On-demand
+Progress
+Migration
+Spot 
+us-west-2
+Spot 
+eu-west-3
+On-demand 
+ap-east-1
+Figure 1: SkyNomad Overview. SkyNomad migrates AI batch
+jobs across multiple regions to harness available spot in-
+stances and minimize the cost. It monitors job progress and
+switches to on-demand instances when spot capacity is un-
+available, ensuring that the job completes before its deadline.
+As model sizes and system complexity grow, these jobs
+become increasingly costly to operate. In this paper, we fo-
+cus on minimizing the cost of running AI batch jobs while
+still meeting their deadlines. Many of these jobs assume they
+are interruptible and must tolerate failures (§3.1), because
+such jobs often run for long periods, and GPU instances can
+experience failures at non-negligible rates [16,39], the like-
+lihood of a failure during execution is significant. To avoid
+wasting computation when failures occur, these jobs typically
+implement checkpoint-based recovery [18,36–38,46,47,49].
+To reduce cost, we can take advantage of a job’s slack
+time, which is the amount of delay it can tolerate before
+risking its deadline, and the preemptible nature of these jobs
+by using spot instances. Cloud providers offer these instances
+as a cheaper alternative to on-demand instances, typically
+3–10× lower in cost [3]. However, they are subject to two
+limitations: preemption by the cloud provider and temporary
+unavailability in the spot market. Therefore, spot capacity
+alone cannot guarantee that deadlines are met and must be
+used together with on-demand instances. To maximize cost
+savings while still meeting the deadline, we need to consider
+1
+arXiv:2601.06520v1  [cs.DC]  10 Jan 2026
+
+
+--- Page 2 ---
+where and when to use spot instances due to the heterogeneity
+they exhibit, spatially across regions and temporally across
+time. When chosen properly, it is possible to access more spot
+capacity at lower prices and further reduce cost, especially
+for AI batch jobs that use GPUs and experience frequent
+preemptions [32]. Existing work (§2, [4, 8, 13, 23, 43, 50])
+explores this opportunity but does not jointly consider the
+spatial and temporal dimensions of spot heterogeneity. Next,
+we describe these two forms of heterogeneity in detail.
+Spatial heterogeneity across regions.
+In public cloud
+providers, availability of spot instances can differ widely
+across cloud regions (§3.2.1). For example, eu-central-1
+may still have spot capacity while us-east-1 has none. By
+leveraging spot instances across regions, a job can continue
+running on spot to make progress even when one region runs
+out of capacity, and benefiting from more cost savings. Pric-
+ing strategies also vary based on supply and usage patterns
+across regions, and can differ by up to 5× [5, 14] (§3.2.3),
+creating opportunities to proactively migrate to cheaper re-
+gions to save costs. However, combining these opportunities
+is challenging. Region availability is unknown ahead of time,
+and the scheduler must navigate multi-dimensional tradeoffs
+when availability and price diverge across regions, such as se-
+lecting between a high-cost region with high availability and a
+low-cost region with limited capacity. In addition, migrating
+jobs across regions with large checkpoints incurs non-trivial
+egress cost [1, 12, 34], so migration must be justified with
+improved availability or a lower price [26,42].
+Temporal heterogeneity across time. Spot instance life-
+times, meaning the duration between provisioning and pre-
+emption, vary significantly across time (§3.2.2). We observe
+that short spot lifetimes, caused by frequent preemptions, of-
+ten occur in short volatile periods. It is beneficial to avoid
+these periods and let the job use spot instances with longer
+lifetimes, which amortizes cold start costs (the cost to resume
+from the last checkpoint) and improves goodput. However,
+predicting spot lifetimes remains challenging. Meanwhile,
+spot availability can change significantly over time (§3.2.1)
+and further complicate the scheduling. Early in the schedule,
+the policy can afford to wait for future periods with higher
+availability, running during those periods and pausing when
+unavailable to increase spot usage. As time passes and the
+deadline becomes tighter, the policy must become more con-
+servative and prioritize steady progress using the resources
+available at the moment, trading off the possibility of better
+availability later against the need to ensure timely completion.
+In summary, real cloud environments are complex and ex-
+hibit both spatial and temporal heterogeneity. Prior deadline-
+aware efforts [50] explore this problem but consider only a
+single region, where many of these challenges do not arise.
+Extending to multiple regions is fundamentally harder be-
+cause spatial heterogeneity must be leveraged while account-
+ing for migration cost, and temporal heterogeneity must be
+evaluated across regions. A scheduler operating under these
+conditions must decide, at any point in time, whether to (i)
+use a spot instance in the current region or wait for one to
+appear, (ii) migrate to another region where spot capacity is
+available, or (iii) use an always-available on-demand instance
+to make progress to meet the deadline.
+We design a multi-region spot scheduling policy to address
+the aforementioned challenges. First, we quantify the value
+of the remaining progress in terms of monetary cost (§4.5).
+We estimate the expected cost of finishing the job on time
+given the current deadline pressure, which guides when the
+job can safely pause to wait for a better opportunity. Sec-
+ond, spot instances make progress only during their effective
+time, which is the uptime after cold start. To capture this,
+we use online regional availability probing (§4.3) to predict
+spot lifetimes (§4.4) and account for progress value only after
+the cold start, which helps avoid regions with volatile avail-
+ability and frequent preemptions. Third, we compare this
+value against the operational cost in each region to guide the
+policy decisions (§4.6), allowing the system to continuously
+evaluate regions and opportunistically migrate when a more
+cost-effective region appears (§4.7).
+We implement this policy in SkyNomad (Figure 1), an AI
+batch job execution system that draws spot capacity from
+multiple regions to complete jobs within deadlines. Users
+specify jobs with periodic checkpointing, and SkyNomad mi-
+grates both computation and checkpoints across regions while
+following the policy’s decisions to minimize cost.
+To evaluate SkyNomad, we deploy it on public clouds to
+run real batch jobs and experience real-time preemptions
+and migrations. As shown in §6.1, SkyNomad achieves 1.25–
+3.96× cost savings while meeting deadlines, compared to
+both prior research systems (e.g., Uniform Progress [50])
+and production systems (e.g., Amazon SageMaker [4]). We
+further conduct a comprehensive evaluation by replaying real
+preemption traces and comparing against existing policies,
+showing that SkyNomad stays within 10% of an omniscient
+policy across a wide range of configurations. These results
+demonstrate that, by leveraging deadline slack and drawing
+spot capacity from multiple regions, it is feasible to drastically
+reduce the cost of AI batch jobs.
+In summary, this paper makes three contributions:
+• Identifying opportunities to leverage spot instances
+across regions to reduce the cost of AI batch jobs.
+• The design of a scheduling policy that draws spot capac-
+ity from multiple regions while guaranteeing deadlines.
+• SkyNomad, an AI batch job execution system that runs
+jobs across regions with significant cost savings.
+2
+Existing Systems for AI Batch Jobs
+In this section, we review several existing systems for run-
+ning batch jobs in the cloud and discuss their limitations and
+missed opportunities for cost reduction (Table 1).
+2
+
+
+--- Page 3 ---
+Deadline
+Guarantee
+Spot
+Instance
+Multi-
+Region
+SageMaker [4]
+✓
+×
+×
+Spot Only [4,13,43]
+×
+✓
+×
+SkyServe [32]
+×
+✓
+✓
+Uniform Progress [50]
+✓
+✓
+×
+SkyNomad
+✓
+✓
+✓
+Table 1: Comparison of systems. Spot Only Systems: Sage-
+Maker Managed Spot [4], Parcae [13], and Bamboo [43].
+2.1
+On-Demand Only Systems
+The most common approach is to launch on-demand instances
+in the cloud, run the job to completion, and then terminate the
+instances. One example is AWS SageMaker [4], a managed
+execution system for AI batch jobs (we discuss its managed
+spot support later). This approach guarantees timely execution
+before the deadline and avoids most failures, which simplifies
+system design. However, it is very costly. Because on-demand
+execution ignores slack, jobs often finish well before their
+deadlines, incurring unnecessary cost.
+2.2
+Spot Systems
+Prior work [4,13,32,43,53,56] uses spot to reduce cost. These
+systems fall into two categories: (1) batch-oriented spot-only
+systems and (2) online serving multi-region systems.
+Spot-only systems fail to meet deadlines. Several existing
+systems like SageMaker Managed Spot [4], Parcae [13] and
+Bamboo [43] rely exclusively on spot instances. This works
+well when spot availability is high, but execution can be de-
+layed indefinitely when spot capacity becomes scarce. Prior
+work [32] shows that, in the worst case, a region can run out
+of spot for 72 hours, during which the job makes no progress.
+Online systems target a different workload. Systems such
+as SkyServe [32] run online LLM serving on spot instances
+across multiple regions and prioritize responsiveness, pro-
+visioning on-demand when spot is insufficient to maintain
+latency SLOs. Because they process requests immediately
+and cannot exploit slack, they miss cost-saving opportunities
+and are unsuitable for batch jobs.
+2.3
+Deadline-Aware Systems
+Uniform Progress (UP) [50] is a deadline-aware policy that
+uses on-demand and spot instances interchangeably. It uses
+spot when available, falls back to on-demand when capacity
+is scarce or slack is low, and spreads job progress evenly over
+time to meet the deadline. While simple, UP ignores temporal
+variation in spot availability and runs in a single region; when
+that region has no spot capacity, it must rely on on-demand,
+pushing cost close to that of always using on-demand (§6.1).
+UP assumes that spot availability is sufficiently stable
+within a single region to allow steady progress. Our anal-
+ysis in §3 shows that real-world availability and lifetime are
+highly non-uniform across both regions and time, making
+single-region policies inherently inefficient. Therefore, a
+more effective policy could leverage multiple regions to ac-
+cess additional spot capacity and further reduce cost [6].
+3
+Background and Motivation
+3.1
+Characteristics of AI Batch Jobs
+Deadlines and slack time. AI batch jobs are typically inter-
+nal workloads that do not directly face end users. Unlike on-
+line serving, which prioritizes responsiveness and must meet
+tight service-level objectives (SLOs), AI batch jobs often run
+for long periods and do not require immediate response. Ex-
+amples include model training and large-scale data analytics
+using AI models. Although they are not latency sensitive,
+such jobs usually have deadlines and cannot be delayed in-
+definitely. For instance, model training must finish before
+a scheduled release, and daily data pipelines must complete
+before the next cycle begins. In this paper, we assume jobs
+have an explicit deadline specified in advance, and the job
+must finish before it. We also assume that the job’s execution
+time is shorter than the time available before the deadline,
+which creates slack time, representing the amount of delay
+the job can tolerate before risking a deadline violation.
+Interruptible. Due to their long-running nature, batch jobs
+are generally designed to be interruptible. They must toler-
+ate unexpected failures without losing significant progress.
+Training jobs typically perform periodic checkpointing, sav-
+ing model parameters and optimizer states as recovery
+points [36, 57]. If a failure occurs, the job resumes from
+the most recent checkpoint. Batch inference and data pro-
+cessing workflows can often be decomposed into independent
+units whose outputs are stored incrementally, with the pro-
+cessed data index serving as a lightweight checkpoint. This
+allows failures to be handled by restarting from unprocessed
+units rather than re-executing the entire dataset.
+Cold start delay. As model sizes grow, batch jobs incur a
+non-negligible cold start delay both at job launch and during
+every recovery. This delay includes instance provisioning,
+dependency installation, and downloading and loading model
+weights onto GPUs. For stateful jobs such as model training,
+it also includes transferring job state when recovering in a
+new location. For example, starting supervised fine-tuning
+for a 14B-parameter model on 8 GPUs can take 5–10 minutes.
+These cold start delays significantly affect overall progress
+and must be accounted for when designing scheduling policy.
+3.2
+Heterogeneity of Spot Instances
+Cloud providers offer a special class of instances, spot in-
+stances, as a cost-efficient option. They are typically 3–10×
+cheaper [28, 32, 50] than regular on-demand instances but
+3
+
+
+--- Page 4 ---
+10/04
+10/05
+10/06
+10/07
+10/08
+10/09
+10/10
+Timestamp
+us-west1-b  ($18.98)
+us-west1-a  ($18.98)
+us-east4-b  ($14.85)
+us-central1-a  ($18.98)
+europe-west1-c  ($16.36)
+asia-southeast1-c  ($19.26)
+asia-southeast1-b  ($19.26)
+asia-south2-b  ($69.91)
+100
+101
+102
+Spot Lifetime (hours)
+Figure 2: Spot availability and lifetime vary widely across regions. Left: availability for 16 a3-highgpu-1g (1×H100) instances
+on GCP over 7 days, shown for 8 representative zones out of the 13 zones we collected. The y-axis shows how many instances
+are available at each moment. Right: box plot of the lifetime distribution, log-scaled. We consider a job that uses 16 instances in
+a gang-scheduled manner: the entire job is preempted if any single instance is preempted, and it resumes only when the full set
+of 16 instances becomes available again. We plot the resulting lifetimes under this scenario.
+come with the risk of being preempted at any time by the
+provider. Spot instances exhibit both spatial heterogeneity
+across regions and temporal heterogeneity over time, across
+multiple dimensions. Next, we describe these dimensions and
+the challenges in harnessing them to reduce cost.
+3.2.1
+Non-Uniform Spot Availability Patterns
+Spot availability represents the periods during which a region
+has accessible spot capacity. An oracle scheduler with perfect
+future knowledge of availability could almost always run the
+job entirely on spot instances, although not necessarily within
+the same region, achieving significant cost reductions. In
+practice, however, availability patterns vary across regions
+and fluctuate over time. When availability is unknown ahead
+of time, it becomes difficult to characterize each region and
+decide which one is the best region at any moment.
+We collect spot availability traces for 16 a3-highgpu-1g
+instances (1×H100) across 13 GCP regions.
+Figure 2
+shows 8 representative examples. Different regions exhibit
+distinct availability patterns: some are generally available
+(asia-south2-b), some are mostly available but experi-
+ence frequent preemptions (us-central1-a), and some are
+largely unavailable (us-west1-b). We find that simultaneous
+preemptions across regions are rare, consistent with obser-
+vations in [27, 32]. This makes regions complementary: at
+almost any given time, at least one region has available spot
+capacity. Prior work [32] shows that the fraction of time in
+which spot instances are available quickly approaches 99%
+once more than four regions are included, and we observed
+similar behavior for 6 regions in our trace.
+Beyond cross-region heterogeneity, availability within a
+single region also exhibits large variance.
+For example,
+asia-southeast1-c is highly available in the first half
+of the trace but completely unavailable in the second half.
+us-east4-b shows a clear diurnal pattern, being available
+during nighttime and unavailable during daytime. These ob-
+servations indicate that no single perfect region is consistently
+available (we discuss the limitation of asia-south2-b in
+§3.2.3). As a result, a single-region policy is fundamentally
+limited, and handling non-uniform spot availability patterns
+becomes the central challenge.
+3.2.2
+Highly Variable Spot Lifetimes
+Beyond availability, spot lifetime is another critical metric.
+It is defined as the duration for which a spot instance can be
+used before it is preempted. Because cold start time is non-
+negligible and does not contribute to job progress, short-lived
+spot instances provide little value if their lifetime is close to
+or smaller than the cold start delay. Let d denote the cold start
+time. If a spot instance has a lifetime t0, then the effective time
+during which the job progresses is t0 −d. When t0 approaches
+d, the job achieves very low goodput since most of the time
+is spent restarting rather than computing.
+However, lifetime distributions are highly variable, across
+both regions and time. For example, Figure 2 shows the
+distribution of spot lifetimes for 8 regions: median lifetimes
+range from under 1 hour (europe-west1-c) to over 20 hours
+(asia-south2-b), spanning more than an order of magnitude.
+Selecting a region with a long upcoming spot lifetime is
+essential because it reduces the number of recoveries and
+amortizes cold start overhead over longer execution periods.
+We also observe that many spot preemptions occur within
+short time spans, which we refer to as volatile periods. These
+periods produce many short-lived spot instances that become
+available briefly and are preempted almost immediately. For
+example, in region us-central1-a, 90% of spot preemp-
+tions occur within 85 hours of a 15-day period.
+Conversely, we observe that spot lifetimes follow a heavy-
+tailed distribution [24,30]: the longer an instance has survived,
+the longer its expected remaining lifetime tends to be. As
+illustrated in Figure 3, the near-linear decay in log–log space
+(R2 ≈0.78–0.90) confirms this pattern: most instances are
+preempted within a few hours, yet a meaningful tail survives
+for tens of hours or more.
+4
+
+
+--- Page 5 ---
+100
+101
+102
+Spot Lifetime (hours)
+100
+101
+102
+Frequency
+slope=-0.66
+R2=0.780
+(a) 16×H100 on GCP.
+100
+101
+102
+Spot Lifetime (hours)
+100
+101
+102
+Frequency
+slope=-0.80
+R2=0.903
+(b) 1×V100 on AWS.
+Figure 3: Spot lifetime distributions on different accelerators.
+Scatter points show frequency counts in equal-width log10
+bins, and solid lines are least-squares fits in log–log space,
+showing a clear heavy-tailed pattern [10,31].
+3.2.3
+Pricing Differences and Proactive Migration
+Another form of heterogeneity resides in the pricing strategies.
+As shown in Figure 4a, prices for the same instance type can
+differ significantly across regions, reaching up to 5×. In
+most clouds (including AWS [5] and GCP [15]), prices also
+fluctuate over time and can vary by up to 1.7× within only
+12 days. Prior work [32,50] often overlooks these differences
+and assumes static pricing, which oversimplifies the problem.
+Beyond instance prices, cloud providers impose additional
+charges for cross-region data transfers. For jobs that maintain
+large checkpoints, such as training workloads, the checkpoint
+must be moved whenever the job migrates to a new region.
+This movement incurs non-negligible egress costs [1,12,34],
+which vary depending on the source region. As shown in Fig-
+ure 4b, egress costs can differ by up to 7× across regions. For
+example, a 14B-parameter fine-tuning job may need to move
+about 500GB of replicated checkpoints; this costs roughly
+$10 from US to Europe but around $40 from Asia to US.
+Migrate to a region with a cheaper spot price may sound
+appealing, even when the current spot instance has not been
+preempted. This form of price-aware proactive migration,
+however, is only beneficial when the migration cost is justified
+by a sufficiently long spot lifetime in the cheaper region. Let
+the price in region i be pi, the migration cost between regions i
+and j be Ci,j, the expected spot lifetime in region i be ti, and d
+be the cold start delay. Suppose the job is currently running on
+a spot instance in region a. When a cheaper region b becomes
+available, migrating is beneficial only if Ca,b ≤pa−pb
+tb−d .
+However, a single region rarely offers the best availability,
+the longest lifetime, and the lowest price simultaneously. For
+example, in §2.3, while mostly available, asia-south2-b is
+4× more expensive than the cheapest region and approaches
+the on-demand price. In contrast, us-east4-b offers the
+lowest cost but experiences frequent preemptions and volatile
+periods. Along with migration cost, trading off among these
+four metrics creates a vast combinatorial decision space.
+10-20
+10-27
+11-03
+11-10
+Timestamp
+5.00
+10.00
+15.00
+20.00
+25.00
+30.00
+Spot Price ($ / hour)
+ap-northeast-1a
+ap-northeast-1c
+ap-south-1a
+ca-central-1a
+eu-central-1c
+eu-west-1c
+us-east-1a
+us-west-2a
+On-Demand
+min: 21.96
+(a) Spot prices.
+US EU CAMX IL AP ME SAAF
+Source Region
+0.00
+0.02
+0.04
+0.06
+0.08
+0.10
+0.12
+0.14
+Avg Transfer Cost ($/GB)
+(b) Egress costs.
+Figure 4: Cost differences across regions and time. (a) Spot
+prices for the same instance type. The dashed line shows the
+cheapest on-demand price. (b) Egress costs determined by
+the source region and ranging from $0.02/GB (US, EU) to
+$0.14/GB (SA, AF). Abbreviations follow AWS region nam-
+ing conventions (e.g., AF for Africa, SA for South America).
+4
+Design
+We now present the design of SkyNomad (Figure 5, Algo-
+rithm 1) to fully harness spot instances for AI batch jobs by
+accounting for spatial and temporal heterogeneity in availabil-
+ity, lifetime, and pricing (§3.2). To stay aware of this hetero-
+geneity, SkyNomad continuously collects real-time informa-
+tion from each region (§4.3) and uses it together with survival
+analysis [2] to predict spot lifetimes (§4.4). To decide whether
+current spot availability is worth taking, SkyNomad consid-
+ers the current deadline pressure and estimates the value (i.e,
+expected monetary cost) of the remaining progress (§4.5),
+which it uses as a reference when choosing to take or wait
+for a better opportunity. Finally, SkyNomad applies a unified
+cost model (§4.6) to compute the utility of each region under
+the current deadline pressure and proactively migrates to a
+better option when available, or pause when the slack time is
+sufficient for better future opportunities (§4.7).
+4.1
+Problem Formulation
+We consider a single batch job, such as model training, that
+runs on a fixed group of instances at any time, with all in-
+stances in the group placed in the same region to benefit from
+high-bandwidth networking. This contrasts with autoscal-
+ing designs that distribute work across a dynamic number of
+instances and multiple regions simultaneously (we discuss
+this further in §8). We assume all instances in the group are
+gang-scheduled, and the preemption of any instance is treated
+as preemption of the entire group, without assuming any spe-
+cific partial recovery strategy, which maximizes compatibility.
+Without loss of generality, we focus on the single-instance
+case in the remainder of the paper, as gang-scheduling allows
+instance groups to be treated as atomic units.
+5
+
+
+--- Page 6 ---
+Unified Cost Model (§4.6)
+Region 1
+Scheduler 
+(§4.7)
+Utility 1
+Utility 2
+Operational 
+Cost
+GPUs: $23 / hour 
+Egress: $80 / TB
+Availability 
+Prober (§4.3)
+Spot Lifetime 
+Predictor (§4.4)
+Region 2
+Operational 
+Cost
+GPUs: $33 / hour 
+Egress: $20 / TB
+Availability 
+Prober (§4.3)
+Spot Lifetime 
+Predictor (§4.4)
+Scheduling Events 
+(Launch / Terminate , §4.1)
+Future Progress 
+Value Estim (§4.5)
+Job’s 
+Deadline
+Current 
+Progress
+Figure 5: Design overview of SkyNomad.
+The job checkpoints periodically, enabling it to pause and
+resume in a different region after an interruption. We assume
+the execution time of the job can be estimated a priori and
+denote it as P units of work. At any time, the job may either
+remain idle, using slack time to wait for a better opportunity,
+or run on an instance. Once it starts or resumes on a new
+instance, it incurs a cold start delay of d time units (§3.1)
+before becoming ready to execute the job. Let p(t) denote
+the total progress made by time t. The rate at which the job
+makes progress depends on the system state:
+dp
+dt =
+(
+1
+Ready
+0
+Otherwise (Cold Start or Idle)
+(1)
+The job must complete before a deadline T, that is, it must
+satisfy p(T) ≥P. Our goal is to minimize the total cost C
+while meeting the deadline, namely argminC s.t. p(T) ≥P.
+Let R denote the set of all regions, each offering both spot
+and on-demand instances. The job can run in any region in R .
+At any time t, the system is in some state s = (r,m), where
+r ∈R is the current job location and m ∈{idle,spot,od} is
+the current mode. Mode idle means the job is waiting with
+no instance running; spot and od mean the job is running on
+a spot or on-demand instance, respectively. Spot instances are
+cheaper but may be preempted, whereas on-demand instances
+are always available but more expensive. The price for state
+s = (r,m) at time t is denoted C(r,m)(t).
+State changes occur through three events:
+• Launch(r,m): Attempts to launch an instance in region r
+with mode m ∈{spot,od}. This action always succeeds
+for m = od, and succeeds for m = spot only if spot
+capacity is available, which is unknown until the attempt.
+A successful launch migrates the checkpoint to r if it is
+not already there and sets the current state to (r,m).
+• Terminate: Stops the current instance, setting m ←
+idle while keeping r unchanged, indicating that the
+checkpoint remains in the same region.
+• Preemption: An external event that the cloud reclaims
+the spot instance, with the same effect as Terminate.
+Given the above events, the system follows a trajectory
+that yields a total cost C, consisting of two parts: compute
+cost and migration cost as the job moves between regions.
+Compute cost accumulates while running, at the price of the
+current region: Ccompute =
+R
+m̸=idleC(r,m)(t)dt.
+Migration cost is incurred each time r changes, i.e., when
+launching in a new region. Each such move requires trans-
+ferring the checkpoint, costing Eri→r j = eri→r j ·Sckpt, where
+eri→r j is the per-byte egress cost and Sckpt is the checkpoint
+size (we assume eri→ri = 0). If the job migrates through re-
+gions r0 →r1 →··· →rk, the total migration cost is Cmigrate =
+∑k
+i=1 Eri−1→ri. The total cost is thus C = Ccompute +Cmigrate.
+4.2
+Deadline-Aware Rules
+First, we establish several rules to ensure completion before
+the deadline without waste. These rules are adapted from [50]
+with a multi-region extension.
+Thrifty Rule. The job should remain idle once all work is
+completed. That is, when p(t) ≥P, it should be in a state
+s = (r,m) with m = idle.
+Safety Net Rule. When the job is idle and the remaining
+slack time is insufficient, it should switch to on-demand and
+stay on it until completion. Specifically, at time t, if T −t <
+P−p(t)+2d, the scheduler switch to on-demand to guarantee
+the deadline. The term 2d accounts for the cold start of the
+current launch and a potential fallback after a preemption.
+Multi-Region Fallback. In a multi-region setting where on-
+demand prices vary across regions, the fallback should choose
+the cheapest on-demand option when possible. Suppose the
+job is currently in region r0 when the safety net is triggered.
+We select the fallback region r as
+argmin
+r∈R
+
+C(r,od)(t)·(P−p(t)+d)+Er0→r
+
+(2)
+where the first term captures the on-demand cost in region r
+to finish the remaining work and the second term captures the
+migration cost to move the checkpoint from r0 to r.
+4.3
+Spot Availability Probing
+Given the heterogeneity of spot availability (§3.2.1), we use
+online availability probing to characterize each candidate re-
+gion and guide scheduling decisions. A probe is a launch
+request that starts an instance with the same GPU configu-
+ration and immediately terminates it if the launch succeeds,
+providing a cost-efficient way to measure regional availability.
+We periodically send probes to candidate regions, with the
+interval set to two hours based on observation showing that
+availability patterns remain stable within this window (Fig-
+ure 2). Unlike static historical traces that can become stale,
+probing provides real-time information during job execution.
+Virtual Instance. Based on probe results, we maintain a
+view of virtual instances, as if an instance were continuously
+6
+
+
+--- Page 7 ---
+running in each region and receiving real-time preemptions.
+This is motivated by the observation that allocation failures
+(the inability to launch new spot) are strongly correlated with
+preemption events [50]. For each region r, we build such a
+virtual instance view from observations of the form (ti,oi),
+where ti is a timestamp and oi ∈0,1 indicates availability. Ob-
+servations arise from four sources: (1) probes (success o = 1,
+failure o = 0), (2) Launch operations (success o = 1, failure
+o = 0), (3) preemption events (o = 0), and (4) Terminate
+operations when we proactively migrate away from a region
+(o = 0). This logical construct lets us infer when an instance
+would have been preempted without actually running it: when-
+ever availability changes from 1 to 0, that is, oi−1 = 1 and
+oi = 0. We treat such an event at time ti as a preemption of the
+virtual instance. Similarly, when availability changes from 0
+to 1, we treat it as a provisioning of the virtual instance.
+4.4
+Spot Lifetime Prediction
+As discussed in §3.2.2, knowing the future spot lifetime in
+each region helps the scheduler favor longer-lived spot in-
+stances, reducing the number of preemptions and amortizing
+both cold start overhead and migration cost. We predict this
+lifetime using the virtual instance trace in each region and, to
+incorporate the heavy-tailed distribution, condition our pre-
+diction on the current age of the virtual instance, defined as
+the time since its last preemption. We apply survival analysis
+to estimate the lifetime distribution, and further refine the
+model to account for sudden bursts of preemptions based on
+the observation of volatile periods.
+4.4.1
+Survival Analysis
+We first extract the historical lifetimes of the virtual instance,
+defined as each continuous period of availability. Each life-
+time begins when a probe or launch succeeds ((1) and (2) in
+§4.3) and ends either with an observed preemption (3) or is
+right-censored when we proactively migrate away from the
+region (4). This yields a set of virtual instance lifetimes. We
+use e(l) to denote the number of preemptions that occur at
+lifetime l (end with (3)), and c(l) to denote the number of
+proactive migrations that occur at lifetime l (end with (4)).
+Based on recent observations of the virtual instance, we
+first compute its age, denoted by a(t). For example, if at time
+t the last three probes succeeded and the fourth most recent
+failed, with a probe interval of two hours, then a(t) = 6 hours.
+Given this age, our goal is to predict how long the region will
+remain available. This requires estimating the conditional
+expected remaining lifetime E[L−a(t) | L > a(t)], where L
+is the random variable for lifetime. Directly estimating is
+complicated by censored data, so we adopt survival analysis.
+The key quantity in survival analysis is the hazard rate
+h(l), which is the instantaneous risk of termination at lifetime
+l given survival up to that point. We estimate h(l) using the
+Nelson-Aalen estimator [2]:
+h(l) = e(l)
+n(l) with n(l) = ∑
+x≥l
+(e(x)+c(x))
+(3)
+where e(l) is the number of preemptions observed at lifetime
+l, c(l) is the number of right-censored observations (proactive
+migrations) at lifetime l, and n(l) is the at-risk population,
+i.e., instances with lifetime at least l. Proactively migrated
+instances are right-censored: they contribute to n(l) but not
+e(l). This estimator is non-parametric, meaning it makes
+no distributional assumptions, and it naturally captures the
+heavy-tailed pattern: when long-lived instances exhibit lower
+preemption risk, fewer preemptions occur at larger l, so e(l)
+decreases and h(l) decreases with l.
+Summing h(l) yields the cumulative hazard H(l) =
+∑li≤l h(li), from which we derive the survival function S(l) =
+exp(−H(l)) = Pr(L > l). For an instance that has already
+survived to age a(t), its expected remaining lifetime is:
+¯L(a(t)) = E[L−a(t) | L > a(t)] =
+1
+S(a(t)) ∑
+li>a(t)
+S(li)
+(4)
+4.4.2
+Volatility and Risk Assessment
+To ensure steady progress, the scheduler must promptly de-
+tect volatile periods (§3.2.2) and avoid placing jobs in regions
+experiencing frequent preemptions. We achieve this by in-
+corporating volatility awareness into lifetime estimation and
+derive an adjusted survival function ˜S(l). We use ˜S in place
+of S when computing ¯L(a(t)), penalizing regions that are
+currently in such periods. The key idea is to compare ob-
+served preemptions against what the long-term hazard rate
+h(l) would predict: if a region experiences far more preemp-
+tions than expected, it is likely in a volatile period. For a time
+window W ending at the current time, we define the volatility
+ratio as γW =
+eW
+∑t∈W h(a(t)), where eW is the observed number
+of preemptions in W, and the denominator is the expected
+number, obtained by summing the hazard rate h at each obser-
+vation time in the window. When γW > 1, more preemptions
+occurred than expected, indicating a volatile period.
+We take γ∗= maxW=(t0 to t),t0∈[0,t) γW over all window
+lengths ending at the current time to conservatively capture
+the most severe preemption density at any time scale. We then
+adjust the survival curve by scaling the cumulative hazard:
+using ˜S(l) = exp(γ∗·−H(l)) to replace S(l) in eq. (4).
+4.5
+Future Progress Value Estimation
+With characterized spot behavior in every region, the question
+now becomes whether the current spot opportunity is worth
+taking or if it is better to pause and wait for a future one.
+To evaluate this, we establish the monetary value of future
+progress: by comparing the expected cost of making the same
+amount of progress in the future with the observed spot (or
+7
+
+
+--- Page 8 ---
+on-demand) operational cost at the moment, we can decide
+whether the system should use the current opportunity or wait.
+This evaluation should depend on the deadline pressure at
+time t, defined as the remaining progress to make divided by
+the remaining time before the deadline:
+θ(t) = P−p(t)
+T −t
+(5)
+as well as the average progress so far:
+˜θ(t) = p(t)
+t
+(6)
+Design Principles. We first propose several general princi-
+ples for evaluating the value of any progress:
+• Equilibrium anchoring: When the job has progressed
+as expected (θ(t) = ˜θ(t) = P
+T ), the policy should accept
+any available spot instances but avoid using on-demand
+instances. In this case, historical spot supply has been
+sufficient to meet the deadline, so if only on-demand
+capacity is available at the moment, it is better to wait
+rather than spend extra on it.
+• Monotonicity: Higher deadline pressure θ(t) should
+yield a higher value, since with less slack the policy must
+make progress to avoid risking a deadline violation.
+• Scale invariance: The evaluation should be consistent
+regardless of the absolute values of P and T, and depend
+only on their ratio.
+Value of Progress. Based on those principles, we estimate
+this value by directly comparing the deadline pressure with
+the average progress so far:
+V(t) = Cod · θ(t)
+˜θ(t)
+(7)
+where Cod = minrC(r,od) is the cheapest on-demand price
+across all regions (we assume on-demand prices do not change
+across time). It satisfies all three principles:
+• Equilibrium anchoring:
+When θ(t) = ˜θ(t), the
+progress is evaluated as Cod. We assume all spot in-
+stances are cheaper than on-demand instances for sim-
+plicity, so the policy will accept any available spot in-
+stances, as they make progress at lower cost, while avoid-
+ing all on-demand instances, as Cod is no greater than any
+on-demand price and thus does not justify using them.
+• Monotonicity: Fix t. Then θ(t) decreases with p(t) and
+˜θ(t) increases with p(t). Therefore, higher θ(t) yields a
+higher ratio θ(t)
+˜θ(t), hence a higher V(t).
+• Scale invariance: V(t) depends only on the ratio be-
+tween progress and time, through θ(t) and ˜θ(t), and not
+on the absolute values of P or T.
+4.6
+Unified Cost Model
+With the value of progress V(t) established (§4.5), we eval-
+uate each candidate state s = (r,m) ∈R × {spot} by com-
+puting its expected net utility (we discuss the od and idle
+cases in the following paragraph). Let the current state be
+s0 = (r0,m0), and let ¯Ls denote the expected remaining life-
+time (§4.4). Over the instance’s lifetime, we define
+¯Ls ·Us = V(t)·max(0, ¯Ls −d)−C(r,m)(t)· ¯Ls −Er0→r
+(8)
+where Us denotes the utility per unit time over the lifetime.
+The three terms on the right-hand side capture: (1) the value
+of progress made during effective runtime, excluding the cold
+start time d; (2) the total compute cost C(r,m)(t) (for simplicity,
+we assume the price does not change within the instance’s
+lifetime); and (3) the one-time migration cost Er0→r if the
+target region differs from the current checkpoint location.
+For comparison across candidates, we normalize by the
+expected lifetime to obtain the utility Us:
+Us =
+V(t)·ηs
+| {z }
+Expected Value of
+Effective Progress
+−C(r,m)(t)
+| {z }
+Operational
+Compute Cost
+−
+Er0→r
+¯Ls
+| {z }
+Amortized
+Migration Cost
+(9)
+where ηs = max(0, ¯Ls−d)/¯Ls is the effectiveness of candidate
+state s, i.e., the fraction of its lifetime spent doing useful
+work. V(t)·ηs thus denotes the effective value of the progress.
+Short-lived spot instances have lower effectiveness, since cold-
+start overhead dominates their runtime. The second and third
+terms capture the operational cost of running in s, namely the
+compute cost combined with the amortized egress cost. The
+migration cost Er0→r is amortized over the lifetime, so longer-
+lived instances amortize this fixed cost more effectively.
+Special cases. For on-demand instances, we assume ¯L(r,od) →
+∞(no preemption), so η(r,od) →1 and the migration cost is
+fully amortized, giving U(r,od) = V(t) −C(r,od). For idling,
+no cost is incurred but no progress is made, so U(r,idle) = 0.
+This means running on s is worthwhile only when U > 0, i.e.,
+when the effective value of progress exceeds its cost.
+4.7
+Putting it All Together
+Algorithm 1 summarizes the scheduling policy. The core idea
+is simple: at each scheduling step, evaluate all candidates
+and migrate to any option that is better than the current state.
+The scheduler first applies the safety net when needed (§4.2,
+lines 4–5). It then periodically sends lightweight probes to
+all regions (§4.3, line 6). After computing the value of fu-
+ture progress based on the current deadline pressure (§4.5,
+line 7), the policy iterates over all candidate states s = (r,m),
+predicts their lifetimes using the virtual instance view (§4.4,
+line 9), and computes their utility U(r,m) (§4.6, line 10). It
+then compares each candidate against the current state’s util-
+ity U(r0,m0).2 Candidates are attempted in descending utility
+order, and the scheduler migrates to the first one that succeeds
+2In practice, we add a hysteresis threshold ∆to prevent thrashing: the
+scheduler switches only when U(r,m) > U(r0,m0) +∆.
+8
+
+
+--- Page 9 ---
+Algorithm 1 SkyNomad Scheduling Policy
+1: Input: Job requiring total progress P, deadline T, and
+candidate regions R
+2: (r0,m0) ←(initial region, idle)
+3: while p(t) < P do
+▷Every scheduling step
+4:
+if SAFETYNET(t) then
+▷§4.2
+5:
+Launch od if m ̸= od; continue
+6:
+PROBEREGIONS(R ) periodically
+▷§4.3
+7:
+V ←PROGRESSVALUEESTIM(t,T, p(t),P) ▷§4.5
+8:
+for each state s ∈R ×{spot,od,idle} do
+9:
+¯Ls ←PREDICTLIFETIME(s)
+▷§4.4
+10:
+Us ←CALCUTILITY(s,V, ¯Ls)
+▷§4.6
+11:
+Sort candidate states by Us descending
+12:
+for each s = (r,m) with Us > U(r0,m0) do
+▷§4.7
+13:
+succeeds ←Launch s or m = idle
+14:
+if succeeds then
+15:
+Terminate (r0,m0) if m0 ̸= idle
+16:
+(r0,m0) ←(r,m); break
+17: Terminate (r0,m0)
+▷Terminate on job completion
+(idling always succeeds; spot may fail due to unavailability).
+This approach ensures the system continually moves toward
+better options as conditions change.
+5
+SkyNomad Implementation
+We implemented SkyNomad, a general deadline-aware batch
+job execution system that combines spot and on-demand in-
+stances across multiple regions to guarantee deadline comple-
+tion while minimizing cost. SkyNomad is workload-agnostic,
+supporting any workload that periodically checkpoints to a
+persistent store, and it seamlessly manages checkpoint migra-
+tion when moving across regions. SkyNomad is built on top of
+SkyPilot [54], an open-source multi-cloud system, and adds a
+scheduler on top of it with ~6,000 lines of code. The imple-
+mentation supports common training frameworks including
+PyTorch [57] and Hugging Face Transformers [48].
+Scheduler. The scheduler manages the entire lifecycle of
+the job. It first performs periodic probes to collect the data
+used in (§4.3). The probe interval is configurable and is set
+to 2 hours by default, which we find sufficient to capture
+key characteristics of the spot market while keeping probing
+overhead reasonable (§6.1). The scheduler then forwards the
+probe results to the policy and provisions instances according
+to the policy’s decision.
+Checkpoint migration. SkyNomad assumes that the work-
+load periodically checkpoints to a persistent store (e.g., a
+cloud bucket) and it handles checkpoint migration when a
+job is moved to another region. Because data on public
+clouds must be loaded onto an instance after it is provisioned,
+SkyNomad implements a two-stage pipeline to accelerate mi-
+gration. While the target instance is provisioning, SkyNomad
+first copies the checkpoint to an object store in the target re-
+gion. Once the instance becomes available, SkyNomad down-
+loads the checkpoint during runtime setup so that the job can
+resume execution promptly.
+6
+Evaluation
+We evaluate SkyNomad comprehensively both on real cloud
+deployments that experience actual preemptions and in sim-
+ulation using replayed spot traces. We seek to answer the
+following questions:
+• Can SkyNomad reduce cost in real cloud environments
+while still completing jobs within their deadlines? (§6.1)
+• Can SkyNomad generalize across different accelerator
+types and their preemption patterns? (§6.1 and §6.2.2)
+• Can SkyNomad achieve consistently low cost under vary-
+ing deadline tightness, number of regions, and check-
+point sizes? (§6.2.3 to §6.2.5)
+• Can SkyNomad generalize across geographic deploy-
+ments and data sovereignty constraints? (§6.2.6)
+6.1
+End-to-End Experiments
+We run end-to-end experiments on AWS to fine-tune LLMs
+using three different accelerator configurations:
+4×L4,
+8×A100, and 4×A10G. We launch all baseline systems
+and SkyNomad simultaneously so they experience the same
+real-time spot preemption events. The total cost of these
+experiments is approximately $8,000.
+Baselines. We compare SkyNomad with:
+• Uniform Progress (UP) [50]: A single-region deadline-
+aware policy that distributes progress evenly over time
+and uses on-demand and spot instances interchangeably to
+guarantee deadline completion.
+• AWS SageMaker Managed Spot (ASM) [4]:
+A
+production-grade batch job execution system that uses spot
+instances to reduce cost. ASM relies exclusively on spot
+instances and can draw spot capacity from multiple avail-
+ability zones within a single region, but only switches zones
+upon preemption and does not support multi-region.
+• UP(S): A multi-region extension of UP that we imple-
+mented as a baseline, representing SkyPilot’s production
+failover policy [41]. Upon preemption, it Switches the
+job to a different region to avoid volatile periods [32], try-
+ing candidate regions sequentially from cheapest to most
+expensive until one succeeds. Between preemptions, it
+follows UP’s progress distribution strategy to guarantee
+deadline completion and exploit rule [50], staying in the
+current region as long as it remains available.3
+We run both UP and ASM separately in each of three re-
+gions (us-west-2, eu-central-1, and ap-northeast-1)
+3We also design additional heuristics (UP(A), UP(AP)) to ablate individ-
+ual components of SkyNomad in §6.2.
+9
+
+
+--- Page 10 ---
+Sky
+Nomad
+UP
+(S)
+US
+EU
+AP
+US
+EU
+AP
+0
+50
+100
+150
+200
+250
+Cost ($)
+59
+74
+83
+68
+113
+83
+83
+234
+UP
+ASM
+(a) 4×L4 (g6.12xlarge)
+Sky
+Nomad
+UP
+(S)
+US
+EU
+AP
+US
+EU
+AP
+0
+200
+400
+600
+800
+1000
+1200
+262
+470
+579
+848
+1014
+668
+977
+1059
+UP
+ASM
+Spot
+On-Demand
+Egress
+(b) 8×A100 (p4d.24xlarge)
+Sky
+Nomad
+UP
+(S)
+US
+EU
+AP
+US
+EU
+AP
+0
+50
+100
+150
+200
+250
+300
+350
+102
+106
+120
+160
+201
+113
+266
+309
+UP
+ASM
+(c) 4×A10G (g5.12xlarge)
+Figure 6: End-to-end cost comparison across three accelerator types. SkyNomad achieves the lowest cost in all configurations.
+Single-region baselines (UP and ASM) show high variance depending on regional spot availability. Only multi-region approaches
+incur egress costs (dotted region at bar tops). A100 shows minimal egress because the large checkpoint size (500 GB) makes
+cross-region migration expensive, so the system prefers intra-region zone switches. All jobs complete within their deadlines.
+to study how regional spot availability affects their perfor-
+mance. ASM is not inherently deadline-aware; to ensure a
+fair comparison, we manually trigger the safety net (§4.2),
+switching to on-demand when needed to meet the deadline.
+Workloads.
+We use Hugging Face Transformers [48]
+to fine-tune Qwen3 models [52] on the Orca-Math
+dataset [35]:
+Qwen3-4B on 4×L4 (g6.12xlarge) and
+4×A10G (g5.12xlarge), and Qwen3-14B on 8×A100
+(p4d.24xlarge). Each job runs on a single instance and
+requires about 30 hours of compute with a 45-hour deadline.
+Checkpoint sizes are 100 GB and 500 GB, respectively. Cold
+start time, including instance provisioning, environment setup,
+and checkpoint loading, is approximately 6 minutes.
+Results. Figure 6 shows the total cost for each system across
+the three accelerator configurations. SkyNomad achieves the
+lowest cost in all cases: 10–55% savings versus the best single-
+region baseline, 47–69% versus the average single-region
+baseline, and 4–44% versus the multi-region baseline UP(S).
+These savings already account for SkyNomad ’s overheads:
+egress costs for cross-region migrations account for up to 16%
+of total cost (dotted portion in Figure 6), while probing costs
+are negligible at $1–3 per job. Despite the egress overhead,
+cross-region migration enables SkyNomad to exploit cheaper
+spot capacity that would otherwise be inaccessible.
+Single region solutions are inherently limited.
+Single-
+region baselines face two limitations. First, the ever-changing
+nature of the spot market means no single region consis-
+tently offers the best availability or price. A region that
+performs well at the start of a job may become unavailable
+mid-execution, and static region selection cannot adapt to
+such changes. In our experiments across three representative
+regions, UP’s total cost varies by up to 1.7× on L4 (Fig-
+ure 6a) and 1.8× on A100 (Figure 6b). While the best re-
+gion eu-central-1 for L4 (Figure 6a) achieves low cost
+with abundant spot capacity, the worst-performing region
+(ap-northeast-1) has no spot available for more than 70%
+of the time and must fall back to expensive on-demand in-
+stances, driving 74% of its total cost. ASM shows even
+higher variance (up to 2.8× on A10G) because its zone-level
+failover may land on a more expensive zone (Figure 6c). Sec-
+ond, spot availability patterns differ across accelerator types:
+eu-central-1 performs well for L4 but poorly for A100,
+while us-west-2 shows the opposite pattern. As a result,
+region choices informed by one GPU type do not necessarily
+transfer to another. Given these limitations, even the best-
+performing single-region baseline (UP in eu-central-1)
+costs 10% more than SkyNomad.
+Naive multi-region is not enough. Multi-region approaches
+achieve lower and more stable costs by drawing spot capacity
+from multiple regions; both SkyNomad and UP(S) benefit from
+the aggregated spot resources across regions and complete
+the job without using any on-demand instances (Figure 6a).
+However, UP(S) only migrates when preempted. If it lands in
+an expensive region that happens to have stable availability,
+it stays there indefinitely. As a result, despite having access
+to all three regions, UP(S) underperforms the best single-
+region baseline on L4 (Figure 6a). SkyNomad, in contrast,
+continuously monitors all candidate zones through probing
+and proactively migrates when expected savings outweigh mi-
+gration costs. This enables SkyNomad to save 44% over UP(S)
+on A100 (Figure 6b). For example, in Figure 7, continuous
+probing of the cheaper zone us-east-2b/c ($1.8/hr) detects
+an availability window at hours 23–25 and predicts a life-
+time of 3.5 hours. Under the unified cost model, this yields a
+higher utility than eu-central-1a, triggering a price-aware
+proactive migration (□marker). Such real-time visibility
+distinguishes SkyNomad from reactive policies like UP(S).
+SkyNomad sees the whole picture.
+Unlike heuristics
+that consider only one metric (e.g., price or availability),
+SkyNomad jointly considers price, predicted lifetime, egress
+10
+
+
+--- Page 11 ---
+0
+5
+10
+15
+20
+25
+30
+35
+40
+45
+Time (hours)
+us-east-2b  ($1.80)
+us-east-2c  ($1.81)
+us-west-2a  ($1.94)
+us-west-2b  ($1.96)
+us-west-2c  ($2.35)
+us-west-2d  ($2.44)
+eu-central-1a  ($2.65)
+eu-central-1b  ($2.65)
+ap-northeast-1a  ($2.32)
+ap-northeast-1c  ($2.32)
+Instance
+Spot
+On-Demand
+ 
+End Reason
+Preemption
+Proactive Mig.
+ 
+Probe
+Avail
+ 
+Deadline
+Completion
+t1=5.6
+t2=13.0 t3=16.3-20.0
+Figure 7: Migration traces for SkyNomad in the L4 experi-
+ment. Green bars indicate spot instance usage; blue segments
+show probe-detected availability; □markers indicate proac-
+tive migration decisions.
+cost, and deadline pressure. We highlight three decisions in
+the L4 trace (Figure 7) that illustrate this.
+(1) t1 = 5.6 hr: After preemption in us-west-2c, SkyNomad
+evaluates all available regions. Probing shows us-east-2c
+($1.81/hr) is available with predicted lifetime of 4 hours. At
+this point, V(t) ≈$2.6/hr, and after accounting for cold start
+overhead (6 minutes), each hour of effective progress is worth
+$2.5. The $2 egress cost, amortized over the 4-hour lifetime,
+adds $0.50/hr. The combined per hour cost is $1.81 + $0.50 =
+$2.31/hr, which is lower than the monetary value of progress,
+yielding positive utility and SkyNomad thus migrates.
+(2) t2 = 13.0 hr: After 4 preemptions in us-east-2 (hours 9–
+13), the job has fallen behind schedule with deadline pressure
+θ(t) = 0.73 (vs. nominal P/T = 0.67; see §4.5), raising
+V(t) to ≈$4/hr. At this elevated value of progress, even the
+more expensive ap-northeast-1c ($2.32/hr) yields positive
+utility. Meanwhile, us-east-2 is detected to be in a volatile
+period (γ∗> 1), reducing its predicted lifetime to under 1 hour.
+SkyNomad then selects ap-northeast-1c as the only region
+with positive utility and tolerates the $2 egress cost.
+(3) t3 = 16.3–20.0 hr: After a spot preemption in region
+ap-northeast-1c, SkyNomad attempts to launch in the
+cheap us-east-2 regions ($1.80/hr) first (highest utility),
+but they are unavailable.
+Other available regions like
+us-west-2c ($2.35/hr) appear volatile and yield near-zero or
+negative utility given V(t) ≈$2.6/hr, while idling has U = 0.
+SkyNomad waits, and as deadline pressure increases, V(t)
+rises until eu-central-1a ($2.65/hr) finally yields positive
+utility at hour 20, at which point SkyNomad launches there.
+Summary. End-to-end experiments confirm that SkyNomad
+meets all deadlines while achieving 55% cost savings on av-
+erage over single-region baselines (up to 70%) through its
+unified cost model, which balances price, availability, migra-
+tion cost, and deadline pressure.
+Sky
+Nomad
+Sky    
+Nomad(o)
+UP
+UP(S)
+UP(A)
+UP(AP)
+0
+250
+500
+750
+1000
+1250
+1500
+1750
+Cost ($)
+Optimal
+(a) H100
+Sky
+Nomad
+Sky    
+Nomad(o)
+UP
+UP(S)
+UP(A)
+UP(AP)
+0
+20
+40
+60
+80
+Optimal
+(b) V100
+Figure 8: Cost on two independent spot traces: (a) H100 on
+GCP and (b) V100 on AWS. The green horizontal line indi-
+cates the Optimal policy cost. SkyNomad generalizes across
+cloud providers and GPU types. We simulate 20 jobs with
+different start times; error bars show standard error.
+6.2
+Simulation with Spot Availability Trace
+To understand whether SkyNomad can perform consistently
+well under diverse conditions, we replay real spot availability
+traces in simulation. This allows us to systematically study
+how parameters such as deadline tightness, number of regions,
+and checkpoint sizes affect the policy at a large scale.
+6.2.1
+Experimental Setup
+Traces. We collect spot availability traces for 16 1×H100
+instances (a3-highgpu-1g) across 13 GCP zones over a 14-
+day period by probing each zone every 10 minutes, at a total
+cost of approximately $9,000. We also use publicly available
+traces for 1×V100 instances on AWS [50] for generalizability.
+Baselines. We compare SkyNomad with:
+• Optimal: An omniscient policy with full knowledge of
+future spot availability. We use dynamic programming
+to compute its optimal decisions, which serve as a lower
+bound on achievable cost while completing the job.
+• SkyNomad (o): A variant of SkyNomad with an oracle for
+the next spot lifetime in each region.
+• UP: Single-region Uniform Progress [50], same as in §6.1.
+We report the average cost across all regions.
+• UP(S): Same as in §6.1.
+• UP(A): A multi-region extension of UP that uses the same
+probing mechanism as SkyNomad (§4.3) and selects regions
+based on observed availability, defined as the fraction of
+successful probes in a sliding window of the last 5 samples.
+• UP(AP): A multi-region extension of UP that selects re-
+gions based on availability divided by spot price, balancing
+availability against cost without lifetime prediction.
+Default parameters. Unless otherwise specified, we use a
+job duration of 100 hours with a 150-hour deadline, a check-
+point size of 50 GB, and a cold start overhead of 6 minutes.
+We use 8 regions by default.
+11
+
+
+--- Page 12 ---
+1.00
+1.05
+1.10
+1.15
+1.20
+1.30
+1.50
+2.00
+Deadline Ratio
+500
+1000
+2000
+5000
+Cost ($)
+SkyNomad
+SkyNomad(o)
+Optimal
+UP
+UP(S)
+UP(A)
+UP(AP)
+Figure 9: Cost with respect to varying deadline ratios. The
+y-axis is in log scale. A ratio of 1.0 is a theoretical lower
+bound.4
+6.2.2
+Generalizability across Accelerators
+Figure 8 compares policy performance on two independent
+spot traces: our H100 trace from GCP and a publicly available
+V100 trace from AWS [50].
+SkyNomad achieves near-optimal cost on both traces: $610
+on H100 (within 11% of Optimal) and $42 on V100 (within
+12% of Optimal). This demonstrates that our approach gener-
+alizes across cloud providers and GPU types.
+We define selection accuracy as the fraction of time a
+policy uses the cheapest available region, capturing its ability
+to identify and leverage the best option throughout execution.
+SkyNomad achieves 83–100% selection accuracy across both
+traces. In contrast, UP(A) never selects the cheapest region,
+yielding 0% selection accuracy on both V100 and H100: it
+always chooses the most available region regardless of price.
+This explains the cost gap: the unified cost model’s price term
+(§4.6) steers selection toward cost-effective regions, while
+availability-only heuristics ignore price entirely.
+The gap between SkyNomad and SkyNomad (o) is under 5%
+on both traces, with 95–99% region selection overlap, indicat-
+ing that SkyNomad’s lifetime prediction leads to nearly iden-
+tical migration decisions as the oracle. Since SkyNomad (o)
+uses an oracle for spot lifetime, this small gap confirms that
+our survival-analysis-based lifetime prediction (§4.4) esti-
+mates lifetimes accurately enough to make near-optimal de-
+cisions. On V100, SkyNomad slightly outperforms SkyNomad
+(o); this is within the variance of the simulation.
+6.2.3
+Impact of Deadline Tightness
+Figure 9 shows how cost varies with deadline tightness. The
+deadline ratio is defined as T/P, where T is the deadline and
+P is the job duration. Larger ratios provide more flexibility to
+wait for spot capacity.
+At a deadline ratio of 1.0, all policies immediately trigger
+the safety net (§4.2) and run entirely on on-demand instances,
+converging to $4,000–$5,000. As slack increases, SkyNomad
+4In practice, cold start overhead requires a slightly higher ratio.
+1
+2
+3
+4
+5
+6
+7
+8
+Number of Regions
+1000
+2000
+600
+3000
+Cost ($)
+SkyNomad
+SkyNomad(o)
+Optimal
+UP
+UP(S)
+UP(A)
+UP(AP)
+Figure 10: Cost with respect to varying number of available
+regions. For all systems, cost decreases monotonically when
+more regions are available. In all cases, SkyNomad achieves
+near-optimal cost.
+0
+200
+500
+1000
+2000
+4000
+Checkpoint Size (GB)
+1000
+2000
+700
+800
+900
+Cost ($)
+SkyNomad
+SkyNomad(o)
+Optimal
+UP
+UP(S)
+UP(A)
+UP(AP)
+Figure 11: Cost with respect to varying checkpoint sizes.
+Larger checkpoints increase migration cost, reducing the ben-
+efit of cross-region scheduling. SkyNomad scales gracefully
+by amortizing migration cost over predicted lifetimes, while
+heuristics like UP(AP) suffer from frequent migrations.
+tracks Optimal closely, reducing cost to $420 at 2.0× and
+staying within 10% of Optimal across all tested ratios.
+Single-region UP scales poorly, remaining at $1,100 (2.6×
+SkyNomad) even at 2.0× slack. Multi-region policies scale
+better by drawing capacity from multiple regions, but still
+lag SkyNomad by 15–30%. The lag is not due to on-demand
+fallback, as multi-region policies rarely trigger the safety
+net. Instead, they select expensive regions: UP(A) greedily
+chooses high-availability regions regardless of price (up to
+3.6× cost in Asia), while UP(AP) and UP(S) react to preemp-
+tions without considering predicted lifetime.
+6.2.4
+Impact of Number of Regions
+Figure 10 shows how cost changes as we vary the number of
+candidate regions from 1 to 8. We incrementally add regions
+in order of their average spot availability.
+With one region, all policies perform similarly ($2,800–
+$3,000) since there is no region selection to optimize. As
+regions increase, SkyNomad approaches Optimal: at 8 regions,
+SkyNomad achieves $707, within 6% of Optimal ($666) and
+12
+
+
+--- Page 13 ---
+2% of SkyNomad (o) ($691).
+Naive heuristics plateau or underperform.
+SkyNomad
+achieves 95% region selection overlap with Optimal, while
+UP(A) achieves only 0.2%. UP(A) settles in an available but
+expensive region and never migrates away: in the 8-region
+scenario, UP(A) selects asia-south2-b (95% availability,
+but 4× the cheapest price) 94% of the time, resulting in
+4.8× higher cost than Optimal. UP(S) considers only price
+and ignores availability, generally underperforming UP(AP).
+UP(AP) tracks SkyNomad more closely ($806 at 8 regions) by
+balancing availability and price, but cannot match our unified
+cost model.
+Beyond 6 regions, returns diminish: SkyNomad and Opti-
+mal improve steadily up to 6 regions, after which aggregated
+availability saturates and new regions contribute overlapping
+availability windows rather than complementary capacity. For
+users with geographic constraints (§6.2.6), even 2–3 well-
+chosen regions suffice for significant savings.
+6.2.5
+Impact of Checkpoint Size
+Checkpoint size affects migration cost since egress cost is
+proportional to the amount of data transferred. Figure 11
+varies checkpoint size from 0 to 4 TB to cover workloads
+ranging from batch inference with small index state to large-
+scale training (full model and optimizer state).
+Single-region UP is unaffected by checkpoint size since it
+never migrates across regions. SkyNomad scales gracefully:
+at 4 TB, SkyNomad reaches $850, 57% cheaper than UP at
+$2,000, by reducing migration frequency 70% compared to
+UP(AP)—preferring to wait for spot recovery rather than incur
+expensive cross-region transfers. The slight cost decrease
+from 200 GB to 500 GB for SkyNomad is within simulation
+variance.
+Heuristics that react to frequently changing signals suffer at
+large checkpoints. UP(AP) exhibits the steepest cost growth:
+availability shifts as new probes arrive, and dividing by price
+amplifies these fluctuations in cheap regions, so a small avail-
+ability change can flip the ratio ranking and trigger a region
+switch. UP(A) is more stable because high-availability re-
+gions tend to remain high. UP(S) is most stable since prices
+rarely change, so it returns to the same cheap regions.
+6.2.6
+Impact of Data Sovereignty Requirements
+Data sovereignty requirements (e.g., GDPR [22]) may re-
+strict jobs to specific geographic regions to prevent data from
+leaving a designated area. We simulate such constraints by
+limiting candidate regions to the same continent. Figure 12
+evaluates SkyNomad under four configurations: US-only (3
+regions), Europe-only (2 regions),5 Asia-only (3 regions), and
+Global (all 13 regions). SkyNomad performs well even with
+geographic constraints: $700 in the US (3 regions), close to
+5Due to quota limits, we only have access to two European regions.
+US
+(8 regions)
+Europe
+(2 regions)
+Asia
+(3 regions)
+Global
+(13 regions)
+Geographic Region Configuration
+500
+1000
+2000
+3000
+Cost ($)
+SkyNomad
+SkyNomad(o)
+Optimal
+UP
+UP(S)
+UP(AP)
+UP(A)
+Figure 12: Cost under geographic constraints (US-only,
+Europe-only, Asia-only, and Global). SkyNomad adapts effec-
+tively across all configurations, achieving significant savings
+even with limited regional diversity. Error bars show 95%
+confidence intervals over 20 jobs.
+the Global optimum of $650; $950 in Europe (2 regions), still
+52% cheaper than UP; and $870 in Asia (3 regions), 68%
+cheaper than UP. Even with only 2–3 regions, SkyNomad
+achieves significant savings, confirming that a modest number
+of well-chosen regions suffices (§6.2.4). Asia shows the high-
+est variance due to heterogeneous availability patterns. UP(A)
+performs particularly poorly ($3,038, 3.6× Optimal) by se-
+lecting the most expensive region (asia-south2-b) 100%
+of the time, achieving 0% selection accuracy. In contrast,
+SkyNomad achieves 100% selection accuracy by consistently
+selecting the cheapest region (asia-southeast1-b), reach-
+ing cost within 0.1% of Optimal.
+7
+Related Work
+Spot instances for training and batch jobs. Spot instances
+have been widely studied for reducing the cost of batch com-
+putations, including HPC [45,55], analytics [40,51], and ML
+training [8, 13, 23, 29, 43]. For example, Bamboo [43] pro-
+vides resilience through redundant computation, Varuna [8]
+dynamically morphs training configurations, and Parcae [13]
+predicts spot availability and live-migrates tasks. However,
+these systems aim to maximize throughput and provide no
+guarantees on meeting deadlines. They rely exclusively on
+spot instances, so if spot capacity disappears for extended pe-
+riods (which can last days [32]), progress halts and deadlines
+cannot be guaranteed.
+Deadline-aware spot scheduling.
+Uniform Progress
+(UP) [50] uses spot when available and falls back to on-
+demand as deadlines approach, achieving 27–84% savings
+over on-demand only. However, UP operates in a single re-
+gion and cannot exploit multi-region spot capacity: when one
+region has no spot available, another may still have capacity.
+Proteus [19] proposed tiered reliability with transient servers,
+but operates within a single region. Snape [53] uses RL to
+distribute capacity across spot and on-demand VMs, but tar-
+13
+
+
+--- Page 14 ---
+gets long-running services with SLO requirements rather than
+batch jobs with deadlines. SkyNomad is the first to combine
+deadline guarantees with multi-region spot scheduling, ex-
+ploiting spatial and temporal heterogeneity to minimize cost.
+Spot instances for serving. Systems like MArk [56], Cock-
+tail [17], and Tributary [21] use spot for inference serving
+with response-time SLOs. SpotServe [33] parallelizes LLM
+inference across spot GPUs and adapts to preemptions, while
+SkyServe [32] replicates instances across regions to maintain
+availability. However, serving systems cannot exploit slack:
+they must provision on-demand immediately when spot dis-
+appears to maintain latency SLOs. Batch jobs can instead
+wait for spot capacity to return, enabling more cost reduction
+without sacrificing deadline requirements.
+8
+Discussion
+Multi-Cloud Extension.
+SkyNomad currently operates
+within a single cloud provider. Extending to multi-cloud
+could further expand the spot capacity pool, but introduces
+challenges including heterogeneous APIs, higher cross-cloud
+migration costs, and provider-specific probing semantics. We
+leave this as future work.
+Availability Signals. We use lightweight probing as our avail-
+ability signal, and it incurs only a modest cost ($1–3 per job).
+Cloud providers are beginning to offer native availability sig-
+nals (e.g., AWS Spot Placement Score [7]) that could reduce
+probing cost but at the expense of portability.
+Autoscaling Integration.
+SkyNomad uses a fixed number
+of instance with gang-scheduled preemption for compatibil-
+ity. Combining multi-region scheduling with elastic autoscal-
+ing [8,23,33,43] could yield additional savings, but requires
+workload-specific support for dynamic parallelism.
+Progress Loss After Preemptions. Computation after the
+last checkpoint is lost upon preemption. SkyNomad’s life-
+time prediction could inform adaptive checkpointing [18,36],
+where the system checkpoints more frequently when the re-
+maining lifetime is predicted to be short. We leave this as
+future work.
+Task-as-a-Service Pricing Model. Single-region schedul-
+ing suffers from high cost variance. Multi-region scheduling
+provides more consistent costs through geographic diversity,
+potentially enabling task-as-a-service pricing models that ab-
+stract away spot market volatility.
+9
+Conclusion
+SkyNomad shows that exploiting spatial and temporal spot
+heterogeneity can greatly reduce AI batch job cost still meet-
+ing deadlines. With real-time probing, lifetime prediction,
+and a unified cost model that captures deadline pressure, and
+operational cost, SkyNomad continually selects the most cost-
+effective region and migrates when beneficial. In real-world
+deployments, SkyNomad reduces costs by 1.25–3.96× com-
+pared to existing research and production systems.
+References
+[1] Network service tiers pricing, 2025. Accessed: 2026-
+01-10.
+[2] Odd Aalen. Nonparametric inference for a family of
+counting processes. The Annals of Statistics, 6(4):701–
+726, 1978.
+[3] Orna Agmon Ben-Yehuda, Muli Ben-Yehuda, Assaf
+Schuster, and Dan Tsafrir. Deconstructing amazon ec2
+spot instance pricing. ACM Transactions on Economics
+and Computation (TEAC), 1(3):1–20, 2013.
+[4] Amazon.
+Amazon sagemaker.
+Available at https:
+//aws.amazon.com/sagemaker/, 2025.
+Accessed:
+2026-01.
+[5] Amazon Web Services.
+Amazon EC2 Spot In-
+stances Pricing.
+https://aws.amazon.com/ec2/
+spot/pricing/, 2025. Accessed: 2026-01.
+[6] Amazon Web Services. Best Practices for EC2 Spot In-
+stances.
+https://docs.aws.amazon.com/AWSEC2/
+latest/UserGuide/spot-best-practices.html,
+2025. Accessed: 2026-01.
+[7] Amazon Web Services.
+Spot Placement Score.
+https://docs.aws.amazon.com/AWSEC2/latest/
+UserGuide/spot-placement-score.html,
+2025.
+Accessed: 2026-01.
+[8] Sanjith Athlur, Nitika Saran, Muthian Sivathanu, Ra-
+machandran Ramjee, and Nipun Kwatra. Varuna: Scal-
+able, low-cost training of massive deep learning models.
+In Proceedings of the Seventeenth European Conference
+on Computer Systems (EuroSys ’22), pages 472–487.
+ACM, 2022.
+[9] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie
+Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind
+Neelakantan, Pranav Shyam, Girish Sastry, Amanda
+Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen
+Krueger, Tom Henighan, Rewon Child, Aditya Ramesh,
+Daniel M. Ziegler, Jeffrey Wu, Clemens Winter, Christo-
+pher Hesse, Mark Chen, Eric Sigler, Mateusz Litwin,
+Scott Gray, Benjamin Chess, Jack Clark, Christopher
+Berner, Sam McCandlish, Alec Radford, Ilya Sutskever,
+and Dario Amodei.
+Language models are few-shot
+learners, 2020.
+[10] Tanujit Chakraborty, Swarup Chattopadhyay, Suchis-
+mita Das, Uttam Kumar, and J. Senthilnath. Searching
+for heavy-tailed probability distributions for modeling
+14
+
+
+--- Page 15 ---
+real-world complex networks. IEEE Access, 10:115092–
+115107, 2022.
+[11] Aakanksha Chowdhery, Sharan Narang, Jacob Devlin,
+Maarten Bosma, Gaurav Mishra, Adam Roberts, Paul
+Barham, Hyung Won Chung, Charles Sutton, Sebastian
+Gehrmann, et al.
+Palm: Scaling language modeling
+with pathways. Journal of Machine Learning Research,
+24(240):1–113, 2023.
+[12] CloudZero. Aws egress costs explained: How to reduce
+spend, 7 2024. Accessed: 2026-01-10.
+[13] Jiangfei Duan, Ziang Song, Xupeng Miao, Xiaoli Xi,
+Dahua Lin, Harry Xu, Minjia Zhang, and Zhihao Jia.
+Parcae: proactive, liveput-optimized dnn training on pre-
+emptible instances. In Proceedings of the 21st USENIX
+Symposium on Networked Systems Design and Imple-
+mentation, NSDI’24, USA, 2024. USENIX Associa-
+tion.
+[14] Nnamdi Ekwe-Ekwe and Adam Barker. Location, lo-
+cation, location: Exploring Amazon EC2 spot instance
+pricing across geographical regions. In Proceedings of
+the 18th IEEE/ACM International Symposium on Clus-
+ter, Cloud and Grid Computing (CCGrid ’18), pages
+370–373. IEEE, 2018.
+[15] Google Cloud. Spot VMs Pricing. https://cloud.
+google.com/spot-vms/pricing, 2025.
+Accessed:
+2026-01.
+[16] Aaron Grattafiori et al. The llama 3 herd of models,
+2024.
+[17] Jashwant Raj Gunasekaran, Prashanth Thinakaran,
+Deepak Narayanan, Ramanathan Kannan, Gabriel
+Parmer, Prakash Mysore, and Anand Sivasubramaniam.
+Cocktail: A multidimensional optimization for model
+serving in cloud. In 19th USENIX Symposium on Net-
+worked Systems Design and Implementation (NSDI 22),
+pages 1041–1057. USENIX Association, 2022.
+[18] Tanmaey Gupta, Sanjeev Krishnan, Rituraj Kumar, Ab-
+hishek Vijeev, Bhargav Gulavani, Nipun Kwatra, Ra-
+machandran Ramjee, and Muthian Sivathanu.
+Just-
+in-time checkpointing: Low cost error recovery from
+deep learning training failures. In Proceedings of the
+Nineteenth European Conference on Computer Systems,
+pages 1110–1125, 2024.
+[19] Aaron Harlap, Alexey Tumanov, Andrew Chung, Gre-
+gory R. Ganger, and Phillip B. Gibbons. Proteus: Agile
+ML elasticity through tiered reliability in dynamic re-
+source markets. In Proceedings of the Twelfth European
+Conference on Computer Systems (EuroSys ’17), pages
+589–604. ACM, 2017.
+[20] Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch,
+Elena Buchatskaya, Trevor Cai, Eliza Rutherford, Diego
+de Las Casas, Lisa Anne Hendricks, Johannes Welbl,
+Aidan Clark, Tom Hennigan, Eric Noland, Katie Milli-
+can, George van den Driessche, Bogdan Damoc, Aurelia
+Guy, Simon Osindero, Karen Simonyan, Erich Elsen,
+Jack W. Rae, Oriol Vinyals, and Laurent Sifre. Training
+compute-optimal large language models, 2022.
+[21] Jiawei Hu, Sayan Ghosh, Wuxinlin Jiang, Wenqi Zheng,
+Ling Zhuo, Narayanan Natarajan, Abhishek Chandra,
+and Ramesh Kannan. Tributary: Spot-dancing for elas-
+tic cloud services.
+In Proceedings of the Eighteenth
+European Conference on Computer Systems (EuroSys
+’23), pages 410–426. ACM, 2023.
+[22] Ahmed Issaoui, Jonas Örtensjö, and M. Sirajul Is-
+lam. Exploring the General Data Protection Regulation
+(GDPR) compliance in cloud services: insights from
+Swedish public organizations on privacy compliance.
+Future Business Journal, 9(1):107, 2023.
+[23] Insu Jang, Zhenning Yang, Zhen Zhang, Xin Jin, and
+Mosharaf Chowdhury. Oobleck: Resilient distributed
+training of large models using pipeline templates. In
+Proceedings of the 29th ACM Symposium on Operating
+Systems Principles (SOSP ’23), pages 382–395. ACM,
+2023.
+[24] JCS Kadupitiya, Vikram Jadhao, and Prateek Sharma.
+Modeling the temporally constrained preemptions of
+transient cloud vms. In Proceedings of the 29th Inter-
+national Symposium on High-Performance Parallel and
+Distributed Computing (HPDC), pages 41–52, 2020.
+[25] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B.
+Brown, Benjamin Chess, Rewon Child, Scott Gray, Alec
+Radford, Jeffrey Wu, and Dario Amodei. Scaling laws
+for neural language models, 2020.
+[26] Ali Khajeh-Hosseini, David Greenwood, and Ian Som-
+merville. Cloud migration: A case study of migrating an
+enterprise it system to iaas. In 2010 IEEE 3rd Interna-
+tional Conference on cloud computing, pages 450–457.
+IEEE, 2010.
+[27] KyungHwan Kim and Kyungyong Lee. Making cloud
+spot instance interruption events visible. In Proceedings
+of the ACM Web Conference 2024 (WWW ’24), pages
+3490–3501. ACM, 2024.
+[28] Dinesh Kumar, Gaurav Baranwal, Zahid Raza, and
+Deo Prakash Vidyarthi.
+A survey on spot pricing in
+cloud computing.
+Journal of Network and Systems
+Management, 26(4):809–856, 2018.
+15
+
+
+--- Page 16 ---
+[29] Kyungyong Lee and Myungjun Son. DeepSpotCloud:
+Leveraging cross-region GPU spot instances for deep
+learning. In 2017 IEEE 10th International Conference
+on Cloud Computing (CLOUD), pages 98–105. IEEE,
+2017.
+[30] Sungjae Lee, Jaeil Hwang, and Kyungyong Lee. Spot-
+lake: Diverse spot instance dataset archive service. In
+2022 IEEE International Symposium on Workload Char-
+acterization (IISWC), pages 242–255. IEEE, 2022.
+[31] Will E. Leland, Murad S. Taqqu, Walter Willinger,
+and Daniel V. Wilson. On the self-similar nature of
+ethernet traffic. In Conference Proceedings on Com-
+munications Architectures, Protocols and Applications,
+SIGCOMM ’93, page 183–193, New York, NY, USA,
+1993. Association for Computing Machinery.
+[32] Ziming Mao, Tian Xia, Zhanghao Wu, Wei-Lin Chi-
+ang, Tyler Griggs, Romil Bhardwaj, Zongheng Yang,
+Scott Shenker, and Ion Stoica. Skyserve: Serving ai
+models across regions and clouds with spot instances.
+In Proceedings of the Twentieth European Conference
+on Computer Systems, EuroSys ’25, pages 159–175,
+New York, NY, USA, 2025. Association for Computing
+Machinery.
+[33] Xupeng Miao, Chunan Shi, Jiangfei Duan, Xiaoli Xi,
+Dahua Lin, Bin Cui, and Zhihao Jia. Spotserve: Serving
+generative large language models on preemptible in-
+stances. In Proceedings of the 29th ACM International
+Conference on Architectural Support for Programming
+Languages and Operating Systems, Volume 2, ASPLOS
+’24, pages 1112–1127, New York, NY, USA, 2024. As-
+sociation for Computing Machinery.
+[34] Microsoft Azure Networking Team. A guide to azure
+data transfer pricing, 2 2025. Accessed: 2026-01-10.
+[35] Arindam Mitra, Hamed Khanpour, Corby Rosset, and
+Ahmed Awadallah. Orca-math: Unlocking the potential
+of slms in grade school math, 2024.
+[36] Jayashree Mohan, Amar Phanishayee, and Vijay Chi-
+dambaram. CheckFreq: Frequent, Fine-Grained DNN
+checkpointing.
+In 19th USENIX Conference on File
+and Storage Technologies (FAST 21), pages 203–216.
+USENIX Association, 2021.
+[37] Deepak Narayanan, Mohammad Shoeybi, Jared Casper,
+Patrick LeGresley, Mostofa Patwary, Vijay Korthikanti,
+Dmitri Vainbrand, Prethvi Kashinkunti, Julie Bernauer,
+Bryan Catanzaro, et al. Efficient large-scale language
+model training on gpu clusters using megatron-lm. In
+Proceedings of the international conference for high per-
+formance computing, networking, storage and analysis,
+pages 1–15, 2021.
+[38] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and
+Yuxiong He. Zero: Memory optimizations toward train-
+ing trillion parameter models. In SC20: International
+Conference for High Performance Computing, Network-
+ing, Storage and Analysis, pages 1–16. IEEE, 2020.
+[39] Charles Reiss, Alexey Tumanov, Gregory R Ganger,
+Randy H Katz, and Michael A Kozuch. Heterogeneity
+and dynamicity of clouds at scale: Google trace analysis.
+In Proceedings of the third ACM symposium on cloud
+computing, pages 1–13, 2012.
+[40] Prateek Sharma, Stephen Lee, Tian Guo, David Irwin,
+and Prashant Shenoy. Spotcheck: Designing a deriva-
+tive iaas cloud on the spot market. In Proceedings of
+the Tenth European Conference on Computer Systems
+(EuroSys ’15), pages 1–15. ACM, 2015.
+[41] SkyPilot.
+SkyPilot task YAML specification: Re-
+covery strategies. https://docs.skypilot.co/en/
+latest/reference/yaml-spec.html, 2025.
+Ac-
+cessed: 2026-01.
+[42] Byung Chul Tak, Bhuvan Urgaonkar, and Anand Siva-
+subramaniam. To move or not to move: The economics
+of cloud computing. In 3rd USENIX Workshop on Hot
+Topics in Cloud Computing (HotCloud 11), 2011.
+[43] John Thorpe, Pengzhan Zhao, Jonathan Eyolfson, Yifan
+Qiao, Zhihao Jia, Minjia Zhang, Ravi Netravali, and
+Guoqing Harry Xu. Bamboo: Making preemptible in-
+stances resilient for affordable training of large DNNs.
+In 20th USENIX Symposium on Networked Systems De-
+sign and Implementation (NSDI 23), pages 497–513,
+Boston, MA, April 2023. USENIX Association.
+[44] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert,
+Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov,
+Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al.
+Llama 2: Open foundation and fine-tuned chat models.
+arXiv preprint arXiv:2307.09288, 2023.
+[45] William Voorsluys and Rajkumar Buyya. Reliable pro-
+visioning of spot instances for compute-intensive appli-
+cations. In Proceedings of the 26th IEEE International
+Conference on Advanced Information Networking and
+Applications (AINA), pages 542–549. IEEE, 2012.
+[46] Borui Wan, Mingji Han, Yiyao Sheng, Yanghua Peng,
+Haibin Lin, Mofan Zhang, Zhichao Lai, Menghan Yu,
+Junda Zhang, Zuquan Song, et al. {ByteCheckpoint}:
+A unified checkpointing system for large foundation
+model development. In 22nd USENIX Symposium on
+Networked Systems Design and Implementation (NSDI
+25), pages 559–578, 2025.
+16
+
+
+--- Page 17 ---
+[47] Zhuang Wang, Zhen Jia, Shuai Zheng, Zhen Zhang, Xin-
+wei Fu, TS Eugene Ng, and Yida Wang. Gemini: Fast
+failure recovery in distributed training with in-memory
+checkpoints. In Proceedings of the 29th Symposium on
+Operating Systems Principles, pages 364–381, 2023.
+[48] Thomas Wolf, Lysandre Debut, Victor Sanh, Julien
+Chaumond, Clement Delangue, Anthony Moi, Pierric
+Cistac, Tim Rault, Remi Louf, Morgan Funtowicz, Joe
+Davison, Sam Shleifer, Patrick von Platen, Clara Ma,
+Yacine Jernite, Julien Plu, Canwen Xu, Teven Le Scao,
+Sylvain Gugger, Mariama Drame, Quentin Lhoest, and
+Alexander Rush. Transformers: State-of-the-art natu-
+ral language processing. In Proceedings of the 2020
+Conference on Empirical Methods in Natural Language
+Processing: System Demonstrations, pages 38–45. As-
+sociation for Computational Linguistics, 2020.
+[49] Yongji Wu, Wenjie Qu, Xueshen Liu, Tianyang Tao,
+Yifan Qiao, Zhuang Wang, Wei Bai, Yuan Tian, Jiaheng
+Zhang, Z. Morley Mao, Matthew Lentz, Danyang Zhuo,
+and Ion Stoica. Lazarus: Resilient and elastic training
+of mixture-of-experts models, 2025.
+[50] Zhanghao Wu, Wei-Lin Chiang, Ziming Mao, Zongheng
+Yang, Eric Friedman, Scott Shenker, and Ion Stoica.
+Can’t be late: Optimizing spot instance savings under
+deadlines. In 21st USENIX Symposium on Networked
+Systems Design and Implementation (NSDI 24), pages
+185–203, Santa Clara, CA, April 2024. USENIX Asso-
+ciation.
+[51] Yan Yan, Yongqiang Gao, Yang Chen, Zonghua Guo,
+Binjie Chen, and Thomas Moscibroda. TR-Spark: Tran-
+sient computing for big data analytics. In Proceedings
+of the Seventh ACM Symposium on Cloud Computing
+(SoCC ’16), pages 484–496. ACM, 2016.
+[52] An Yang et al. Qwen3 technical report, 2025.
+[53] Fangkai Yang, Lu Wang, Zhenyu Xu, Jue Zhang, Liqun
+Li, Bo Qiao, Camille Couturier, Chetan Bansal, Soumya
+Ram, Si Qin, Zhen Ma, Inigo Goiri, Eli Cortez, Terry
+Yang, Victor Ruhle, Saravan Rajmohan, Qingwei Lin,
+and Dongmei Zhang.
+Snape: Reliable and low-cost
+computing with mixture of spot and on-demand vms. In
+Proceedings of the 28th ACM International Conference
+on Architectural Support for Programming Languages
+and Operating Systems (ASPLOS ’23), pages 631–643.
+ACM, 2023.
+[54] Zongheng Yang, Zhanghao Wu, Michael Luo, Wei-
+Lin Chiang, Romil Bhardwaj, Woosuk Kwon, Siyuan
+Zhuang, Frank Sifei Luan, Gautam Mittal, Scott
+Shenker, and Ion Stoica. SkyPilot: An intercloud broker
+for sky computing.
+In 20th USENIX Symposium on
+Networked Systems Design and Implementation (NSDI
+23), pages 437–455, Boston, MA, April 2023. USENIX
+Association.
+[55] Sangho Yi, Derrick Kondo, and Artur Andrzejak. Re-
+ducing costs of spot instances via checkpointing in the
+Amazon Elastic Compute Cloud. In 2012 IEEE 3rd In-
+ternational Conference on Cloud Computing (CLOUD),
+pages 236–243. IEEE, 2010.
+[56] Chengliang Zhang, Minchen Yu, Wei Wang, and Feng
+Yan. Mark: Exploiting cloud services for cost-effective,
+slo-aware machine learning inference serving. In 2019
+USENIX Annual Technical Conference (USENIX ATC
+19), pages 1049–1062. USENIX Association, 2019.
+[57] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo,
+Chien-Chin Huang, Min Xu, Less Wright, Hamid Sho-
+janazeri, Myle Ott, Sam Shleifer, Alban Desmaison,
+Can Balioglu, Pritam Damania, Bernard Nguyen, Geeta
+Chauhan, Yuchen Hao, and Shen Li.
+Pytorch fsdp:
+Experiences on scaling fully sharded data parallel. Pro-
+ceedings of the VLDB Endowment, 16(12):3848–3860,
+2023.
+17
