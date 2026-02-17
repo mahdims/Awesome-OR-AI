@@ -1,0 +1,4517 @@
+--- Page 1 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision
+Quantization for Large Language Models
+Xin Nie 1 Haicheng Zhang 1 Liang Dong 1 Beining Feng 1 Jinhong Weng 1 Guiling Sun 1
+Abstract
+Mixed-precision quantization is a promising ap-
+proach for compressing large language models
+under tight memory budgets. However, existing
+mixed-precision methods typically suffer from
+one of two limitations: they either rely on ex-
+pensive discrete optimization to determine preci-
+sion allocation, or introduce hardware inefficien-
+cies due to irregular memory layouts. We pro-
+pose SFMP, a search-free and hardware-friendly
+mixed-precision quantization framework for large
+language models. The framework is built upon
+four novel ideas: 1) Fractional bit-width, which
+extends integer bit-width for weight matrix to
+fractional value and transforms discrete preci-
+sion allocation as a continuous problem; 2) Block-
+wise mixed-precision, enabling fine-grained pre-
+cision within weight matrices while remaining
+hardware-friendly; 3) Row-column weight re-
+ordering, which aggregates salient weights via
+row and column reordering, incurring only a
+small activation reordering overhead during in-
+ference; 4) Unified GEMM kernel, which sup-
+ports mixed-precision GEMM at arbitrary aver-
+age bit-width. Extensive experiments demonstrate
+that SFMP outperforms state-of-the-art layer-wise
+mixed-precision methods under the same memory
+constraints, while significantly reducing quanti-
+zation cost and improving inference efficiency.
+Code is available at https://github.com/
+Nkniexin/SFMP
+1. Introduction
+Weight quantization is an efficient approach to compressing
+large language models (LLMs). It requires no modifications
+to the model architecture and directly maps high-precision
+continuous weights to a discrete space, reducing the average
+bits of model parameters, which enables deployment of
+1College of Electronic Information and Optical Engineering,
+Nankai University, Tian Jin, China. Correspondence to: Guiling
+Sun <sungl@nankai.edu.cn>.
+preprint
+3.75
+4.00
+4.25
+4.50
+4.75
+5.00
+5.25
+Memory (GB)
+55
+60
+65
+70
+75
+Zero-shot Avg. (%)
+W3
+W4
+LLaMA3.1 8B
+SFMP
+AMQ
+BitStack
+GPTQ
+AWQ
+Figure 1. Trade-off between memory usage and average zero-
+shot accuracy on ARC-Easy, ARC-Challenge, PIQA, HellaSwag,
+WinoGrande, and BoolQ.
+LLMs in memory-constrained edge scenarios (Zhang et al.,
+2024; Hosseinzadeh & Khamfroush, 2025; Husom et al.,
+2025). Existing methods (Frantar et al., 2023; Xiao et al.,
+2023; Lin et al., 2024; Kim et al., 2024; Liu et al., 2025b)
+achieve near-lossless compression at 8-bit precision and
+only incur 1–3% accuracy loss at 4-bit.
+For ultra-large models, such as LLaMA3.1-70B, assigning
+a uniform integer bit-width to all linear layers limits the
+choices of model size and cannot adapt to diverse mem-
+ory budgets. To address this limitation, layer-wise mixed-
+precision quantization (Lee et al., 2025; Cheng et al., 2025;
+Liu et al., 2025a; Dong et al., 2020) assigns different integer
+bit-widths to each linear layer, enabling flexible compres-
+sion under given memory constraints. However, from an
+optimization perspective, layer-wise mixed-precision quan-
+tization constitutes a constrained integer programming prob-
+lem (ILP), which is known to be NP-hard (Hochba, 1997).
+For example, for LLaMA3.1-70B (560 weight matrices)
+with candidate bit-widths {2, 3, 4}, the search space is 3560.
+Existing methods typically transform the problem to fit off-
+the-shelf ILP solvers (Bellman, 1966; Wolsey, 2020) or
+heuristic algorithms (Deb et al., 2002; Kirkpatrick et al.,
+1983) to obtain a relatively good solution in a short time.
+Even so, state-of-the-art layer-wise mixed-precision meth-
+ods AMQ (Lee et al., 2025) still require 44 hours to search
+for the bit allocation of LLaMA3.1-70B. This raises a ques-
+tion: “Under a given memory budget, can we design a
+strategy to obtain a near-optimal bit allocation without
+1
+arXiv:2602.01027v1  [cs.LG]  1 Feb 2026
+
+
+--- Page 2 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+any search or solver-based optimization?”
+Beyond layer-wise mixed-precision quantization, many
+methods introduce finer-grained strategies, such as channel-
+wise (Zihan et al., 2025; Wang et al., 2024), group-wise
+(Huang et al., 2025; Hooper et al., 2025), or even element-
+wise schemes (Kim et al., 2024; Zhao & Yuan, 2025; Li
+et al., 2023) in a weight matrix. Although such strategies
+can further improve model accuracy, they induce irregular
+memory access patterns and incur substantial overhead in
+weight packing and unpacking, which significantly degrades
+inference performance. Some approaches (Kim et al., 2024;
+Zihan et al., 2025) attempt to mitigate this inference speed
+degradation with custom compute kernels (Li et al., 2024;
+Qin et al., 2020; Liu et al., 2025c). However, the result-
+ing speedup is limited. Additionally, combining these fine-
+grained schemes with layer-wise mixed-precision further
+complicates the discrete optimization problem. This raises
+another important question: “Can we design a quantiza-
+tion format that achieves fine-grained mixed-precision
+while remaining hardware-friendly?”
+In this paper, to address these limitations, we propose
+SFMP, a Search-free Mixed-precision framework. SFMP
+eliminates the need to solve complex integer programming
+problems under memory constraints, reducing the time re-
+quired for compressing LLMs. Moreover, SFMP intro-
+duces a fine-grained yet hardware-friendly quantization
+format that organizes memory and executes matrix com-
+putations in a unified manner. SFMP is built upon four
+key ideas: 1) Fractional bit-width: we extend integer
+bit-width for weight matrix to fractional value, transform-
+ing mixed-precision quantization from a discrete, combi-
+natorial optimization problem into a continuous problem;
+2) Block-wise mixed-precision: a format achieves fine-
+grained mixed-precision while remaining hardware-friendly;
+3) Row-column weight reordering: weights are reordered
+along rows and columns to aggregate salient weights and
+align with the block-wise format, incurring only a small
+activation reordering overhead during inference; 4) Uni-
+fied GEMM kernel: for weight matrices with arbitrary
+average bit-width, we propose a unified kernel for memory
+layout and mixed-precision GEMM execution. As shown
+in Fig. 1, our method achieves superior quantized model
+performance compared to state-of-the-art layer-wise mixed-
+precision method (Lee et al., 2025) under the same memory
+footprint.
+2. Related Works
+Salience-Aware Mixed-Precision Quantization. Weight
+salience is widely used to guide mixed-precision quantiza-
+tion. SqueezeLLM (Kim et al., 2024) computes the global
+Fisher Information Matrix (Ly et al., 2017) and retains
+a small set of salient weights in high precision. BiLLM
+Table Lookup+Sum
+Precompute
+Table (FP16)
+GEMM
+O (FP16)
+Dequant
+O (FP16)
+Figure 2. Comparison of two GEMM computation paradigms:
+Left) dequant-based GEMM; Right) one-bit LUT-based GEMM.
+(Huang et al., 2024) observes that salience often concen-
+trates along specific rows or columns and reduces quanti-
+zation error through column-wise partitioning. Similarly,
+Slim-LLM (Huang et al., 2025) exploits row-wise salience
+by introducing group-wise mixed-precision quantization,
+achieving improved accuracy over fixed-precision schemes
+under the same average bit-width.
+One-bit LUT-Based GEMM. Some prior works (Wei et al.,
+2025; Park et al., 2025b; 2024; You et al., 2024; Ganji et al.,
+2023; Park et al., 2025a) introduce a dequantization-free
+compute paradigm for FP-INT GEMM. As shown in Fig. 2,
+a q-bit quantized weight matrix is decomposed into q one-
+bit matrices. For an activation vector of group size g, the dot
+products between the activation and all 2g possible binary
+patterns are precomputed and stored in a lookup table (LUT).
+Consequently, the GEMV operation between the activation
+vector and the one-bit weight matrix can be replaced by
+LUT accesses and accumulation. This paradigm eliminates
+the overhead of weight unpacking at runtime, particularly
+for ultra low-bit quantization. Moreover, it provides a uni-
+fied computation kernel: The GEMM computation between
+activation and a weight matrix of arbitrary integer bit-width
+can be expressed as a linear combination of one-bit GEMMs.
+Owing to its LUT-dominated execution, this paradigm has
+been demonstrated to be energy-efficient (Jeon et al., 2020;
+Cicek et al., 2022; Kim et al., 2025), making it especially
+suitable for edge devices. A detailed description of the
+computation flow is provided in Appendix B.
+3. Motivation
+High Cost of Layer-Wise Bit Allocation. As shown in
+Fig. 3, layer-wise mixed-precision quantization (Tang et al.,
+2022; Ranjan & Savakis, 2024; Zhao et al., 2024; Ranjan
+& Savakis, 2025) requires solving a discrete optimization
+problem, leading to an exponentially large search space as
+the number of layers grows. Although heuristic methods
+can reduce the search complexity, obtaining a satisfactory
+configuration remains costly in practice. For example, AMQ
+(Lee et al., 2025) requires around 44 hours to search mixed-
+precision configuration for LLaMA3.1-70B. This motivates
+the development of search-free bit allocation strategies that
+scale efficiently to large models.
+2
+
+
+--- Page 3 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+Memory Budget
+Search, Optimization
+…
+…
+High-cost layer-wise
+Q
+K
+V
+Gate
+Up
+Down
+int 2
+int 3
+int 4
+Search-free method
+Memory Budget
+Search-free
+40h
+0.15h↓
+int 2
+int 3
+…
+…
+Q
+K
+V
+Gate
+Up
+Down
+Hardware inefficiency
+Hardware efficiency
+…
+Group-wise
+512
+128
+Unified mixed-
+precision GEMM
+int 2
+int 3
+int 2
+int 3
+Llama
+3.1-70B
+560 weights
+…
+…
+(Avg.bits:2.5)
+(Avg.bits:2.5)
+int 4
+Channel-wise
+…
+…
+1
+128
++
+FP16 sparse
+Int+FP16
+Int
+Figure 3. Motivation of SFMP.
+Hardware Inefficiency of Element-,
+Group-,
+and
+Channel-Wise Quantization. Despite their accuracy ben-
+efits, fine-grained mixed-precision schemes are often mis-
+aligned with efficient hardware execution. As illustrated in
+Fig. 3, element-wise methods store sparse high-precision
+weights, introducing additional sparse storage. Channel-
+wise or group-wise methods partially improves regularity,
+yet still incur irregular memory access patterns. These char-
+acteristics limit the inference throughput in practical deploy-
+ment. For example, our empirical study in Fig. 12 shows that
+the group-wise mixed-precision method SliM-LLM (Huang
+et al., 2025) suffers 30–50% lower inference throughput
+than GPTQ (Frantar et al., 2023) at the same average bit.
+Structured Clustering of Salient Weights. Several prior
+studies (Lin et al., 2024; Huang et al., 2024; 2025) have
+shown that the distribution of weight salience exhibits struc-
+tured patterns, typically aligned along rows or columns of
+the weight matrix. This behavior is commonly attributed to
+the convergence properties of the multi-head self-attention
+mechanism. However, as shown in Fig. 13, the weight
+salience is often scattered within rows or columns rather
+than forming compact blocks. This observation motivates
+our reordering strategy, which aligns the salient weight with
+hardware-friendly memory organization.
+4. SFMP
+4.1. Preliminaries
+Global Salience of Weights. Weights in large language
+models exhibit heterogeneous salience to the final model
+loss. We estimate the global salience of weights by analyz-
+ing their impact on the model’s output loss.
+Assuming the model has converged, the loss variation ∆L
+induced by a perturbation from W to W ′ can be approxi-
+mated by a second-order expansion:
+∆L ≈(W −W ′)⊤H(W −W ′),
+(1)
+where H denotes the Hessian of the global loss with respect
+to weights. Since computing the full Hessian is intractable
+for large-scale models, we approximate it using the Fisher
+Information Matrix (Ly et al., 2017),
+H ≈F = E[gg⊤],
+(2)
+where g denotes the gradient of the loss with respect to the
+weights, and the expectation is taken over a small calibra-
+tion dataset. Following prior work (Kim et al., 2024), we
+adopt a diagonal approximation by ignoring cross-weight
+interactions. Therefore, the Fisher diagonal values can serve
+as salience scores, reflecting the importance of individual
+weights to the final output. Detailed derivations are provided
+in Appendix C.
+Notation. For the l-th weight matrix Wl ∈Rm×n, we
+denote its corresponding global salience matrix by Sl ∈
+Rm×n. Each entry Sl,i,j represents the salience of the
+weight element Wl,i,j, as estimated by the diagonal values
+of the global Fisher Information Matrix.
+4.2. Fractional Bit-Width for Weight Matrix
+Let the set of candidate integer bit-widths be
+B = {b1, b2, . . . , bq},
+bi ∈Z>0.
+(3)
+In the layer-wise mixed-precision method, all weights in a
+weight matrix have the same quantization bit-width. we re-
+fine the minimum unit of bit allocation to individual weight
+elements. Then, the mixed-precision quantization problem
+can be formulated as follows: given a target average bit
+b ∈R>0, find a set of coefficients {α1, α2, . . . , αq} such
+that
+q
+X
+i=1
+αi = 1
+and
+q
+X
+i=1
+αibi = b,
+(4)
+under which an optimal element-wise quantization bit-width
+is assigned to each weight. In fact, solving this optimization
+problem can obtain an optimal quantized model, as element-
+wise allocation provides finer granularity than layer-wise
+methods. However, this optimization problem is highly chal-
+lenging due to the massive number of parameters in large
+language models. As the model size and the number of can-
+didate integer bit-widths increase, the problem complexity
+grows exponentially. To make the problem tractable, we
+restrict the element-wise bit-width choices to a small set of
+candidate values.
+The empirical study from CMPQ (Zihan et al., 2025) pro-
+vides a insight: “at an average bit-width of 3, 4-bit weights
+are often insufficient to compensate the errors introduced
+3
+
+
+--- Page 4 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+…,
+,…
+Calibration data
+Fisher estimation
+(diagonal)
+Global
+salience
+Reordered
+salience
+Reordered by row-
+column salience
+…,
+,…
+Reordered by global salience
+Block –wise bit allocation
+Unified mixed-precision GEMM
+Memory budget
+Group size
+…
+Unallocated
+…,
+,…
+Sorted by
+block salience
+…,
+,…
+Reorder
+Unified mixed-
+precision GEMM
+Reorder
+Reduce
+…,
+, …
+,
+,
+,
+,
+,
+…,
+, …
+,
+,
+,
+,
+,
+,
+,
+layout
+Block-major
+Low
+High
+Avg.bits: b
+Figure 4. Pipeline of SFMP.
+by 2-bit weights”. Inspired by this observation, we limit the
+candidate bit-width set to two values, with the difference
+between them not exceeding 1. Therefore, for a given aver-
+age bit b, the candidate quantization bit-widths are uniquely
+determined as:
+B = {⌊b⌋, ⌈b⌉},
+(5)
+where ⌊·⌋denotes the floor function and ⌈·⌉denotes the
+ceiling function. The bit allocation problem now simplifies
+to a binary optimization problem under the constraints:
+α1 + α2 = 1,
+α1⌊b⌋+ α2⌈b⌉= b.
+(6)
+Considering the global salience of weights, a natural and
+effective allocation strategy is to assign higher bit-widths to
+more salient weights. Specifically, let α = b−⌊b⌋represent
+the fractional part of b. The bit-width allocation strategy for
+weight {Wl}L
+l=1 is:
+bit(Wl,i,j) =
+(
+⌈b⌉,
+Sl,i,j ≥τα,
+⌊b⌋,
+otherwise,
+(7)
+where τα denotes the α-quantile of S. Notably, once the
+average bits b is specified, this strategy directly yields the bit
+allocation without solving any optimization problem. Under
+this scheme, the average bit-width of each weight matrix is
+no longer an integer but a fractional value.
+4.3. Block-Wise Mixed-Precision
+However, although the element-wise bit allocation strat-
+egy is theoretically accurate and simple to implement, it
+is not hardware-friendly. This is because weights assigned
+the same quantization bit-width in a weight matrix are dis-
+tributed in a highly irregular spatial pattern, which makes
+structured quantization difficult.
+To balance quantization performance and hardware effi-
+ciency, we adopt a coarser but structured block-wise bit
+allocation strategy. That means the bit-widths are assigned
+at the block level rather than to individual weights. Specif-
+ically, each weight matrix Wl is partitioned into a set of
+non-overlapping two-dimensional blocks of size mb × nb,
+denoted as
+{Bl,1, Bl,2, . . . , Bl,Kl},
+Bl,k ∈Rmb×nb.
+(8)
+We define the global salience of a block as the sum of the
+global salience values of all weights contained within it.
+Formally, the salience of the k-th block in the l-th weight
+matrix is given by
+Sal(Bl,k) =
+X
+(i,j)∈Bl,k
+Sl,i,j.
+(9)
+Based on the block-level salience, we treat each block as
+the minimum decision unit for bit allocation. Consistent
+with the element-wise strategy, we select a threshold τα =
+Quantileα
+
+{Sal(Bl,k)}L, Kl
+l=1,k=1
+
+and define the block-wise
+bit allocation as:
+bit(Bl,k) =
+(
+⌈b⌉,
+if Sal(Bl,k) ≥τα,
+⌊b⌋,
+otherwise.
+(10)
+This block-wise strategy identifies high-salience regions in
+a more structured manner, yielding regular and hardware-
+friendly bit patterns. In practice, the block dimensions
+(mb, nb) are determined by balancing fine-grained granular-
+ity and hardware characteristics. For example, on GPUs, we
+adopt block sizes such as (256, 128) or (512, 128) to match
+common GEMM tiling strategies and warp-level parallelism
+in CUDA.
+4.4. Row-Column Weight Reordering
+As mentioned in Section 3, the spatial distribution of weight
+salience is primarily structured along rows or columns,
+4
+
+
+--- Page 5 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+offline
+3 bit
+2 bit
+1 bit
+Block-major Layout
+Decompose
++
+One-bit
+LUT-based GEMM
+runtime
+GEMV
+…,
+,…
+,
+,
+,
++
+…,
+,…
+,
+,
+,
+Figure 5. An example of unified mixed-precision GEMM.
+rather than forming spatially contiguous block-level clusters.
+Consequently, block-wise bit allocation is spatially mis-
+aligned with the salience patterns. Therefore, prior to block-
+wise bit allocation, we reorder the weight matrix based on
+row and column salience to achieve block-level aggregation
+of salient weights.
+Given the salience matrix Sl ∈Rm×n, we compute row-
+and column-wise salience by summation,
+sl,row = Sl1,
+sl,col = S⊤
+l 1,
+(11)
+where 1 denotes the all-ones vector. Row and column per-
+mutations are then obtained by sorting the salience vectors
+in descending order,
+pl,row = argsort(sl,row),
+pl,col = argsort(sl,col).
+(12)
+Let Pl,row and Pl,col denote the corresponding permutation
+matrices. The reordered weight matrix is given by
+˜Wl = Pl,rowWlPl,col.
+(13)
+As shown in Fig. 4, the reordering strategy spatially ag-
+gregate high-salience weights, improving the alignment be-
+tween weight salience and block-wise bit allocation. No-
+tably, the reordering is performed offline and incurs no run-
+time overhead. During inference, As shown in Eq. 14, the
+reordering can be equivalently applied to the activation Xl,
+whose cost is negligible compared to the GEMM operation.
+XlW T
+l = Xl(P T
+l,col)−1 ˜W T
+l (P T
+l,row)−1.
+(14)
+4.5. Unified Mixed-Precision GEMM Kernel
+For our proposed block-wise mixed-precision format, adopt-
+ing dequant-based operators introduces two major chal-
+lenges: 1) conventional row-major or column-major stor-
+age layouts complicate weight packing and unpacking, as
+the block structure is not explicitly represented in memory.
+2) mixed-precision formats require additional control-flow
+branching and multiple kernel variants in compute kernels
+(e.g., CUDA kernels), increasing implementation complex-
+ity.
+As shown in Fig. 5, to address challenge 1), we propose
+a block-major representation, where the quantized weight
+matrix is partitioned into blocks according to the (mb, nb)
+selected in Eq. 8 and organized in a block-major layout, en-
+abling contiguous memory access within each block. To ad-
+dress challenge 2), we employ a unified GEMM kernel that
+processes all blocks regardless of their bit-widths. Specif-
+ically, each block is decomposed into one-bit components
+and computed via one-bit LUT-based GEMM, thereby elim-
+inating explicit weight dequantization and precision-specific
+execution paths (see Appendix G for detailed CUDA imple-
+mentation).
+4.6. Pipeline of SFMP
+Fig. 4 shows the pipeline of SFMP. First, SFMP reorders
+weight matrices by global salience and partitions them into
+fixed-size blocks. Second, based on the memory budget and
+other configurations, SFMP computes the average bits b and
+selects two candidate precisions ⌊b⌋and ⌈b⌉. Then, SFMP
+assigns ⌈b⌉to a fraction α = b −⌊b⌋of the most salient
+blocks, with the rest using ⌊b⌋. Finally, we organize weights
+in a block-major layout and convert each weight block into
+the one-bit format, enabling unified execution using the one-
+bit LUT-based GEMM. The entire pipeline is parameter-free
+and requires no search or iterative optimization.
+5. Experiments
+We evaluate our method on several state-of-the-art pre-
+trained models, including LLaMA3.1 8B and 70B (Dubey
+et al., 2024), Qwen3 8B, 14B and 32B (Yang et al., 2025).
+Weight salience is estimated by computing the Fisher Infor-
+mation Matrix following SqueezeLLM (Kim et al., 2024),
+using 1k samples from C4 (Raffel et al., 2020). The block
+shape (mb, nb) is (512, groupsize), where group quantiza-
+tion is applied along the nb dimension within each block. To
+ensure fair comparison, following AMQ (Lee et al., 2025),
+we avoid introducing complex tricks and just adopt AWQ
+(Lin et al., 2024) as our quantization method. We compare
+our method against fixed-precision methods such as GPTQ
+and AWQ, group-wise mixed-precision method SliM-LLM
+(Huang et al., 2025), any-size methods such as BitStack
+(Wang et al., 2025) and AMQ. Our method is orthogonal
+to most quantization tricks, in Appendix I, we further com-
+bine our approach with Quantization-Aware Training (QAT)
+method (Chen et al., 2024). All experiments are conducted
+on A100-80GB GPU.
+We evaluate our method from multiple perspectives. For lan-
+guage modeling, we report perplexity on C4 and WikiText2
+5
+
+
+--- Page 6 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+(Merity et al., 2017). For zero-shot evaluation, we use the
+LM Evaluation Harness (Gao et al., 2021) to evaluate six
+tasks, including ARC-Challenge, ARC-Easy (Clark et al.,
+2018), PIQA (Bisk et al., 2020), HellaSwag (Zellers et al.,
+2019), BoolQ (Clark et al., 2019), and WinoGrande (Sak-
+aguchi et al., 2021). We further evaluate 5-shot performance
+on MMLU (Hendrycks et al., 2020) and GSM8K (Cobbe
+et al., 2021). For inference performance, considering edge
+deployment scenarios, we report both kernel-level latency
+and end-to-end inference speed (tokens / s) when generating
+128 tokens with batch size 1.
+5.1. Main Results
+SFMP vs. Any-Size Methods. Table 1 reports the model
+perplexity and zero-shot task accuracy under different mem-
+ory budgets for models quantized with SFMP, AMQ, and
+BitStack. We report results under different BPW (bits per
+weight) settings. Across multiple model scales, SFMP con-
+sistently outperforms AMQ. The advantage of SFMP be-
+comes more pronounced at extremely low precision (e.g.,
+BPW=2.5), where it achieves the best average zero-shot
+accuracy among all methods. At BPW=3.5, SFMP retains
+98.90% of the average zero-shot performance of the FP16
+LLaMA3.1-70B model. Moreover, Table 2 shows that on
+the 5-shot MMLU and GSM8K benchmarks, SFMP con-
+sistently outperforms AMQ across all model sizes. These
+results demonstrate that SFMP remains robust on challeng-
+ing tasks and show that our strategy is more stable and
+effective than layer-wise mixed-precision methods, even
+without any search or optimization.
+SFMP vs. Fixed-Precision Methods. We compare SFMP
+with GPTQ, AWQ and SliM-LLM, which apply a uniform
+bit-width across all weight matrices. Table 3 reports per-
+plexity and average zero-shot accuracy on the BPW ranging
+from 2.25 to 4. Across all settings, SFMP consistently out-
+performs fixed-precision methods. For both LLaMA3.1 8B
+and LLaMA3.1 70B, GPTQ and AWQ exhibit a sharp perfor-
+mance degradation at BPW=2.25. In contrast, by setting the
+group size to 256, SFMP enables 12.5% of the weights to be
+quantized at 3-bit, which substantially mitigates this degra-
+dation and leads to significantly improved performance.
+This reveals an important trend: under a fixed memory
+budget, moderately increasing the group size thereby allo-
+cates more memory budget to weight bit-width rather than
+scales and zero-points, leading to improved model perfor-
+mance. We provide a detailed analysis in Appendix H.1.
+Moreover, SFMP consistently outperforms the group-wise
+mixed-precision method SliM-LLM and provides greater
+flexibility in precision allocation, as SliM-LLM enforces
+fixed average bit-width across all weight matrices.
+Inference Performance. We evaluate the inference per-
+formance of SFMP across a wide range of hardware plat-
+forms. As shown in Fig. 6, fixed-precision uniform quan-
+Table 1. Evaluation of Llama 3.1 8B/70B models compressed
+by SFMP, BitStack and AMQ at the BPW of 2.5, 3.0, 3.5 and
+4.0, using a groupsize of 128, showing WikiText-2 and C4 dataset
+perplexity (PPL) alongside zero-shot tasks average accuracy. BPW
+denotes “bits per weight”. Quantization scales and zero-points are
+stored in FP16. Detailed zero-shot accurcy is provided in Table 11.
+Model Mem.
+(MB) BPW Method Wiki(↓) C4(↓) Avg.(↑)
+15,317
+16
+FP16
+6.15
+8.89
+75.01
+4,085
+2.5
+BitStack
+23.28
+38.23
+58.19
+AMQ
+17.85
+24.01
+58.65
+SFMP
+14.49
+18.81
+64.34
+4,501
+3.0
+BitStack
+12.55
+20.47
+64.40
+AMQ
+9.38
+13.05
+68.78
+SFMP
+9.51
+13.13
+69.74
+4,917
+3.5
+BitStack
+9.47
+15.29
+68.59
+AMQ
+7.39
+10.54
+72.56
+SFMP
+7.19
+10.28
+72.97
+5,333
+4.0
+BitStack
+8.39
+13.47
+70.95
+AMQ
+6.86
+9.79
+73.46
+8B
+SFMP
+6.80
+9.72
+74.33
+134,571
+16
+FP16
+2.81
+7.11
+80.96
+24,411
+2.5
+BitStack
+7.55
+12.92
+74.51
+AMQ
+7.62
+12.14
+74.33
+SFMP
+7.24
+10.07
+74.60
+28,491
+3.0
+BitStack
+6.38
+11.21
+76.30
+AMQ
+5.84
+9.47
+77.80
+SFMP
+5.31
+8.36
+78.07
+32,571
+3.5
+BitStack
+5.44
+9.52
+78.24
+AMQ
+4.26
+8.20
+79.11
+SFMP
+4.00
+7.33
+80.07
+36,651
+4.0
+BitStack
+4.98
+8.92
+79.17
+AMQ
+3.49
+7.61
+80.14
+70B
+SFMP
+3.37
+7.01
+80.47
+tization framework GPTQModel 1 becomes slower as the
+BPW decreases. This counterintuitive behavior is caused by
+the increasing weight unpacking and dequantization over-
+head at low bit-width. In contrast, SFMP exhibits an in-
+crease in inference speed as the BPW reduces. This advan-
+tage stems from its one-bit LUT-based GEMM formulation,
+where the computational latency of the kernel scales approx-
+imately linearly with the BPW (see Fig. 8). Moreover, the
+decomposition-based compression method BitStack suffers
+from repeated weight reconstruction during inference, lead-
+ing to substantially worse performance, even compared to
+FP16.
+5.2. Analysis and Ablation Study
+Impact of row-column reordering. We analyze the contri-
+bution of row-column reordering through an ablation study
+with four settings: no reorder, column reorder, row reorder,
+and combined row–column reorder. As shown in Fig. 7,
+two key observations can be drawn: 1) Column reordering
+usually outperforms row reordering. This may be because
+it is better aligned with the activation-aware principle of
+AWQ, thereby more effectively protecting important input
+channels during quantization. 2) The performance gains
+from the row and column reordering gradually diminish
+1https://github.com/ModelCloud/GPTQModel
+6
+
+
+--- Page 7 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+2.25
+2.5
+3.0
+4.0
+0
+50
+100
+150
+200
+Tokens / s
+RTX3090 / Llama3.1 8B
+2.25
+2.5
+3.0
+4.0
+0
+50
+100
+150
+200
+RTX4090 / Llama3.1 8B
+2.25
+2.5
+3.0
+4.0
+0
+10
+20
+30
+40
+50
+60
+A100 / Llama3.1 70B
+2.25
+2.5
+3.0
+4.0
+0
+20
+40
+60
+80
+100
+H100 / Llama3.1 70B
+BPW
+FP16
+BitStack
+GPTQModel
+SFMP
+Figure 6. End-to-end throughput (tokens/s) of generating a sequence length of 128 with batchsize of 1. FP16 inference of LLaMA3.1 70B
+is not feasible on single A100 and H100 due to memory constraints.
+Table 2. 5-shot MMLU, GSM8K task results over Qwen3 family.
+PPL and zero-shot accuracy can be found in Table 13.
+Model
+Mem.
+(MB) BPW Method MMLU GSM8K
+15,623
+16
+FP16
+74.88
+87.19
+AMQ
+50.78
+15.09
+4,445
+2.5
+SFMP
+57.33
+49.20
+AMQ
+65.41
+73.66
+4,859
+3.0
+SFMP
+66.03
+74.34
+AMQ
+71.71
+83.32
+5,273
+3.5
+SFMP
+72.11
+84.46
+AMQ
+73.44
+85.75
+Qwen3 8B
+5,687
+4.0
+SFMP
+73.60
+87.17
+28,169
+16
+FP16
+78.78
+88.19
+AMQ
+56.18
+48.76
+6,906
+2.5
+SFMP
+62.55
+59.14
+AMQ
+71.89
+79.16
+7,694
+3.0
+SFMP
+73.74
+85.22
+AMQ
+75.87
+84.48
+8,481
+3.5
+SFMP
+77.00
+86.10
+AMQ
+76.89
+86.58
+Qwen3 14B
+9,269
+4.0
+SFMP
+78.14
+87.41
+62,490
+16
+FP16
+81.28
+85.05
+AMQ
+64.37
+59.38
+12,270
+2.5
+SFMP
+73.62
+68.08
+AMQ
+73.89
+67.11
+14,130
+3.0
+SFMP
+77.68
+72.33
+AMQ
+77.12
+77.96
+15,990
+3.5
+SFMP
+79.30
+79.30
+AMQ
+80.19
+79.83
+Qwen3 32B
+17,850
+4.0
+SFMP
+81.03
+81.04
+as the BPW increases. At BPW = 4, all four configura-
+tions achieve nearly identical accuracy. This convergence is
+due to AWQ already achieving near-lossless compression
+at 4-bit precision, which leaves little room for further im-
+provement from reordering. Therefore, at higher BPW, we
+recommend disabling reordering to achieve faster inference.
+Kernel evaluation. Fig. 8 compares the GEMV latency
+under three settings: FP16 (cuBLAS), the uniform quantiza-
+tion kernel from GPTQModel, and our unified kernel. We se-
+lect two representative GEMV operations from LLaMA3.1-
+70B: q proj and down proj. Across all shapes and BPW,
+our kernel consistently achieves lower latency than both
+cuBLAS and GPTQModel. Notably, the latency of our ker-
+Table 3. Evaluation of Llama3.1 8B/70B models quantized by
+SFMP, AWQ, SliM-LLM and GPTQ on WikiText-2, C4 perplexity
+(PPL), and zero-shot tasks. For BPW=2.25 and BPW=3.25 settings
+, our method use a group size of 256. Memory overhead from
+extra quantization parameters in GPTQ and AWQ at w3, w4 is
+omitted as it is negligible. SliM-LLM only supports group-wise
+quantization. Detailed zero-shot accuracy is provided in Table 12.
+Model Mem.
+(MB) BPW
+Method
+Wiki(↓) C4(↓) Avg.(↑)
+15,317
+16
+FP16
+6.15
+8.89
+75.01
+3,877
+2.25
+GPTQw2g128
+232
+165
+38.55
+AWQw2g128
+1.57e6
+1.86e6
+35.80
+SliM-LLMg128
+193
+142
+40.67
+SFMPg256
+28.61
+32.61
+57.69
+4,501
+3.0
+GPTQw3
+22.13
+25.05
+55.83
+AWQw3
+16.06
+19.79
+64.61
+SFMPg128
+9.51
+13.13
+69.74
+4,709
+3.25
+GPTQw3g128
+8.28
+11.49
+69.22
+AWQw3g128
+8.23
+11.58
+70.72
+SliM-LLMg128
+8.17
+11.25
+70.31
+SFMPg256
+7.60
+10.73
+72.35
+5,333
+4.0
+GPTQw4
+7.5
+10.38
+71.46
+AWQw4
+7.23
+10.26
+73.60
+8B
+SFMPg128
+6.80
+9.72
+74.33
+134,571
+16
+FP16
+2.81
+7.11
+80.96
+22,371
+2.25
+GPTQw2g128
+113.22
+131.9
+40.02
+AWQw2g128
+1.8e6
+1.5e6
+40.65
+SliM-LLMg128
+68.84
+88.36
+46.51
+SFMPg256
+8.17
+11.42
+72.65
+28,491
+3.0
+GPTQw3
+1.6e4
+1.3e4
+36.17
+AWQw3
+43.14
+43.59
+47.68
+SFMPg128
+5.31
+8.36
+78.07
+30,531
+3.25
+GPTQw3g128
+5.17
+8.76
+71.09
+AWQw3g128
+4.80
+8.62
+79.15
+SliM-LLMg128
+4.74
+8.52
+77.41
+SFMPg256
+4.33
+7.56
+79.38
+36,651
+4.0
+GPTQw4
+1.4e4
+8.8e3
+36.72
+AWQw4
+4.18
+8.29
+75.95
+70B
+SFMPg128
+3.37
+7.01
+80.47
+nel decreases approximately linearly with reducing BPW.
+This trend is attributed to eliminating weight dequantiza-
+tion overhead and leveraging LUT-based computation. In
+contrast, the latency of GPTQModel’s kernel increases with
+lower BPW due to the growing overhead of weight unpack-
+ing.
+Overhead of reorder. To evaluate the inference overhead
+introduced by activation reordering, we conduct end-to-end
+generation experiments on LLaMA3.1-8B (RTX 3090) and
+LLaMA3.1-70B (A100). As shown in Fig. 9, reordering
+incurs a modest slowdown of at most 5%. The overhead is
+7
+
+
+--- Page 8 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+10
+12
+14
+16
+18
+20
+22
+C4 PPL (
+)
+LLaMA3.1 8B
+Baseline (No reorder)
+Column reorder
+Row reorder
+Row+Column reorder
+14
+16
+18
+20
+22
+24
+Qwen3 8B
+2.5
+3.0
+3.5
+4.0
+60.0
+62.5
+65.0
+67.5
+70.0
+72.5
+75.0
+Zero-shot Avg. (%) (
+)
+2.5
+3.0
+3.5
+4.0
+64
+66
+68
+70
+72
+BPW
+Figure 7. Impact of row and column reordering across different
+BPWs on model perplexity (↓) and zero-shot accuracy (↑).
+2.5
+3.0
+3.5
+4.0
+400
+600
+800
+Latency (µs)
+890
+8192 × 8192
+SFMP
+GPTQModel
+FP16 (cuBLAS)
+2.5
+3.0
+3.5
+4.0
+1000
+1500
+2000
+2500
+2880
+8192 × 28672
+BPW
+Figure 8. Latency comparison of our unified mixed-precision ker-
+nel , uniform quantization kernel from GPTQModel and cuBLAS
+FP16 kernel on A100.
+2.25
+2.5
+3
+3.5
+4
+0
+50
+100
+150
+200
+Tokens / s
+168
+162
+150
+139
+130
+177
+170
+157
+146
+136
+RTX3090 / LLaMA3.1-8B
+2.25
+2.5
+3
+3.5
+4
+0
+10
+20
+30
+40
+50
+60
+52
+49
+43
+38
+35
+55
+52
+45
+40
+36
+A100 / LLaMA3.1-70B
+BPW
+Reorder
+No Reorder
+Figure 9. Throughput (tokens / s) comparison for end-to-end
+generation of 128 tokens with and without reordering.
+more pronounced for smaller models, whose inference is
+less dominated by GEMM operations compared to larger
+models. Moreover, the overhead of reordering consistently
+diminishes as BPW increases, since the growing cost of
+one-bit LUT-based GEMM amortizes the fixed reordering
+overhead.
+Search cost.
+Table 4 compares the algorithmic cost
+of searching mixed-precision configurations for BitStack,
+AMQ, SliM-LLM and SFMP in terms of memory and time,
+evaluated on A100-80GB GPUs. BitStack incurs substan-
+tial overhead due to weight decomposition and block-wise
+sorting. AMQ reduces the search cost via proxy-based
+predictors and pruning, reducing the time to 44 hours for
+2.5
+3
+3.5
+0
+5
+10
+15
+20
+25
+30
+Layer Index
+4
+q
+k
+v
+o
+gate
+up
+down
+2
+3
+4
+bit-width
+Figure 10. Visualization of bit allocation over linear layers with
+different BPWs at Llama3.1 8B. The numbers on the left indicate
+the BPW per configuration.
+LLaMA3.1-70B. SliM-LLM can be executed with fewer
+GPUs, but configuring LLaMA3.1-70B still takes 8 hours.
+In contrast, SFMP directly assigns bit-widths by global
+salience. Its only cost is estimating the diagonal values of
+the Fisher Information Matrix using a small calibration set,
+resulting in minimal algorithmic overhead.
+Table 4. The search cost on Llama 3.1 family of SFMP, BitStack,
+AMQ, SliM-LLM.
+Model
+8B
+70B
+Parameter
+#GPU
+Cost (h)
+#GPU
+Cost (h)
+SliM-LLM
+1
+2
+1
+8
+BitStack
+1
+12
+4
+>300
+AMQ
+1
+7
+4
+44
+SFMP
+1
+0.05
+4
+0.15
+Bit allocation visualization. Fig. 10 shows the bit allo-
+cation result on LLaMA3.1-8B. We provide detailed bit-
+widths for each linear layer in Table 10. It can be observed
+that the Value projection in self-attention consistently re-
+tains the higher bit-widths, followed by the Gate, Up, and
+Down layers, with Query and Key projections assigned the
+lower bit-widths. This patter is consistent with prior findings
+from AMQ (Lee et al., 2025), validating the effectiveness
+of SFMP’s bit allocation scheme.
+6. Conclusion
+See Appendix J for limitations. SFMP reformulates mixed-
+precision quantization by introducing fractional bit-width
+for the weight matrix. With only two candidate integer bit-
+widths, precision is directly allocated using global weight
+salience, avoiding combinatorial decisions.
+To remain
+hardware-friendly, SFMP adopts a structured block-wise
+scheme, which slightly sacrifices accuracy in exchange for
+regular memory layouts and efficient execution. SFMP bal-
+ances model accuracy and hardware execution efficiency,
+offering a practical approach for deploying large language
+models in resource-constrained environments.
+8
+
+
+--- Page 9 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+Impact Statement
+This paper presents work whose goal is to advance the field
+of Machine Learning. There are many potential societal
+consequences of our work, none which we feel must be
+specifically highlighted here.
+References
+Bellman, R. Dynamic programming. science, 153(3731):
+34–37, 1966.
+Bisk, Y., Zellers, R., Gao, J., Choi, Y., et al. Piqa: Reasoning
+about physical commonsense in natural language. In Pro-
+ceedings of the AAAI conference on artificial intelligence,
+volume 34, pp. 7432–7439, 2020.
+Chen, M., Shao, W., Xu, P., Wang, J., Gao, P., Zhang,
+K., and Luo, P.
+Efficientqat: Efficient quantization-
+aware training for large language models. arXiv preprint
+arXiv:2407.11062, 2024.
+Cheng, W., Zhang, W., Guo, H., and Shen, H.
+Sign-
+roundv2: Closing the performance gap in extremely low-
+bit post-training quantization for llms. arXiv preprint
+arXiv:2512.04746, 2025.
+Cicek, N. M., Shen, X., and Ozturk, O. Energy efficient
+boosting of gemm accelerators for dnn via reuse. ACM
+Transactions on Design Automation of Electronic Systems
+(TODAES), 27(5):1–26, 2022.
+Clark, C., Lee, K., Chang, M.-W., Kwiatkowski, T., Collins,
+M., and Toutanova, K. BoolQ: Exploring the surprising
+difficulty of natural yes/no questions. In Proceedings
+of the 2019 Conference of the North American Chapter
+of the Association for Computational Linguistics: Hu-
+man Language Technologies, Volume 1 (Long and Short
+Papers), pp. 2924–2936, June 2019.
+Clark, P., Cowhey, I., Etzioni, O., Khot, T., Sabharwal, A.,
+Schoenick, C., and Tafjord, O. Think you have solved
+question answering? try arc, the ai2 reasoning challenge.
+arXiv preprint arXiv:1803.05457, 2018.
+Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,
+Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,
+R., et al. Training verifiers to solve math word problems.
+arXiv preprint arXiv:2110.14168, 2021.
+Deb, K., Pratap, A., Agarwal, S., and Meyarivan, T. A
+fast and elitist multiobjective genetic algorithm: Nsga-
+ii. IEEE transactions on evolutionary computation, 6(2):
+182–197, 2002.
+Dong, Z., Yao, Z., Arfeen, D., Gholami, A., Mahoney,
+M. W., and Keutzer, K. Hawq-v2: Hessian aware trace-
+weighted quantization of neural networks. Advances in
+neural information processing systems, 33:18518–18529,
+2020.
+Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle,
+A., Letman, A., Mathur, A., Schelten, A., Yang, A., Fan,
+A., et al. The llama 3 herd of models. arXiv e-prints, pp.
+arXiv–2407, 2024.
+Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D.
+OPTQ: Accurate quantization for generative pre-trained
+transformers. In The Eleventh International Conference
+on Learning Representations, 2023.
+Ganji, D. C., Ashfaq, S., Saboori, E., Sah, S., Mitra, S.,
+Askarihemmat, M., Hoffman, A., Hassanien, A., and
+Leonardon, M.
+Deepgemm: Accelerated ultra low-
+precision inference on cpu architectures using lookup
+tables. In Proceedings of the IEEE/CVF conference on
+computer vision and pattern recognition, pp. 4656–4664,
+2023.
+Gao, L., Tow, J., Biderman, S., Black, S., DiPofi, A., Foster,
+C., Golding, L., Hsu, J., McDonell, K., Muennighoff,
+N., et al. A framework for few-shot language model
+evaluation. Version v0. 0.1. Sept, 10:8–9, 2021.
+Hendrycks, D., Burns, C., Basart, S., Zou, A., Mazeika,
+M., Song, D., and Steinhardt, J.
+Measuring mas-
+sive multitask language understanding. arXiv preprint
+arXiv:2009.03300, 2020.
+Hochba, D. S. Approximation algorithms for np-hard prob-
+lems. ACM Sigact News, 28(2):40–52, 1997.
+Hooper, C., Sakr, C., Keller, B., Venkatesan, R., Keutzer,
+K., Shao, S., and Khailany, B.
+Fgmp: Fine-grained
+mixed-precision weight and activation quantization for
+hardware-accelerated llm inference.
+arXiv preprint
+arXiv:2504.14152, 2025.
+Hosseinzadeh, M. and Khamfroush, H. Dilemma: Joint
+llm quantization and distributed llm inference over edge
+computing systems. arXiv preprint arXiv:2503.01704,
+2025.
+Huang, W., Liu, Y., Qin, H., Li, Y., Zhang, S., Liu, X.,
+Magno, M., and Qi, X. Billm: pushing the limit of post-
+training quantization for llms. In Proceedings of the 41st
+International Conference on Machine Learning, 2024.
+Huang, W., Qin, H., Liu, Y., Li, Y., Liu, Q., Liu, X.,
+Benini, L., Magno, M., Zhang, S., and QI, X. Slim-
+LLM: Salience-driven mixed-precision quantization for
+large language models. In Forty-second International
+Conference on Machine Learning, 2025.
+Husom, E. J., Goknil, A., Astekin, M., Shar, L. K., K ˜A¥ sen,
+A., Sen, S., Mithassel, B. A., and Soylu, A. Sustainable
+9
+
+
+--- Page 10 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+llm inference for edge ai: Evaluating quantized llms for
+energy efficiency, output accuracy, and inference latency.
+ACM Transactions on Internet of Things, 6(4):1–35, 2025.
+Jang, W. and Tambe, T. Blockdialect: Block-wise fine-
+grained mixed format quantization for energy-efficient
+LLM inference. In Forty-second International Confer-
+ence on Machine Learning, 2025.
+Jeon, Y., Park, B., Kwon, S. J., Kim, B., Yun, J., and Lee,
+D. Biqgemm: matrix multiplication with lookup table
+for binary-coding-based quantized dnns. In SC20: Inter-
+national Conference for High Performance Computing,
+Networking, Storage and Analysis, pp. 1–14. IEEE, 2020.
+Kim, H., Kim, T., Park, T., Kim, D., Yu, Y., Kim, H., and
+Park, Y. Accelerating llms using an efficient gemm li-
+brary and target-aware optimizations on real-world pim
+devices. In Proceedings of the 23rd ACM/IEEE Interna-
+tional Symposium on Code Generation and Optimization,
+pp. 225–240, 2025.
+Kim, S., Hooper, C., Gholami, A., Dong, Z., Li, X., Shen,
+S., Mahoney, M. W., and Keutzer, K. Squeezellm: dense-
+and-sparse quantization. In Proceedings of the 41st In-
+ternational Conference on Machine Learning, ICML’24.
+JMLR.org, 2024.
+Kirkpatrick, S., Gelatt Jr, C. D., and Vecchi, M. P. Optimiza-
+tion by simulated annealing. science, (4598):671–680,
+1983.
+Lee, S., Woo, S.-t., Jin, J.-g., Lee, C., and Park, E. Amq:
+Enabling automl for mixed-precision weight-only quan-
+tization of large language models. In Proceedings of
+the 2025 Conference on Empirical Methods in Natural
+Language Processing, pp. 35520–35538, 2025.
+Li, J., Xu, J., Li, S., Huang, S., Liu, J., Lian, Y., and Dai, G.
+Fast and efficient 2-bit llm inference on gpu: 2/4/16-bit
+in a weight matrix with asynchronous dequantization. In
+Proceedings of the 43rd IEEE/ACM International Confer-
+ence on Computer-Aided Design, pp. 1–9, 2024.
+Li, S., Ning, X., Hong, K., Liu, T., Wang, L., Li, X., Zhong,
+K., Dai, G., Yang, H., and Wang, Y. Llm-mq: Mixed-
+precision quantization for efficient llm deployment. In
+The Efficient Natural Language and Speech Processing
+Workshop with NeurIPS, volume 9, pp. 3, 2023.
+Lin, J., Tang, J., Tang, H., Yang, S., Chen, W.-M., Wang,
+W.-C., Xiao, G., Dang, X., Gan, C., and Han, S. Awq:
+Activation-aware weight quantization for on-device llm
+compression and acceleration. Proceedings of machine
+learning and systems, 6:87–100, 2024.
+Liu, F., Wang, Z., Xia, J., Zhao, J., Zhao, S., Li, J., Liu, J.,
+Jiang, L., and Guan, H. FlexQuant: A flexible and effi-
+cient dynamic precision switching framework for LLM
+quantization. In Findings of the Association for Com-
+putational Linguistics: EMNLP 2025, pp. 4152–4161,
+November 2025a.
+Liu, Z., Zhao, C., Fedorov, I., Soran, B., Choudhary, D., Kr-
+ishnamoorthi, R., Chandra, V., Tian, Y., and Blankevoort,
+T. Spinquant: LLM quantization with learned rotations.
+In The Thirteenth International Conference on Learning
+Representations, 2025b.
+Liu, Z., Zhao, C., Huang, H., Chen, S., Zhang, J., Zhao,
+J., Roy, S., Jin, L., Xiong, Y., Shi, Y., Xiao, L., Tian,
+Y., Soran, B., Krishnamoorthi, R., Blankevoort, T., and
+Chandra, V. Paretoq: Improving scaling laws in extremely
+low-bit LLM quantization. In The Thirty-ninth Annual
+Conference on Neural Information Processing Systems,
+2025c.
+Ly, A., Marsman, M., Verhagen, J., Grasman, R. P., and
+Wagenmakers, E.-J.
+A tutorial on fisher information.
+Journal of Mathematical Psychology, 80:40–55, 2017.
+Merity, S., Xiong, C., Bradbury, J., and Socher, R. Pointer
+sentinel mixture models. In International Conference on
+Learning Representations, 2017.
+Park, G., park, B., Kim, M., Lee, S., Kim, J., Kwon, B.,
+Kwon, S. J., Kim, B., Lee, Y., and Lee, D. LUT-GEMM:
+Quantized matrix multiplication based on LUTs for effi-
+cient inference in large-scale generative language models.
+In The Twelfth International Conference on Learning
+Representations, 2024.
+Park, G., Bae, J., Kwon, B., Kim, B., Kwon, S. J., and Lee,
+D. Anybcq: Hardware efficient flexible binary-coded
+quantization for multi-precision llms.
+arXiv preprint
+arXiv:2510.10467, 2025a.
+Park, G., Kwon, H., Kim, J., Bae, J., Park, B., Lee, D., and
+Lee, Y. Figlut: An energy-efficient accelerator design
+for fp-int gemm using look-up tables. In 2025 IEEE
+International Symposium on High Performance Computer
+Architecture (HPCA), pp. 1098–1111, 2025b.
+Qin, E., Samajdar, A., Kwon, H., Nadella, V., Srinivasan, S.,
+Das, D., Kaul, B., and Krishna, T. Sigma: A sparse and
+irregular gemm accelerator with flexible interconnects for
+dnn training. In 2020 IEEE International Symposium on
+High Performance Computer Architecture (HPCA), pp.
+58–70. IEEE, 2020.
+Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S.,
+Matena, M., Zhou, Y., Li, W., and Liu, P. J. Exploring
+the limits of transfer learning with a unified text-to-text
+10
+
+
+--- Page 11 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+transformer. Journal of machine learning research, 21
+(140):1–67, 2020.
+Ranjan, N. and Savakis, A.
+Lrp-qvit: Mixed-precision
+vision transformer quantization via layer-wise relevance
+propagation. arXiv preprint arXiv:2401.11243, 2024.
+Ranjan, N. and Savakis, A. Mix-qvit: Mixed-precision
+vision transformer quantization driven by layer im-
+portance and quantization sensitivity.
+arXiv preprint
+arXiv:2501.06357, 2025.
+Sakaguchi, K., Bras, R. L., Bhagavatula, C., and Choi, Y.
+Winogrande: An adversarial winograd schema challenge
+at scale. Communications of the ACM, 64(9):99–106,
+2021.
+Tang, C., Ouyang, K., Wang, Z., Zhu, Y., Ji, W., Wang,
+Y., and Zhu, W. Mixed-precision neural network quanti-
+zation via learned layer-wise importance. In European
+conference on computer vision, pp. 259–275. Springer,
+2022.
+Wang, J., Yin, Y., Sun, H., Qi, Q., Wang, J., Zhuang, Z.,
+Yang, T., and Liao, J. Outliertune: Efficient channel-wise
+quantization for large language models. arXiv preprint
+arXiv:2406.18832, 2024.
+Wang, X., Wang, P., Wang, B., Zhang, D., Zhou, Y., and
+Qiu, X. Bitstack: Any-size compression of large lan-
+guage models in variable memory environments. In The
+Thirteenth International Conference on Learning Repre-
+sentations, 2025.
+Wei, J., Cao, S., Cao, T., Ma, L., Wang, L., Zhang, Y., and
+Yang, M. T-mac: Cpu renaissance via table lookup for
+low-bit llm deployment on edge. In Proceedings of the
+Twentieth European Conference on Computer Systems,
+pp. 278–292, 2025.
+Wolsey, L. A. Integer programming. John Wiley & Sons,
+2020.
+Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., and Han,
+S. Smoothquant: Accurate and efficient post-training
+quantization for large language models. In International
+conference on machine learning, pp. 38087–38099, 2023.
+Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng, B.,
+Yu, B., Gao, C., Huang, C., Lv, C., et al. Qwen3 technical
+report. arXiv preprint arXiv:2505.09388, 2025.
+You, H., Guo, Y., Fu, Y., Zhou, W., Shi, H., Zhang, X.,
+Kundu, S., Yazdanbakhsh, A., and Lin, Y. C.
+Shif-
+taddllm: Accelerating pretrained llms via post-training
+multiplication-less reparameterization. Advances in Neu-
+ral Information Processing Systems, 37:24822–24848,
+2024.
+Zellers, R., Holtzman, A., Bisk, Y., Farhadi, A., and Choi,
+Y. Hellaswag: Can a machine really finish your sen-
+tence? In Proceedings of the 57th Annual Meeting of the
+Association for Computational Linguistics, 2019.
+Zhang, X., Liu, J., Xiong, Z., Huang, Y., Xie, G., and
+Zhang, R. Edge intelligence optimization for large lan-
+guage model inference with batching and quantization.
+In 2024 IEEE Wireless Communications and Networking
+Conference (WCNC), pp. 1–6. IEEE, 2024.
+Zhao, P. and Yuan, X. GANQ: GPU-adaptive non-uniform
+quantization for large language models. In Forty-second
+International Conference on Machine Learning, 2025.
+Zhao, X., Xu, R., Gao, Y., Verma, V., Stan, M. R., and Guo,
+X. Edge-mpq: Layer-wise mixed-precision quantization
+with tightly integrated versatile inference units for edge
+computing. IEEE Transactions on Computers, 2024.
+Zihan, C., Bike, X., Jundong, L., and Cong, S. Channel-wise
+mixed-precision quantization for large language models,
+2025.
+11
+
+
+--- Page 12 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+Appendix
+Appendix Overview
+Appendix A: Additional Related Works
+Appendix B: Details about One-Bit Lut-Based GEMM
+Appendix C: Fisher-Information-Based Global Salience of Weight
+Appendix D: Empirical Study on Inference Speed of Group-wise Mixed-Precision Methods
+Appendix E: Empirical Analysis of Weight Salience Distribution
+Appendix F: Detailed Algorithm
+Appendix G: Detailed CUDA Implementation
+Appendix H: Additional Ablation Analysis
+Appendix I: SFMP with Quantization-Aware Training
+Appendix J: Limitation and Discussion
+Appendix K: Autoregressive Decoding Comparison Between SFMP and AMQ
+Appendix L: More Results of Bit Allocation Visualizations
+A. Additional Related Works
+A.1. Structured and Unstructured Quantization Format
+Structured quantization formats are generally more favorable for hardware execution. For example, assigning a uniform
+integer precision to an entire linear layer enables regular memory access patterns and allows weights to be dequantized in
+a uniform manner, without introducing conditional branches or complex control flow. In large-scale models where such
+weight matrices appear extensively, this structured design is particularly advantageous for hardware acceleration (Frantar
+et al., 2023; Lin et al., 2024; Chen et al., 2024; Lee et al., 2025). In contrast, unstructured quantization formats typically
+offer finer granularity and greater flexibility. They allow the quantization precision to be adaptively adjusted according to
+the characteristics of individual weights or channels, and thus can achieve higher model accuracy under the same memory
+budget compared to structured quantization (Huang et al., 2025; Jang & Tambe, 2025; Li et al., 2023; Kim et al., 2024; Zhao
+& Yuan, 2025). However, this increased flexibility often comes at the cost of irregular memory access patterns and more
+complex dequantization procedures. As a result, unstructured quantization is generally less efficient in terms of inference
+latency and hardware utilization than structured quantization, especially on general-purpose accelerators.
+A.2. Layer-Wise Mixed-Precision
+Layer-wise mixed-precision quantization assigns different bit-widths to individual linear layers and typically formulates
+bit allocation as an integer programming or multi-objective optimization problem under a memory budget. However, this
+problem is NP-complete. For large-scale models, the search space becomes prohibitively large: LLaMA3.1 8B contains 224
+linear layers, leading to a search space of 2224 even with only two candidate bit-widths, while LLaMA3.1 70B expands this
+space to 2560. To obtain acceptable solutions within a reasonable time, existing mixed-precision methods rely on heuristic
+strategies to reduce the search space. Most approaches (Cheng et al., 2025; You et al., 2024) adopt constrained formulations
+and solve the resulting integer programs using off-the-shelf solvers, whereas methods such as AMQ (Lee et al., 2025) cast
+bit allocation as a multi-objective optimization problem and employ genetic algorithms to approximate Pareto-optimal
+solutions.
+12
+
+
+--- Page 13 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+Bit-serial Decomposition
+1
+0 0 0 0
+0 0 0 1
+1 1 1 0
+1 1 1 1
+…
+Precompute
+Table
+0
+1
+14
+15
+…
+1 1 0 1
+…
+…
+9 7 6 3
+…
+1 0 0 0 …
+2
+3
+…
+…
+…
+…
+0 0 0 1 
+1 1 0 1
+0 1 1 1
+1 1 1 0
+1 0 1 0
+…
+Run Time
+Figure 11. Detailed computation procedure of one-bit Lut-based GEMM.
+B. Details about One-Bit Lut-Based GEMM
+Fig. 11 illustrates the detailed computational procedure of one-bit Lut-based GEMM. First, a q-bit quantized weight matrix
+Wint ∈Zm×n is decomposed into q one-bit matrices {W0, W1, ..., Wq−1}, where Wi ∈{0, 1}m×n, representing the
+respective bit planes of the original weights. For example, for integer values (9, 7, 6, 3) with binary representations (1001,
+0111, 0110, 0011), the vector for the lowest bit is (1, 1, 0, 1), and the vector for the highest bit is (1, 0, 0, 0). This
+decomposition is performed offline, incurring no runtime overhead. During inference, for an activation vector of the group
+size g, the operator precomputes the dot products between this activation vector and all 2g possible combinations of one-bit
+weights, storing the results in the LUT. Thus, the original matrix computation requiring high-precision multiply-accumulate
+operations is simplified into highly efficient table lookups followed by summation. As shown in the Eq. 15, the matrix
+multiplication between the activation X and the original quantized weight Wint can be transformed into a sum of multiple
+one-bit GEMM operations:
+X × Wint = X ×
+ q−1
+X
+i=0
+2iWi
+!
+=
+q−1
+X
+i=0
+2i X × Wi, Wi ∈{0, 1}m×n.
+(15)
+To reduce the table size and accelerate table lookup, a commonly used technique is mirror storage. Typically, dequantized
+weight ˆW can be written in the following form:
+ˆW =
+q−1
+X
+i=0
+2isWi + z, Wi ∈{0, 1}m×n,
+(16)
+where s ∈R denotes the scale and z ∈R denotes the zero-point. we apply a simple linear transformation by setting ˆs = 1
+2s,
+ˆWi = 2Wi −1, ˆz = z + 1
+2
+Pq−1
+i=0 2is. After that, the dequantized weight ˆW can be rewritten as:
+ˆW =
+q−1
+X
+i=0
+2iˆs ˆWi + ˆz,
+ˆWi ∈{−1, 1}m×n.
+(17)
+Under this transformation, for example, with an input activation combinations [x1, x2, x3, x4], the output of the dot product
+has 16 possible outcomes, ranging from (−x1 −x2 −x3 −x4, ..., x1 + x2 + x3 + x4). When storing the lookup table, we
+only need to store half of the possible results, as the remaining half can be obtained by negating the stored values. This table
+compression method is lossless, fully preserving model inference accuracy while also reducing memory usage by half and
+accelerating table access.
+The one-bit Lut-based GEMM has been demonstrated to offer high computational efficiency and energy efficiency (Park
+et al., 2025b; Wei et al., 2025). FIGLUT (Park et al., 2025b) optimized the table structure for GPU architectures to avoid
+bank conflicts, while T-MAC (Wei et al., 2025) leveraged CPU vectorized lookup instructions (AVX2/NEON) to enable
+efficient LUT operations on CPUs.
+13
+
+
+--- Page 14 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+C. Fisher-Information-Based Global Salience of Weight
+The objective of quantization is to approximate the original full-precision weight W with their quantized representation W ′,
+while minimizing the degradation of the final task loss. To obtain a reliable measure of the global salience of individual
+weights, we aim to characterize how sensitive the final loss is to perturbations of individual weights.
+Let L(W) denote the original output of the model with weights W. When the weights are perturbed by quantized weights
+W ′, the change in loss can be approximated by a second-order Taylor expansion:
+L(W) −L(W ′) ≈g⊤(W −W ′) + 1
+2(W −W ′)⊤H(W −W ′),
+(18)
+where g = ∇W L(W) and H = E
+h
+∂2L(W )
+∂W 2
+i
+are gradient and the Hessian of the loss.
+Since the model is assumed to be well-trained, the gradient term vanishes in expectation, ∇W L(W) ≈0, and the dominant
+contribution to the loss increase induced by quantization comes from the second-order term:
+∆L ≈1
+2(W −W ′)⊤H(W −W ′).
+(19)
+This expression reveals that the effect of weight perturbations on the final loss is governed by the curvature of the loss
+landscape. Perturbations along directions with large curvature lead to disproportionately larger loss increases, implying that
+different weights have inherently different salience.
+Direct computation of the Hessian is infeasible for large-scale models. Following prior work (Kim et al., 2024), we
+approximate the Hessian using the Fisher Information Matrix (Ly et al., 2017):
+H ≃F = E(x,y)∼D
+
+∇W log p(y|x; W) ∇W log p(y|x; W)⊤
+,
+(20)
+which can be efficiently estimated using gradients computed over a sample dataset D. This approximation is well-motivated
+for maximum-likelihood objectives and has been widely adopted in sensitivity and pruning analyses.
+To further reduce computational complexity, we assume that cross-weight interactions are negligible and approximate the
+Fisher matrix by its diagonal:
+F ≈diag(F11, . . . , FNN).
+(21)
+Under this diagonal approximation, the expected increase in loss induced by parameter perturbations decomposes into a sum
+of independent per-weight contributions:
+∆L ≈1
+2
+N
+X
+i=1
+Fii (Wi −W ′
+i)2.
+(22)
+Interpretation as Global Salience.
+The above formulation provides a clear interpretation of the diagonal Fisher Infor-
+mation Fii as a global salience score for each weight wi. Specifically, Fii quantifies how sensitive the final loss is to
+perturbations of wi. For the same magnitude of perturbation, weights with larger Fisher diagonal values induce larger
+increases in the end-to-end loss. Therefore, Fii serves as a principled second-order measure of weight salience, capturing
+global model behavior rather than local layer-wise statistics.
+14
+
+
+--- Page 15 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+2.25
+3.25
+0
+20
+40
+60
+80
+Tokens / s
+RTX3090 / Llama3.1 8B
+2.25
+3.25
+0
+20
+40
+60
+80
+100
+RTX4090 / Llama3.1 8B
+2.25
+3.25
+0
+10
+20
+30
+A100 / Llama3.1 70B
+2.25
+3.25
+0
+10
+20
+30
+40
+50
+H100 / Llama3.1 70B
+BPW
+FP16
+SliM-LLM
+GPTQModel
+Figure 12. Inference throughput (tokens / s) comparison between SliM-LLM and GPTQ when generating 128 tokens with batch size 1.
+FP16 inference of LLaMA3.1 70B is not feasible on single A100 and H100 due to memory constraints. BPW denotes “bits per weight”
+10th
+30th
+20th
+q
+gate
+down
+high
+low
+up
+o
+v
+k
+Figure 13. Weight salience distribution in the 10th, 20th, 30th layers of LLaMA3.1 8B
+D. Empirical Study on Inference Speed of Group-wise Mixed-Precision Methods
+We present an empirical study that compares the inference throughput of the group-wise mixed-precision method SliM-LLM
+(Huang et al., 2025) and the uniform quantization method GPTQ (Frantar et al., 2023). For SliM-LLM, we use the official
+released code, while GPTQ is evaluated using GPTQModel2. As shown in Fig. 12, at the same BPW (bits per weight),
+SliM-LLM exhibits a substantial reduction in inference throughput compared to GPTQ, with a slowdown of up to 50%. The
+result indicates that group-wise mixed-precision quantization introduces significant hardware inefficiencies, leading to a
+reduced inference speed.
+E. Empirical Analysis of Weight Salience Distribution
+Fig. 13 illustrates the distribution of weight salience in LLaMA3.1 8B. It can be observed that weight salience tends to
+concentrate along rows or columns of the weight matrix, rather than forming spatially contiguous blocks.
+2https://github.com/ModelCloud/GPTQModel
+15
+
+
+--- Page 16 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+Algorithm 1 Fisher Diagonal Estimation
+Input: model parameters θ, data loader D
+Output: estimated Fisher diagonal F
+Initialize F ←0 for all parameters
+for each batch x in D do
+Compute model outputs y = model(x)
+Compute loss L(y, x)
+Compute gradients: g = ∇θL
+Accumulate squared gradients: F ←F + g2
+end for
+Average: F ←F/|D|
+Algorithm 2 Block-wise Mixed-Precision Bit Allocation with Row-Column Reordering
+Input: salience matrices {Sl}L
+l=1, weight matrices {Wl}L
+l=1, average bit b, block size (mb, nb)
+Output: bit allocation for each block bit(Bl,k)
+for i = 1 to L do
+sl,row = Sl1
+sl,col = S⊤
+l 1
+pl,row = argsort(sl,row),
+Pl,row = perm(pl,row)
+pl,col = argsort(sl,col),
+Pl,col = perm(pl,col)
+˜Wl = Pl,rowWlPl,col
+˜Sl = Pl,rowSlPl,col
+Partition ˜Wl into blocks {Bl,1, . . . , Bl,Kl} of size mb × nb
+Sal(Bl,k) = P
+(i,j)∈Bl,k ˜Sl,i,j
+end for
+τα = Quantileα
+ {Sal(Bl,k)}∀l,k
+
+for each block Bl,k do
+bit(Bl,k) =
+(
+⌈b⌉,
+Sal(Bl,k) ≥τα
+⌊b⌋,
+otherwise
+end for
+F. Detailed Algorithm
+Algorithm 1 describes how the Fisher diagonal of model parameters is estimated via squared gradients. Algorithm 2 details
+the block-wise mixed-precision bit allocation with row-column reordering.
+G. Detailed CUDA Implementation
+Fig. 14 shows our CUDA implementation: a quantized matrix-vector multiplication. After applying a quantization algorithm
+(e.g., AWQ), the integer weights within each block are decomposed into multiple one-bit components. We then apply an
+equivalent linear transformation, as described in Appendix B, which facilitates the subsequent construction of lookup tables.
+The transformed weights are finally packed along the nb dimension into uint8 values.
+During matrix–vector multiplication, input activations are grouped into 8-element vectors, and the corresponding dot
+products for all 28 = 256 possible activation combinations are precomputed and stored in a lookup table. Owing to the
+applied linear transformation, only 128 entries need to be explicitly constructed, while the remaining entries can be obtained
+via mirror.
+Once the lookup table is constructed, the quantized weights, stored as packed uint8 values, are used to index the table
+and perform accumulation. To improve lookup efficiency, the table is stored in shared memory, enabling fast access during
+computation.
+16
+
+
+--- Page 17 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+weight
+qweight
+quantize
+decompose
+one-bits
+0 1 1 0
+0 0 1 0
+…
+linear 
+transformation
+8
+8
+8
+precompute
+mirror
+0
+127
+precompute
+…
+…
+255
+mirror
+UINT 8
+INT q
+FP 16
+one-bits
+…
+-1 1 1 -1
+1 -1 1 -1
+…
+precompute
+1
+mirror
+0
+127
+255
+0
+127
+255
+Figure 14. CUDA implementation.
+H. Additional Ablation Analysis
+H.1. Impact of Block Size
+We study the impact of block size (mb, nb) on model accuracy.
+H.1.1. EFFECT OF mb.
+As shown in Table 5, decreasing mb consistently improves model accuracy. This behavior is expected, as a smaller mb
+corresponds to a finer granularity of block-wise mixed-precision. However, when mb < 512, further reducing mb only
+yields marginal accuracy gains. Therefore, in practice, considering GPU hardware characteristics such as warp size and
+thread scheduling, we typically choose mb ∈{256, 512} to achieve a good balance between accuracy and efficiency.
+Table 5. Ablation study of block size mb under different BPWs. Each entry reports (WikiText2 perplexity (↓), Zero-shot average accuracy
+(%) (↑)), with nb fixed to 128.
+Model
+BPW
+mb=64
+mb=128
+mb=256
+mb=512
+mb=1024
+LLaMA3.1 8B
+2.50
+(14.43, 64.28)
+(14.43, 64.40)
+(14.48, 64.21)
+(14.49, 64.34)
+(14.93, 63.68)
+3.00
+(9.48, 69.85)
+(9.50, 69.78)
+(9.50, 69.47)
+(9.51, 69.74)
+(9.57, 68.96)
+3.50
+(7.18, 73.06)
+(7.19, 72.90)
+(7.18, 72.93)
+(7.19, 72.97)
+(7.28, 72.78)
+LLaMA3.1 70B
+2.50
+(7.21, 74.80)
+(7.22, 74.72)
+(7.24, 74.65)
+(7.24, 74.60)
+(7.31, 74.02)
+3.00
+(5.29, 78.20)
+(5.31, 78.02)
+(5.30, 78.14)
+(5.31, 78.07)
+(5.40, 77.85)
+4.00
+(4.00, 80.02)
+(4.00, 79.94)
+(4.00, 80.15)
+(4.00, 80.07)
+(4.00, 79.66)
+H.1.2. EFFECT OF nb.
+In contrast to mb, the choice of nb exhibits a more pronounced and non-monotonic effect on accuracy. In our quantization
+scheme, each block applies group quantization with a group size of nb. The parameter nb directly controls both quantization
+granularity and the storage overhead of quantization parameters.
+Under a fixed memory budget, a smaller nb leads to higher overhead for storing scale and zero-point parameters. For
+example, assuming that the scales and zero-points are stored in FP16, when nb = 128, they require an average of 0.25 bits
+per weight. This overhead increases to 0.5 bits when nb = 64, and decreases to 0.125 bits when nb = 256. As shown in
+Table 6, if nb is too small, excessive budget is consumed by quantization parameters, leaving insufficient bit-width for the
+weights themselves and degrading model accuracy. Conversely, if the group size is too large, the value distribution within a
+17
+
+
+--- Page 18 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+group may become highly heterogeneous, and uniform quantization introduces large quantization errors, which also harms
+performance.
+Consequently, nb is neither “the smaller the better” nor “the larger the better,”. Notably, prior mixed-precision methods
+typically fix the group size (e.g., nb = 128) and overlook its impact on the accuracy–budget trade-off. Our ablation analysis
+demonstrate that careful selection of group size is essential for achieving optimal accuracy under fixed memory budget. We
+leave adaptive group size selection under a fixed memory budget as an interesting direction for future work.
+Table 6. Ablation study of block size nb. Each entry reports (WikiText2 perplexity (↓), Zero-shot average accuracy (%) (↑)), with mb
+fixed to 512.
+Model
+BPW
+nb=64
+nb=128
+nb=256
+nb=512
+LLaMA3.1 8B
+2.25
+(4894, 36.79)
+(2520, 37.42)
+(28.61, 57.69)
+(43.56, 57.39)
+2.50
+(737, 40.90)
+(14.49, 64.34)
+(14.05, 64.96)
+(17.93, 62.94)
+3.00
+(10.12, 68.40)
+(9.51, 69.74)
+(9.55, 69.51)
+(9.53, 68.58)
+3.25
+(8.83, 69.99)
+(8.41, 70.77)
+(7.60, 72.35)
+(7.60, 72.62)
+3.50
+(7.98, 71.76)
+(7.19, 72.97)
+(7.21, 73.26)
+(7.27, 73.25)
+LLaMA3.1 70B
+2.25
+(2746, 45.11)
+(1482, 47.52)
+(8.17, 72.65)
+(11.26, 68.43)
+2.50
+(235, 57.36)
+(7.24, 74.60)
+(7.13, 75.12)
+(7.64, 73.85)
+3.00
+(5.47, 77.25)
+(5.31, 78.07)
+(5.36, 77.94)
+(5.40, 77.80)
+3.25
+(4.98, 76.13)
+(4.60, 76.71)
+(4.33, 79.38)
+(4.28, 79.56)
+3.50
+(4.13, 79.49)
+(4.00, 80.07)
+(4.02, 80.25)
+(4.05, 80.48)
+H.2. Impact of Sample Size for Fisher Estimation
+Table 7 reports the impact of the sample size used for Fisher information estimation on model performance. As shown
+in the table, increasing the sample size beyond 512 leads to only marginal improvements in model performance across
+different BPWs. Based on this observation, we adopt a sample size of 1K throughout our work as a reasonable trade-off
+between estimation accuracy and computational cost. Notably, even with a sample size of 128, our method is still able
+to achieve competitive performance, indicating a certain degree of robustness to imperfect Fisher estimation. In addition,
+model performance under the lower BPW exhibits higher sensitivity to the sample size. This trend further highlights the
+importance of accurately identifying salient weights when performing low-bit quantization.
+Table 7. Impact of sample size for Fisher estimation on model performance. Each entry reports (WikiText2 perplexity (↓), Zero-shot
+average accuracy (%) (↑))
+Model
+BPW
+128
+256
+512
+1024
+2048
+LLaMA3.1 8B
+2.5
+(14.61,63.98)
+(14.56,64.28)
+(14.43,64.11)
+(14.49,64.34)
+(14.47,64.40)
+3
+(9.65,69.34)
+(9.60,69.82)
+(9.56,69.60)
+(9.51,69.74)
+(9.53,69.98)
+3.5
+(7.22,72.89)
+(7.24,72.93)
+(7.20,72.78)
+(7.19,72.97)
+(7.19,73.04)
+4
+(6.80,74.29)
+(6.80,74.39)
+(6.80,74.41)
+(6.80,74.33)
+(6.79,74.28)
+LLaMA3.1 70B
+2.5
+(7.30,74.32)
+(7.26,74.54)
+(7.26,74.67)
+(7.24,74.60)
+(7.23,74.71)
+3
+(5.38,77.82)
+(5.33,78.10)
+(5.33,77.92)
+(5.31,78.07)
+(5.30,78.19)
+3.5
+(4.10,80.02)
+(4.05,79.85)
+(4.03,79.93)
+(4.00,80.07)
+(4.00,80.13)
+4
+(3.43,80.50)
+(3.44,80.29)
+(3.38,80.02)
+(3.37,80.47)
+(3.38,80.23)
+18
+
+
+--- Page 19 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+I. SFMP with Quantization-Aware Training
+The block-wise mixed-precision format of SFMP is orthogonal to most quantization tuning techniques. As shown in Table 8,
+by integrating SFMP with EfficientQAT (Chen et al., 2024), an advanced quantization-aware training (QAT) method, we
+further improve model accuracy.
+Table 8. Evaluation of Llama3.1 8B and Qwen3 8B quantized by EfficientQAT and SFMP++ on C4 perplexity (PPL), and zero-shot tasks.
+SFMP++ denotes SFMP combined with EfficientQAT.
+Model
+BPW
+Method
+Wiki2(↓) C4(↓) HellaS.(↑) WinoG.(↑) ARC-e(↑) ARC-c(↑) PIQA(↑) BoolQ(↑) Avg.(↑)
+L3.1 8B
+16
+FP16
+6.15
+8.89
+78.99
+72.93
+81.19
+53.41
+81.39
+82.15
+75.01
+2.25
+EfficientQATw2g128
+13.20
+14.86
+64.96
+64.64
+63.97
+37.71
+75.03
+71.77
+63.01
+SFMP++g256
+10.89
+13.32
+69.29
+67.17
+69.44
+40.61
+76.99
+74.59
+66.35
+3
+EfficientQATw3
+8.14
+10.71
+75.62
+71.67
+74.83
+48.12
+79.76
+78.13
+71.36
+SFMP++g128
+7.74
+10.59
+75.20
+71.67
+77.27
+49.15
+79.27
+78.75
+71.89
+3.25
+EfficientQATw3g128
+7.31
+10.14
+76.44
+72.22
+79.55
+52.90
+79.92
+79.79
+73.47
+SFMP++g256
+7.12
+9.97
+76.66
+72.33
+79.88
+53.12
+79.96
+80.67
+73.77
+Q3 8B
+16
+FP16
+9.73
+13.30
+74.93
+68.66
+80.85
+56.65
+77.47
+86.64
+74.20
+2.25
+EfficientQATw2g128
+19.76
+18.87
+61.47
+64.64
+71.51
+44.37
+73.50
+78.93
+65.74
+SFMP++g256
+15.10
+16.69
+65.49
+64.40
+74.58
+47.95
+74.81
+82.69
+68.32
+3
+EfficientQATw3
+11.74
+14.57
+71.56
+67.14
+79.77
+53.58
+77.75
+85.50
+72.55
+SFMP++g128
+10.39
+13.81
+72.26
+67.88
+79.80
+53.67
+78.18
+86.06
+72.98
+3.25
+EfficientQATw3g128
+9.99
+13.49
+72.40
+68.35
+77.44
+52.82
+77.42
+85.41
+72.31
+SFMP++g256
+9.69
+13.31
+72.88
+68.43
+79.99
+54.96
+77.64
+86.56
+73.41
+J. Limitation and Discussion
+Despite the effectiveness of the proposed method, several limitations remain and point to promising directions for future
+work.
+• Broader hardware support. Our current implementation and evaluation focus on GPU-based inference. Supporting
+additional hardware platforms such as CPUs, NPUs, and TPUs, would significantly broaden the applicability of our
+method.
+• Batch size scope. Our work targets memory-constrained edge scenarios and therefore optimizes computation kernels
+primarily for the batch size = 1 setting. Extending the proposed kernels to efficiently support larger batch sizes is an
+important direction for future work.
+• Adaptive group size. As discussed in the Appendix H.1, the group size plays a critical role in determining model
+accuracy under a fixed memory budget. However, existing mixed-precision quantization methods typically treat the
+group size as a fixed hyperparameter (e.g., 128), determined heuristically, and is independent of the bit allocation
+strategy. A promising future direction is to incorporate the group size into the mixed-precision optimization process
+and allow flexible, adaptive group sizes, which may further improve model performance.
+K. Autoregressive Decoding Comparison Between SFMP and AMQ
+In Table 9 , we present qualitative comparisons of autoregressive decoding behavior between SFMP and AMQ. Given the
+same prompt, both models generate outputs in a deterministic autoregressive manner using greedy decoding.
+19
+
+
+--- Page 20 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+Table 9. Some examples of autoregressive generations obtained with AMQ and SFMP at the BPW of 2.5.
+Models
+AMQ
+SFMP
+LLaMA3.1 8B
+The capital of France is Paris. The capital of France is
+Paris. The capital of France is Paris. The capital of France is
+Paris...
+The capital of France is Paris. It is a city of 2.5 million
+people. It is the most populous city in France. It is also
+the capital of the European Union...
+The main reason for climate change is the increase in
+the amount of greenhouse gases in the atmosphere. The
+greenhouse gases are emitted by the human activities. The
+greenhouse gases are emitted by the human activities. The
+greenhouse gases are emitted by the human activities...
+The main reason for climate change is the increase in
+the amount of greenhouse gases in the atmosphere. The
+greenhouse gases are carbon dioxide, methane, and water
+vapor. The greenhouse gases are emitted by the human
+activities. The greenhouse gases are also emitted by the
+natural activities...
+Explain three reasons why people learn languages?
+1)2)3)4)5)6)7)8)9)10)11)12)13)14)15)16)17)18)...
+Explain three reasons why people learn languages? (1)
+to communicate with people from other countries (2) to
+communicate with people who speak the same language
+(3) to communicate with people who speak a different
+language...
+Qwen3 8B
+The capital of France is Paris. What is the capital of the
+United Kingdom? What is the capital of the United King-
+dom? What is the capital of the United Kingdom? What
+is the capital of the United Kingdom? What is the capital
+of the United Kingdom? What is the capital of the United
+Kingdom? What is the capital...
+The capital of France is Paris. The capital of the United
+States is Washington, D.C. The capital of Canada is Ot-
+tawa. The capital of Australia is Canberra. The capital of
+Japan is Tokyo. The capital of South Korea is Seoul. The
+capital of the United Kingdom is London. The capital of
+Germany is Berlin...
+The main reason for climate change is the increase in the
+temperature of the Earth. The temperature of the Earth has
+increased by 0.6 degrees Celsius. The temperature of the
+Earth has increased by 0.6 degrees Celsius. The temperature
+of the Earth has increased by 0.6 degrees Celsius. The
+temperature of the Earth has...
+The main reason for climate change is the greenhouse
+effect. The greenhouse effect is the process by which the
+atmosphere of the Earth allows the solar radiation to pass
+through, but then traps the heat that is emitted by the Earth,
+which is then absorbed by the atmosphere. This process is
+important for the climate of the Earth, but it is also...
+Explain three reasons why people learn languages? The
+answer should be in the form of a 150 word essay, with
+the first sentence being a summary of the essay. The first
+sentence is the summary of the essay. The rest of the essay
+is the explanation. The first sentence is the summary of the
+essay...
+Explain three reasons why people learn languages?
+(a) To communicate with others, (b) To understand the
+culture of the language, and (c) To learn the language for
+its own sake. Explain each reason with examples. (a) To
+communicate with others: For example, if you want to
+talk to someone in...
+2.5
+3
+3.5
+0 5 1015202530354045505560657075
+Layer Index
+4
+q
+k
+v
+o
+gate
+up
+down
+2
+3
+4
+bit-width
+Figure 15. Visualization of bit allocation over linear layers with different BPWs at Llama3.1 70B. The numbers on the left indicate the
+BPW per configuration.
+L. More Results of Bit Allocation Visualizations
+Table 10 shows an example of detailed bit allocation results on LLaMA3.1 8B with the BPW of 2.5 and 3, using a group
+size of 128. Fig 15 shows the visualization on LLaMA3.1 70B. Fig 16 shows the visualization on Qwen3 8B. Fig 17 shows
+the visualization on Qwen3 32B.
+20
+
+
+--- Page 21 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+Table 10. Detailed bit allocation results over linear layers with the BPW of 2.5 and 3 at Llama3.1 8B, using a group size of 128.
+BPW = 2.5
+BPW = 3.0
+Layer
+q
+k
+v
+o
+gate
+up
+down
+q
+k
+v
+o
+gate
+up
+down
+0
+2.01
+2.04
+2.66
+2.96
+2.12
+2.29
+2.70
+2.03
+2.08
+2.72
+3.00
+2.74
+2.95
+3.00
+1
+2.04
+2.07
+3.00
+2.90
+2.17
+2.56
+2.96
+2.08
+2.13
+3.00
+3.00
+2.99
+3.00
+3.00
+2
+2.11
+2.13
+3.00
+2.67
+2.26
+2.72
+2.83
+2.22
+2.25
+3.00
+2.91
+3.00
+3.00
+3.00
+3
+2.13
+2.17
+3.00
+2.97
+2.15
+2.68
+2.76
+2.32
+2.45
+3.00
+3.00
+2.98
+3.00
+3.00
+4
+2.08
+2.12
+3.00
+2.86
+2.11
+2.66
+2.76
+2.20
+2.27
+3.00
+3.00
+2.90
+3.00
+3.00
+5
+2.25
+2.22
+3.00
+2.94
+2.82
+3.00
+3.00
+2.25
+2.22
+3.00
+2.94
+2.82
+3.00
+3.00
+6
+2.21
+2.23
+3.00
+2.99
+2.65
+2.99
+3.00
+2.21
+2.23
+3.00
+2.99
+2.65
+2.99
+3.00
+7
+2.23
+2.21
+3.00
+3.00
+2.49
+2.97
+2.99
+2.23
+2.21
+3.00
+3.00
+2.49
+2.97
+2.99
+8
+2.20
+2.21
+3.00
+3.00
+2.36
+2.94
+2.99
+2.20
+2.21
+3.00
+3.00
+2.36
+2.94
+2.99
+9
+2.22
+2.21
+3.00
+3.00
+2.27
+2.91
+2.99
+2.22
+2.21
+3.00
+3.00
+2.27
+2.91
+2.99
+10
+2.13
+2.11
+3.00
+2.94
+2.25
+2.87
+2.98
+2.13
+2.11
+3.00
+2.94
+2.25
+2.87
+2.98
+11
+2.22
+2.16
+3.00
+2.97
+2.21
+2.79
+2.93
+2.22
+2.16
+3.00
+2.97
+2.21
+2.79
+2.93
+12
+2.15
+2.16
+3.00
+3.00
+2.21
+2.70
+2.89
+2.15
+2.16
+3.00
+3.00
+2.21
+2.70
+2.89
+13
+2.18
+2.14
+3.00
+2.97
+2.22
+2.73
+2.93
+2.18
+2.14
+3.00
+2.97
+2.22
+2.73
+2.93
+14
+2.19
+2.14
+3.00
+2.97
+2.28
+2.85
+2.95
+2.19
+2.14
+3.00
+2.97
+2.28
+2.85
+2.95
+15
+2.14
+2.17
+3.00
+2.82
+2.39
+2.96
+2.99
+2.14
+2.17
+3.00
+2.82
+2.39
+2.96
+2.99
+16
+2.13
+2.14
+3.00
+2.93
+2.58
+2.99
+2.99
+2.13
+2.14
+3.00
+2.93
+2.58
+2.99
+2.99
+17
+2.11
+2.13
+3.00
+2.89
+2.74
+3.00
+3.00
+2.11
+2.13
+3.00
+2.89
+2.74
+3.00
+3.00
+18
+2.12
+2.10
+3.00
+2.97
+2.86
+3.00
+3.00
+2.12
+2.10
+3.00
+2.97
+2.86
+3.00
+3.00
+19
+2.09
+2.10
+3.00
+2.74
+2.91
+3.00
+3.00
+2.09
+2.10
+3.00
+2.74
+2.91
+3.00
+3.00
+20
+2.09
+2.10
+3.00
+2.81
+2.93
+3.00
+3.00
+2.09
+2.10
+3.00
+2.81
+2.93
+3.00
+3.00
+21
+2.10
+2.11
+3.00
+2.70
+2.93
+3.00
+3.00
+2.10
+2.11
+3.00
+2.70
+2.93
+3.00
+3.00
+22
+2.07
+2.07
+3.00
+2.66
+2.93
+3.00
+3.00
+2.07
+2.07
+3.00
+2.66
+2.93
+3.00
+3.00
+23
+2.11
+2.11
+3.00
+2.82
+2.91
+3.00
+3.00
+2.11
+2.11
+3.00
+2.82
+2.91
+3.00
+3.00
+24
+2.07
+2.08
+2.91
+2.56
+2.89
+3.00
+3.00
+2.07
+2.08
+2.91
+2.56
+2.89
+3.00
+3.00
+25
+2.11
+2.13
+2.95
+2.49
+2.85
+3.00
+3.00
+2.11
+2.13
+2.95
+2.49
+2.85
+3.00
+3.00
+26
+2.09
+2.09
+2.89
+2.59
+2.77
+3.00
+2.99
+2.09
+2.09
+2.89
+2.59
+2.77
+3.00
+2.99
+27
+2.10
+2.10
+2.77
+2.37
+2.63
+2.98
+2.94
+2.10
+2.10
+2.77
+2.37
+2.63
+2.98
+2.94
+28
+2.08
+2.10
+2.90
+2.53
+2.23
+2.77
+2.59
+2.08
+2.10
+2.90
+2.53
+2.23
+2.77
+2.59
+29
+2.18
+2.22
+2.86
+2.34
+2.13
+2.40
+2.52
+2.18
+2.22
+2.86
+2.34
+2.13
+2.40
+2.52
+30
+2.06
+2.08
+2.72
+2.36
+2.16
+2.36
+2.54
+2.06
+2.08
+2.72
+2.36
+2.16
+2.36
+2.54
+31
+2.03
+2.06
+2.34
+2.23
+2.06
+2.19
+2.33
+2.10
+2.15
+2.95
+2.47
+2.22
+2.36
+2.78
+2.5
+3
+3.5
+0
+5
+10
+15
+20
+25
+30
+35
+Layer Index
+4
+q
+k
+v
+o
+gate
+up
+down
+2
+3
+4
+bit-width
+Figure 16. Visualization of bit allocation over linear layers with different BPWs at Qwen3 8B. The numbers on the left indicate the BPW
+per configuration.
+21
+
+
+--- Page 22 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+2.5
+3
+3.5
+0
+5
+10 15 20 25 30 35 40 45 50 55 60
+Layer Index
+4
+q
+k
+v
+o
+gate
+up
+down
+2
+3
+4
+bit-width
+Figure 17. Visualization of bit allocation over linear layers with different BPWs at Qwen3 32B. The numbers on the left indicate the BPW
+per configuration.
+Table 11. Evaluation of Llama 3.1 8B/70B models compressed by SFMP, BitStack and AMQ at the BPW of 2.5, 3.0, 3.5 and 4.0, showing
+WikiText-2 and C4 dataset perplexity (PPL) alongside zero-shot tasks accuracy.
+Model Mem.
+(MB) BPW Method Wiki2(↓) C4(↓) HellaS.(↑) WinoG.(↑) ARC-e(↑) ARC-c(↑) PIQA(↑) BoolQ(↑) Avg.(↑)
+8B
+15,317
+16
+FP16
+6.15
+8.89
+78.99
+72.93
+81.19
+53.41
+81.39
+82.15
+75.01
+4,085
+2.5
+BitStack
+23.28
+38.23
+52.13
+62.51
+59.43
+32.42
+71.55
+71.10
+58.19
+AMQ
+17.85
+24.01
+57.18
+63.61
+59.63
+34.89
+71.00
+65.57
+58.65
+SFMP
+14.49
+18.81
+64.35
+66.46
+66.58
+41.13
+74.05
+73.49
+64.34
+4,501
+3.0
+BitStack
+12.55
+20.47
+63.35
+65.67
+68.64
+39.33
+75.41
+74.01
+64.40
+AMQ
+9.38
+13.05
+70.38
+70.01
+72.69
+45.48
+77.64
+76.48
+68.78
+SFMP
+9.51
+13.13
+71.89
+67.80
+75.80
+47.40
+78.13
+77.43
+69.74
+4,917
+3.5
+BitStack
+9.47
+15.29
+68.61
+68.59
+74.12
+43.69
+77.37
+79.17
+68.59
+AMQ
+7.39
+10.54
+76.15
+73.01
+77.10
+49.57
+79.54
+80.00
+72.56
+SFMP
+7.19
+10.28
+76.95
+73.64
+76.72
+49.49
+79.87
+81.16
+72.97
+5,333
+4.0
+BitStack
+8.39
+13.47
+71.61
+69.53
+76.64
+47.78
+78.94
+81.19
+70.95
+AMQ
+6.86
+9.79
+77.83
+73.09
+78.20
+50.68
+79.92
+81.04
+73.46
+SFMP
+6.80
+9.72
+77.76
+73.95
+79.50
+52.22
+81.01
+81.53
+74.33
+70B
+134,571
+16
+FP16
+2.81
+7.11
+85.07
+79.40
+86.70
+65.02
+84.22
+85.35
+80.96
+24,411
+2.5
+BitStack
+7.55
+12.92
+77.19
+75.53
+80.43
+54.18
+80.09
+79.63
+74.51
+AMQ
+7.62
+12.14
+75.39
+75.85
+79.50
+53.50
+80.14
+81.62
+74.33
+SFMP
+7.24
+10.07
+79.36
+75.06
+79.34
+54.01
+81.56
+78.29
+74.60
+28,491
+3.0
+BitStack
+6.38
+11.21
+79.40
+76.95
+81.44
+56.66
+81.66
+81.68
+76.30
+AMQ
+5.84
+9.74
+80.4
+77.19
+82.28
+59.73
+82.86
+84.37
+77.80
+SFMP
+5.31
+8.36
+81.64
+77.35
+83.63
+60.15
+82.75
+82.91
+78.07
+32,571
+3.5
+BitStack
+5.44
+9.52
+81.72
+77.82
+83.54
+59.47
+83.24
+83.64
+78.24
+AMQ
+4.26
+8.20
+83.10
+78.30
+84.05
+60.92
+83.73
+84.59
+79.11
+SFMP
+4.00
+7.33
+83.45
+79.40
+85.48
+64.33
+84.00
+83.76
+80.07
+36,651
+4.0
+BitStack
+4.98
+8.92
+82.01
+79.79
+84.64
+61.69
+83.19
+83.73
+79.17
+AMQ
+3.49
+7.61
+84.12
+78.77
+85.77
+62.80
+84.11
+85.26
+80.14
+SFMP
+3.37
+7.01
+84.05
+78.85
+85.86
+64.97
+84.12
+84.95
+80.47
+22
+
+
+--- Page 23 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+Table 12. Evaluation of Llama3.1 8B/70B models quantized by SFMP, AWQ, and GPTQ on WikiText-2, C4 perplexity (PPL), and
+zero-shot tasks. For BPW=2.25 and BPW=3.25 settings, our method use a group size of 256. Memory overhead from extra quantization
+parameters in GPTQ and AWQ at w3, w4 is omitted as it is negligible.
+Model Mem.
+(MB) BPW
+Method
+Wiki2(↓) C4(↓) HellaS.(↑) WinoG.(↑) ARC-e(↑) ARC-c(↑) PIQA(↑) BoolQ(↑) Avg.(↑)
+8B
+15,317
+16
+FP16
+6.15
+8.89
+78.99
+72.93
+81.19
+53.41
+81.39
+82.15
+75.01
+3,877
+2.25
+GPTQw2g128
+232
+165
+29.27
+50.74
+28.41
+23.21
+53.75
+45.96
+38.56
+AWQw2g128
+1.57E6
+1.86E6
+26.44
+50.27
+24.78
+24.82
+50.65
+37.82
+35.80
+SliM-LLMg128
+193
+142
+31.14
+51.98
+30.67
+24.87
+55.14
+50.22
+40.67
+SFMPg256
+28.61
+32.61
+57.76
+61.88
+57.24
+34.81
+69.26
+65.17
+57.69
+4,501
+3.0
+GPTQw3
+22.13
+25.05
+56.71
+61.48
+52.98
+34.12
+68.12
+61.59
+55.83
+AWQw3
+16.06
+19.79
+68.79
+64.56
+65.48
+42.06
+74.31
+72.50
+64.62
+SFMPg128
+9.51
+13.13
+71.89
+67.80
+75.80
+47.40
+78.13
+77.43
+69.74
+4,709
+3.25
+GPTQw3g128
+8.28
+11.49
+74.42
+70.87
+70.54
+45.73
+78.35
+75.41
+69.22
+AWQw3g128
+8.23
+11.58
+74.57
+70.95
+75.92
+48.46
+78.67
+75.77
+70.72
+SliM-LLMg128
+8.17
+11.25
+74.76
+70.32
+70.04
+46.28
+78.11
+82.35
+70.31
+SFMPg256
+7.60
+10.73
+76.24
+71.98
+76.68
+48.38
+79.60
+81.22
+72.35
+5,333
+4.0
+GPTQw4
+7.50
+10.38
+76.88
+71.43
+75.08
+49.23
+79.22
+76.91
+71.46
+AWQw4
+7.23
+10.26
+77.92
+72.30
+77.14
+52.65
+80.63
+80.97
+73.60
+SFMPg128
+6.80
+9.72
+77.76
+73.95
+79.50
+52.22
+81.01
+81.53
+74.32
+70B
+134,571
+16
+FP16
+2.81
+7.11
+85.07
+79.40
+86.70
+65.02
+84.22
+85.35
+80.96
+22,371
+2.25
+GPTQw2g128
+113.22
+131.90
+37.16
+52.64
+25.38
+25.85
+51.69
+47.40
+40.02
+AWQw2g128
+1.8E6
+1.5e6
+26.43
+53.20
+24.54
+26.02
+51.52
+62.17
+40.65
+SliM-LLMg128
+68.84
+88.36
+48.19
+60.15
+30.11
+29.87
+58.14
+52.60
+46.51
+SFMPg256
+8.17
+11.42
+75.61
+72.45
+77.86
+52.47
+79.65
+77.86
+72.65
+28,491
+3.0
+GPTQw3
+1.6E4
+1.3E4
+26.45
+48.78
+25.80
+25.94
+52.23
+37.83
+36.17
+AWQw3
+43.14
+43.59
+44.57
+53.04
+42.30
+28.92
+63.93
+53.33
+47.68
+SFMPg128
+5.31
+8.36
+81.64
+77.35
+83.63
+60.15
+82.75
+82.91
+78.07
+30,531
+3.25
+GPTQw3g128
+5.17
+8.76
+81.61
+76.09
+68.22
+43.86
+74.37
+82.39
+71.09
+AWQw3g128
+4.80
+8.62
+82.67
+78.85
+83.96
+62.37
+83.41
+83.64
+79.15
+SliM-LLMg128
+4.74
+8.52
+82.16
+76.78
+79.84
+59.67
+82.91
+83.10
+77.41
+SFMPg256
+4.33
+7.56
+82.80
+78.45
+84.55
+62.46
+83.57
+84.46
+79.38
+36,651
+4.0
+GPTQw4
+1.4E4
+8.8E3
+26.43
+51.85
+25.29
+26.79
+52.12
+37.86
+36.72
+AWQw4
+4.18
+8.29
+83.39
+63.06
+83.00
+60.32
+83.19
+82.75
+75.95
+SFMPg128
+3.37
+7.01
+84.05
+78.85
+85.86
+64.97
+84.12
+84.95
+80.47
+Table 13. Evaluation of Qwen3 8B/14B/32B models compressed by SFMP and AMQ at the BPW of 2.5, 3.0, 3.5 and 4.0, showing
+WikiText-2 and C4 dataset perplexity (PPL) alongside zero-shot tasks accuracy.
+Model Mem.
+(MB) BPW Method Wiki2(↓) C4(↓) HellaS.(↑) WinoG.(↑) ARC-e(↑) ARC-c(↑) PIQA(↑) BoolQ(↑) Avg.(↑)
+8B
+15,623
+16
+FP16
+9.73
+13.30
+74.93
+68.66
+80.85
+56.65
+77.47
+86.64
+74.20
+AMQ
+22.78
+26.01
+55.76
+58.41
+56.19
+35.75
+69.70
+75.90
+58.62
+4,445
+2.5
+SFMP
+16.50
+19.85
+61.46
+63.30
+72.05
+44.37
+72.69
+83.09
+66.16
+AMQ
+13.45
+17.11
+66.71
+63.93
+73.78
+47.61
+73.94
+84.40
+68.40
+4,859
+3.0
+SFMP
+12.10
+15.72
+70.10
+65.90
+79.08
+54.18
+75.24
+84.56
+71.51
+AMQ
+11.34
+14.63
+71.42
+67.08
+77.06
+51.02
+76.93
+86.40
+71.65
+5,273
+3.5
+SFMP
+10.41
+13.99
+72.70
+68.51
+78.28
+55.12
+76.12
+85.69
+72.74
+AMQ
+10.44
+13.81
+73.64
+67.27
+78.49
+53.92
+77.25
+85.29
+72.64
+5,687
+4.0
+SFMP
+9.96
+13.42
+74.20
+68.35
+79.04
+55.15
+77.09
+85.88
+73.29
+14B
+28,169
+16
+FP16
+8.65
+12.01
+78.92
+72.84
+82.79
+60.41
+79.98
+89.33
+77.38
+AMQ
+13.76
+18.62
+64.31
+63.90
+70.47
+44.18
+72.09
+84.39
+66.56
+6,906
+2.5
+SFMP
+12.25
+15.96
+69.14
+68.51
+75.21
+50.68
+76.44
+86.73
+71.12
+AMQ
+11.28
+16.12
+71.16
+69.34
+75.89
+50.27
+75.94
+85.33
+71.32
+7,694
+3.0
+SFMP
+10.29
+13.87
+75.35
+71.74
+80.89
+57.58
+78.45
+87.80
+75.30
+AMQ
+9.73
+13.29
+76.04
+71.98
+81.56
+58.31
+79.12
+87.56
+75.76
+8,481
+3.5
+SFMP
+9.19
+12.66
+77.35
+72.93
+82.49
+59.98
+79.60
+88.96
+76.89
+AMQ
+9.21
+12.62
+77.68
+72.13
+82.05
+59.42
+79.65
+88.76
+76.62
+9,269
+4.0
+SFMP
+8.98
+12.48
+78.23
+72.45
+83.08
+60.41
+79.60
+89.02
+77.13
+32B
+62,490
+16
+FP16
+7.61
+10.78
+82.56
+72.93
+83.25
+60.92
+81.88
+86.42
+77.99
+AMQ
+10.89
+14.45
+71.68
+64.19
+73.90
+50.63
+75.74
+80.08
+69.37
+12,270
+2.5
+SFMP
+10.03
+13.12
+76.93
+67.32
+78.41
+55.89
+79.16
+82.26
+73.33
+AMQ
+9.36
+12.68
+77.10
+68.15
+79.62
+58.83
+77.14
+83.26
+74.02
+14,130
+3.0
+SFMP
+8.84
+12.22
+80.00
+70.48
+81.35
+59.64
+79.27
+86.70
+76.24
+AMQ
+8.23
+11.47
+80.02
+71.26
+81.15
+59.71
+79.14
+84.78
+76.01
+15,990
+3.5
+SFMP
+8.10
+11.28
+81.18
+72.53
+82.02
+60.41
+81.42
+85.88
+77.24
+AMQ
+8.00
+11.19
+81.58
+71.76
+82.31
+60.87
+80.95
+85.42
+77.15
+17,850
+4.0
+SFMP
+7.95
+11.13
+82.01
+72.83
+83.46
+61.09
+81.73
+86.20
+77.89
+23
+
+
+--- Page 24 ---
+SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+Table 14. Evaluation of Qwen3 8B/14B/32B models quantized by SFMP, AWQ, SliM-LLM and GPTQ on WikiText-2, C4 perplexity
+(PPL), and zero-shot tasks. For BPW=2.25 and BPW=3.25 settings, our method use a group size of 256. Memory overhead from extra
+quantization parameters in GPTQ and AWQ at w3, w4 is omitted as it is negligible.
+Model Mem.
+(MB) BPW
+Method
+Wiki2(↓) C4(↓) HellaS.(↑) WinoG.(↑) ARC-e(↑) ARC-c(↑) PIQA(↑) BoolQ(↑) Avg.(↑)
+8B
+15,623
+16
+FP16
+9.73
+13.30
+74.93
+68.66
+80.85
+56.65
+77.47
+86.64
+74.20
+4,238
+2.25
+GPTQw2g128
+39.79
+35.90
+38.60
+49.88
+30.85
+24.65
+54.62
+44.86
+40.58
+AWQw2g128
+1.34E5
+1.53E5
+25.96
+50.12
+26.01
+27.30
+51.36
+62.17
+40.49
+SliM-LLMg128
+33.75
+31.67
+44.18
+51.43
+34.04
+25.78
+55.89
+47.82
+43.19
+SFMPg256
+25.21
+24.50
+57.10
+60.22
+66.57
+39.76
+71.44
+79.39
+62.41
+4,859
+3.0
+GPTQw3
+15.02
+17.46
+62.71
+58.25
+54.25
+37.03
+71.06
+68.78
+58.68
+AWQw3
+15.22
+18.51
+65.27
+57.62
+57.65
+38.91
+73.01
+76.08
+61.42
+SFMPg128
+12.10
+15.72
+70.10
+65.90
+79.08
+54.18
+75.24
+84.56
+71.51
+5,066
+3.25
+GPTQw3g128
+11.03
+14.44
+71.35
+64.80
+73.74
+48.46
+76.17
+83.48
+69.67
+AWQw3g128
+11.66
+15.06
+70.68
+65.03
+74.92
+50.17
+75.46
+83.97
+70.04
+SliM-LLMg128
+11.22
+14.78
+70.18
+64.31
+73.53
+49.70
+75.11
+82.46
+69.22
+SFMPg256
+10.89
+14.36
+71.86
+68.43
+80.47
+53.38
+77.09
+85.14
+72.73
+5,687
+4.0
+GPTQw4
+10.31
+13.81
+73.55
+65.19
+76.47
+51.10
+76.50
+85.41
+71.37
+AWQw4
+10.62
+14.25
+73.62
+67.00
+79.30
+54.35
+75.84
+85.41
+72.59
+SFMPg128
+9.96
+13.42
+74.20
+68.35
+79.04
+55.15
+77.09
+85.88
+73.29
+14B
+28,169
+16
+FP16
+8.65
+12.01
+78.92
+72.84
+82.79
+60.41
+79.98
+89.33
+77.38
+6,512
+2.25
+GPTQw2g128
+23.76
+23.96
+49.74
+52.25
+37.71
+27.73
+61.37
+62.78
+48.60
+AWQw2g128
+4.3E5
+4.0E7
+25.73
+50.43
+25.33
+26.11
+50.97
+62.21
+40.13
+SliM-LLMg128
+21.43
+20.78
+51.93
+54.17
+40.95
+32.21
+63.62
+65.80
+51.40
+SFMPg256
+14.27
+17.90
+66.22
+65.11
+72.47
+45.90
+74.65
+86.21
+68.43
+7,694
+3.0
+GPTQw3
+12.38
+15.09
+70.81
+65.04
+63.34
+42.92
+74.91
+78.86
+65.98
+AWQw3
+12.50
+15.51
+71.84
+62.59
+65.40
+44.03
+74.92
+78.47
+66.21
+SFMPg128
+10.29
+13.87
+75.35
+71.74
+80.89
+57.58
+78.45
+87.80
+75.30
+8,087
+3.25
+GPTQw3g128
+9.74
+12.99
+76.35
+69.77
+82.23
+58.61
+78.40
+88.01
+75.56
+AWQw3g128
+9.83
+13.27
+75.41
+69.77
+80.43
+56.91
+78.13
+88.44
+74.85
+SliM-LLMg128
+9.68
+13.12
+75.72
+69.16
+82.55
+58.10
+78.47
+88.33
+75.39
+SFMPg256
+9.54
+12.94
+76.95
+73.32
+82.24
+59.13
+78.84
+88.29
+76.46
+9,269
+4.0
+GPTQw4
+9.24
+12.64
+77.17
+70.79
+80.59
+56.91
+79.65
+88.47
+75.60
+AWQw4
+9.48
+13.11
+77.56
+72.53
+81.31
+57.84
+79.76
+88.44
+76.24
+SFMPg128
+8.98
+12.48
+78.23
+72.45
+83.08
+60.41
+79.60
+89.02
+77.13
+32B
+62,490
+16
+FP16
+7.61
+10.78
+82.56
+72.93
+83.25
+60.92
+81.88
+86.42
+77.99
+11,340
+2.25
+GPTQw2g128
+25.43
+23.09
+53.21
+53.98
+36.44
+28.15
+61.15
+65.17
+49.68
+AWQw2g128
+1.3E6
+1.4E6
+25.83
+47.82
+25.08
+22.69
+49.51
+62.17
+38.85
+SliM-LLMg128
+28.54
+29.16
+48.97
+50.34
+37.68
+32.08
+57.40
+63.21
+37.75
+SFMPg256
+11.07
+14.03
+74.22
+66.61
+76.01
+52.82
+77.26
+84.98
+71.98
+14,130
+3.0
+GPTQw3
+11.99
+14.08
+74.65
+63.61
+61.48
+44.79
+75.95
+77.49
+66.33
+AWQw3
+12.01
+14.78
+75.66
+62.90
+71.92
+52.51
+76.12
+76.75
+69.31
+SFMPg128
+8.84
+12.22
+80.00
+70.48
+81.35
+59.64
+79.27
+86.70
+76.24
+15,060
+3.25
+GPTQw3g128
+8.63
+11.74
+79.80
+70.40
+79.75
+56.65
+79.92
+87.82
+75.72
+AWQw3g128
+8.60
+11.75
+79.78
+72.29
+79.98
+60.12
+80.56
+84.17
+76.15
+SliM-LLMg128
+8.54
+11.68
+80.09
+70.84
+79.13
+58.35
+80.72
+86.18
+75.89
+SFMPg256
+8.18
+11.35
+81.10
+71.20
+82.45
+61.60
+81.61
+85.38
+77.22
+17,850
+4.0
+GPTQw4
+8.33
+11.34
+81.05
+71.58
+80.17
+58.44
+80.08
+87.88
+76.53
+AWQw4
+8.26
+11.40
+82.02
+70.48
+81.87
+60.56
+81.06
+80.61
+76.10
+SFMPg128
+7.95
+11.13
+82.01
+72.83
+83.46
+61.09
+81.73
+85.20
+77.89
+24

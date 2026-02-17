@@ -1,0 +1,4179 @@
+--- Page 1 ---
+Optimizing LLM Inference: Fluid-Guided Online Scheduling with
+Memory Constraints
+Ruicheng Ao∗
+Massachusetts Institute of Technology
+Gan Luo†
+Peking University
+David Simchi-Levi∗
+Massachusetts Institute of Technology
+Xinshang Wang‡
+Alibaba Group
+January 6, 2026
+Abstract
+Large Language Models (LLMs) power many modern applications, but their inference procedure poses
+unique scheduling challenges: the Key-Value (KV) cache grows dynamically during response generation,
+and memory overflow triggers eviction that can cascade into system-wide failures. Even when memory
+capacity exceeds the theoretical requirement, conventional scheduling algorithms fail because they do not
+account for this dynamic memory growth—a system that should be stable can become unstable under
+poor scheduling.
+This paper formulates LLM inference optimization as a multi-stage online scheduling problem. We
+develop a fluid dynamics approximation to establish a tractable benchmark and derive the Waiting for
+Accumulated Inference Threshold (WAIT) algorithm. WAIT uses threshold-based batching to prevent
+eviction by keeping the system near load balance, achieving near-optimal throughput when output lengths
+are known.
+For practical settings where output lengths are unknown at arrival, we introduce Nested WAIT. Rather
+than predicting output lengths, Nested WAIT classifies prompts on-the-fly: short prompts complete
+early and exit, while longer prompts naturally advance to later segments.
+A safety buffer provides
+high-probability protection against memory overflow with only logarithmic overhead.
+Theoretical analysis establishes near-optimal performance in the asymptotic regime. Experiments on
+Llama-7B with an A100 GPU demonstrate that our approach achieves superior throughput and reduced
+latency compared to vLLM and Sarathi. This work applies operations research principles to establish a
+theoretical framework for LLM deployment under memory constraints.
+Keywords: Large Lanugage Model, Key-value cache, Memory Constraint, Online scheduling
+1
+Introduction
+Large Language Models (LLMs) now dominate natural language processing (NLP) (Devlin et al. 2019,
+Brown et al. 2020, Kaplan et al. 2020, Ouyang et al. 2022, Wei et al. 2022a,b, Touvron et al. 2023, OpenAI
+2024), powering chatbots (Anthropic 2023, Bai et al. 2023, OpenAI 2024, DeepSeek-AI 2025), search engines
+(Google 2023, Microsoft 2023), and programming assistants (GitHub 2022, Anthropic 2025). These models
+generate text through inference—producing responses to user queries—which imposes significant computa-
+tional demands on memory and processing resources (Garc´ıa-Mart´ın et al. 2019). Systems like ChatGPT
+incur daily inference costs exceeding $700,000 and contribute to substantial carbon emissions (Patel 2023,
+∗R. Ao and D. Simchi-Levi are with the Institute of Data, System and Society at Massachusetts Institute of Technology;
+emails: {aorc, dslevi}@mit.edu.
+†G. Luo is with School of Mathematical Sciences, Peking University, Beijing, China; email: luogan@stu.pku.edu.cn.
+‡X. Wang is with DAMO Acedamy, Alibaba US, Seattle, WA; email: xinshang.w@alibaba-inc.com.
+1
+arXiv:2504.11320v2  [cs.LG]  5 Jan 2026
+
+
+--- Page 2 ---
+Figure 1: An example of LLM inference.
+Patterson et al. 2021). Efficient inference scheduling can reduce these operational costs and energy consump-
+tion (Strubell et al. 2019, Desislavov et al. 2021) by balancing system throughput and response latency (Wu
+et al. 2022).
+To design effective scheduling, we must first understand the LLM inference process. Figure 1 provides a step-
+by-step illustration of how a query is processed during inference. The process begins when a user submits a
+prompt—e.g., “Is apple a fruit?”—which is then passed through several computational stages. The inference
+pipeline consists of two main phases:
+• Prefill Phase (stage 0): Upon receiving the prompt, the model first tokenizes the input into a
+sequence of discrete units (e.g., “Is”, “apple”, “a”, “fruit”, “?”). These tokens are then embedded
+and simultaneously processed in a single forward pass to compute the Key-Value (KV) cache, which
+stores intermediate representations (i.e., attention keys and values) for each token. These precomputed
+values enable efficient reuse during subsequent decoding steps. This phase corresponds to Stage 0 in
+Figure 1, where all prompt tokens are embedded and their KV representations are added to the cache.
+• Decode Phase (stages 1 to l′): After the prefill phase, the model enters the decode phase, where
+it generates the output one token at a time. At each stage, the model queries the existing KV cache
+to compute the next token, appends the new token to the output sequence, and updates the KV
+cache with its key-value pair. For instance, the model might first generate “Yes” (Stage 1), then “it”
+(Stage 2), followed by “is” (Stage 3), and finally the “End of Sequence” (EOS) token (Stage 4). This
+progression is depicted in the lower part of Figure 1. Each token generation step involves both reading
+from and writing to the KV cache, resulting in a memory footprint that grows linearly with the length
+of the generated sequence.
+Figure 1 also highlights key performance metrics in LLM inference:
+• Time-To-First-Token (TTFT) measures the latency from user input to the first generated token.
+• Latency refers to the total time required to complete the generation of all output tokens.
+• Throughput captures the average number of tokens generated per unit time.
+This inference structure, particularly the growing memory requirements and sequential decoding pattern,
+introduces fundamental constraints on scheduling and batching. Efficient scheduling must account for both
+prompt heterogeneity and KV cache dynamics to balance latency and resource use.
+Scheduling LLM inference tasks involves grouping prompts into batches processed concurrently on a GPU.
+2
+
+
+--- Page 3 ---
+Batching improves throughput: processing multiple prompts together amortizes the fixed overhead of each
+iteration and better uses GPU parallelism. However, this benefit comes with a fundamental tension—larger
+batches consume more memory through their combined KV caches. The KV cache improves efficiency, as it
+prevents the model from recalculating attention history for each new token; without it, computational cost
+would scale quadratically with sequence length. But the KV cache also grows dynamically during decode,
+making memory footprint unpredictable. This creates a core trade-off: larger batches increase throughput
+but consume more memory, risking capacity overflow.
+Memory overflow can occur in several practical scenarios: (i) bursty arrivals, where sudden traffic spikes
+temporarily exceed capacity; (ii) unknown output lengths, where prompts generate longer responses than an-
+ticipated; and (iii) multi-tenant environments, where multiple users compete for GPU memory. The unknown
+output length problem is particularly challenging: since the scheduler cannot predict how much memory each
+prompt will eventually consume, it cannot reliably plan batch composition or admission decisions. Tradi-
+tional scheduling methods such as Shortest Job First (SJF) assume fixed job sizes and known processing
+times, making them unsuitable when memory demands grow unpredictably (Tay et al. 2022, Kang et al.
+2024, Hooper et al. 2025).
+The Eviction Challenge. When the total KV cache exceeds GPU memory capacity, the system must
+evict some in-progress prompts. Two approaches exist: (i) swapping to CPU/SSD, incurring I/O overhead
+(Sheng et al. 2023, Aminabadi et al. 2022); or (ii) recomputation, where the KV cache is discarded and
+the prompt restarts from prefill (Kwon et al. 2023).
+We focus on recomputation because: (1) it is the
+default in modern production systems such as vLLM (vLLM Team 2025); and (2) our goal is to minimize
+eviction through intelligent scheduling, rather than optimizing the eviction mechanism itself (Li et al. 2025a).
+Eviction creates a vicious cycle: freeing memory temporarily, but restarted prompts consume resources again,
+potentially triggering further evictions—users may experience this as error messages (e.g., “Something went
+wrong”) or incomplete responses under heavy load.
+Memory sufficiency alone does not guarantee stability. The key to maximizing throughput is load balance—
+the equilibrium state where arrival and completion rates match. Yet even when total capacity C exceeds the
+optimal steady-state memory M ∗(derived in our fluid analysis), naive policies can push the system away
+from equilibrium. For instance, first-come-first-served (FCFS) can trigger cascading evictions that reduce
+throughput by 12–25
+Preventing eviction requires approaching load balance through controlled admission.
+Effective scheduling
+demands not just sufficient capacity, but maintaining the system near equilibrium by carefully controlling
+when prompts advance to the next decode stage. This ”approaching load balance” principle guides our
+algorithm design: threshold-based mechanisms hold prompts at decode stage boundaries until memory
+conditions permit safe continuation, keeping the system close to the balanced fluid dynamics.
+Recent system-level optimizations for LLM inference (Yu et al. 2022, Kwon et al. 2023, Agrawal et al. 2023,
+Pope et al. 2023, DeepSeek-AI 2024, Patel et al. 2024, Zhong et al. 2024) focus on engineering solutions
+but lack a rigorous mathematical foundation. In practice, output length predictions are imprecise or costly
+(Fu et al. 2025), and algorithms designed for known output lengths can degenerate significantly when this
+assumption fails (see Proposition 5).
+Our Approach. We develop a fluid dynamics approximation that provides fundamental insights into LLM
+inference scheduling. The fluid model reveals the equilibrium state—where prompt arrivals and completions
+balance—and characterizes the optimal steady-state memory M ∗that maximizes throughput. This equi-
+librium serves as a target: when the stochastic system operates near this balanced state, it achieves high
+throughput while avoiding eviction. The fluid analysis shows that exploiting memory is key to throughput—
+larger batches process more prompts per iteration, maximizing GPU utilization.
+Guided by these fluid insights, we design threshold-based algorithms that keep the stochastic system close
+to the fluid equilibrium. The WAIT algorithm demonstrates this for known output lengths: threshold-based
+admission control at each decode stage prevents the system from drifting away from balance. For unknown
+output lengths, we introduce Nested WAIT, which classifies prompts on-the-fly—short prompts complete
+early and exit, while longer prompts naturally advance to later segments, all without requiring output length
+3
+
+
+--- Page 4 ---
+prediction. Both algorithms achieve asymptotic optimality by approaching the fluid equilibrium.
+1.1
+Summary of Contributions
+This work contributes to LLM inference scheduling through the following contributions:
+• Memory-Constrained Scheduling Model: We develop a multi-stage online scheduling model that
+captures the dynamic growth of KV cache memory during LLM inference, where exceeding capacity
+triggers costly prompt evictions (Section 2). Using a fluid dynamics approximation from queueing
+theory, we characterize the optimal throughput and steady-state memory M ∗under perfect scheduling
+(Section 3).
+• Eviction-Prevention Scheduling Algorithms: We develop threshold-based algorithms that pre-
+vent memory overflow and minimize eviction. The WAIT algorithm (Section 4) demonstrates the core
+insight for known output lengths, while the Nested WAIT algorithm (Section 5) extends this to un-
+known output lengths through on-the-fly type classification. Both achieve asymptotic optimality via
+coupling arguments.
+• Experimental Validation: We evaluate our algorithms on synthetic and real-world datasets, out-
+performing benchmarks like vLLM (Kwon et al. 2023) and Sarathi (Agrawal et al. 2023), which are
+widely recognized high-performance inference engines, in average throughput using Llama2-7B on a
+single A100 GPU (Section 6).
+These contributions bridge operations research and machine learning, providing a theoretical framework
+for memory-constrained LLM inference scheduling that explicitly addresses the eviction problem. Memory-
+constrained LLM inference initially appears as a complex multi-stage stochastic system with feedback through
+eviction. Our threshold mechanism transforms this into a tractable problem amenable to queueing analysis
+by decoupling the interactions between prompt types. Our framework is directly applicable to Prefill-Decode
+Disaggregated systems such as DistServe (Zhong et al. 2024) and Splitwise (Patel et al. 2024), where the
+decode server handles only decode operations, making the linear iteration time model (Section 2) exact.
+1.2
+Other Related Work
+Online Scheduling Problem and Queueing System.
+Classical online scheduling problems focus on
+optimally assigning jobs that arrive sequentially, each with varying completion times.
+In settings with
+stochastic arrivals, foundational studies such as Devanur and Hayes (2009), Vee et al. (2010), Cole and
+Roughgarden (2014), Balkanski et al. (2016), Lattanzi et al. (2020) have developed algorithms that learn
+arrival patterns or distributions to refine scheduling strategies over time. Beyond individual job processing,
+works like Im and Moseley (2013), Lucier et al. (2013), Liu and Lu (2015), Li et al. (2020) have explored
+simultaneous batching and scheduling, grouping similar jobs to enhance efficiency. Within queueing theory,
+fluid models serve as first-order approximations of stochastic systems, enabling near-optimal control strategies
+Mandelbaum et al. (1998), Maglaras (2000), B¨auerle (2002), Liu and Whitt (2011), while asymptotic analysis
+offers insights into long-term system behavior. However, these traditional approaches do not account for
+key features of LLM inference that complicate asymptotic analysis: (i) iteration time varies with batch
+composition and current KV cache sizes, precluding fixed service time assumptions; (ii) memory footprint
+grows dynamically during decode as new tokens are generated; (iii) out-of-memory (OOM) events trigger
+prompt eviction, creating feedback loops—classical stability and limit theorems assume jobs complete once
+started, whereas eviction invalidates standard drift arguments.
+LLM Inference.
+Theoretical frameworks for analyzing Large Language Model (LLM) inference are scarce,
+despite their widespread use. Unlike traditional scheduling, LLM inference involves stochastic arrivals, dy-
+namic memory constraints, and multi-phase processing, complicating analytical efforts. System-level works
+like Patel (2023) (“Splitwise”) and Zhong et al. (2024) (“DistServe”) split inference into prompt handling and
+pipeline execution, while scheduling methods such as Yu et al. (2022), Agrawal et al. (2023), and Agrawal
+et al. (2024b) use batching to boost throughput—similar to our approach.
+Other optimizations include
+DeepSeek-AI (2024) with multi-head latent attention and low-rank KV compression, and Fu et al. (2025)
+4
+
+
+--- Page 5 ---
+with Kendall’s Tau for prioritizing prompts by predicted output lengths. These works focus on engineering
+efficiency and system design. From an operations research perspective, several recent works analyze LLM
+inference scheduling from an online algorithms viewpoint, focusing on competitive ratio and regret bounds.
+Jaillet et al. (2025) develops an online scheduling algorithm with near-optimal regret guarantees for settings
+with known output lengths. Wang et al. (2025) studies optimization with variable prefill and decode lengths in
+pipeline parallelism settings. Chen et al. (2025) addresses robust optimization under prediction uncertainty,
+considering adversarial scenarios. These works provide worst-case performance guarantees that complement
+our fluid-based approach, which targets asymptotic optimality in throughput. In parallel, Li et al. (2025b)
+proposes a stochastic processing model with general batch processing time—including piecewise linear iter-
+ation time that captures transitions between compute-bound and memory-bound regimes—demonstrating
+that work-conserving algorithms achieve optimal throughput. Regarding output length uncertainty, Jaillet
+et al. (2025) and Wang et al. (2025) assume known output lengths at arrival, Chen et al. (2025) considers ad-
+versarial unknown lengths, while our Nested WAIT algorithm addresses stochastic unknown output lengths
+through on-the-fly classification. Their frameworks employ modeling abstractions tailored to competitive ra-
+tio analysis, while our model explicitly captures memory-dependent iteration time (Equation (1)) to analyze
+the throughput-memory trade-off and eviction prevention mechanisms central to our contribution.
+1.3
+Notations
+For integer n ≥1, we denote [n] = {1, 2, . . . , n} as the set of integers from 1 to n. For x ∈R, denote ⌈x⌉as the
+smallest integer not smaller than x and ⌊x⌋as the largest integer not greater than x. Denote x+ = max{x, 0}.
+For set S, denote |S| as its cardinality. For two functions f(T) and g(T), we use f(T) = O(g(T)) if there
+exists constant c1 > 0 such that f(T) ≤c1g(T) as T →+∞and f(T) = Ω(g(T)) if there exists constant
+c2 > 0 such that f(T) ≥c2g(T) as T →+∞.
+2
+Model
+We formalize the online scheduling problem for Large Language Model (LLM) inference under memory
+constraints. Unlike traditional scheduling where job sizes are fixed, LLM inference involves dynamically
+growing memory demands: the Key-Value (KV) cache expands continuously as prompts generate output
+tokens, and the two-phase structure (prefill and decode) creates fundamentally different resource consumption
+patterns. This dynamic growth, combined with unknown output lengths, distinguishes our problem from
+classical queueing models. We first introduce the inference process, then describe prompt characteristics,
+batching rules, system constraints, and performance metrics.
+2.1
+Notation
+We summarize the key notation used throughout this paper in Table 1.
+2.2
+Prompts and Inference Process
+User queries, called prompts, arrive at a single Graphics Processing Unit (GPU) for processing. We focus on
+maximizing how fully the GPU is used, and our algorithms extend to multi-GPU settings such as pipeline
+parallelism, where each prompt is processed across different GPUs in different layers of the LLM. When
+communication costs are negligible, our algorithms apply directly to these settings.
+During the inference process, each prompt is divided into discrete units known as tokens during the prefill
+phase and generates output text through an inference process in the decode phase. A token represents a
+distinct text element, such as a word or subword, and its processing relies on a memory structure called the
+Key-Value (KV) cache. The KV cache improves inference efficiency by storing the computational history
+of prior tokens, thus avoiding redundant computations. The cache size increases as tokens are processed,
+requiring careful memory management to maintain system performance.
+Prompt Characteristics: Prompts arrive stochastically and are classified into m distinct types according
+to their input / output lengths, indexed by j ∈{1, . . . , m}.
+We assume that prompts of type j arrive
+5
+
+
+--- Page 6 ---
+Table 1: Summary of Notation
+Symbol
+Description
+m
+Number of prompt types
+j
+Index of prompt type, j ∈{1, . . . , m}
+λj
+Arrival rate of type-j prompts (Poisson process)
+lj
+Input length (tokens) of type-j prompts after prefill
+l′
+j
+Output length (tokens) of type-j prompts in decode phase
+s
+Stage index: s = 0 for prefill, s ∈{1, . . . , l′
+j} for decode
+k
+Segment index in Nested WAIT, k ∈{1, . . . , m}
+b
+Batch index (iteration count)
+nt
+js
+Number of type-j prompts at stage s at time t
+nj
+Threshold for type-j prompts in WAIT algorithm
+nk
+Threshold for segment k in Nested WAIT
+C
+GPU memory capacity
+Gt
+Set of prompts with KV cache on GPU at time t
+Bt
+Batch of prompts processed at iteration t (Bt ⊆Gt)
+τ
+Iteration time to process a batch
+d0
+Fixed overhead time per batch iteration
+d1
+Time cost per unit of KV cache memory
+M ∗
+Equilibrium memory usage in fluid model
+n∗
+j
+Equilibrium number of active type-j prompts
+Thoughput∗
+Equilibrium throughput (fluid benchmark)
+Π
+Class of admissible scheduling policies
+according to a Poisson process with rate λj. Each prompt’s memory footprint depends on its processing
+stage. A prompt of type j has the following properties:
+(
+a length of lj tokens after prefill;
+a length of lj + l′
+j tokens after decode.
+Therefore, a type-j prompt must undergo one prefill iteration followed by l′
+j decode iterations to complete
+its inference processing. During the prefill phase, the prompt’s input context and question are embedded as
+lj tokens in a single iteration, consuming a KV cache of size lj units. In the subsequent decode phase, one
+output token is generated per iteration, each incurring an additional unit of KV cache memory.
+To track processing progress, we define a prompt to be in stage s = 0 if it is about to undergo the prefill
+phase, and in stage s (where s ∈{1, . . . , l′
+j}) if it is scheduled to receive its s-th output token during the
+decode phase. Thus, a prompt at stage s occupies memory of size lj + s units.
+Though the total number of different types m can be large (for example, from 1 to 10000), our algorithms
+and their theoretical guarantees exhibit only a weak (logarithmic) dependence on m. The analysis relies
+primarily on the total arrival rate across all types, ensuring that our approach scales efficiently regardless of
+the number of types.
+While our analysis focuses on fixed arrival rates λj, our threshold-based algorithms can be extended to
+settings with time-varying arrivals by dynamically adjusting thresholds based on the arrival rates (see Sec-
+tion 7).
+2.3
+Batching and Iteration Time
+To use GPU resources efficiently, the GPU processes tasks in batches, combining prompts for prefilling
+and prefilled prompts for decoding. Figure 2 illustrates the temporal dynamics of batching and scheduling
+in GPU-based inference.
+Two prompts, P1 and P2, arrive sequentially and are processed according to
+their current stage—prefill or decode—at each time step. Initially, P1 arrives and enters the prefill phase,
+6
+
+
+--- Page 7 ---
+embedding its input sequence “How are you?” in a single iteration. Shortly after, P2 arrives with the query
+“Is 5 a prime?”, which is also scheduled for prefill. The GPU batches prompts in the same phase together;
+thus, P1 is processed for prefill alone, followed by P2.
+At the next step, P1 enters the decode phase,
+generating its first output token “I’m,” while P2 undergoes prefill in parallel. Subsequently, both prompts
+advance in the decode phase, each generating one token per iteration: “Yes” for P2 and “I’m fine” for P1.
+This example highlights how the scheduler interleaves prompts in different stages—prefill and decode—into
+shared GPU batches, thereby improving throughput. Prefill stages involve initializing KV caches based on
+input tokens, while decode stages extend outputs one token at a time, with incremental KV cache updates.
+In general, consider a batch composed of:
+• n1 prompts in the prefill phase (stage s = 0), where prompt i has input length lj(i) tokens corresponding
+to its type j(i). These prompts are processed to initialize their KV caches.
+• n2 prompts in the decode phase, where prompt i is at stage si ∈{1, . . . , l′
+j(i)}, having generated si
+output tokens. The total KV cache size for prompt i is lj(i) + si tokens.
+Figure 2: Example of batching and scheduling.
+Experiments in Agrawal et al. (2023), Kwon et al. (2023), Zhong et al. (2024) show that iteration time scales
+linearly with total KV cache size. We model this as:
+τ = d0 + d1 ·
+ n1
+X
+i=1
+lj(i) +
+n2
+X
+i′=1
+(lj(i′) + si′)
+!
+|
+{z
+}
+Total KV cache size in batch
+,
+(1)
+where d0 denotes the fixed overhead time associated with processing a batch, and d1 represents the time cost
+per unit of KV cache memory. Equation (1) shows that iteration time scales linearly with total KV cache
+size. The fixed overhead d0 has an important implication: to maximize throughput, we should use memory
+as fully as possible. Larger batches amortize the fixed cost d0 across more prompts, improving efficiency.
+However, this must be balanced against the memory constraint (2) to avoid eviction. Figure 3 provides a
+numerical validation of this modeling. We deploy Llama-7B and Llama-13B on a single L20 GPU to test
+time cost per iteration, using batches consisting of different number of tokens repeated 20 times. The result
+is highly consistent with our model.
+The linear model (1) is most accurate when: (i) batches are decode-dominated, as each decode iteration
+processes one token per prompt and the computational cost is dominated by KV cache memory access; (ii)
+the system employs prefill-decode disaggregation (Zhong et al. 2024, Patel et al. 2024), where the decode
+server handles only decode operations, making Eq. (1) exact. In mixed prefill-decode batches, the linear
+model provides a good approximation when prefill lengths are similar across prompts.
+More generally, iteration time can exhibit piecewise linear behavior across different operating regimes. For
+example, Li et al. (2025b) models iteration time as τ(b′) = c + a · max{0, b′ −b0}, where iteration time
+is constant for small batch sizes and grows linearly beyond a threshold b0. This captures the transition
+between compute-bound and memory-bound regimes: when batches are small, GPU cores are the bottleneck;
+when batches are large, memory bandwidth dominates. Our algorithms and analysis extend naturally to
+such piecewise linear models. The threshold mechanism in WAIT (Section 4) and Nested WAIT (Section 5)
+7
+
+
+--- Page 8 ---
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Number of Tokens
+1e6
+0
+50
+100
+150
+200
+250
+Inference Time (ms)
+Llama 7B
+Llama 13B
+Figure 3: Inference time of Llama-7B and Llama-13B with different number of tokens in the batch on a
+single L20 GPU
+controls the number of prompts in each decode stage, ensuring the system operates within safe memory limits
+regardless of whether iteration time is strictly linear or piecewise linear. The key insight—balancing arrivals
+and completions to approach the fluid equilibrium—remains valid as long as iteration time scales predictably
+with batch composition. We adopt the simplified linear model (1) for tractability in our theoretical analysis,
+while noting that the empirical validation in Figure 3 confirms this approximation is accurate in the decode-
+dominated regime where our algorithms operate.
+2.4
+Memory Constraint and Challenges
+Unlike traditional scheduling where job sizes are fixed, LLM inference faces a unique challenge: prompts
+occupy memory that grows during decode. Each generated token adds one unit to the prompt’s KV
+cache, causing the memory footprint to expand continuously until completion. This dynamic growth creates
+eviction risks even when total capacity appears sufficient.
+Memory Constraint: At all times t, the total KV cache stored on GPU must not exceed capacity C:
+X
+i∈Gt
+(lj(i) + st
+i) ≤C,
+(2)
+where Gt denotes the set of prompts whose KV caches are stored on GPU at time t. This includes both
+prompts actively processed in the current batch Bt ⊆Gt and prompts that are preempted but retain
+their KV caches on GPU. Here j(i) is the type of prompt i, and st
+i ∈{0, 1, . . . , l′
+j(i)} is its current stage.
+Unlike traditional scheduling where job sizes are fixed, the memory footprint lj(i) + st
+i grows dynamically as
+decode progresses (st
+i increases each iteration). This dynamic growth creates the risk of eviction: if memory
+becomes insufficient to satisfy the constraint (2), ongoing prompts must be removed from the GPU and
+their KV caches discarded. When eviction is necessary, prompts are removed in LIFO order (most recently
+admitted prompts are evicted first) until sufficient memory is freed. Evicted prompts lose all accumulated
+computation and must restart from the prefill phase (stage s = 0), re-entering the scheduling queue as new
+arrivals. This creates a vicious cycle: eviction temporarily frees memory, but restarted prompts compete
+for resources again, potentially triggering further evictions—a phenomenon we call cascading failure. The
+following example illustrates this mechanism.
+Example 1 (Dynamic Memory Growth and Eviction) Consider a simple prompt type: users submit
+“Hello” queries, each expecting a 1-token response “Hi.” Each prompt has prefill length l = 1 token and
+decode length l′ = 1 token. Memory consumption evolves as follows:
+• Stage s = 0 (awaiting prefill): No memory allocated yet.
+• After prefill: The prompt’s KV cache occupies l = 1 unit of memory.
+8
+
+
+--- Page 9 ---
+• After decode (stage s = 1): The prompt occupies l + s = 1 + 1 = 2 units before completion.
+Suppose the GPU has capacity C = 12 units. A batch processes 4 prompts at prefill (using 4 × 1 = 4 units)
+and 4 prompts at decode (using 4 × 2 = 8 units), totaling 4 + 8 = 12 units with 4 completions per iteration.
+Now consider a scenario where 6 new prompts arrive simultaneously while 3 prompts are already decoding:
+1. Current state: 3 prompts in decode occupy 3 × 2 = 6 units.
+2. Admit all 6 for prefill: After prefill, these 6 prompts advance to decode. The 3 existing decode
+prompts complete. System now has 6 prompts in decode, occupying 6 × 2 = 12 units—memory is
+full.
+3. Next batch: 4 new prompts arrive. To prefill them (needing 4 × 1 = 4 units), we must evict 2 decode
+prompts to free space.
+4. Evicted prompts restart: The 2 evicted prompts lose their KV caches and return to stage s = 0,
+re-entering the queue as new arrivals.
+5. Cascade: These restarted prompts compete with new arrivals.
+The imbalance persists, triggering
+repeated evictions.
+This example reveals the cascading eviction problem our algorithms target. Even with C ≥M ∗(the
+equilibrium memory from our fluid analysis, Section 3), poor admission control triggers this cascade, making
+the system unstable. The eviction-restart cycle can persist indefinitely, degrading throughput significantly
+(Example 2 quantifies this for FCFS, showing 12-25% throughput loss).
+Core Challenge.
+When output lengths are unknown, optimistic admission risks overflow; pessimistic
+admission wastes capacity. Our threshold-based algorithms resolve this dilemma by: (i) preventing evictions
+through controlled admission, (ii) exploiting memory fully via batching, (iii) classifying prompts on-the-fly
+as they complete decode stages. This approach maintains the system near the load-balanced equilibrium
+derived in Section 3, where arrivals match completions and memory use is stable.
+2.5
+Performance Metrics
+We define the metrics guiding scheduling optimization:
+• Throughput: Average number of tokens generated in decode phase per unit time, measuring system
+efficiency. We count throughput only after prompt completion to ensure validity of the output.
+• Latency: Average elapsed time from prompt arrival to completion, capturing responsiveness.
+• Time to First Token (TTFT): Average delay from prompt arrival to the generation of the first
+token, reflecting initial user-perceived delay.
+2.6
+Optimization Problem and Policy Space
+We formalize the problem as optimizing throughput subject to latency and TTFT constraints over continuous
+time horizon [0, T]:
+max
+π∈Π
+E
+h
+Thoughput(T,π)i
+,
+s.t.
+E
+h
+Latency(T,π)i
+≤LT ,
+E
+h
+TTFT(T,π)i
+≤F T ,
+X
+i∈Gt
+(lj(i) + st
+i) ≤C,
+∀t.
+(3)
+Policy Space Π. We define the class of admissible scheduling policies Π. At each decision epoch t, a policy
+π ∈Π observes the system state and makes scheduling decisions subject to the following constraints:
+9
+
+
+--- Page 10 ---
+Information Structure. The system state at time t includes: (i) the set of all prompts that have arrived by
+time t, along with their input lengths li; (ii) the current stage st
+i of each prompt i (i.e., how many output
+tokens have been generated); (iii) whether each prompt’s KV cache is currently stored on GPU. Policies are
+non-anticipating: decisions at time t depend only on information available at or before time t. In particular,
+the output length l′
+i of a prompt may be unknown until the prompt completes (generates an end-of-sequence
+token). This unknown output length is a key challenge addressed by our Nested WAIT algorithm (Section 5).
+Admissible Actions. At each decision epoch, a policy may:
+1. Admit: Select a subset of waiting prompts (at stage s = 0) to enter the system. Admitted prompts
+wait until included in a batch for prefill.
+2. Batch: Form a batch Bt of prompts to process in the current iteration. After prefill completes, a
+prompt’s KV cache is allocated on GPU.
+3. Preempt: Pause a prompt while retaining its KV cache on GPU. The prompt can resume later without
+recomputation.
+4. Evict: Remove a prompt’s KV cache from GPU to free memory when the constraint (2) cannot be
+satisfied. Eviction follows a LIFO (Last In, First Out) policy: the most recently admitted prompts
+are evicted first. The evicted prompt returns to the waiting queue at stage s = 0, losing all prior
+computation.
+Memory Constraint. At all times, the total KV cache stored on GPU must satisfy the capacity constraint (2).
+Preemption and eviction are both permitted, but eviction is costly: the evicted prompt re-enters the system
+as a new arrival and must repeat all processing stages from the beginning. Our WAIT algorithms are designed
+to prevent eviction by controlling admission through thresholds, thereby avoiding the memory pressure that
+causes eviction.
+3
+Fluid Dynamics and Equilibrium
+Unlike traditional queueing systems where job sizes are fixed, LLM inference faces a unique challenge: KV
+cache memory grows dynamically as prompts progress through decode stages. Each additional generated
+token increases the prompt’s memory footprint, making it difficult to predict when total memory usage
+will exceed capacity C and trigger costly evictions. These evictions waste the partial computation already
+invested in interrupted prompts, degrading both throughput and latency.
+We develop a fluid model to characterize the system’s equilibrium state—a balanced configuration where
+arrival rates match completion rates and memory usage stabilizes. This equilibrium serves two purposes.
+First, it quantifies the maximum sustainable throughput Thoughput∗under memory constraint C, estab-
+lishing a benchmark for any scheduling policy. Second, it reveals the load-balancing principle that guides
+our algorithm design (Section 4): maintain the system close to equilibrium to prevent evictions. When
+prompts distribute evenly across processing stages, memory consumption remains predictable and overflow
+risk minimizes.
+We first analyze a system with a single prompt type to build intuition about equilibrium dynamics, then
+extend to multiple heterogeneous types.
+The equilibrium provides a theoretical benchmark; our WAIT
+algorithm (Section 4) achieves asymptotic optimality by approaching this benchmark through threshold-
+based admission control that keeps the system near the balanced state.
+3.1
+Single-Type Fluid Model
+We begin with a system handling prompts of a single type j. Each prompt’s memory usage depends on its
+processing stage: lj tokens in the prefill stage (s = 0) and lj +s tokens in the s-th decode stage (s = 1, . . . , l′
+j).
+When the prompt completes stage s = l′
+j, it finishes decoding and its KV cache is cleared from GPU memory.
+In equilibrium, we assume the system maintains n∗
+j active prompts distributed evenly across all (l′
+j+1) stages,
+with n∗
+j/(l′
+j +1) prompts at each stage. This balanced distribution is crucial: if prompts accumulate at later
+10
+
+
+--- Page 11 ---
+decode stages—where memory consumption is highest (lj + l′
+j tokens)—total usage may exceed capacity C,
+forcing evictions that waste partial computation. By spreading prompts evenly, we minimize overflow risk
+while maximizing throughput. This equilibrium model allows us to derive the system’s fundamental capacity
+limit.
+Before deriving the equilibrium parameters, we identify when the system becomes fundamentally unstable—
+regardless of the scheduling policy used. Intuitively, each prompt requires total processing time d1(l′
+j +
+1)(lj + l′
+j/2) to load its KV cache across all (l′
+j + 1) stages. When the arrival rate exceeds the inverse of this
+processing time, the queue grows unbounded.
+Proposition 1 When the condition λjd1(l′
+j + 1)
+
+lj +
+l′
+j
+2
+
+≥1 is satisfied, the system becomes unstable in
+the sense that the expected average latency under any scheduling policy with deterministic arrival rate λj
+grows linearly with time. Formally,
+E[Latency(T,π)] = Ω(T)
+as
+T →∞.
+This condition represents the fundamental capacity limit: arrivals outpace completions, causing latency to
+grow linearly with time. The proof constructs an equilibrium batch and shows that even in this balanced
+state, arrivals exceed completions when the condition holds (Appendix A.1). We therefore assume λjd1(l′
+j +
+1)
+
+lj +
+l′
+j
+2
+
+< 1 for the remainder of this section, ensuring the system can reach equilibrium.
+The total memory usage in equilibrium depends on the distribution of prompts across stages:
+M ∗
+j =
+n∗
+j
+l′
+j + 1
+l′
+j
+X
+s=0
+(lj + s) = n∗
+j
+
+lj + l′
+j
+2
+
+,
+(4)
+where we sum over all (l′
+j + 1) stages, each containing n∗
+j/(l′
+j + 1) prompts. The factor (lj + l′
+j/2) represents
+the average memory per prompt across its lifecycle, from prefill (lj) to final decode stage (lj + l′
+j).
+To find n∗
+j, we use the equilibrium condition: arrivals must equal completions. Each iteration processes one
+stage for all n∗
+j prompts, taking time (d0 + d1M ∗
+j ). During this time, λj(d0 + d1M ∗
+j ) new prompts arrive.
+For equilibrium, this must equal the n∗
+j/(l′
+j + 1) prompts that complete:
+(d0 + d1M ∗
+j )
+|
+{z
+}
+Time per iteration
+λj =
+
+d0 + d1n∗
+j
+
+lj + l′
+j
+2
+
+λj =
+n∗
+j
+l′
+j + 1.
+Solving for n∗
+j yields:
+n∗
+j =
+d0λj(l′
+j + 1)
+1 −d1λj(l′
+j + 1)(lj +
+l′
+j
+2 )
+.
+Substituting this into the memory equation, the equilibrium memory equals:
+M ∗
+j = n∗
+j
+
+lj + l′
+j
+2
+
+=
+d0λj(l′
+j + 1)
+
+lj +
+l′
+j
+2
+
+1 −d1λj(l′
+j + 1)(lj +
+l′
+j
+2 )
+.
+(5)
+This equilibrium batch size balances arrivals and completions. The denominator
+ 1 −d1λj(l′
+j + 1)(lj + l′
+j/2)
+
+represents the fraction of iteration time available for processing—as this approaches zero, batch size grows
+unbounded (approaching instability). The average throughput at equilibrium is the number of decode tokens
+generated per iteration divided by the time consumption for one iteration. In each iteration, n∗
+j/(l′
+j + 1)
+prompts complete (those at stage l′
+j), each generating l′
+j decode tokens:
+Thoughput∗
+j =
+n∗
+j · l′
+j
+(l′
+j + 1)(d0 + d1n∗
+j
+
+lj +
+l′
+j
+2
+
+)
+= λjl′
+j,
+(6)
+11
+
+
+--- Page 12 ---
+where the equality follows from the equilibrium condition in line 46. This shows how arrival rate, memory,
+and throughput relate in equilibrium, where arrivals equal completions.
+3.2
+Multiple-Type Fluid Model
+The single-type analysis provides intuition, but real systems handle multiple prompt types simultaneously,
+each with different input lengths lj and output lengths l′
+j. This heterogeneity introduces a key challenge:
+types compete for the same memory capacity C. Admitting a long prompt (large l′
+j) may force evicting
+multiple short prompts, wasting their partial computation—a cascading failure we analyze in Section 4. We
+now extend the equilibrium model to capture this multi-type interaction.
+We assume the system maintains n∗
+j active prompts of each type j ∈{1, . . . , m} in equilibrium. Following
+the derivation of (5), the total memory occupancy equals:
+M ∗=
+m
+X
+j=1
+n∗
+j
+
+lj + l′
+j
+2
+
+(7)
+with:
+(d0 + d1M ∗)
+|
+{z
+}
+Time per iteration
+λj(l′
+j + 1) = n∗
+j, ∀j ∈{1, 2, · · · , m}
+since the arrivals during each iteration should equal the number of completions in equilibrium, and there are
+(l′
+j + 1) stages total. Substituting the above equations into (7) yields
+M ∗=
+d0
+Pm
+j=1 λj(l′
+j + 1)
+
+lj +
+l′
+j
+2
+
+1 −d1
+Pm
+j=1 λj(l′
+j + 1)
+
+lj +
+l′
+j
+2
+
+(8)
+Aggregating the results above, we get the processing time per iteration in equilibrium:
+Processing Time∗
+= d0 + d1M ∗
+=
+d0
+1 −d1
+Pm
+j=1 λj(l′
+j + 1)(lj + 1
+2l′
+j),
+(9)
+as well as the average throughput:
+Thoughput∗=
+m
+X
+j=1
+n∗
+j · l′
+j
+(l′
+j + 1) · (d0 + d1M ∗) =
+m
+X
+j=1
+λjl′
+j
+(10)
+The equilibrium throughput benchmarks all non-predictive policies within the policy class Π. The following
+proposition demonstrates that the expected throughput of any policy in Π cannot exceed the equilibrium
+throughput Thoughput∗, as specified in Equation (10).
+Proposition 2 Suppose that the memory capacity satisfies C ≥M ∗, where M ∗denotes the equilibrium
+memory given in (8). Then, for any online policy π ∈Π, the expected throughput satisfies
+E[Thoughput(T,π)] ≤Thoughput∗,
+where Thoughput∗is given in (10).
+This result has two implications for algorithm design. First, it quantifies the theoretical limit: no non-
+predictive policy can exceed Thoughput∗= Pm
+j=1 λjl′
+j when C ≥M ∗. This establishes a performance
+benchmark for any scheduling policy.
+Second, it suggests a design principle: any policy that prevents
+evictions and maintains balanced stages can approach this throughput. This motivates our WAIT algorithm
+(Section 4), which uses thresholds to keep the system near equilibrium, preventing the cascading failures
+that cause FCFS to fall short (see Example 2).
+12
+
+
+--- Page 13 ---
+The equilibrium analysis reveals a critical design principle: maintain balanced prompt distribution across
+stages. Having exactly n∗
+j/(l′
+j + 1) prompts at each stage prevents two failure modes. First, if prompts
+accumulate at later decode stages—where each consumes more memory—total usage may exceed capacity
+C, forcing evictions that waste partial computation. Second, if prompts concentrate at early stages while
+later stages starve, the system leaves processing capacity unused, reducing throughput.
+This load-balancing principle directly motivates our WAIT algorithm (Section 4).
+By controlling when
+prompts advance to the next stage via thresholds, WAIT keeps the system close to the balanced equilibrium,
+preventing the cascading evictions that plague FCFS (see Example 2 in Section 4). The fluid model thus
+provides both a performance benchmark and a design guide.
+In classical queueing theory, fluid models typically lead to ordinary differential equations (ODEs) describing
+the continuous transition of queue lengths over time. Constructing such ODEs for LLM inference, how-
+ever, presents technical challenges. Eviction events—triggered when memory usage exceeds capacity—cause
+discontinuous jumps in the system state, as KV caches of evicted prompts are cleared entirely rather than
+decreasing smoothly. At boundaries where certain stage populations reach zero or where drift terms vanish,
+the direction of state transition becomes ambiguous under standard ODE analysis.
+We therefore adopt
+a discrete, iteration-based framework that directly characterizes equilibrium and uses it as a performance
+benchmark pending a complete characterization of such an asymptotic regime.
+4
+Scheduling with Known Arrival Types: The WAIT Algorithm
+This section introduces the Waiting for Accumulated Inference Threshold (WAIT) algorithm, a scheduling
+policy that maximizes throughput under known prompt arrival types. Using the fluid dynamics established in
+Section 3, WAIT optimizes batch formation and scheduling by accumulating prompts until specific thresholds
+are met. This approach uses resources efficiently in stochastic environments by maintaining the system near
+equilibrium while respecting memory constraints and optimizing latency and time-to-first-token (TTFT).
+We assume that the memory capacity C ≥M ∗, the equilibrium memory capacity given in (8) (otherwise the
+throughput can never approach the optimal fluid throughput (10) by Proposition 2).
+Remark 1 (On the Assumption C ≥M ∗) Our theoretical analysis assumes C ≥M ∗, as this is the nec-
+essary condition under which the system can achieve stable operation without accumulating backlog. When
+C < M ∗(the overloaded regime), our algorithms remain effective: the eviction prevention mechanism still
+outperforms baselines, as demonstrated in Section 6. Avoiding eviction cascades provides value across all
+operating regimes.
+4.1
+Motivation: Why Naive Scheduling Fails
+We first demonstrate why naive scheduling policies fail even when memory capacity is sufficient, motivating
+the design of WAIT.
+Consider what happens under a First-Come-First-Serve (FCFS) policy that processes prompts immediately
+upon arrival. Even when the memory capacity C equals the equilibrium memory M∗—seemingly sufficient
+to handle the workload—FCFS can trigger catastrophic failure. The following proposition formalizes this
+observation.
+Proposition 3 When the memory capacity C equals the equilibrium memory M∗, there exists an instance
+where the First-Come-First-Serve (FCFS) policy incurs a throughput gap of Thoughput∗−E[ThoughputT ] =
+Ω(1) as T →∞.
+The proof is provided in Appendix. To illustrate the mechanism behind this failure concretely, consider the
+following example.
+Example 2 (Eviction Cascade under FCFS) Consider a single prompt type where each prompt is a
+simple query such as “Hello” with a 1-token response “Hi”—prefill length l = 1 and decode length l′ = 1.
+Each prompt occupies 1 unit of memory after prefill and 2 units after decode. Let the memory capacity be
+13
+
+
+--- Page 14 ---
+C = 12 and arrival rate λ = 4. The fluid equilibrium has 4 prompts at each stage (prefill and decode), using
+exactly 4 × 1 + 4 × 2 = 12 units of memory with 4 completions per iteration.
+Now suppose the system starts slightly imbalanced with 6 prompts at stage 0 (awaiting prefill) and 3 prompts
+at stage 1 (in decode). Under FCFS:
+1. Iteration 1: Process all 9 prompts. The 3 decode prompts complete, but the 6 prefill prompts advance
+to decode, requiring 6 × 2 = 12 units. Memory is exactly full with only 3 completions.
+2. Iteration 2: During iteration 1, approximately 4 new prompts arrive.
+To admit them for prefill
+(4 × 1 = 4 units needed), we must evict 2 decode prompts (freeing 2 × 2 = 4 units). Now we have 4
+prefill + 4 decode = 4 + 8 = 12 units.
+3. Iteration 3: The 4 decode prompts complete (4 completions). The 2 previously evicted prompts, having
+lost their KV caches, must now restart from the prefill phase (stage s = 0)—they re-enter the queue
+as new arrivals, competing for resources alongside genuinely new prompts. This restart mechanism
+perpetuates the imbalance.
+This eviction-restart cycle persists, yielding approximately 3-3.5 completions per iteration instead of the
+optimal 4. Even though C = M ∗= 12 (theoretically sufficient capacity), FCFS causes cascading
+failures that reduce throughput by 12-25%.
+This example demonstrates a fundamental insight: memory sufficiency alone does not guarantee stability—a
+system that should be stable can become unstable under poor scheduling. The root cause is that FCFS
+does not maintain load balance: it admits prompts greedily, causing the system to deviate from the fluid
+equilibrium and triggering the eviction-restart cycle.
+4.2
+The WAIT Algorithm
+The WAIT algorithm prevents eviction cascades by maintaining load balance through a threshold mechanism.
+The core idea is to control admission at each decode stage, ensuring that the rate of new arrivals matches the
+rate of completions. This keeps the system close to the fluid equilibrium derived in Section 3, approaching load
+balance where arrival and completion rates match. This principle—maintaining the system near equilibrium
+through controlled admission—is central to preventing the cascading failures illustrated in Example 2.
+The threshold-and-wait mechanism achieves three goals. First, it prevents eviction cascades by controlling
+admission. Second, it decouples the complex multi-stage, multi-type dynamics, transforming the system into
+m independent single-type analyses.
+Third, by waiting until thresholds are met, the batch approaches
+the fluid equilibrium size, using memory capacity fully to maximize throughput. The decoupling is crucial:
+without thresholds, delays in one type would affect memory availability for others through shared capacity
+constraints, creating feedback loops that resist standard queueing analysis. The threshold mechanism breaks
+these inter-type dependencies through algorithm design, not inherent problem simplicity. The third goal
+reflects a key insight: memory is not just a constraint to satisfy, but a resource to exploit—larger batches
+process more prompts per iteration, and waiting for the threshold ensures we form batches large enough to
+use memory efficiently while staying within safe limits.
+Algorithm Description.
+For each prompt type j ∈[m], WAIT sets a threshold nj derived from the fluid
+dynamics. At time t, the algorithm monitors the inventory nt
+js—the number of waiting prompts of type j
+at stage s. Type j prompts are included in a batch only when:
+nt
+j0 ≥nj.
+When this condition is met, WAIT constructs a batch by selecting min{nj, nt
+js} prompts of type j at each
+stage s for all types meeting the threshold. If no type satisfies the condition, the algorithm waits for more
+arrivals. KV caches for waiting prompts are preserved, avoiding redundant computation. The complete
+specification is in Algorithm 1 and Figure 4.
+14
+
+
+--- Page 15 ---
+Figure 4: Pipeline of Algorithm 1
+4.3
+Asymptotic Analysis
+We evaluate the performance of WAIT in an asymptotic regime that captures long-run system behav-
+ior. Specifically, we scale the arrival rates to λ(ζ)
+j
+= ζλj and processing speeds accordingly ((d(ζ)
+0 , d(ζ)
+1 ) =
+(ζ−1d0, ζ−1d1)) while keeping memory capacity C fixed. This can equivalently be viewed as scaling the time
+horizon from T to ζT while keeping arrival rates and processing speeds unchanged. As ζ →∞, we obtain
+infinite-horizon limits that characterize the system’s long-run average performance, allowing us to study
+throughput stability under sustained load.
+Performance Metric: We focus on the average throughput, denoted Thoughput(ζ,π), where π represents
+the WAIT policy, defined as:
+Thoughput(ζ,π) = 1
+ζT
+m
+X
+j=1
+N (ζ,π)
+j
+,
+with N (ζ,π)
+j
+being the total number of type-j tokens processed under scaling ζ.
+The average latency
+Latency(ζ,π), TTFT(ζ,π) and TTFT are defined similarly by dividing the quantity by ζ. Our objective is to
+demonstrate that Thoughput(ζ,π) approaches the fluid equilibrium benchmark Thoughput∗= Pm
+j=1 λjl′
+j
+(10) as ζ →∞while giving bound to the latency and TTFT.
+4.4
+Theoretical Analysis
+When memory capacity satisfies C ≥M ∗(where M ∗is the equilibrium memory from Equation (8)), consider
+the WAIT policy π parameterized by thresholds [n1, . . . , nm], where nj is the threshold for type-j prompts
+at each stage. WAIT is asymptotically optimal when the thresholds satisfy:
+∆T(n1:m) := d0 + d1M π ≤nj
+λj , ∀j ∈[m],
+M π =
+m
+X
+j=1
+nj(l′
+j + 1)
+ lj +
+l′
+j
+2
+
+(11)
+The intuition follows from Equation (9): when type j is included in a batch, the iteration time ∆T ensures
+that expected arrivals of type j do not exceed nj. This keeps the system close to the fluid equilibrium, using
+memory capacity fully for throughput while avoiding overflow.
+15
+
+
+--- Page 16 ---
+Algorithm 1 WAIT: Waiting for Accumulated Inference Threshold
+Input: Memory C, arrival rates λj, thresholds nj satisfying (11), ∀j ∈[m]
+1: Initialize prompt inventory njs ←0 for all j ∈[m], s ∈{0, 1, . . . , l′
+j}
+2: Initialize event queue with arrival events for each type j
+3: Set current time t ←0
+4: while True do
+5:
+Wait for the next event (arrival or batch completion)
+6:
+if event is an arrival of type j then
+7:
+Update inventory: nj0 ←nj0 + 1
+▷Add new prompt to waiting queue of prefill phase
+8:
+else if event is a batch completion then
+9:
+Update inventory: For each j in batch B, njs ←njs −min{nj, njs} for s = 0, . . . , l′
+j
+10:
+Advance prompts: For each j, move min{nj, njs} prompts from stage s to s + 1
+11:
+Clear KV caches for prompts reaching stage l′
+j + 1
+▷Free memory for completed prompts
+12:
+end if
+13:
+Check if nj0 ≥nj for any j ∈[m]
+▷Check threshold for batching
+14:
+if condition nj0 ≥nj is met for some j then
+15:
+Form batch B by selecting min{nj, njs} prompts of type j at each stage s for all j meeting the condition
+16:
+Process batch B, keep prompts outside the batch waiting and do not delete their KV caches
+17:
+end if
+18: end while
+Theorem 1 Assume the thresholds π = [n1, . . . , nm] satisfy (11), then we have
+Thoughput∗−E
+h
+Thoughput(ζ,π)i
+= O((ζT)−1
+2 ),
+E
+h
+Latency(ζ,π)i
+, E
+h
+TTFT(ζ,π)i
+= O
+
+(ζT)
+1
+2
+
+.
+Moreover, when we have ∆T[1,...,m] < nj/λj, ∀j ∈[m] where ∆T[1,...,m] is defined in (11), it holds that
+Thoughput∗−E
+h
+Thoughput(ζ,π)i
+= O(1/(ζT)),
+E
+h
+Latency(ζ,π)i
+, E
+h
+TTFT(ζ,π)i
+= O(1).
+The WAIT algorithm prevents eviction cascades through a simple but powerful principle: controlled admis-
+sion via thresholds. By requiring nt
+j0 ≥nj before admitting type-j prompts, the algorithm ensures that
+expected arrivals during each iteration do not exceed completions. This keeps each prompt type close to its
+equilibrium inventory level, preventing the overflow that triggers eviction cascades in FCFS (Example 2).
+The threshold mechanism simultaneously achieves three design goals: (1) eviction prevention by controlling
+when prompts enter batches; (2) approaching load balance by maintaining the system near the fluid equilib-
+rium where arrivals match completions; and (3) memory exploitation by waiting until batches can be formed
+close to the equilibrium size M ∗, maximizing throughput.
+From an analytical perspective, the threshold decouples the m prompt types: we can analyze each type
+independently, as if it were the only type in the system.
+Without this decoupling, delays in one type
+would affect memory availability for others through the shared capacity constraint, creating feedback loops
+that resist standard queueing analysis. With types decoupled, we apply standard techniques—constructing
+dominating processes and using drift analysis—to establish the asymptotic optimality bounds.
+The key
+insight: it is the algorithm design, not inherent problem simplicity, that makes this tractable. The complete
+proof is in Appendix B.
+Theorem 1 provides performance bounds that match the worst-case lower bounds for latency and Time to
+First Token (TTFT). The following proposition establishes these lower bounds.
+Proposition 4 There exists an instance where C = M ∗, and for any non-predictive online policy π, the
+expected average latency and TTFT satisfy
+E[Latency(ζ,π)],
+E[TTFT(ζ,π)] = Ω((ζT)1/2).
+16
+
+
+--- Page 17 ---
+Moreover, we demonstrate that the latency for type j prompts depends exclusively on the relationship
+between ∆T[1,...,m] and nj/λj. Specifically, when ∆T[1,...,m] < nj/λj, the average latency and TTFT for
+type j prompts are O(1), offering a more precise performance estimate than that provided in Theorem 1.
+A limitation of WAIT is its reliance on known arrival types and rates, which may not hold in realistic
+environments (though we can approximate it by using predictors, see e.g. (Fu et al. 2025)). In the next
+section, we address this issue by extending WAIT to handle unknown arrival types, introducing a nested
+variant that adapts to stochastic settings with unknown prompt types upon arrival.
+5
+Scheduling with Unknown Arrival Types: The Nested WAIT
+Algorithm
+The WAIT algorithm achieves near-optimal throughput when we know prompt types at arrival. In practice,
+however, we cannot predict how many tokens a prompt will generate—output lengths reveal themselves
+only as decode progresses. The Nested Waiting for Accumulated Inference Threshold (Nested WAIT) algo-
+rithm exploits this gradual revelation: prompts classify themselves on-the-fly as they decode. Short
+prompts complete early and exit; longer prompts naturally advance to later segments. No prediction is
+needed—the algorithm simply lets each prompt reveal its type through its decode trajectory.
+Example 3 (Unknown Output Lengths) Continuing Example 2, suppose output lengths are now un-
+known at arrival: each “Hello” prompt receives either “Hi” (1 token) or “Hi there!”
+(2 tokens).
+The
+scheduler faces a dilemma. If it optimistically assumes all outputs are short (1 token each), it admits 6
+prompts with capacity C = 12, requiring 6 × 2 = 12 units after decode. But if some outputs turn out to be 2
+tokens (requiring 3 units each), memory overflows and eviction cascades begin. Conversely, if the scheduler
+conservatively assumes all outputs are long, it admits only 4 prompts to stay safe, wasting 25% of capacity
+when most outputs are actually short.
+This dilemma—optimism leads to eviction, pessimism wastes capacity—leads to our design principles: (i)
+avoid eviction by not over-committing memory; (ii) classify on-the-fly by letting prompts reveal their type
+as they decode; (iii) don’t waste throughput by exploiting available capacity; (iv) let shorter prompts finish
+first so they free memory without being blocked by longer ones.
+5.1
+Algorithm Overview
+Example 3 reveals a fundamental dilemma: optimism risks eviction, pessimism wastes capacity. We resolve
+this through on-the-fly classification. Rather than predicting output lengths at arrival, Nested WAIT lets
+prompts reveal their output as they decode. Short prompts complete early and exit; longer prompts naturally
+advance to later segments.
+The core idea is nested thresholds: segment 1 handles all prompts from decode stage 0 to l′
+1; segment 2
+handles prompts that survive past l′
+1 (i.e., types 2 through m); segment 3 handles prompts past l′
+2; and so
+on. Each segment k has its own threshold nk controlling when it processes prompts. This nesting achieves
+two goals: (i) short prompts complete in early segments without being blocked by long prompts; (ii) each
+segment operates at high memory utilization for its remaining types.
+Formally, let output lengths satisfy l′
+1 < l′
+2 < · · · < l′
+m, where type j has decode length l′
+j. We organize
+inference into m nested segments, where segment k spans decode stages from l′
+k−1 + 1 to l′
+k (with l′
+0 = 0).
+The algorithm uses thresholds π = [n1, . . . , nm] where nk controls when segment k begins processing and
+limits batch size per stage.
+Segment 1 processes all newly arrived prompts (at combined rate λ1 + · · · + λm) through decode stages
+0, 1, . . . , l′
+1. After l′
+1 + 1 iterations, two outcomes emerge: type-1 prompts have completed their output and
+exit the system, freeing their memory; all other prompts (types 2 through m) advance to segment
+2. Segment 2 now processes only these longer prompts (at reduced rate λ2 + · · · + λm) through stages
+l′
+1 +1, . . . , l′
+2. This pattern repeats: after l′
+2 −l′
+1 more iterations, type-2 prompts exit, and types 3 through m
+17
+
+
+--- Page 18 ---
+advance to segment 3. Prompts classify themselves by completing (short) or continuing (long) at each
+segment boundary.
+If segment k∗has fewer than nk∗prompts, we pause processing for that segment and all later ones, retaining
+their KV caches on GPU. We continue batching exactly nk prompts per stage in segments k < k∗and
+perform iterations. Since new long prompts arrive continuously, segment k∗resumes once its threshold is
+met. Algorithm 2 formalizes this procedure, and Figure 5 illustrates the pipeline.
+We assume identical prefill lengths l1 = l2 = · · · = lm for clarity, though the general case extends similarly to
+Algorithm 1 by forming segment groups for each prefill length. The number of output lengths m minimally
+impacts performance, which depends primarily on total arrival rates. The number of segments can also differ
+from m while retaining near-optimal guarantees (Section 7).
+Figure 5: Pipeline of the Nested WAIT Algorithm
+Consider Example 3 with two prompt types: “Hello” →“Hi” (1 token, type 1) and “Hello” →“Hi there!” (2
+tokens, type 2). At arrival, we cannot distinguish them. After one decode iteration, however, the prompts
+reveal themselves: type-1 prompts have completed their output (“Hi”) and exit; type-2 prompts have
+generated only their first token (“Hi”) and continue. Nested WAIT exploits this revelation by partitioning
+processing into two segments. Segment 1 processes all newly arrived prompts (both types) through stages
+0, 1 (up to l′
+1 = 1) at combined rate λ1 +λ2. Segment 2 processes only type-2 prompts (those that survived
+segment 1) through stage 2 (up to l′
+2 = 2) at reduced rate λ2. No prediction is needed—prompts simply
+classify themselves by completing or continuing at the segment 1 boundary.
+Figure 6 visualizes the algorithm in action. At time t = 0, prompts P1 and P2 arrive but are insufficient
+to trigger processing, as Segment 1 has fewer than 3 prompts. At t = 1, P3 arrives, satisfying the Segment
+1 threshold, and the batch is processed. Since these prompts have just begun decoding, none qualify for
+Segment 2. At t = 5, a new wave of prompts (P4, P5) arrives, again below the threshold. By t = 7, the
+threshold is met with P6, P7, and processing proceeds. Now, P3, having reached a deeper decode stage,
+transitions to Segment 2. However, since the Segment 2 threshold is still unmet, only Segment 1 is processed.
+Finally, at t = 14, enough prompts have advanced into Segment 2 (P3, P5, P6, etc.) to satisfy both segment
+thresholds. At this point, the Nested WAIT algorithm jointly schedules both segments, batching according
+to type-specific readiness. This example shows how the algorithm defers processing to ensure type separation
+and stage-aligned batching.
+This nested structure directly implements the four design principles from Example 3: (i) we avoid eviction
+by never exceeding thresholds; (ii) prompts classify on-the-fly at segment boundaries; (iii) we don’t
+waste throughput because each segment operates at its own optimal threshold; (iv) short prompts
+18
+
+
+--- Page 19 ---
+Figure 6: Example of the Nested WAIT Algorithm
+finish first within segment 1, freeing memory without waiting for long prompts. Crucially, no prediction
+is needed—prompts simply reveal their output by completing or continuing. This achieves high memory
+utilization for all types simultaneously, not just the shortest or longest. We now formalize this intuition.
+5.2
+Main Theorem
+We now analyze Nested WAIT in the asymptotic regime, following the same framework as Section 4. The
+unknown-output-length setting introduces additional stochastic variability: since we cannot predict
+which prompts will be long, some may queue at segment boundaries waiting for thresholds. This affects both
+memory requirements and throughput guarantees. We characterize average throughput Thoughput(ζ,π),
+latency Latency(ζ,π), and time-to-first-token TTFT(ζ,π) under threshold policy π = [n1, . . . , nm].
+Before showing Nested WAIT achieves near-optimal throughput, we establish a lower bound showing that
+some extra memory beyond M ∗is necessary when output lengths are unknown.
+Intuition: When memory capacity equals exactly C = M ∗(the fluid equilibrium), any algorithm that cannot
+predict output lengths faces a dilemma at every iteration. If we admit too many prompts optimistically, some
+will reveal longer outputs than expected, causing overflow and eviction. If we admit too few conservatively,
+we waste capacity. Either scenario creates a throughput gap of Ω(1) over time.
+Proposition 5 When memory capacity C equals the equilibrium memory M∗, there exists an instance
+where any online non-predictive policy π, unaware of prompt types upon arrival, incurs a throughput gap
+Thoughput∗−E[Thoughput(ζ,π)] = Ω(1).
+This lower bound shows that uncertainty has a cost: we need more memory than the fluid equilibrium to
+hedge against unknown output lengths. Theorem 2 shows that only a logarithmic amount of extra memory
+suffices under Nested WAIT.
+As in Section 4, thresholds must balance two goals: (i) throughput efficiency (don’t wait too long to
+form batches); (ii) segment stability (ensure later segments receive enough prompts). This leads to two
+constraints, analogous to Equation (11).
+Similar to Equation (11), we define ∆T[1,...,m](n1, . . . , nm) as the time cost per iteration with exactly nk
+19
+
+
+--- Page 20 ---
+Algorithm 2 Nested WAIT: Nested Waiting for Accumulated Inference Threshold
+Input: Memory capacity C, arrival rates λj for j ∈[m], thresholds nk for segments k ∈[m]
+Input: Output lengths l′
+1 < l′
+2 < · · · < l′
+m for prompt types j ∈[m]
+▷Qk,s: number of prompts in segment k at decode stage s; entry stage of segment k is l′
+k−1 (with l′
+0 = 0)
+1: Initialize Qk,s ←0 for all segments k ∈[m] and stages s ∈[l′
+k−1, l′
+k −1]
+2: Initialize event queue; set current time t ←0
+3: while True do
+4:
+Wait for the next event (arrival or batch completion)
+5:
+if event is an arrival then
+6:
+Q1,0 ←Q1,0 + 1
+▷New prompts enter segment 1 at stage 0
+7:
+else if event is a batch completion for segment k then
+8:
+for each stage s in segment k do
+9:
+Advance min{nk, Qk,s} prompts from stage s to s + 1
+10:
+end for
+11:
+if prompts reach stage l′
+k (end of segment k) then
+12:
+if k < m then
+13:
+Move to segment k + 1 at stage l′
+k
+▷These are type-(k + 1) or longer
+14:
+else
+15:
+Complete and clear KV caches
+16:
+end if
+17:
+end if
+18:
+end if
+19:
+Find largest k such that Qk′,l′
+k′−1 ≥nk′ for all k′ ≤k
+▷All segments up to k meet threshold
+20:
+if such k exists then
+21:
+Form batch from segments 1, . . . , k: select min{nk′, Qk′,s} prompts per stage
+22:
+Process batch; prompts outside batch wait with KV caches retained
+23:
+end if
+24: end while
+prompts per stage in segment k, for all k ∈[1, . . . , m]. Thresholds must satisfy:
+∆T[1,...,m](n1, . . . , nm) <
+n1
+Pm
+j=1 λj
+,
+nk+1
+nk
+> pk, ∀k ∈{1, . . . , m −1},
+(12)
+where pk = (Pm
+j=k+1 λj)/(Pm
+j=k λj) < 1. To state the memory requirement, we define the memory usage
+when running iteration with exactly nk prompts per stage in segment k, for all k ∈[1, . . . , m] as:
+M π =
+m
+X
+k=1
+nk
+ l + 1
+2L′
+k
+
+∆l′
+k,
+where L′
+k =
+k
+X
+r=1
+l′
+r, ∆l′
+k = l′
+k −l′
+k−1, l′
+0 = 0.
+(13)
+Here, the formula captures the peak batch memory when exactly nk prompts occupy each segment k: the
+term nk is the threshold (maximum prompts concurrently decoding in segment k), ∆l′
+k = l′
+k −l′
+k−1 counts
+the decode stages spanned by segment k, and (l + 1
+2L′
+k) represents the average memory per prompt within
+segment k, where L′
+k = l′
+1 + · · · + l′
+k is the cumulative decode length.
+We define the total number of
+iterations over time horizon [0, T] as B. Therefore, we have T ≥PB
+b=1 ∆Tb-th Batch ≥B · min ∆TBatch,
+where ∆Tb-th Batch denotes the time cost of the b-th iteration and ∆Tmin = minb{∆TBatch}. Theorem 2
+establishes asymptotic optimality for Nested WAIT in the asymptotic regime with unknown prompt types,
+given thresholds π = [n1, . . . , nm] satisfying Equation (12).
+20
+
+
+--- Page 21 ---
+Theorem 2 Assume thresholds π = [n1, . . . , nm] satisfy Equation (12), and memory M satisfies:
+M (ζ,π)
+≥M π +
+m
+X
+k=2
+(l + l′
+k−1)
+
+nk + θ−1
+k
+ln
+mζB
+δ
+
+=O
+
+2M π +
+m
+X
+k=1
+(l + l′
+k−1)θ−1
+k
+ln
+mζB
+δ
+
+,
+(14)
+where θk ≥8(nk −nk−1pk)/nk. Then:
+Thoughput∗−E
+
+Thoughput(ζ,π)
+= O
+ (ζT)−1
+,
+E
+
+Latency(ζ,π)
+, E
+
+TTFT(ζ,π)
+= O(1).
+Moreover, memory is not exceeded with probability at least 1 −δ during time horizon [0, T].
+Nested WAIT extends the dimensionality reduction approach from WAIT to handle unknown output lengths.
+The core insight is that thresholds nk in each segment k bound the state space, just as in WAIT—but now
+prompts classify themselves on-the-fly by completing or continuing at segment boundaries, rather than
+revealing their type at arrival. There is even no need to know the actual output—we only observe whether
+each prompt completes or continues. This on-the-fly classification creates a key technical challenge: prompts
+entering segment 2 at time t are precisely those that survived segment 1, creating a delayed arrival process
+with rate λ2 + · · · + λm that depends on the history of earlier segments. We address this through a coupling
+argument: the number of prompts transitioning from segment k to k+1 couples to a Poisson process with rate
+Pm
+j=k+1 λj, allowing us to analyze each segment’s queue independently despite the temporal dependency.
+This coupling reveals why the safety buffer is necessary. When segment k has fewer than nk prompts, pro-
+cessing pauses and prompts queue at the boundary. Because we cannot predict which prompts will advance
+to later segments, this queueing introduces stochastic fluctuations beyond the fluid limit. Doob’s maximal
+inequality bounds the maximum queue length over time horizon [0, T] with high probability, showing the
+bound grows only as O(ln(T/δ))—this logarithmic overhead is the safety buffer in Equation (14). The key
+is that despite not knowing output lengths, the threshold mechanism keeps each segment close to its equi-
+librium batch size, maintaining the system near the load-balanced state where arrivals match completions.
+This prevents the cascading evictions that occur in FCFS (Example 2) while achieving the same design
+goals as WAIT: eviction prevention, approaching load balance, and memory exploitation. The full proof in
+Appendix C formalizes the coupling construction and derives explicit constants.
+The memory requirement in Equation (14) consists of two components with clear operational interpretations:
+1. Base memory M π: This is the equilibrium memory from the fluid model—the memory needed
+when exactly nk prompts occupy each stage in segment k. This represents the “steady-state” memory
+consumption.
+2. Safety buffer Pm
+k=2(l+l′
+k−1)(nk+θ−1
+k
+ln(mζB/δ)): This additional memory hedges against stochastic
+fluctuations when output lengths are unknown. It has three components:
+• nk: Accounts for prompts queueing at segment k boundaries, waiting for thresholds.
+• θ−1
+k
+ln(mζB/δ): High-probability protection against queue buildup (overflow occurs with proba-
+bility ≤δ).
+• (l + l′
+k−1): Memory footprint of prompts at the boundary between segments k −1 and k.
+This safety buffer is logarithmic in the time horizon T (via B) and confidence level 1/δ, making it a modest
+overhead compared to the base memory M π. This is why Proposition 5 shows that some extra memory
+beyond M ∗is necessary for unknown output lengths, but our Theorem 2 demonstrates that only a logarithmic
+amount suffices.
+21
+
+
+--- Page 22 ---
+Number of types: The algorithm’s performance depends primarily on arrival rates and output lengths,
+not the number of types m. Even for large m (e.g., output lengths {1, 2, . . . , m}), descending thresholds
+n1 > n2 > · · · > nm remain effective when arrival rates satisfy condition (12).
+Safety buffer overhead: The memory requirement in (14) is typically dominated by the base term M π.
+The safety buffer (second term) grows only logarithmically in the time horizon and is modest in practice.
+Section ?? provides numerical validation.
+Segment-wise generalization: In practice, we use a segment-wise variant that groups m types into
+L ≤m segments (Section 7). This design addresses two concerns: (i) robustness to varying or uncertain type
+distributions; (ii) for long decode lengths, maintaining separate thresholds for every type may be infeasible.
+Grouping into segments provides stable scheduling with similar guarantees. Having established theoretical
+foundations for both known and unknown output lengths, we now validate our algorithms experimentally
+(Section ??).
+6
+Numerical Experiments
+We evaluate our (Nested) WAIT algorithm through numerical experiments. Our analysis focuses on two
+distinct scenarios: (i) simulated prompts designed to test the algorithm under controlled conditions, and (ii)
+a real-world dataset sourced from Zheng et al. (2023) to assess its performance in practical settings.
+We conduct all experiments using Microsoft Vidur to simulate an NVIDIA A100 GPU, mirroring the hard-
+ware configuration that prior studies used (Agrawal et al. 2024a). We benchmark our WAIT algorithm
+against vLLM (Kwon et al. 2023) and Sarathi (Agrawal et al. 2023), widely recognized inference engines
+that employ First-Come-First-Serve (FCFS) scheduling. Specifically, vLLM prioritizes new arrivals, while
+Sarathi prioritizes ongoing prompts, with both enforcing fixed limits on the total number of tokens and
+prompts per iteration.
+6.1
+Experiment on WAIT Algorithm
+We first evaluate the WAIT algorithm when prompt output lengths are known upon arrival. We generate
+simulated prompts with varying input lengths lj and output lengths l′
+j, drawn from distributions that emulate
+real-world variability. We adjust arrival rates λj to simulate both low-traffic and high-traffic scenarios, testing
+the algorithm’s resilience under stress. Specifically, we generate type j prompts via a Poisson process with
+rate λj and test two scenarios:
+(i) Low demand: m = 2, (l1, l2) = (10, 10), (l′
+1, l′
+2) = (10, 20), (λ1, λ2) = (1000, 1000);
+(ii) High demand: m = 3, (l1, l2, l3) = (20, 20, 20), (l′
+1, l′
+2, l′
+3) = (100, 200, 300), (λ1, λ2, λ3) = (6000, 4000, 2000).
+For practical implementation, we simplify threshold computation in WAIT. Given a batch size limit B, we set
+the threshold for type j prompts as nj = B · ρj/(l′
+j + 1), where ρj = λj/ Pm
+j′=1 λj′, aligning with Algorithm
+1. To ensure a fair comparison, we enforce the same batch size limit across WAIT, Sarathi, and vLLM.
+The throughput of WAIT surpasses that of the benchmark algorithms across all tested arrival rates, as
+illustrated in the left panels of Figure 7 and Figure 8.
+This improvement is due to WAIT’s ability to
+optimize batch formation, minimizing GPU idle time. Latency, shown in the right panels, remains within
+acceptable limits, indicating a good balance between efficiency and responsiveness.
+6.2
+Experiment on Nested WAIT Algorithm
+Next, we evaluate the Nested WAIT algorithm, designed for scenarios where prompt output lengths are
+unknown. We test it on both synthetic and real-world datasets, using the same batch size limits across all
+algorithms and setting thresholds proportional to arrival rates in each segment for practical implementation.
+We begin with a synthetic dataset where m = 4, prefill lengths are fixed at 10 tokens, decode lengths are
+(20, 40, 80, 160), and arrival rates follow a 20 : 40 : 80 : 160 ratio. We set thresholds (n1, n2, n3, n4) with the
+ratio 15 : 14 : 12 : 8. Figure 11 shows improved throughput and latency over benchmarks.
+22
+
+
+--- Page 23 ---
+0
+2
+4
+6
+8
+10
+12
+14
+Time Horizon (T)
+0
+1000
+2000
+3000
+4000
+5000
+6000
+7000
+Average Throughput
+Average Throughput vs Time Horizon (T)
+WAIT
+Sarathi
+vLLM
+0
+1000
+2000
+3000
+4000
+5000
+6000
+Prompt Number (N)
+0.0
+0.2
+0.4
+0.6
+0.8
+Average Latency
+Average Latency vs Prompt Number (N)
+WAIT
+Sarathi
+vLLM
+Figure 7: Average throughput and latency across algorithms on the synthetic dataset with low demand.
+0
+20
+40
+60
+80
+100
+120
+140
+Time Horizon (T)
+0
+2000
+4000
+6000
+8000
+10000
+Average Throughput
+Average Throughput vs Time Horizon (T)
+WAIT
+Sarathi
+vLLM
+0
+1000
+2000
+3000
+4000
+5000
+6000
+Prompt Number (N)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+Average Latency
+Average Latency vs Prompt Number (N)
+WAIT
+Sarathi
+vLLM
+Figure 8: Average throughput and latency across algorithms on the synthetic dataset with high demand.
+23
+
+
+--- Page 24 ---
+For real-world testing, we use the dataset from Zheng et al. (2023), which contains over 210,000 prompts
+from Vicuna and Chatbot Arena. In this dataset, we use questions as prompts and answers as decoded
+tokens. Figure 9 shows the distribution of prefill and decode lengths. We randomly sample 50,000 prompts
+and simulate arrivals via a Poisson process.
+To implement Nested WAIT, we group decode lengths (1 to 500 tokens) into 10 bins of 50 tokens each (e.g.,
+[1-50], [51-100], etc). For each bin, we compute the mean prefill length (approximately 60 tokens, as shown
+in Figure 10) and arrival rates proportional to 23 : 11 : 8 : 7 : 6 : 4 : 3 : 2 : 1 : 1. We set m = 10 and
+thresholds (n1, . . . , n10) with the ratio 66 : 43 : 32 : 24 : 17 : 11 : 7 : 4 : 2 : 1, following (12). Prompts in the
+k-th decode stage are assigned to segment ⌈k/50⌉.
+We first test a synthetic workload with prefill fixed at 60 tokens and decode lengths clustered into 10 types
+(50, 100, ..., 500 tokens), with arrival rates matching the real dataset’s proportions. We evaluate Nested
+WAIT with queries per second (QPS) of 55 and 550, shown in Figure 12 and Figure 13, respectively. Nested
+WAIT outperforms benchmarks in both throughput and latency.
+Finally, we test the real dataset with original prefill and decode lengths, using the same thresholds. Figure
+14 shows that Nested WAIT achieves higher throughput with a modest increase in latency (approximately
+0.5 seconds per prompt), enhancing system efficiency while maintaining responsiveness. We applied the
+thresholds, originally designed for static arrival rates, to this time-varying scenario, which resulted in slightly
+higher latency.
+0
+100
+200
+300
+400
+500
+Prefill Length
+103
+104
+105
+Frequency
+Mean: 59.24
+Median: 21.00
+0
+100
+200
+300
+400
+500
+Decode Length
+104
+105
+Frequency
+Mean: 147.32
+Median: 116.00
+Figure 9: Distribution of prefill and decode lengths in the real dataset.
+(0, 50]
+(50, 100]
+(100, 150]
+(150, 200]
+(200, 250]
+(250, 300]
+(300, 350]
+(350, 400]
+(400, 450]
+(450, 500]
+Prefill Length Range
+0
+10
+20
+30
+40
+50
+60
+70
+Mean Prefill Length
+Mean = 61.92
+(0, 50]
+(50, 100]
+(100, 150]
+(150, 200]
+(200, 250]
+(250, 300]
+(300, 350]
+(350, 400]
+(400, 450]
+(450, 500]
+Decode Length Range
+0
+50000
+100000
+150000
+200000
+250000
+Count
+Figure 10: Mean prefill lengths and prompt counts per decode length bin in the real dataset.
+7
+Extensions
+The WAIT and Nested WAIT algorithms assume constant arrival rates and a fixed number of segments
+matching the number of prompt types. In practice, however, LLM inference systems face two additional
+challenges: (i) time-varying workloads, where arrival rates fluctuate throughout the day (e.g., peak
+24
+
+
+--- Page 25 ---
+0
+20
+40
+60
+80
+100
+120
+140
+160
+Time Horizon (T)
+0
+1000
+2000
+3000
+4000
+5000
+6000
+Average Throughput
+Average Throughput vs Time Horizon (T)
+Nested WAIT
+Sarathi
+vLLM
+0
+1000
+2000
+3000
+4000
+5000
+6000
+7000
+8000
+Prompt Number (N)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Average Latency
+Average Latency vs Prompt Number (N)
+Nested WAIT
+Sarathi
+vLLM
+Figure 11: Average throughput and latency across algorithms on the synthetic dataset.
+0
+20
+40
+60
+80
+100
+Time Horizon (T)
+0
+1000
+2000
+3000
+4000
+5000
+6000
+Average Throughput
+Average Throughput vs Time Horizon (T)
+Nested WAIT
+Sarathi
+vLLM
+0
+500
+1000
+1500
+2000
+2500
+3000
+3500
+4000
+Prompt Number (N)
+0.0
+0.1
+0.2
+0.3
+0.4
+Average Latency
+Average Latency vs Prompt Number (N)
+Nested WAIT
+Sarathi
+vLLM
+Figure 12: Average throughput and latency across algorithms on the real dataset with clustered output
+lengths (low arrival rates).
+0
+20
+40
+60
+80
+100
+120
+Time Horizon (T)
+0
+1000
+2000
+3000
+4000
+5000
+6000
+Average Throughput
+Average Throughput vs Time Horizon (T)
+Nested WAIT
+Sarathi
+vLLM
+0
+500
+1000
+1500
+2000
+2500
+3000
+3500
+4000
+Prompt Number (N)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+Average Latency
+Average Latency vs Prompt Number (N)
+Nested WAIT
+Sarathi
+vLLM
+Figure 13: Average throughput and latency across algorithms on the real dataset with clustered output
+lengths (high arrival rates).
+25
+
+
+--- Page 26 ---
+0
+20
+40
+60
+80
+100
+120
+140
+160
+Time Horizon (T)
+0
+1000
+2000
+3000
+4000
+Average Throughput
+Average Throughput vs Time Horizon (T)
+Nested WAIT
+Sarathi
+vLLM
+0
+500
+1000
+1500
+2000
+2500
+3000
+3500
+4000
+Prompt Number (N)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+Average Latency
+Average Latency vs Prompt Number (N)
+Nested WAIT
+Sarathi
+vLLM
+Figure 14: Average throughput and latency across algorithms on the real dataset with actual output lengths.
+hours vs. off-hours); (ii) numerous prompt types, where maintaining separate thresholds for hundreds
+of output lengths becomes infeasible. We address these challenges through two extensions that preserve the
+core algorithmic principles—eviction prevention and approaching load balance—while adapting to realistic
+deployment scenarios.
+First, we extend Nested WAIT to handle time-varying arrival rates λt
+j by replacing constant-rate threshold
+conditions with accumulated arrival constraints over each iteration window. The coupling-based proof tech-
+nique extends naturally, requiring only that threshold conditions hold at every time instant (Section 7.1).
+Second, we introduce a segment-wise design that groups m prompt types into L ≤m segments, reducing
+algorithmic complexity while maintaining asymptotic optimality (Section ??). Numerical validation con-
+firms that a moderate segment count (e.g., L = 10) suffices in practice, with memory overhead remaining
+logarithmic.
+7.1
+Time-Varying Arrival Rates
+Time-varying arrival rates capture daily patterns in real LLM services: morning traffic surges, afternoon lulls,
+evening peaks. The key insight is that our threshold mechanism remains valid as long as the accumulated
+arrivals during each iteration window stay below the completion capacity. Formally, we replace constant
+rates λj with time-dependent rates λt
+j, assumed continuous and uniformly bounded by λmax < ∞to prevent
+unbounded bursts.
+We analyze the asymptotic optimality of the Nested WAIT algorithm under time-varying arrival rates,
+denoted λt
+j for prompt type j ∈[m] at time t ∈[0, T].
+We define the accumulated arrivals of type j over the interval [t1, t2] as λj[t1, t2] :=
+R t2
+t1 λt
+j dt. Recall from
+Equation (11) that ∆T[1,2,...,m](n1, · · · , nm) represents the per-iteration time cost when processing exactly
+nk prompts at each stage in segment k, for all k ∈[m], as in (12), where nk is the threshold defined in
+Algorithm 2.
+For the Nested WAIT policy defined by π = [n1, . . . , nm], we consider the following conditions for all t ∈[0, T],
+0 < ∆t ≤∆T[1,2,··· ,m](n1, · · · , nm) and k = 1, 2, . . . , m −1, analogous to (12):
+m
+X
+j=1
+λj
+
+t, t + ∆t
+
+≤
+m
+X
+j=1
+λj
+
+t, t + ∆T[1,2,··· ,m](n1, · · · , nm)
+
+< n1,
+nk+1/nk > pk[t, t + ∆t],
+(15)
+26
+
+
+--- Page 27 ---
+where pk[t, t + ∆t] = (Pm
+j=k+1 λj[t, t + ∆t])/(Pm
+j=k λj[t, t + ∆t]).
+We define the total number of iterations over time horizon [0, T] as B. Therefore, we have T ≥PB
+b=1 ∆Tb-th Batch ≥
+B · min ∆TBatch, where ∆Tb-th Batch denotes the time cost of the b-th iteration and ∆Tmin = minb{∆TBatch}.
+The following theorem extends Theorem 2 to time-varying arrival rates.
+Theorem 3 Suppose the thresholds π = [n1, . . . , nm] satisfy (15), and the memory M (ζ,π) fulfills:
+M (ζ,π) ≥M π +
+m
+X
+k=2
+(l + l′
+k−1)
+
+nk + θ−1
+k
+ln
+
+mζB
+δ
+
+= O
+ 
+2M π +
+m
+X
+k=1
+θ−1
+k (l + l′
+k−1) ln
+
+mζB
+δ
+!
+,
+where the memory usage M π is defined as (13) and θk is given in (21) with the lower bound in Equation
+(22). The following asymptotic bounds hold:
+Thoughput∗−E
+h
+Thoughput(ζ,π)i
+= O
+ (ζT)−1
+,
+E
+h
+Latency(ζ,π)i
+, E
+h
+TTFT(ζ,π)i
+= O(1).
+Additionally, the memory usage remains below M ζ,π with probability at least 1 −δ over the time horizon
+[0, T].
+The extension to time-varying rates preserves the dimensionality reduction structure from Theorem 2. The
+key adaptation is that threshold conditions (15) must hold at every time instant t ∈[0, T], replacing con-
+stant rates λj with accumulated arrivals λj[t, t + ∆t] over each iteration window. Because arrival rates are
+continuous and bounded, the coupling construction remains valid: prompts transitioning from segment k to
+k + 1 still couple to a Poisson process, now with time-varying rate Pm
+j=k+1 λt
+j. The Lindley recursion and
+Doob’s maximal inequality apply identically, bounding queue lengths with the same logarithmic overhead.
+Appendix D provides the detailed proof.
+7.2
+Segment Design
+When LLM systems handle hundreds of distinct output lengths (e.g., m = 500 in the LMSYS dataset Zheng
+et al. (2023)), maintaining individual thresholds for each type becomes impractical: the algorithm must
+track queue lengths separately for every output length, increasing memory overhead and implementation
+complexity.
+The segment-wise design addresses this by grouping similar output lengths into L ≤m
+segments, where each segment k aggregates types with comparable decode lengths. This reduces algorithmic
+complexity from O(m) to O(L) while preserving asymptotic optimality—prompts still classify themselves
+on-the-fly, but now at segment boundaries rather than individual type boundaries.
+We assume constant arrival rates for clarity, though the approach extends to time-varying rates as discussed
+in Section 7.1. Consider m prompt types with decode lengths l′
+1 < · · · < l′
+m and arrival rates λ1, λ2, · · · , λm.
+Our objective is to merge these into L segments, where L ≤m. For notational convenience, let ∆L := m/L.
+We partition the m types into L segments as follows: types 1 to ∆L, types ∆L + 1 to 2∆L, . . . , types
+(L −1)∆L + 1 to m.
+For each segment k ∈{1, . . . , L}, the total arrival rate is defined as λ′
+k = P
+(k−1)∆L+1≤j≤k∆L λj. Addition-
+ally, we define λ′(k1 →k2) := Pk2
+r=k1 λ′
+r for 1 ≤k1 ≤k2 ≤L.
+Given a policy π = [n1, . . . , nL] with threshold nk for the k-th segment in Algorithm 2, we formulate a linear
+system analogous to Equation (12):
+∆T[1:L](n1:L) ≤
+n1
+PL
+r=1 λ′r
+,
+nk+1
+nk
+> pk, ∀k < L,
+(16)
+27
+
+
+--- Page 28 ---
+where pk = λ′(k+1→L)
+λ′(k→L) , ∆T[1,...,L](n1, . . . , nL) = d0 + d1M π(n1, . . . , nL), and the memory M π running with
+nk at each stage in segment k is given by:
+M π(n1, . . . , nL) =
+L
+X
+k=1
+nk
+
+l + k
+2∆L
+
+∆L.
+As in Section 7.1, we define the total number of iterations over time horizon [0, T] as B, satisfying T ≥
+PB
+b=1 ∆Tb-th Batch ≥B · min ∆TBatch.
+The segment-wise design achieves two practical goals: (i) robustness to varying or uncertain type distribu-
+tions—if actual output lengths differ slightly from predictions, grouping into segments absorbs the variation;
+(ii) simplicity in deployment—maintaining L = 10 segments is far easier than tracking m = 500 individ-
+ual types. The theoretical guarantee shows that this simplification incurs no asymptotic cost: throughput
+remains O(1/(ζT)) away from optimal, with the same logarithmic safety buffer.
+Theorem 4 For any fixed number of segments L and thresholds π = [n1, . . . , nL] satisfying Equation (16),
+if the memory capacity M (ζ,π) satisfies:
+M (ζ,π) ≥M π +
+L
+X
+k=2
+(l + l′
+k−1)nk
++
+L
+X
+k=2
+(l + l′
+k−1)θ−1
+k
+ln
+mζB
+δ
+
+= O
+
+2M π +
+L
+X
+k=1
+(l + l′
+k−1)θ−1
+k
+ln
+mζB
+δ
+
+,
+(17)
+where θk is given by Equation (20) with lower bound 8(nk −nk−1pk)/nk. The performance of Nested WAIT
+satisfies:
+Thoughput∗−E
+h
+Thoughput(ζ,π)i
+= O
+ (ζT)−1
+,
+E
+h
+Latency(ζ,π)i
+= O(1),
+E
+h
+TTFT(ζ,π)i
+= O(1).
+Moreover, memory is not exceeded with probability at least 1 −δ over the total batch counts b ∈{1, · · · , B}
+as well as the time horizon t ∈[0, T].
+Clustering m types into L segments preserves the core threshold structure from Theorem 2.
+The key
+observation is that aggregation commutes with the coupling argument: individual arrival rates (λ1, . . . , λm)
+are replaced by aggregated rates (λ′
+1, . . . , λ′
+L) where λ′
+k = P
+j∈segment k λj, but the delayed arrival process for
+segment k still couples to a Poisson process with rate PL
+r=k+1 λ′
+r. The Lindley recursion and Doob’s maximal
+inequality apply identically at the segment level, yielding the same logarithmic overhead in Equation (17).
+The proof follows the structure of Theorem 2 in Appendix C.
+We validate the segment-wise design numerically using the LMSYS dataset Zheng et al. (2023) (Section 6)
+with m = 500 prompt types, decode lengths from 1 to 500, and fixed prefill length 62. The distribution of
+arrival rates, shown in Figure 15, is proportional to normalized frequencies from real user traffic.
+We analyze the three components of the memory bound in Equation (17): (1) the peak batch memory usage
+PL
+k=1 nk
+ l + k
+2∆
+
+∆, (2) the queue length bound PL
+k=2 nk(l + l′
+k−1), and (3) the high-probability queue
+length bound PL
+k=2 θ−1
+k (l + l′
+k−1) ln
+
+(L−1)(T +1)
+δ
+
+.
+Figures 16, 17, and 18 plot these three memory components (y-axis) as functions of the number of segments
+L (x-axis), under varying arrival rates, time horizons T, and confidence levels δ. Each panel shows: Term 1
+28
+
+
+--- Page 29 ---
+0
+100
+200
+300
+400
+500
+Decode Length
+103
+104
+Frequency (Log Scale)
+Mean: 147.33
+Median: 117.00
+0
+100
+200
+300
+400
+500
+Decode Length
+10 3
+10 2
+Normalized Frequency (Log Scale)
+Figure 15: Arrival rate construction from real data, with rates proportional to normalized frequencies.
+(blue circles) representing the fluid equilibrium memory from batching, Term 2 (green squares) representing
+the deterministic queue bound, Term 3 (red triangles) representing the stochastic safety buffer with loga-
+rithmic dependence on T and δ, and their sum (black crosses) representing the total memory requirement
+M (ζ,π). Three key observations emerge: (i) Term 1 (fluid equilibrium memory) dominates Terms 2 and 3
+across all parameter settings, confirming that the safety buffer remains modest relative to the base batching
+requirement. (ii) The total memory (black line) follows a U-shaped curve with respect to L: too few
+segments waste memory by over-provisioning for heterogeneous types (high Term 1 at small L), while too
+many segments increase overhead from maintaining separate queues. The minimum occurs around L = 5-10,
+validating the choice of L = 10 in Section 6. (iii) Term 3 exhibits smooth growth as δ decreases (comparing
+left vs. right panels in Figures 16 and 17) and as T increases (comparing Figure 18), consistent with the
+logarithmic bound in the theoretical analysis.
+5
+10
+15
+20
+25
+Number of Segments
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+Value
+1e7
+= 0.1
+Term 1
+Term 2
+Term 3
+Sum
+5
+10
+15
+20
+25
+Number of Segments
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+Value
+1e7
+= 0.00001
+Term 1
+Term 2
+Term 3
+Sum
+Figure 16: Memory usage proportions under low arrival rate (total rate = 50, T = 200). Left: δ = 0.1;
+Right: δ = 10−5.
+These extensions demonstrate that the core threshold-based design—eviction prevention through controlled
+admission—remains robust to realistic deployment conditions. Time-varying arrival rates and segment-wise
+grouping introduce no fundamental barrier; the coupling-based analysis extends naturally with logarithmic
+overhead. Section ?? validates these theoretical guarantees through experiments on real workloads, showing
+that Nested WAIT with L = 10 segments matches the performance of the full m-type algorithm while
+significantly reducing implementation complexity.
+8
+Conclusion, Limitations, and Future Directions
+This paper addresses the online scheduling problem for LLM inference under memory constraints, where
+KV caches grow dynamically during decode and eviction risks complicate traditional scheduling approaches.
+We introduce the (Nested) WAIT algorithm, which provides theoretical guarantees for throughput and
+latency in the asymptotic regime, even when output lengths are unknown upon arrival. Our threshold-based
+29
+
+
+--- Page 30 ---
+5
+10
+15
+20
+25
+Number of Segments
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+Value
+1e8
+= 0.1
+Term 1
+Term 2
+Term 3
+Sum
+5
+10
+15
+20
+25
+Number of Segments
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+Value
+1e8
+= 0.00001
+Term 1
+Term 2
+Term 3
+Sum
+Figure 17: Memory usage proportions under high arrival rate (total rate = 500, T = 200). Left: δ = 0.1;
+Right: δ = 10−5.
+0
+5
+10
+15
+20
+25
+Number of Segments
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+Value
+1e7
+T = 20
+Term 1
+Term 2
+Term 3
+Sum
+0
+5
+10
+15
+20
+25
+Number of Segments
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+Value
+1e7
+T = 2000
+Term 1
+Term 2
+Term 3
+Sum
+Figure 18: Memory usage proportions with varying time horizons (total rate = 50, δ = 0.001). Left: T = 20;
+Right: T = 2000.
+admission control prevents eviction cascades while approaching fluid equilibrium.
+While our algorithms
+demonstrate strong performance, determining optimal threshold parameters for specific deployment scenarios
+remains an open problem. Furthermore, extending the algorithm to multi-GPU scenarios—prevalent in real-
+world applications—introduces additional complexities. Additionally, as system-level optimizations for LLM
+inference advance with new techniques (e.g., multi-head latent attention), developing analytical frameworks
+that incorporate these advances remains an important challenge. We discuss several promising directions for
+future work.
+8.1
+More Volatile Arrivals
+In practical settings, the distribution of incoming prompts becomes non-stationary, violating the stationarity
+assumption underlying our model. While our algorithm can be directly adapted to scenarios with moderate
+variations in arrival rates—provided they remain within system capacity—by re-solving the fluid equilibrium,
+a thorough analysis of its performance in more volatile environments, such as during demand surges, remains
+an open question. Investigating how the (Nested) WAIT algorithm behaves under such conditions warrants
+further study.
+8.2
+Extension to Multi-GPU Systems
+Our current research is limited to single-GPU systems, capable of supporting LLMs such as Llama-13B.
+Extending the algorithm to multi-GPU environments introduces additional considerations, including com-
+munication costs, parallelization strategies, and hardware constraints. For example, while single-GPU de-
+30
+
+
+--- Page 31 ---
+ployment is relatively straightforward, multi-GPU setups necessitate careful management of data parallelism,
+tensor parallelism, and pipeline parallelism. Moreover, communication overhead becomes a critical factor,
+particularly since many large-scale models require multiple GPUs for deployment. Developing a theoretical
+framework that incorporates these elements requires addressing communication overhead and synchroniza-
+tion constraints specific to distributed GPU architectures.
+8.3
+Analytical Framework for Up-to-Date LLM Inference Models
+In recent years, system-level designs for LLM inference have influenced the field. For instance, the multi-
+head latent attention (MLA) mechanism introduced by DeepSeek-AI (2024) has achieved a 90% reduction in
+memory cost through KV cache compression. Integrating these state-of-the-art system-level optimizations
+into a theoretical framework presents a promising direction for future research.
+Endnotes
+Acknowledgement
+We sincerely thank Dr.
+Zijie Zhou and Prof.
+Jing Dong for their valuable suggestions and insightful
+comments, which significantly helped improve the quality of this work.
+References
+Agrawal, A., Kedia, N., Mohan, J., Panwar, A., Kwatra, N., Gulavani, B., Ramjee, R., and Tumanov, A. (2024a).
+Vidur: A large-scale simulation framework for llm inference. Proceedings of Machine Learning and Systems,
+6:351–366.
+Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra, N., Gulavani, B., Tumanov, A., and Ramjee, R. (2024b).
+Taming {Throughput-Latency} tradeoff in {LLM} inference with {Sarathi-Serve}. In 18th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI 24), pages 117–134.
+Agrawal, A., Panwar, A., Mohan, J., Kwatra, N., Gulavani, B. S., and Ramjee, R. (2023). Sarathi: Efficient llm
+inference by piggybacking decodes with chunked prefills. arXiv preprint arXiv:2308.16369.
+Aminabadi, R. Y., Rajbhandari, S., Awan, A. A., Li, C., Li, D., Zheng, E., Ruwase, O., Smith, S., Zhang, M., Rasley,
+J., and He, Y. (2022). Deepspeed-inference: Enabling efficient inference of transformer models at unprecedented
+scale. In SC22: International Conference for High Performance Computing, Networking, Storage and Analysis,
+pages 1–15. IEEE.
+Anthropic (2023). Claude. https://claude.ai.
+Anthropic (2025). Claude 3.7 sonnet.
+Asmussen, S. (2003). Applied probability and queues, volume 2. Springer.
+Bai, J., Bai, S., Chu, Y., Cui, Z., Dang, K., Deng, X., Fan, Y., Ge, W., Han, Y., Huang, F., et al. (2023). Qwen
+technical report. arXiv preprint arXiv:2309.16609.
+Balkanski, E., Rubinstein, A., and Singer, Y. (2016). The power of optimization from samples. Advances in Neural
+Information Processing Systems, 29.
+B¨auerle, N. (2002).
+Optimal control of queueing networks: An approach via fluid models.
+Advances in Applied
+Probability, 34(2):313–328.
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G.,
+Askell, A., et al. (2020). Language models are few-shot learners. Advances in neural information processing
+systems, 33:1877–1901.
+Chen, Z., Ye, Y., and Zhou, Z. (2025). Adaptively robust llm inference optimization under prediction uncertainty.
+arXiv preprint arXiv:2508.14544.
+Cole, R. and Roughgarden, T. (2014).
+The sample complexity of revenue maximization.
+In Proceedings of the
+forty-sixth annual ACM symposium on Theory of computing, pages 243–252.
+31
+
+
+--- Page 32 ---
+DeepSeek-AI (2024). Deepseek-v2: A strong, economical, and efficient mixture-of-experts language model.
+DeepSeek-AI (2025). Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement learning.
+Desislavov, R., Mart´ınez-Fern´andez, S., and Franch, X. (2021). Compute and energy consumption trends in deep
+learning inference. arXiv preprint arXiv:2109.02132.
+Devanur, N. R. and Hayes, T. P. (2009). The adwords problem: online keyword matching with budgeted bidders
+under random permutations. In Proceedings of the 10th ACM conference on Electronic commerce, pages 71–78.
+Devlin, J., Chang, M.-W., Lee, K., and Toutanova, K. (2019). Bert: Pre-training of deep bidirectional transformers for
+language understanding. In Proceedings of the 2019 conference of the North American chapter of the association
+for computational linguistics: human language technologies, volume 1 (long and short papers), pages 4171–4186.
+Durrett, R. (2019). Probability: theory and examples, volume 49. Cambridge university press.
+Fu, Y., Zhu, S., Su, R., Qiao, A., Stoica, I., and Zhang, H. (2025). Efficient llm scheduling by learning to rank.
+Advances in Neural Information Processing Systems, 37:59006–59029.
+Garc´ıa-Mart´ın, E., Rodrigues, C. F., Riley, G., and Grahn, H. (2019). Estimation of energy consumption in machine
+learning. Journal of Parallel and Distributed Computing, 134:75–88.
+GitHub (2022). Copilot.
+Google (2023). Bard. https://bard.google.com.
+Hooper, C., Kim, S., Mohammadzadeh, H., Mahoney, M. W., Shao, S., Keutzer, K., and Gholami, A. (2025).
+Kvquant: Towards 10 million context length llm inference with kv cache quantization. Advances in Neural
+Information Processing Systems, 37:1270–1303.
+Im, S. and Moseley, B. (2013). Online batch scheduling for flow objectives. In Proceedings of the twenty-fifth annual
+ACM symposium on Parallelism in algorithms and architectures, pages 102–104.
+Jaillet, P., Jiang, J., Mellou, K., Molinaro, M., Podimata, C., and Zhou, Z. (2025). Online scheduling for llm inference
+with kv cache constraints.
+Kang, H., Zhang, Q., Kundu, S., Jeong, G., Liu, Z., Krishna, T., and Zhao, T. (2024). Gear: An efficient kv cache
+compression recipefor near-lossless generative inference of llm. arXiv e-prints, pages arXiv–2403.
+Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., Chess, B., Child, R., Gray, S., Radford, A., Wu, J., and
+Amodei, D. (2020). Scaling laws for neural language models. arXiv preprint arXiv:2001.08361.
+Kingman, J. F. C. (1962). On queues in heavy traffic. Journal of the Royal Statistical Society: Series B (Method-
+ological), 24(2):383–392.
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Gonzalez, J., Zhang, H., and Stoica, I. (2023).
+Efficient memory management for large language model serving with pagedattention. In Proceedings of the
+29th Symposium on Operating Systems Principles, pages 611–626.
+Lattanzi, S., Lavastida, T., Moseley, B., and Vassilvitskii, S. (2020).
+Online scheduling via learned weights.
+In
+Proceedings of the Fourteenth Annual ACM-SIAM Symposium on Discrete Algorithms, pages 1859–1877. SIAM.
+Li, R., Pal, S., Pullu, V. N., Ryoo, J. H., John, L. K., and Yadwadkar, N. J. (2025a). Oneiros: Kv cache optimization
+through parameter remapping for multi-tenant llm serving. arXiv preprint arXiv:2507.11507. To appear in
+ACM SoCC 2025.
+Li, W., Wang, L., Chai, X., and Yuan, H. (2020). Online batch scheduling of simple linear deteriorating jobs with
+incompatible families. Mathematics, 8(2):170.
+Li, Y., Dai, J., and Peng, T. (2025b). Throughput-optimal scheduling algorithms for llm inference and ai agents.
+Accessed: 2025-04-11.
+Liu, P. and Lu, X. (2015). Online unbounded batch scheduling on parallel machines with delivery times. Journal of
+Combinatorial Optimization, 29:228–236.
+Liu, Y. and Whitt, W. (2011). A network of time-varying many-server fluid queues with customer abandonment.
+Operations research, 59(4):835–846.
+Lucier, B., Menache, I., Naor, J., and Yaniv, J. (2013). Efficient online scheduling for deadline-sensitive jobs. In
+Proceedings of the twenty-fifth annual ACM symposium on Parallelism in algorithms and architectures, pages
+305–314.
+Maglaras, C. (2000). Discrete-review policies for scheduling stochastic networks: Trajectory tracking and fluid-scale
+asymptotic optimality. The Annals of Applied Probability, 10(3):897–929.
+Mandelbaum, A., Massey, W. A., and Reiman, M. I. (1998). Strong approximations for markovian service networks.
+Queueing Systems, 30(1):149–201.
+32
+
+
+--- Page 33 ---
+Microsoft (2023). Bing ai. https://www.bing.com/chat.
+OpenAI (2024). Gpt-4 technical report.
+Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright, C., Mishkin, P., Zhang, C., Agarwal, S., Slama, K., Ray,
+A., et al. (2022). Training language models to follow instructions with human feedback. Advances in neural
+information processing systems, 35:27730–27744.
+Patel, D. (2023). Peeling The Onion’s Layers: Large Language Models’ Cost, Context, and Feature Breakdown.
+Semianalysis blog. Accessed: [Insert Date Here].
+Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, ´I., Maleki, S., and Bianchini, R. (2024). Splitwise: Efficient gen-
+erative llm inference using phase splitting. in 2024 acm/ieee 51st annual international symposium on computer
+architecture (isca). IEEE Computer Society, Los Alamitos, CA, USA, pages 118–132.
+Patterson, D., Gonzalez, J., Le, Q., Liang, C., Munguia, L.-M., Rothchild, D., So, D., Texier, M., and Dean, J.
+(2021). Carbon emissions and large neural network training. arXiv preprint arXiv:2104.10350.
+Pope, R., Douglas, S., Chowdhery, A., Devlin, J., Bradbury, J., Heek, J., Xiao, K., Agrawal, S., and Dean, J. (2023).
+Efficiently scaling transformer inference. Proceedings of Machine Learning and Systems, 5:606–624.
+Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Chen, B., Liang, P., R´e, C., Stoica, I., and Zhang, C. (2023).
+Flexgen: High-throughput generative inference of large language models with a single gpu. In International
+Conference on Machine Learning, pages 31094–31116. PMLR.
+Strait, P. (1974). On the maximum and minimum of partial sums of random variables. Pacific Journal of Mathematics,
+52(2):585–593.
+Strubell, E., Ganesh, A., and McCallum, A. (2019). Energy and policy considerations for deep learning in nlp. arXiv
+preprint arXiv:1906.02243.
+Tay, Y., Dehghani, M., Bahri, D., and Metzler, D. (2022). Efficient transformers: A survey. ACM Computing Surveys,
+55(6):1–28.
+Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux, M.-A., Lacroix, T., Rozi`ere, B., Goyal, N., Ham-
+bro, E., Azhar, F., et al. (2023).
+Llama: Open and efficient foundation language models.
+arXiv preprint
+arXiv:2302.13971.
+Vee, E., Vassilvitskii, S., and Shanmugasundaram, J. (2010). Optimal online assignment with forecasts. In Proceedings
+of the 11th ACM conference on Electronic commerce, pages 109–118.
+vLLM Team (2025). vllm v1: A major upgrade to vllm’s core architecture. https://docs.vllm.ai/en/latest/
+getting_started/v1_user_guide.html. Blog post, January 27, 2025. ”In vLLM V1, the default preemption
+mode is RECOMPUTE rather than SWAP, as recomputation has lower overhead in the V1 architecture”.
+Wang, M., Ye, Y., and Zhou, Z. (2025). Llm serving optimization with variable prefill and decode lengths. arXiv
+preprint arXiv:2508.06133.
+Wei, J., Tay, Y., Bommasani, R., Raffel, C., Zoph, B., Borgeaud, S., Yogatama, D., Bosma, M., Zhou, D., Metzler,
+D., et al. (2022a). Emergent abilities of large language models. arXiv preprint arXiv:2206.07682.
+Wei, J., Wang, X., Schuurmans, D., Bosma, M., Xia, F., Chi, E., Le, Q. V., Zhou, D., et al. (2022b).
+Chain-
+of-thought prompting elicits reasoning in large language models. Advances in neural information processing
+systems, 35:24824–24837.
+Wu, C.-J., Raghavendra, R., Gupta, U., Acun, B., Ardalani, N., Maeng, K., Chang, G., Aga, F., Huang, J., Bai, C.,
+et al. (2022). Sustainable ai: Environmental implications, challenges and opportunities. Proceedings of Machine
+Learning and Systems, 4:795–813.
+Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-G. (2022).
+Orca: A distributed serving system for
+{Transformer-Based} generative models. In 16th USENIX Symposium on Operating Systems Design and Im-
+plementation (OSDI 22), pages 521–538.
+Zheng, L., Chiang, W.-L., Sheng, Y., Li, T., Zhuang, S., Wu, Z., Zhuang, Y., Li, Z., Lin, Z., Xing, E. P., et al. (2023).
+Lmsys-chat-1m: A large-scale real-world llm conversation dataset. arXiv preprint arXiv:2309.11998.
+Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X., and Zhang, H. (2024). {DistServe}: Disaggregating
+prefill and decoding for goodput-optimized large language model serving.
+In 18th USENIX Symposium on
+Operating Systems Design and Implementation (OSDI 24), pages 193–210.
+33
+
+
+--- Page 34 ---
+A
+Proofs of Propositions
+A.1
+Proof of Proposition 1
+Proof Outline. We show that when λjd1(l′
+j + 1)(lj + l′
+j/2) ≥1, arrivals consistently exceed completions
+regardless of batch size, causing queue length to grow unboundedly.
+Proof 1 Consider a system with only type-j prompts and suppose nj prompts are in the batch. If equilibrium
+were to hold, prompts would be uniformly distributed across stages 0, 1, . . . , l′
+j, with nj/(l′
+j + 1) prompts at
+each stage. The total memory consumption is:
+Mj =
+nj
+l′
+j + 1
+l′
+j
+X
+s=0
+(lj + s) = nj
+
+lj + l′
+j
+2
+
+.
+The iteration time to process this batch is:
+τj = d0 + d1Mj = d0 + d1nj
+
+lj + l′
+j
+2
+
+.
+During this iteration, the expected number of arriving prompts is:
+Arrivalsj = τj · λj = d0λj + λjd1nj
+
+lj + l′
+j
+2
+
+,
+while the number of completions is nj/(l′
+j + 1) (prompts at stage l′
+j complete). The arrival-completion gap
+satisfies:
+Arrivalsj −
+nj
+l′
+j + 1 = d0λj + nj
+"
+λjd1
+
+lj + l′
+j
+2
+
+−
+1
+l′
+j + 1
+#
+≥d0λj > 0,
+where the inequality follows from λjd1(l′
+j + 1)(lj + l′
+j/2) ≥1.
+Since this gap is positive for all nj > 0, the queue length after N iterations satisfies:
+Queue Length(N) ≥d0λj · N.
+The latency for a prompt arriving at iteration N grows as Ω(N), establishing instability.
+A.2
+Proof of Proposition 2
+Proof Outline. The expected throughput of any online policy cannot exceed the fluid throughput Thoughput∗,
+since throughput is bounded by the arrival rate of output tokens.
+Proof 2 In the fluid model, the equilibrium parameters are:
+∆T =
+d0
+1 −d1
+Pm
+j=1 λj(l′
+j + 1)(lj + l′
+j/2),
+n∗
+j = ∆T · λj(l′
+j + 1),
+M ∗= ∆T ·
+m
+X
+j=1
+λj(l′
+j + 1)(lj + l′
+j/2),
+Thoughput∗=
+m
+X
+j=1
+λjl′
+j.
+In any stochastic system, throughput is counted only after prompts complete. Over time horizon [0, T], let
+ArrivalsT
+j denote the total arrivals of type-j prompts. The total output tokens generated cannot exceed the
+total output length of all arrivals:
+Throughput(π,T ) ≤
+m
+X
+j=1
+ArrivalsT
+j · l′
+j.
+34
+
+
+--- Page 35 ---
+Taking expectations and dividing by T:
+E[Thoughput(π,T )] ≤
+m
+X
+j=1
+E
+"
+ArrivalsT
+j
+T
+#
+· l′
+j =
+m
+X
+j=1
+λjl′
+j = Thoughput∗.
+A.3
+Proof of Proposition 3
+Proof Outline. We construct a two-type example where FCFS suffers from cascading evictions even when
+capacity equals equilibrium memory M ∗, leading to Ω(1) throughput gap.
+Proof 3 Consider two prompt types: type 1 with (l1, l′
+1, λ1) = (1, 1, 1) and type 2 with (l2, l′
+2, λ2) = (1, 2, 1).
+Fluid Equilibrium. The equilibrium equations d0 + d1(1.5n1 + 2n2) = n1/2 = n2/3 yield:
+K =
+d0
+1 −9d1
+,
+n∗
+1 = 2K,
+n∗
+2 = 3K,
+M ∗= 9K.
+Setting K = 1 (without loss of generality), we have n∗
+1 = 2, n∗
+2 = 3, M ∗= 9.
+Equilibrium Batch Composition. In equilibrium, the batch contains:
+• Type 1: 1 prompt at stage 0 (memory = 1), 1 prompt at stage 1 (memory = 2, completing)
+• Type 2: 1 prompt at stage 0 (memory = 1), 1 at stage 1 (memory = 2), 1 at stage 2 (memory = 3,
+completing)
+Overflow Probability. Let (X1, X2) denote arrivals during one iteration, where Xj ∼Poisson(1). The
+combinations that do not cause memory overflow within two iterations are: (0, 0), (1, 0), (0, 1), (1, 1), (2, 0).
+All other combinations lead to overflow. The overflow probability is:
+p = 1 −1
+e2 −1
+e2 −1
+e2 −1
+e2 −1
+2e2 = 1 −9
+2e2 ≈0.391.
+Since overflow probability is bounded away from zero, FCFS experiences eviction with constant probability at
+each iteration. This leads to queue length growth Ω(t) and throughput gap Ω(1).
+A.4
+Proof of Proposition 5
+Proof Outline. Using the same two-type example, we show that when output lengths are unknown until
+completion, any online policy faces either memory underutilization or constant overflow probability.
+Proof 4 Consider the same setup as Proposition 3: type 1 with (l1, l′
+1, λ1) = (1, 1, 1) and type 2 with
+(l2, l′
+2, λ2) = (1, 2, 1). The fluid equilibrium gives M∗= 9.
+The key constraint is that prompt types cannot be distinguished until a type-2 prompt enters stage 2 (generates
+its second output token). At stage 0 and stage 1, both types appear identical to the scheduler.
+Consider any admissible batching policy. For each possible batch configuration, one of the following must
+hold:
+1. Memory underutilization: The batch leaves significant memory unused, causing expected arrivals
+to exceed completions during the iteration.
+2. Overflow risk: The batch fully utilizes memory, but faces constant probability ρ > 0 of overflow when
+arrivals exceed expectations.
+Since throughput is counted only upon prompt completion, and the fluid throughput equals expected arrivals’
+output length per unit time, any policy that either underutilizes memory or experiences overflow incurs a
+throughput gap of at least Ω(ρ) compared to Thoughput∗.
+35
+
+
+--- Page 36 ---
+B
+Proof of Theorem 1
+Proof Outline.
+This proof establishes asymptotic optimality of the WAIT algorithm when output lengths
+are known. The structure proceeds in two parts:
+1. Single-type case: We construct a coupled dominating process using the Lindley recursion and apply
+Kingman’s bound for queue length expectations.
+2. Multiple-type case: We extend to m types by applying the coupling construction type-by-type,
+leveraging that the fixed threshold nj decouples inter-type dynamics.
+Key techniques include: Lindley recursion for queue length bounds (Asmussen 2003, Proposition 6.3), cou-
+pling construction to dominate the original process, Kingman’s bound for negative drift processes (Kingman
+1962), and standard random walk results (Strait 1974).
+Throughout this appendix, we use b to denote the batch index (the count of completed batch iterations),
+which is distinct from the stage index s ∈{0, 1, . . . , l′
+j} used in the main text for decode stages. We use t for
+continuous time and T (or B) for the total number of batches over the time horizon.
+We first consider the single-type case, then extend to multiple types.
+B.0.1
+Single-Type Case
+Consider a single prompt type with threshold n. For general scheduling algorithms, analyzing this system
+in continuous time is challenging: KV cache grows dynamically during decode, arrivals are stochastic, and
+eviction risks complicate the dynamics.
+The key insight of the WAIT policy is that its threshold mechanism achieves dimensionality reduction.
+By waiting until exactly n prompts accumulate before initiating a batch, the algorithm enforces a fixed
+batch size, which ensures constant processing time ∆T per batch. This decouples the complex continuous-
+time dynamics into a tractable discrete-time process. This reduction—from a complex memory-constrained
+queueing system to a simple random walk analysis—is enabled by the algorithm design, not an inherent
+simplicity of the problem.
+Specifically, let ˜λ denote the continuous-time arrival rate. The WAIT policy’s fixed batch size implies that
+arrivals during each batch follow Poisson(˜λ · ∆T). Defining λ = ˜λ · ∆T (expected arrivals per batch), we can
+analyze the system as an embedded Markov chain observed at batch completion times, indexed by b ∈N.
+Setting n = λ corresponds to critical loading. The throughput loss arises from “stuck” iterations where
+insufficient prompts are available.
+Lemma 1 (Queue Length and Stuck Time) This lemma connects queue accumulation to throughput
+loss through stuck iterations. Let Xb denote the number of arrivals during batch b, where Xb ∼Poisson(λ).
+Let W b denote the queue length after batch b, with W 0 = 0. The state transition is:
+W b+1 = W b + Xb −λ · 1{W b + Xb ≥λ}.
+Define Bstuck as the number of stuck iterations (where W b + Xb < λ). Then:
+E[W B] = λ · E[Bstuck].
+The proof is in Appendix E.1. This lemma connects queue accumulation to throughput loss: stuck iterations
+directly translate to waiting prompts. To bound E[W B], we construct a coupled dominating process that
+admits tractable analysis via classical queueing techniques.
+Lemma 2 (Coupled Dominating Process) The coupled process starts with a safety buffer (2λ vs 0) and
+maintains dominance throughout. Define { ˜W b} by:
+˜W 0 = 2λ,
+˜W b+1 = max{2λ, ˜W b + Xb −λ}.
+Then ˜W b ≥W b + λ for all b ∈N.
+The proof is in Appendix E.2.
+36
+
+
+--- Page 37 ---
+Lindley recursion.
+To analyze the coupled process, we apply the Lindley recursion representation (As-
+mussen 2003, Proposition 6.3):
+Lemma 3 (Lindley Representation) Let Sk = Pk
+r=1(Xr −λ) be the partial sum process. Then:
+˜W B = 2λ + max(SB, SB −S1, . . . , SB −SB−1, 0).
+This classical queueing representation is made applicable by the WAIT policy’s threshold design. Define
+ξk = Xk −λ. We use time-reversal symmetry to simplify the maximum expression:
+max(SB, SB −S1, . . . , SB −SB−1, 0) = max
+1≤k≤B
+
+B
+X
+r=k
+ξr+ d= max
+1≤k≤B
+
+k
+X
+r=1
+ηr+
+,
+ηr d= X1 −λ.
+Thus ˜W B d= 2λ + max1≤k≤B(Pk
+r=1 ηr)+.
+Since ˜W B ≥W B + λ, we have E[W B] ≤E[ ˜W B] −λ. Let Y B = max1≤k≤B(Pk
+r=1 ηr)+. By (Strait 1974,
+Lemma 2):
+Lemma 4 (Random Walk Maximum)
+E
+
+Y B
+= E
+
+max
+1≤k≤B(Sk)+
+
+=
+B
+X
+k=1
+1
+k E
+
+(Sk)+
+.
+This standard result (Strait 1974) decomposes the maximum into a sum over batch indices. For E[(Sk)+],
+by the Cauchy-Schwarz inequality and Var(Sk) = λk, we have E[(Sk)+] ≤
+√
+λk. Hence:
+E[Y B] ≤
+√
+λ
+B
+X
+k=1
+k−1/2 ∼
+√
+λB
+as B →∞.
+Lemma 5 (Throughput Gap Bound)
+E[W B] −λ ≤E[Y B] ≤
+√
+λ
+B
+X
+k=1
+1
+√
+k
+∼
+√
+λB,
+B →∞.
+The throughput gap is thus
+1
+B E[W B] = O(B−1/2).
+Asymptotic Regime.
+In the asymptotic regime where the time horizon scales as ζ →∞:
+1
+Bζ E[W B,ζ] = λζ
+Bζ + (λB)ζ/2
+Bζ
+=
+ λ
+B
+ζ
++ λζ/2B−ζ/2 →0
+as ζ →∞.
+B.0.2
+Multiple-Type Case
+We now extend to m prompt types. Consider the WAIT policy π = [n1, . . . , nm], where nj is the threshold
+for type-j prompts.
+Policy Class Π.
+Define the processing time for a full batch (containing all m types):
+∆T[1,...,m] = d0 + d1 ·
+m
+X
+j=1
+nj(l′
+j + 1)
+
+lj + l′
+j
+2
+
+.
+(18)
+37
+
+
+--- Page 38 ---
+Approaching Load Balance.
+The constraint ∆T[1,...,m] ≤nj/λj (Equation 19) embodies the ”approach-
+ing load balance” principle. For each type j, expected arrivals during a full batch equal λj · ∆T[1,...,m]. The
+constraint ensures arrivals do not exceed batch size nj, preventing queue accumulation and eviction risk. The
+equilibrium policy π∗achieves equality (arrivals = completions), maximizing throughput while maintaining
+stability.
+The policy parameters must satisfy:
+∆T[1,...,m] ≤nj
+λj
+for all j ∈[m],
+M π =
+m
+X
+j=1
+nj(l′
+j + 1)
+
+lj + l′
+j
+2
+
+≥M ∗.
+(19)
+These constraints ensure that for any π ∈Π: when all m types are batched together, arrivals do not
+exceed completions for each type (i.e., Arrivalj ≤Completionj). The equilibrium policy corresponds to
+π∗= [ n∗
+1
+l′
+1+1, · · · ,
+n∗
+m
+l′m+1] when M π = M ∗.
+Notation.
+Let b denote the batch index, Jb the set of types in batch b, ts(b) the start time and te(b) the
+end time of batch b. The waiting time ts(b + 1) −te(b) > 0 occurs only when no type meets its threshold.
+State Transition.
+At batch b + 1:
+W te(b+1)
+(j)
+= W te(b)
+(j)
++ X[te(b),ts(b+1)]
+(j)
++ Y [ts(b+1),te(b+1)]
+(j)
+−nj · 1{j ∈Jb+1},
+j = 1, . . . , m,
+where X[te(b),ts(b+1)]
+(j)
+∼Poisson(λj ·(ts(b+1)−te(b))) and Y [ts(b+1),te(b+1)]
+(j)
+∼Poisson(λj ·(te(b+1)−ts(b+1)))
+are independent arrival counts during waiting and processing periods.
+Batch Processing Time.
+Recall from (18) that ∆T[1,...,m] denotes the processing time for a full batch.
+Under fixed thresholds, this time is constant across batches.
+Type Decoupling.
+Fixed thresholds nj enable type decoupling. Each type j has independent arrivals
+during batch processing: Xb
+(j) ∼Poisson(λj · ∆T[1,...,m]). Arrivals depend only on the type-specific rate λj
+and batch time ∆T[1,...,m], not on other types’ queue states. This independence allows us to analyze each
+type separately and sum the resulting bounds.
+Lemma 6 (Multiple-Type Coupled Process) Define a coupled process { ˜W b
+(j)} indexed by batch b:
+˜W 0
+(j) = 2nj,
+˜W b+1
+(j)
+= max{2nj, ˜W b
+(j) + Xb
+(j) −nj},
+Xb
+(j) ∼Poisson(λj · ∆T[1,...,m]).
+Then ˜W b
+(j) ≥W b
+(j) for all b ≥0 and j = 1, . . . , m.
+The proof is in Appendix E.3. Define Y b
+(j) = Xb
+(j) −nj. The coupled process becomes:
+˜W 0
+(j) = 2nj,
+˜W b+1
+(j)
+= max{2nj, ˜W b
+(j) + Y b
+(j)}.
+Case 1: Zero Drift (∆T[1,...,m] = nj/λj).
+When λj · ∆T[1,...,m] = nj, we have E
+h
+Y b
+(j)
+i
+= 0 (zero drift).
+By Lemma 5:
+E
+h
+W B
+(j)
+i
+≤E
+h
+˜W B
+(j)
+i
+≤λj +
+p
+λjB.
+38
+
+
+--- Page 39 ---
+Case 2: Negative Drift (∆T[1,...,m] < nj/λj).
+When E
+h
+Y b
+(j)
+i
+= λj∆T[1,...,m] −nj < 0, the coupled
+process has negative drift. Since
+Var(Y b
+(j)) = λj · ∆T[1,...,m],
+E
+h
+Y b
+(j)
+i = nj −λj · ∆T[1,...,m],
+by Kingman’s bound (Kingman 1962):
+E
+h
+W B
+(j)
+i
+≤E
+h
+˜W B
+(j)
+i
+≤2nj +
+λj · ∆T[1,...,m]
+2
+ nj −λj · ∆T[1,...,m]
+.
+Equilibrium Case (C = M ∗).
+When π∗= [ n∗
+1
+l′
+1+1, · · · ,
+n∗
+m
+l′m+1], all types satisfy ∆T[1,...,m] = nj/λj (zero
+drift). Summing over all types:
+1
+B
+m
+X
+j=1
+E
+h
+W B
+(j)
+i
+≤1
+B
+m
+X
+j=1
+λj +
+m
+X
+j=1
+r
+λj
+B = O(B−1/2).
+Asymptotic Regime.
+As ζ →∞:
+1
+ζB
+m
+X
+j=1
+λj +
+m
+X
+j=1
+s
+λj
+ζB →0.
+The expected end-to-end latency scales as O(B−1/2).
+Strictly Negative Drift Case.
+When ∆T[1,...,m] < nj/λj for all j, the throughput gap is O(B−1):
+1
+B
+m
+X
+j=1
+E
+h
+W B
+(j)
+i
+≤1
+B
+m
+X
+j=1
+ 
+2nj +
+λj · ∆T[1,...,m]
+2
+ nj −λj · ∆T[1,...,m]
+
+!
+= O(B−1).
+C
+Proof of Theorem 2
+Proof Outline.
+This proof establishes asymptotic optimality of Nested WAIT when output lengths are
+unknown.
+The algorithm achieves on-the-fly classification: prompts classify themselves by their actual
+output lengths at segment boundaries, requiring no prediction. The structure proceeds as follows:
+1. First segment analysis: All prompts enter segment 1 with Poisson arrivals.
+We couple with a
+Lindley process and apply Kingman’s inequality for bounded expectations.
+2. Subsequent segments analysis: After completing segment k −1, prompts naturally reveal whether
+they continue to segment k. This type revelation follows Binomial thinning: a fraction pk of completions
+continue, while short prompts finish without being delayed by longer ones. We apply Lindley coupling
+to each segment.
+3. High-probability bounds prevent eviction: Expected bounds ensure average stability, but stochas-
+tic fluctuations risk overflow. We construct an exponential martingale and apply Doob’s inequality to
+obtain high-probability memory bounds, preventing eviction cascades.
+We adopt notation consistent with the main text (Section 5). Let l denote the common input length (tokens
+after prefill), and let l′
+j denote the output length for type-j prompts. We use b to denote the batch index
+(count of completed iterations) and k ∈{1, . . . , m} to denote the segment index, where segment k contains
+prompts with output lengths in (l′
+k−1, l′
+k]. The threshold for segment k is nk (from Equation (12)). We
+denote by W b
+(k) the queue length for segment k after batch b, and by B the total number of batches over
+the time horizon. The thinning probability pk = (Pm
+j=k λj)/(Pm
+j=k−1 λj) represents the fraction of prompts
+completing segment k −1 that continue to segment k.
+39
+
+
+--- Page 40 ---
+C.1
+First Segment Analysis
+All prompts initially enter segment 1 with Poisson arrivals at aggregate rate Pm
+j=1 λj.
+We construct a
+dominating process and apply Kingman’s inequality to bound expected queue length.
+For the first segment (k = 1), the state transition is:
+W b+1
+(1)
+= W b
+(1) + Y b
+(1) −n1 · 1{W b
+(1) + Y b
+(1) ≥n1},
+Y b
+(1) ∼Poisson(∆Tb ·
+m
+X
+j=1
+λj),
+where ∆Tb denotes the processing time of batch b. Since ∆Tb ≤∆T[1,...,m] (the time for a full batch), we
+construct a dominating process:
+¯W b+1
+(1)
+= ¯W b
+(1) + ¯Y b
+(1) −n1 · 1{ ¯W b
+(1) + ¯Y b
+(1) ≥n1},
+¯Y b
+(1) ∼Poisson(∆T[1,...,m] ·
+m
+X
+j=1
+λj).
+This is further dominated by a Lindley process:
+˜W 0
+(1) = 2n1,
+˜W b+1
+(1)
+= max{2n1, ˜W b
+(1) + ¯Y b
+(1) −n1}.
+Since ∆T[1,...,m] · Pm
+j=1 λj < n1 (negative drift), by Kingman’s inequality (Kingman 1962):
+E
+h
+W b
+(1)
+i
+≤2n1 +
+∆T[1,...,m] · Pm
+j=1 λj
+2
+
+n1 −∆T[1,...,m] · Pm
+j=1 λj
+.
+Remark. Prompts waiting in the first segment are stored in CPU and do not consume GPU memory.
+C.2
+Subsequent Segments Analysis (k ≥2)
+For segment k (2 ≤k ≤m), the arrival process reflects on-the-fly classification: prompts that completed
+segment k−1 reveal whether their output lengths exceed l′
+k−1. This type revelation follows binomial thinning
+with probability pk.
+Arrivals come from prompts that completed segment k −1:
+Y b
+(k) ∼Binomial (nk−1, pk) ,
+where pk =
+Pm
+j=k λj
+Pm
+j=k−1 λj
+.
+On-the-fly Classification via Binomial Thinning.
+The arrival process Y b
+(k) ∼Binomial(nk−1, pk)
+reflects the on-the-fly classification mechanism, not merely a modeling choice. After segment k−1 processing,
+exactly nk−1 prompts complete that stage. Among these, a fraction pk =
+Pm
+j=k λj
+Pm
+j=k−1 λj have output lengths
+exceeding l′
+k−1. These prompts naturally continue to segment k. Prompts classify themselves by their actual
+output lengths—no prediction needed. Short prompts complete quickly without being delayed by longer
+ones.
+The state transition is:
+W b+1
+(k) = W b
+(k) + Y b
+(k) −nk · 1{W b
+(k) + Y b
+(k) ≥nk},
+where b indexes the batches containing segment k −1. Note that each segment has its own batch index, but
+all are bounded by the total batch count B.
+Define Xb
+(k) = Y b
+(k) −nk. We construct a coupled dominating process:
+Lemma 7 (Coupled Process for Segment k) Define { ˜W b
+(k)} by:
+˜W 0
+(k) = nk,
+˜W b+1
+(k) = max{nk, ˜W b
+(k) + Xb
+(k)}.
+Then ˜W b
+(k) ≥W b
+(k) for all b ∈N.
+40
+
+
+--- Page 41 ---
+The proof is in Appendix E.4. The process { ˜W b
+(k)} has the Lindley representation:
+˜W b+1
+(k) = nk + max
+0≤i≤b{Si
+(k)},
+where Si
+(k) =
+i
+X
+r=1
+Xr
+(k), S0
+(k) = 0.
+Expected Queue Length.
+Since E
+h
+Xb
+(k)
+i
+= nk−1pk −nk < 0 (negative drift), by Kingman’s inequality
+(Kingman 1962):
+E
+h
+W b
+(k)
+i
+≤E
+h
+˜W b
+(k)
+i
+≤nk + nk−1 · pk(1 −pk)
+2 (nk −nk−1 · pk).
+Negative drift ensures queue stability, preventing unbounded growth that would lead to eviction. This bound
+ensures finite expected queue length for each segment k ≥2, controlling expected GPU memory consumption.
+The segment structure ensures shorter prompts complete without waiting for longer ones to finish.
+C.3
+Throughput Gap Bound
+Using B as the total batch count (upper bound for each segment’s batch index), the throughput gap is:
+1
+B
+m
+X
+k=1
+E
+h
+W B
+(k)
+i
+≤2n1
+B +
+∆T[1,...,m] · Pm
+j=1 λj
+2B
+
+n1 −∆T[1,...,m] · Pm
+j=1 λj
+ + 1
+B
+m
+X
+k=2
+nk + 1
+B
+m
+X
+k=2
+nk−1 · pk(1 −pk)
+2 (nk −nk−1 · pk).
+Asymptotic Regime.
+As ζ →∞, the throughput gap is O((ζB)−1). The expected latency and TTFT
+are O(1).
+C.4
+High-Probability Memory Bound
+High-Probability Bounds Prevent Eviction.
+Expected queue length bounds ensure average stability.
+However, stochastic fluctuations may cause W b
+(k) to exceed these limits, risking memory overflow and eviction.
+We derive high-probability bounds to quantify this overflow risk. By choosing capacity C to ensure overflow
+probability < δ across all batches and segments, we prevent eviction cascades.
+Martingale Construction.
+To obtain high-probability bounds on queue length, we need to control tail
+probabilities of the random walk maximum max0≤i≤s−1{Si
+(k)}. Expected bounds alone cannot prevent rare
+but catastrophic overflow events. We construct an exponential martingale that enables Doob’s inequality,
+converting expected bounds into probabilistic guarantees.
+We need to estimate
+P
+
+max{0, S1
+(k), · · · , Ss−1
+(k) } ≥c
+
+= P
+
+max
+0≤i≤s−1{Si
+(k)} ≥c
+
+, ∀c > 0, where S0
+(k) = 0.
+Define the exponential martingale M i
+(k) = eθSi
+(k). For this to be a martingale, the moment generating function
+must equal 1, ensuring zero expected drift in log space:
+ϕ(k)(θ) = E
+h
+eθXi
+(k)
+i
+= e−θnk(1 −pk + pkeθ)nk−1 = 1.
+The following lemma establishes existence and properties of the solution θk > 0 that satisfies this martingale
+condition (proof in Appendix E.5).
+Lemma 8 Suppose nk−1 > nk > nk−1pk and pk ∈(0, 1). Then there exists a unique solution θk > 0 to the
+equation
+e−θknk(1 −pk + pkeθk)nk−1 = 1,
+(20)
+41
+
+
+--- Page 42 ---
+where θk is strictly increasing with respect to D = nk −nk−1pk and satisfies the lower bound
+θk ≥8(nk −nk−1pk)
+nk−1
+.
+When θk > 0 satisfies ϕ(θk) = 1, the process M i
+(k) is a martingale starting at M 0
+(k) = eθk·0 = 1. This
+zero-drift property in log space enables Doob’s inequality to bound tail probabilities.
+By Doob’s martingale inequality (Durrett 2019), we have that
+P( max
+1≤i≤b−1{eθkSi
+(k)} ≥a) ≤E
+
+M i
+a
+= E
+
+M 0
+a
+= 1
+a.
+Exponentiating both sides of the inequality event, we obtain:
+P( max
+1≤i≤b−1{eθSi
+(k)} ≥eθc) ≤1
+eθc ⇒P( max
+1≤i≤b−1{Si
+(k)} ≥c) ≤e−θc.
+Using the dominance ˜W b
+(k) = nk + max0≤i≤b−1{Si
+(k)} ≥W b
+(k), we have
+P
+
+W b
+(k) ≥c
+
+< P
+
+˜W b
+(k) ≥c
+
+= P( max
+1≤i≤b−1{Si
+(k)} ≥c −nk) ≤e−θk(c−nk)
+For all 2 ≤k ≤m and 1 ≤b ≤B:
+P
+
+W b
+(k) ≥c
+
+< e−θk(c−nk),
+where θk > 0 is the solution to (20).
+Union bound for safety guarantee.
+To ensure memory consumption does not exceed the bound at any
+batch b ∈{1, . . . , B} with probability at least 1−δ, we apply a union bound across all segments and batches.
+For each segment k ∈{2, . . . , m} and batch index b ∈{1, . . . , B}, we have:
+P
+
+W b
+(k) ≥c
+
+< e−θk(c−nk),
+There are m −1 segments (from k = 2 to m) and B batches (from b = 1 to B). We allocate the total failure
+probability δ across all segments and batches. The total number of events is (m −1) · B. Set the overflow
+probability for each segment and batch to:
+P
+
+W b
+(k) ≥ck
+
+≤
+δ
+(m −1) · B ⇒e−θk(ck−nk) ≤
+δ
+(m −1) · B ⇒ck ≥nk +
+ln
+
+(m−1)·B
+δ
+
+θk
+If we choose
+ck = nk +
+ln
+
+(m−1)·B
+δ
+
+θk
+,
+then we have that
+P
+
+W b
+(k) ≥ck
+
+≤
+δ
+(m −1) · B .
+Next, we compute the joint probability of overflow across all segments and batches using a union bound:
+P
+ m
+[
+k=2
+B
+[
+b=1
+{W b
+(k) ≥ck}
+!
+≤
+m
+X
+k=2
+B
+X
+b=1
+P
+
+W b
+(k) ≥ck
+
+≤(m −1) · B ·
+δ
+(m −1) · B = δ
+Thus:
+P
+
+W b
+(k) ≤ck for all k ∈{2, . . . , m},
+b ∈{1, . . . , B}
+
+≥1 −δ.
+42
+
+
+--- Page 43 ---
+So the memory consumption is bounded:
+Memory Consumptionb = M π +
+m
+X
+k=2
+W b
+(k) · (l + l′
+k−1) ≤M π +
+m
+X
+k=2
+ck · (l + l′
+k−1)
+where M π is the peak batch memory usage as defined in Equation (13):
+M π =
+m
+X
+j=1
+nj
+
+l + L′
+j
+2
+
+∆l′
+j,
+with L′
+j =
+j
+X
+i=1
+l′
+i, ∆l′
+j = l′
+j −l′
+j−1, l′
+0 = 0.
+Note that this differs from the M π formula for the WAIT algorithm (Theorem 1), because Nested WAIT
+groups prompts into segments based on their unknown output lengths, leading to segment-wise memory
+accumulation
+Substitute ck = nk +
+ln(
+(m−1)·B
+δ
+)
+θk
+, we have that
+Memory Consumptionb ≤M π +
+m
+X
+k=2
+
+nk +
+ln
+
+(m−1)·B
+δ
+
+θk
+
+· (l + l′
+k−1).
+Define the memory bound MB:
+MB = M π +
+m
+X
+k=2
+nk · (l + l′
+k−1) +
+m
+X
+k=2
+ln
+
+(m−1)·B
+δ
+
+θk
+· (l + l′
+k−1).
+By the lower bound in Lemma 8, we can obtain the upper bound of the third term:
+m
+X
+k=2
+ln
+
+(m−1)·B
+δ
+
+θk
+· (l + l′
+k−1) ≤
+m
+X
+k=2
+nk−1
+8(nk −nk−1pk) ln
+(m −1) · B
+δ
+
+· (l + l′
+k−1)
+And this MB ensures that with probability at least 1 −δ, the memory consumption does not exceed MB at
+any batch index b ∈{1, . . . , B}.
+D
+Proof of Theorem 3
+Proof Outline.
+This proof extends Nested WAIT to time-varying arrival rates λj(t). Time-varying rates
+make exact load balance impossible, since the optimal threshold depends on the instantaneous arrival pattern.
+The worst-case domination strategy maintains load balance even at peak rates: by designing thresholds
+to handle worst-case arrivals, we ensure system stability across all scenarios. This conservative approach
+prevents eviction throughout the time horizon. The structure proceeds as follows:
+1. First segment analysis: Poisson arrivals with time-varying rates are dominated by a time-invariant
+process using worst-case aggregate rate Λπ = supb{Pm
+j=1 λj[t(b), t(b) + ∆T[1,...,m]]}. We couple with a
+Lindley process and apply Kingman’s inequality.
+2. Subsequent segments analysis: Binomial arrivals with time-varying thinning probabilities pk(b)
+are dominated by worst-case p∗
+k = supb{pk(b)}. This ensures safety across all batch compositions. We
+apply Lindley coupling to each segment.
+3. Throughput and high-probability bounds: Asymptotic optimality follows from the time-invariant
+dominated processes. High-probability memory bounds follow the same martingale construction, using
+worst-case parameters to prevent eviction.
+We use b to denote the batch index and k ∈{1, . . . , m} to denote the segment index. The total number of
+batches is denoted by B.
+43
+
+
+--- Page 44 ---
+D.1
+First Segment Analysis
+For the first segment (k = 1), the state transition rule is
+W b+1
+(1)
+= W b
+(1) + Y b
+(1) −n1 · 1{W b
+(1) + Y b
+(1) ≥n1},
+Y b
+(1) ∼Poisson
+ m
+X
+j=1
+λj[t(b), t(b) + ∆Tb]
+
+,
+where t(b) denotes the start time of batch b and ∆Tb denotes the processing time of batch b.
+Worst-case domination.
+Time-varying arrival rates prevent exact load balance since optimal thresholds
+depend on instantaneous arrival patterns.
+To maintain stability across all scenarios, we use worst-case
+domination: design thresholds to handle peak arrival rates, ensuring eviction prevention even under worst-
+case conditions. Since ∆Tb ≤∆T[1,...,m] (the time for a full batch containing all m types), we construct a
+dominating process { ¯W b
+(1)}:
+¯W b+1
+(1)
+= ¯W b
+(1) + ¯Y b
+(1) −n1 · 1{ ¯W b
+(1) + ¯Y b
+(1) ≥n1},
+¯Y b
+(1) ∼Poisson
+ m
+X
+j=1
+λj[t(b), t(b) + ∆T[1,...,m]]
+
+.
+By (15), the aggregate arrival rate during any batch is bounded by the worst-case aggregate rate:
+m
+X
+j=1
+λj[t(b), t(b) + ∆T[1,...,m]] ≤sup
+∀b
+
+
+
+m
+X
+j=1
+λj[t(b), t(b) + ∆T[1,...,m]]
+
+
+< n1.
+Define Λπ = sup∀b
+nPm
+j=1 λj[t(b), t(b) + ∆T[1,...,m]]
+o
+< n1 as the worst-case aggregate arrival rate. This
+enables a time-invariant dominating process that provides tractable bounds:
+˜W b+1
+(1)
+= ˜W b
+(1) + ˜Y b
+(1) −n1 · 1{ ˜W b
+(1) + ˜Y b
+(1) ≥n1},
+˜Y b
+(1) ∼Poisson(Λπ).
+This time-invariant process enables classical queueing analysis. Define Xb
+(1) = ˜Y b
+(1) −n1. The process { ˜W b
+(1)}
+is dominated by a Lindley process:
+W
+0
+(1) = 2n1,
+W
+b+1
+(1) = max{2n1, W
+b
+(1) + Xb
+(1)},
+∀b ∈N.
+Thus we have the dominance chain:
+W b
+(1) ≤¯W b
+(1) ≤˜W b
+(1) ≤W
+b
+(1),
+∀b ∈N.
+Since n1 > Λπ, the process {W
+b
+(1)} has negative drift. By Kingman’s inequality (Kingman 1962), with
+Var(Xb
+(1)) = Λπ,
+E
+h
+Xb
+(1)
+i = n1 −Λπ,
+we obtain
+E
+h
+W b
+(1)
+i
+≤2n1 +
+Λπ
+2 (n1 −Λπ).
+D.2
+Subsequent Segments Analysis (k ≥2)
+For segment k (2 ≤k ≤m), arrivals come from prompts that completed segment k −1. The batch index b
+for segment k counts only batches containing segment k −1. These indices differ across segments but are
+bounded by the total batch count B.
+44
+
+
+--- Page 45 ---
+Time-varying thinning probabilities.
+Consider the b-th arrival to segment k, which comes from the
+b-th batch containing segment k −1. The thinning probability pk(b) depends on the prompt composition
+in this batch and varies over time. Although exact arrival times are unknown, arrivals occur within some
+interval [t, t + ∆t] where t + ∆t ≤t(b, k −1), the starting time of the b-th batch containing segment k −1.
+To handle this time variation, we use the worst-case thinning probability. By (15):
+pk(b) =
+Pm
+j=k+1 λj[t, t + ∆t]
+Pm
+j=k λj[t, t + ∆t]
+≤p∗
+k <
+nk
+nk−1
+,
+∀b ∈N.
+The arrival process is
+Y b
+(k) ∼Binomial(nk−1, pk(b)),
+∀b ≥0,
+and the state transition rule is
+W b+1
+(k) = W b
+(k) + Y b
+(k) −nk · 1{W b
+(k) + Y b
+(k) ≥nk},
+where b indexes batches containing segment k −1, since new arrivals to segment k occur only when segment
+k −1 is processed.
+Define Xb
+(k) = Y b
+(k)−nk. Although the distribution Y b
+(k) ∼Binomial(nk−1, pk(b)) is time-varying, the coupling
+construction follows Lemma 7:
+Lemma 9 (Coupling for Time-Varying Case) Define a coupled process { ˜W b
+(k)} by:
+˜W 0
+(k) = nk,
+˜W b+1
+(k) = max{nk, ˜W b
+(k) + Xb
+(k)},
+Xb
+(k) = Y b
+(k) −nk.
+Then ˜W b
+(k) ≥W b
+(k) for all b ∈N.
+To apply Kingman’s inequality (Kingman 1962), we construct a time-invariant dominating process:
+¯W 0
+(k) = nk,
+¯W b+1
+(k) = max{nk, ¯W b
+(k) + ¯Xb
+(k)},
+¯Xb
+(k) = ¯Y b
+(k) −nk,
+¯Y b
+(k) ∼Binomial(nk−1, p∗
+k),
+∀b ∈N.
+Then we have the dominance chain:
+¯W b
+(k) ≥˜W b
+(k) ≥W b
+(k),
+∀b ∈N.
+The process ¯W b
+(k) has the Lindley representation:
+¯W 0
+(k) = nk,
+¯W b+1
+(k) = nk + max
+0≤i≤b{ ¯Si
+(k)},
+where ¯S0
+(k) = 0, ¯Si
+(k) =
+i
+X
+r=1
+¯Xr
+(k), 1 ≤i ≤b.
+Since
+E
+h
+¯Xb
+(k)
+i
+= nk−1 · p∗
+k −nk < 0,
+∀b ∈N,
+the coupled process { ¯W b
+(k)} has negative drift. With
+Var( ¯Xb
+(k)) = nk−1p∗
+k(1 −p∗
+k),
+E
+h
+¯Xb
+(k)
+i = nk −p∗
+knk−1,
+45
+
+
+--- Page 46 ---
+Kingman’s inequality (Kingman 1962) yields:
+E
+
+max
+0≤i≤b{ ¯Si
+(k)}
+
+≤nk−1p∗
+k(1 −p∗
+k)
+2(nk −nk−1p∗
+k).
+Thus, the expected queue length is bounded:
+E
+h
+W b
+(k)
+i
+≤E
+h
+˜W b
+(k)
+i
+≤E
+h
+¯W b
+(k)
+i
+≤nk + nk−1p∗
+k(1 −p∗
+k)
+2(nk −nk−1p∗
+k).
+D.3
+Throughput and High-Probability Bounds
+The discussion of asymptotic optimal throughput under bounded latency and TTFT follows Appendix C. For
+high-probability bounds, the analysis follows the same martingale construction applied to the time-invariant
+coupled process { ¯W b
+(k)} defined above. By the same argument as in Appendix C, with ¯Xr
+(k) = ¯Y r
+(k) −nk,
+¯Y r
+(k) ∼Binomial(nk−1, p∗
+k), and p∗
+k < nk/nk−1, the memory bound MB is:
+MB = M π +
+m
+X
+k=2
+nk · (l + l′
+k−1) +
+m
+X
+k=2
+θ−1
+k
+ln
+(m −1) · B
+δ
+
+· (l + l′
+k−1),
+where θk (2 ≤k ≤m) is the unique positive solution to:
+e−θknk(1 −p∗
+k + p∗
+keθk)nk−1 = 1.
+(21)
+Since p∗
+k = supb{pk(b)} represents the worst-case thinning probability, by the strictly increasing property of
+θk in Lemma 8, this yields the smallest θk and hence the largest memory bound term. The lower bound for
+θk follows from the same analysis in Appendix C.
+E
+Proof of Lemmas
+Throughout this section, we use b for the batch index and B for the total number of batches.
+E.1
+Proof of Lemma 1
+To prove this lemma, we take expectations on both sides of the state transition equation:
+E
+
+W b+1
+= E
+
+W b
++ λ −λP(W b + Xb ≥λ).
+Summing from b = 0 to B −1, and noting that W 0 = 0, we obtain:
+E
+
+W B
+= λB −λE [B −Bstuck] = λ · E [Bstuck] .
+E.2
+Proof of Lemma 2
+We prove by induction on the batch index b. The coupled process { ˜W b} starts with a safety buffer of 2λ
+(compared to the real process starting at 0), ensuring it remains above W b +λ throughout. For the inductive
+step, we consider two cases based on whether the system can process a batch or experiences a stuck iteration.
+Base case.
+For b = 0: ˜W 0 = 2λ ≥λ = W 0 + λ.
+Inductive step.
+Assume ˜W b ≥W b + λ for some b ≥0. We show ˜W b+1 ≥W b+1 + λ by considering two
+cases:
+Case 1 (Batch processed): If W b + Xb ≥λ, the queue has accumulated enough prompts to process a
+batch, so W b+1 = W b + Xb −λ. Then
+˜W b+1 = max{2λ, ˜W b + Xb −λ} ≥˜W b + Xb −λ ≥(W b + λ) + Xb −λ = W b+1 + λ.
+46
+
+
+--- Page 47 ---
+Case 2 (Stuck iteration): If W b + Xb < λ, insufficient prompts are available and the system cannot
+process a batch (stuck iteration). The queue simply accumulates arrivals: W b+1 = W b + Xb. The safety
+buffer ensures dominance:
+˜W b+1 = max{2λ, ˜W b + Xb −λ} ≥2λ = λ + λ > W b+1 + λ.
+By induction, ˜W b ≥W b + λ for all b ∈N.
+E.3
+Proof of Lemma 6
+Proof idea.
+The coupled process dominates the real process by maintaining a consistent full-batch pro-
+cessing schedule, while the real process may skip type j in some batches when W b
+(j) < nj. We analyze
+periods when type j actively joins batches and show the coupled process makes at most one additional batch
+iteration, preserving dominance.
+Proof.
+Since ˜W b
+(j) ≥2nj, when W b
+(j) < nj, we trivially have ˜W b
+(j) ≥W b
+(j).
+Initially, W 0
+(j) = 0. As arrivals accumulate, W b
+(j) reaches nj and type j joins the batch. After processing,
+W b
+(j) may drop below nj, and the cycle repeats.
+Consider a period [b0, b1] when W b
+(j) ≥nj, meaning type j is actively joining batches in the real process.
+Let τ = max{b ≤b0 : W b
+(j) = nj} be the last time before b0 when the queue length equals exactly nj. We
+compare the number of batch iterations between the real and coupled processes over the interval [τ, b].
+For any b ∈[b0, b1], the elapsed time is t(b) −t(τ), where t(b) denotes the time at batch b. Since each batch
+takes at most ∆T[1,··· ,m] time (the full-batch processing time), we can bound the number of batch iterations
+Iτ→b (real process) and ˜Iτ→b (coupled process):
+Iτ→b ≥⌊t(b) −t(τ)
+∆T[1,··· ,m]
+⌋,
+˜Iτ→b ≤1 + ⌊t(b) −t(τ)
+∆T[1,··· ,m]
+⌋⇒˜Iτ→b ≤1 + Iτ→b.
+Thus, the coupled process makes at most one more iteration than the real process after τ.
+At time τ, the real process may be in a batch without type j (since not all batches contain all types),
+while the coupled process just completed a full batch containing all types. This yields the initial dominance
+˜W τ
+(j) ≥nj = W τ
+(j).
+For batches in the interval (τ, b], the arrival dynamics are identical for both processes. Since type j joins
+every batch in the real process during this period (as W b
+(j) ≥nj), but the coupled process completes at most
+one additional batch, the dominance is maintained. Thus ˜W b
+(j) ≥W b
+(j) for all b ≥0.
+E.4
+Proof of Lemma 7
+The proof follows the same induction structure as Lemma 2, adapted to the Nested WAIT setting where
+arrivals follow binomial thinning from segment k −1 completions.
+Base case.
+For b = 0: ˜W 0
+(k) = nk ≥0 = W 0
+(k).
+Inductive step.
+Assume ˜W b
+(k) ≥W b
+(k) for some b ≥0. We show ˜W b+1
+(k) ≥W b+1
+(k)
+by case analysis:
+Case 1 (Segment batch processed): If W b
+(k) + Y b
+(k) ≥nk, then W b+1
+(k) = W b
+(k) + Y b
+(k) −nk, so
+˜W b+1
+(k) = max{nk, ˜W b
+(k) + Xb
+(k)} ≥˜W b
+(k) + Xb
+(k) ≥W b
+(k) + Y b
+(k) −nk = W b+1
+(k) .
+Case 2 (Segment stuck): If W b
+(k) + Y b
+(k) < nk, then W b+1
+(k) = W b
+(k) + Y b
+(k), so
+˜W b+1
+(k) = max{nk, ˜W b
+(k) + Xb
+(k)} ≥nk > W b+1
+(k) .
+47
+
+
+--- Page 48 ---
+By induction, ˜W b
+(k) ≥W b
+(k) for all b ∈N.
+E.5
+Proof of Lemma 8
+This lemma establishes existence and properties of the parameter θk > 0 that makes the exponential process
+eθkSi
+(k) a martingale. This enables Doob’s inequality to convert expected queue length bounds into high-
+probability bounds, preventing eviction cascades.
+Existence and uniqueness.
+For simplicity, we denote θ = θk. Define the function
+f(θ) = e−θnk(1 −pk + pkeθ)nk−1.
+We seek θ > 0 such that f(θ) = 1. First, evaluate f(θ) at θ = 0:
+f(0) = e0(1 −pk + pk · 1)nk−1 = 1.
+Thus, θ = 0 is a trivial solution, but we need θ > 0 to obtain useful high-probability bounds. To analyze
+f(θ) for θ > 0, we consider the logarithm
+g(θ) = ln f(θ) = −θnk + nk−1 ln(1 −pk + pkeθ),
+g′(θ) = −nk + nk−1 ·
+pkeθ
+1 −pk + pkeθ .
+At θ = 0,
+g(0) = 0, g′(0) = −nk + nk−1pk.
+Since E[Xb
+(k)] = nk−1pk −nk < 0, we have g′(0) < 0, so f(θ) is decreasing near θ = 0. Consider the second
+derivative:
+g′′(θ) = nk−1 ·
+pkeθ(1 −pk)
+(1 −pk + pkeθ)2 > 0
+for
+θ > 0,
+since pk ∈(0, 1) and nk−1 > 0. Thus, g(θ) is strictly convex. Convexity ensures that g(θ) can cross zero at
+most once for θ > 0, guaranteeing uniqueness. Now, consider the limit as θ →∞:
+f(θ) ≈pnk−1
+k
+eθ(nk−1−nk).
+By our settings, nk−1 > nk, which ensures f(θ) →∞as θ →∞. Thus, f(θ) is continuous, convex, starts at
+f(0) = 1, decreases below 1 for small θ > 0 (since g′(0) = nk−1pk −nk < 0 by negative drift), and increases
+to infinity. By the intermediate value theorem and convexity, there exists a unique θ > 0 such that f(θ) = 1.
+Monotonicity in drift.
+Next, we prove that the solution θ > 0 is strictly increasing with respect to the
+drift D = nk −nk−1pk. This shows that tighter capacity (larger D, more negative drift) leads to larger θ
+and thus tighter high-probability bounds. Recall that g(0) = 0, g′(0) = −D < 0, and g′′(θ) > 0 for θ > 0,
+so g(θ) is strictly convex. The unique positive solution θ > 0 occurs where g(θ) crosses zero after initially
+decreasing from g(0) = 0.
+Consider two values D1 and D2 such that D1 < D2, with corresponding functions g1(θ) = −θ(nk−1pk +
+D1) + nk−1 ln(1 −pk + pkeθ) and g2(θ) = −θ(nk−1pk + D2) + nk−1 ln(1 −pk + pkeθ), and solutions θ1 and
+θ2, respectively. At θ = 0, we have g′
+1(0) = −D1 > g′
+2(0) = −D2, meaning g2(θ) decreases more steeply from
+zero than g1(θ).
+For a fixed θ > 0, the partial derivative
+∂g
+∂D = −θ < 0, so increasing D decreases g(θ) pointwise. Since
+g(θ) is convex and approaches infinity as θ →∞, the zero crossing of g(θ; D) shifts to a larger θ when D
+increases. Hence, if D2 > D1, then θ2 > θ1. Operationally, this means larger safety margins yield tighter
+high-probability bounds.
+48
+
+
+--- Page 49 ---
+Drift-to-θ scaling.
+Finally, we characterize how the solution θ > 0 scales with drift D, nk−1, and pk.
+When the drift D = nk −nk−1pk is small (system near critical load), the solution θ is also small. To derive
+an explicit approximation, we expand g(θ) around θ = 0 using Taylor’s theorem:
+g(θ) = g(0) + g′(0)θ + 1
+2g′′(0)θ2 + O(θ3) = 0 −Dθ + 1
+2nk−1pk(1 −pk)θ2 + O(θ3).
+Setting g(θ) = 0 and neglecting higher-order terms, we obtain the quadratic approximation
+−Dθ + 1
+2nk−1pk(1 −pk)θ2 ≈0 =⇒θ ≈
+2D
+nk−1pk(1 −pk).
+This shows that for small D, the solution scales linearly: θ = O(D). Specifically, θ ≈2(nk−nk−1pk)
+nk−1pk(1−pk) . This lin-
+ear scaling implies that the high-probability memory bound grows logarithmically in B/δ, with the coefficient
+inversely proportional to the drift D.
+General lower bound.
+To obtain a uniform lower bound valid for all D > 0 (not just small D), we apply
+Taylor’s theorem with remainder:
+g(θ) = g(0) + g′(0)θ + 1
+2g′′(c)θ2 = −Dθ + 1
+2g′′(c)θ2 = 0 =⇒θ =
+2D
+g′′(c).
+for some c ∈(0, θ)
+To find an upper bound for g′′(c), we write g′′(x) = nk−1 ·
+pkex(1−pk)
+(1−pk+pkex)2 and define h(y) =
+pky(1−pk)
+(1−pk+pky)2 where
+y = ex ≥1. By differentiation, h(y) achieves a maximum of 1
+4 over y ≥1 and 0 < pk < 1 (attained when the
+numerator and denominator are balanced). Thus we have that g′′(x) ≤nk−1 · 1
+4 = nk−1
+4
+=⇒θ =
+2D
+g′′(c) ≥
+2D
+nk−1/4 =
+8D
+nk−1 . So a general lower bound is:
+θ ≥8(nk −nk−1pk)
+nk−1
+.
+(22)
+49
