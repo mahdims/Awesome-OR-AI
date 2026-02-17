@@ -1311,29 +1311,24 @@ def demo(**config):
     save_score_cache(score_cache)
     print(f"[5/6] Score cache saved ({len(score_cache)} entries)", flush=True)
 
-    # 1. update README.md file
+    # 1. update JSON files (README generated separately by src/scripts/generate_readme.py)
     if publish_readme:
-        print("  Updating README ...", end=" ", flush=True)
         json_file = config['json_readme_path']
-        md_file   = config['md_readme_path']
         if config['update_paper_links']:
+            print("  Enriching paper links (readme JSON) ...", end=" ", flush=True)
             update_paper_links(json_file)
         else:
-            update_json_file(json_file,data_collector)
-        json_to_md(json_file,md_file, task ='Update Readme')
+            update_json_file(json_file, data_collector)
         print("done", flush=True)
 
-    # 2. update docs/index.md file (to gitpage)
+    # 2. update docs JSON file (to gitpage)
     if publish_gitpage:
-        print("  Updating GitPage ...", end=" ", flush=True)
         json_file = config['json_gitpage_path']
-        md_file   = config['md_gitpage_path']
         if config['update_paper_links']:
+            print("  Enriching paper links (gitpage JSON) ...", end=" ", flush=True)
             update_paper_links(json_file)
         else:
-            update_json_file(json_file,data_collector_web)
-        json_to_md(json_file, md_file, task ='Update GitPage', \
-            to_web = True, use_tc=False, use_b2t=False)
+            update_json_file(json_file, data_collector_web)
         print("done", flush=True)
 
     elapsed = time.time() - start_time
@@ -1469,16 +1464,14 @@ def redo_category(category_name, **config):
         data_collector_web.append(data_web)
 
     # Step 4: Save results (merge into existing JSON, replacing only this category)
+    # README is generated separately by src/scripts/generate_readme.py
     print(f"\n[4/5] Saving results ...", flush=True)
     if publish_readme:
         update_json_file(config['json_readme_path'], data_collector)
-        json_to_md(config['json_readme_path'], config['md_readme_path'], task='Update Readme')
-        print(f"  README updated", flush=True)
+        print(f"  JSON (readme) updated", flush=True)
     if publish_gitpage:
         update_json_file(config['json_gitpage_path'], data_collector_web)
-        json_to_md(config['json_gitpage_path'], config['md_gitpage_path'],
-                   task='Update GitPage', to_web=True, use_tc=False, use_b2t=False)
-        print(f"  GitPage updated", flush=True)
+        print(f"  JSON (gitpage) updated", flush=True)
 
     save_score_cache(score_cache)
     print(f"  Score cache saved ({len(score_cache)} entries)", flush=True)
