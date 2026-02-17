@@ -1062,15 +1062,16 @@ def update_paper_links(filename):
                 db_updates = 0
                 for keywords, v in json_data.items():
                     for paper_id, contents in v.items():
-                        _, _, _, affiliation, _, _, code = parse_arxiv_string(str(contents))
+                        _, _, _, affiliation, venue, _, code = parse_arxiv_string(str(contents))
                         has_code = code and code != 'null' and 'null' not in code.lower()
                         repo_url = None
                         if has_code:
                             url_match = re.search(r'\[link\]\((.+?)\)', code)
                             if url_match:
                                 repo_url = url_match.group(1)
-                        if affiliation or repo_url:
-                            db.update_paper_metadata(paper_id, affiliations=affiliation, code_url=repo_url)
+                        if affiliation or venue or repo_url:
+                            db.update_paper_metadata(paper_id, affiliations=affiliation,
+                                                     venue=venue, code_url=repo_url)
                             db_updates += 1
                 logging.info(f"Database updated: {db_updates} papers enriched")
         except Exception as e:

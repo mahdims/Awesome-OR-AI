@@ -46,6 +46,11 @@ class Database:
             self.conn.execute("ALTER TABLE paper_analyses ADD COLUMN is_relevant INTEGER DEFAULT 1")
         except Exception:
             pass  # column already exists
+        # Add venue column to paper_analyses if it doesn't exist yet
+        try:
+            self.conn.execute("ALTER TABLE paper_analyses ADD COLUMN venue TEXT")
+        except Exception:
+            pass  # column already exists
         return self
 
     def close(self):
@@ -331,12 +336,17 @@ class Database:
     # === Paper Metadata Enrichment ===
 
     def update_paper_metadata(self, arxiv_id: str, affiliations: str = None,
-                               code_url: str = None):
-        """Update paper metadata fields (affiliations, code_url in artifacts)."""
+                               code_url: str = None, venue: str = None):
+        """Update paper metadata fields (affiliations, venue, code_url). Only fills empty fields."""
         if affiliations:
             self.execute(
                 "UPDATE paper_analyses SET affiliations = ? WHERE arxiv_id = ? AND (affiliations IS NULL OR affiliations = '')",
                 (affiliations, arxiv_id)
+            )
+        if venue:
+            self.execute(
+                "UPDATE paper_analyses SET venue = ? WHERE arxiv_id = ? AND (venue IS NULL OR venue = '')",
+                (venue, arxiv_id)
             )
         if code_url:
             # Update code_url inside artifacts JSON

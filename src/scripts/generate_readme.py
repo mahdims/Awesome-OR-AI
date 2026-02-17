@@ -108,9 +108,9 @@ def _pdf_cell(arxiv_id: str) -> str:
 # ── DB queries ────────────────────────────────────────────────────────────────
 
 def _load_l1(db: Database, category: str) -> dict:
-    """Return {arxiv_id: {score, brief, affiliations}} for all L1-analyzed papers."""
+    """Return {arxiv_id: {score, brief, affiliations, venue, code_url}} for all analyzed papers."""
     rows = db.fetchall(
-        """SELECT arxiv_id, relevance, significance, brief, affiliations
+        """SELECT arxiv_id, relevance, significance, brief, affiliations, venue, artifacts
            FROM paper_analyses
            WHERE category = ?""",
         (category,)
@@ -122,6 +122,10 @@ def _load_l1(db: Database, category: str) -> dict:
             rel = json.loads(row["relevance"] or "{}")
         except Exception:
             rel = {}
+        try:
+            artifacts = json.loads(row["artifacts"] or "{}")
+        except Exception:
+            artifacts = {}
         score = (rel.get("methodological", 0)
                  + rel.get("problem", 0)
                  + rel.get("inspirational", 0))
@@ -129,6 +133,8 @@ def _load_l1(db: Database, category: str) -> dict:
             "score":        score,
             "brief":        (row["brief"] or "").strip(),
             "affiliations": (row["affiliations"] or "").strip(),
+            "venue":        (row["venue"] or "").strip(),
+            "code_url":     (artifacts.get("code_url") or "").strip(),
         }
     return result
 
@@ -187,30 +193,34 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
     lines.append("| Date | Title | Authors | Affiliation | Code |")
     lines.append("|------|-------|---------|-------------|------|")
     for _, content in sorted_papers[:TOP_N]:
-        date, title, authors, json_affil, _, aid, code = _parse(str(content))
+        date, title, authors, json_affil, json_venue, aid, json_code = _parse(str(content))
         info   = l1.get(aid, {})
         affil  = info.get("affiliations") or json_affil
+        db_code = info.get("code_url")
+        code_cell = _code_cell(f"**[link]({db_code})**" if db_code else json_code)
         brief  = info.get("brief", "")
-        lines.append(f"| {date} | {_title_cell(title, brief)} | {authors} | {affil} | {_code_cell(code)} |")
+        lines.append(f"| {date} | {_title_cell(title, brief)} | {authors} | {affil} | {code_cell} |")
     lines.append("")
 
     # ── Best Papers (top N by M+I+P, L1-analyzed papers only) ────────────────
     lines.append("### ⭐ Best Papers\n")
     scored = []
     for _, content in sorted_papers:
-        date, title, authors, json_affil, _, aid, code = _parse(str(content))
+        date, title, authors, json_affil, json_venue, aid, json_code = _parse(str(content))
         if aid in l1:
-            scored.append((date, title, authors, json_affil, aid, code, l1[aid]))
-    scored.sort(key=lambda x: x[6]["score"], reverse=True)
+            scored.append((date, title, authors, json_affil, json_venue, aid, json_code, l1[aid]))
+    scored.sort(key=lambda x: x[7]["score"], reverse=True)
 
     if scored:
         lines.append("| Score | Date | Title | Authors | Affiliation | Code |")
         lines.append("|-------|------|-------|---------|-------------|------|")
-        for date, title, authors, json_affil, aid, code, info in scored[:TOP_N]:
+        for date, title, authors, json_affil, json_venue, aid, json_code, info in scored[:TOP_N]:
             affil = info.get("affiliations") or json_affil
+            db_code = info.get("code_url")
+            code_cell = _code_cell(f"**[link]({db_code})**" if db_code else json_code)
             lines.append(
                 f"| {info['score']}/30 | {date} | {_title_cell(title, info['brief'])} "
-                f"| {authors} | {affil} | {_code_cell(code)} |"
+                f"| {authors} | {affil} | {code_cell} |"
             )
     else:
         lines.append("*No papers with L1 analysis yet.*")
@@ -238,14 +248,17 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
     lines.append("| Score | Date | Title | Authors | Affiliation | Venue | PDF | Code |")
     lines.append("|-------|------|-------|---------|-------------|-------|-----|------|")
     for _, content in sorted_papers[:MAX_FULL_LIST]:
-        date, title, authors, json_affil, venue, aid, code = _parse(str(content))
-        info       = l1.get(aid, {})
-        affil      = info.get("affiliations") or json_affil
-        brief      = info.get("brief", "")
-        score_str  = f"{info['score']}/30" if info else "—"
+        date, title, authors, json_affil, json_venue, aid, json_code = _parse(str(content))
+        info      = l1.get(aid, {})
+        affil     = info.get("affiliations") or json_affil
+        venue     = info.get("venue") or json_venue
+        brief     = info.get("brief", "")
+        score_str = f"{info['score']}/30" if info else "—"
+        db_code   = info.get("code_url")
+        code_cell = _code_cell(f"**[link]({db_code})**" if db_code else json_code)
         lines.append(
             f"| {score_str} | {date} | {_title_cell(title, brief)} "
-            f"| {authors} | {affil} | {venue} | {_pdf_cell(aid)} | {_code_cell(code)} |"
+            f"| {authors} | {affil} | {venue} | {_pdf_cell(aid)} | {code_cell} |"
         )
     lines.append("\n</details>\n")
 
@@ -273,11 +286,22 @@ def generate_readme(json_path: Path, out_path: Path, to_web: bool = False):
 
             l1 = _load_l1(db, category)
 
-            # Sync affiliations: for papers not yet in DB, write JSON affil to DB
+            # Sync affiliations/venue/code: write JSON values to DB where DB is empty
             for _, content in papers.items():
-                _, _, _, json_affil, _, aid, _ = _parse(str(content))
-                if json_affil and (aid not in l1 or not l1[aid].get("affiliations")):
-                    db.update_paper_metadata(aid, affiliations=json_affil)
+                _, _, _, json_affil, json_venue, aid, json_code = _parse(str(content))
+                info = l1.get(aid, {})
+                needs_affil = json_affil and not info.get("affiliations")
+                needs_venue = json_venue and not info.get("venue")
+                needs_code  = json_code and json_code.lower() not in ("null", "none", "") \
+                              and not info.get("code_url")
+                if needs_affil or needs_venue or needs_code:
+                    url_match = re.search(r'\[link\]\((.+?)\)', json_code) if needs_code else None
+                    db.update_paper_metadata(
+                        aid,
+                        affiliations=json_affil if needs_affil else None,
+                        venue=json_venue if needs_venue else None,
+                        code_url=url_match.group(1) if url_match else None,
+                    )
 
             # Re-load l1 after sync so affiliations are fresh
             l1 = _load_l1(db, category)
