@@ -213,8 +213,8 @@ def load_config(config_file:str) -> dict:
             if 'filters' in v:
                 keywords[k] = parse_filters(v['filters'])
         return keywords
-    with open(config_file,'r') as f:
-        config = yaml.load(f,Loader=yaml.FullLoader)
+    with open(config_file, 'r', encoding='utf-8') as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
         config['kv'] = pretty_filters(**config)
         logging.info(f'config = {config}')
     return config
@@ -422,7 +422,7 @@ def get_paper_metadata_s2(arxiv_ids: list) -> dict:
 def load_score_cache(cache_path=SCORE_CACHE_PATH):
     """Load the persistent relevance score cache from disk."""
     try:
-        with open(cache_path, "r") as f:
+        with open(cache_path, "r", encoding='utf-8') as f:
             content = f.read()
             if content:
                 return json.loads(content)
@@ -435,7 +435,7 @@ def load_score_cache(cache_path=SCORE_CACHE_PATH):
 def save_score_cache(cache, cache_path=SCORE_CACHE_PATH):
     """Save the relevance score cache to disk."""
     try:
-        with open(cache_path, "w") as f:
+        with open(cache_path, "w", encoding='utf-8') as f:
             json.dump(cache, f)
     except Exception as e:
         logging.warning(f"Failed to save score cache: {e}")
@@ -873,7 +873,7 @@ def clean_json_data(filename):
     Remove pre-2024 papers from JSON file and migrate old format entries
     to include venue column.
     """
-    with open(filename, "r") as f:
+    with open(filename, "r", encoding='utf-8') as f:
         content = f.read()
         if not content:
             return
@@ -910,7 +910,7 @@ def clean_json_data(filename):
             new_papers[paper_id] = entry
         new_data[topic] = new_papers
 
-    with open(filename, "w") as f:
+    with open(filename, "w", encoding='utf-8') as f:
         json.dump(new_data, f)
 
     logging.info(f"Cleaned {filename}: removed {removed_count} pre-{MIN_YEAR} papers, migrated {migrated_count} entries")
@@ -964,7 +964,7 @@ def update_paper_links(filename):
       2. VENUE: if empty → re-check ArXiv metadata + Semantic Scholar
       3. CODE: if null → waterfall: PwC → HuggingFace → S2 → GitHub search
     """
-    with open(filename, "r") as f:
+    with open(filename, "r", encoding='utf-8') as f:
         content = f.read()
         if not content:
             m = {}
@@ -1077,14 +1077,14 @@ def update_paper_links(filename):
             logging.warning(f"Database update skipped: {e}")
 
     # Dump updated JSON
-    with open(filename, "w") as f:
+    with open(filename, "w", encoding='utf-8') as f:
         json.dump(json_data, f)
 
 def update_json_file(filename,data_dict):
     '''
     daily update json file using data_dict
     '''
-    with open(filename,"r") as f:
+    with open(filename, "r", encoding='utf-8') as f:
         content = f.read()
         if not content:
             m = {}
@@ -1103,8 +1103,8 @@ def update_json_file(filename,data_dict):
             else:
                 json_data[keyword] = papers
 
-    with open(filename,"w") as f:
-        json.dump(json_data,f)
+    with open(filename, "w", encoding='utf-8') as f:
+        json.dump(json_data, f)
 
 def json_to_md(filename,md_filename,
                task = '',
@@ -1135,7 +1135,7 @@ def json_to_md(filename,md_filename,
     DateNow = str(DateNow)
     DateNow = DateNow.replace('-','.')
 
-    with open(filename,"r") as f:
+    with open(filename, "r", encoding='utf-8') as f:
         content = f.read()
         if not content:
             data = {}
@@ -1143,11 +1143,11 @@ def json_to_md(filename,md_filename,
             data = json.loads(content)
 
     # clean README.md if daily already exist else create it
-    with open(md_filename,"w+") as f:
+    with open(md_filename, "w+", encoding='utf-8') as f:
         pass
 
     # write data into README.md
-    with open(md_filename,"a+") as f:
+    with open(md_filename, "a+", encoding='utf-8') as f:
 
         if (use_title == True) and (to_web == True):
             f.write("---\n" + "layout: default\n" + "---\n\n")
@@ -1206,7 +1206,7 @@ def _load_existing_ids(json_path):
     """Load all paper IDs already in the JSON database."""
     ids = set()
     try:
-        with open(json_path, "r") as f:
+        with open(json_path, "r", encoding='utf-8') as f:
             content = f.read()
             if content:
                 data = json.loads(content)
@@ -1225,6 +1225,12 @@ def demo(**config):
     max_results = config['max_results']
     publish_readme = config['publish_readme']
     publish_gitpage = config['publish_gitpage']
+
+    # Optional single-category filter (--category flag)
+    filter_category = config.get('filter_category')
+    if filter_category:
+        keywords = {k: v for k, v in keywords.items() if k == filter_category}
+        print(f"[--category] Restricting fetch to: '{filter_category}'", flush=True)
 
     # Initialize OpenAI client for relevance filtering
     llm_client = None
@@ -1261,10 +1267,11 @@ def demo(**config):
 
         # keyword-based search
         for i, (topic, keyword) in enumerate(keywords.items(), 1):
-            print(f"\n  [{i}/{len(keywords)}] Keyword search: '{topic}' ...", flush=True)
+            cat_max = config['keywords'].get(topic, {}).get('max_results', max_results)
+            print(f"\n  [{i}/{len(keywords)}] Keyword search: '{topic}' (max {cat_max}) ...", flush=True)
             t0 = time.time()
             data, data_web = get_daily_papers(topic, query=keyword,
-                                            max_results=max_results,
+                                            max_results=cat_max,
                                             llm_client=llm_client,
                                             category_description=category_descriptions.get(topic, topic),
                                             score_cache=score_cache,
@@ -1277,7 +1284,8 @@ def demo(**config):
             data_collector_web.append(data_web)
 
         # citation-based search
-        citation_topics = [(t, c) for t, c in config['keywords'].items() if 'seed_papers' in c]
+        citation_topics = [(t, c) for t, c in config['keywords'].items()
+                           if 'seed_papers' in c and (not filter_category or t == filter_category)]
         for i, (topic, cfg) in enumerate(citation_topics, 1):
             seed_count = len(cfg['seed_papers'])
             print(f"\n  [Citation {i}/{len(citation_topics)}] '{topic}' ({seed_count} seed papers) ...", flush=True)
@@ -1332,7 +1340,7 @@ def demo(**config):
     # Count total papers in output
     total_papers = 0
     try:
-        with open(config['json_readme_path'], 'r') as f:
+        with open(config['json_readme_path'], 'r', encoding='utf-8') as f:
             content = f.read()
             if content:
                 all_data = json.loads(content)
@@ -1344,14 +1352,14 @@ def demo(**config):
 def clear_category_from_json(filename, category):
     """Remove all papers for a given category from a JSON file."""
     try:
-        with open(filename, "r") as f:
+        with open(filename, "r", encoding='utf-8') as f:
             content = f.read()
             data = json.loads(content) if content else {}
     except FileNotFoundError:
         return 0
     removed = len(data.get(category, {}))
     data[category] = {}
-    with open(filename, "w") as f:
+    with open(filename, "w", encoding='utf-8') as f:
         json.dump(data, f)
     return removed
 
@@ -1400,6 +1408,7 @@ def redo_category(category_name, **config):
     publish_gitpage = config['publish_gitpage']
     cfg = config['keywords'][category_name]
     category_description = cfg.get('description', category_name)
+    cat_max = cfg.get('max_results', max_results)
 
     # Step 1: Clear old data for this category
     print(f"\n[1/5] Clearing old data for '{category_name}' ...", flush=True)
@@ -1431,10 +1440,10 @@ def redo_category(category_name, **config):
     # Keyword-based search (if this category has filters)
     if category_name in keywords:
         keyword = keywords[category_name]
-        print(f"  Keyword search (max {max_results} results) ...", flush=True)
+        print(f"  Keyword search (max {cat_max} results) ...", flush=True)
         t0 = time.time()
         data, data_web = get_daily_papers(category_name, query=keyword,
-                                          max_results=max_results,
+                                          max_results=cat_max,
                                           llm_client=llm_client,
                                           category_description=category_description,
                                           score_cache=score_cache)
@@ -1477,7 +1486,7 @@ def redo_category(category_name, **config):
     elapsed = time.time() - start_time
     total_papers = 0
     try:
-        with open(config['json_readme_path'], 'r') as f:
+        with open(config['json_readme_path'], 'r', encoding='utf-8') as f:
             content = f.read()
             if content:
                 all_data = json.loads(content)
@@ -1494,9 +1503,12 @@ if __name__ == "__main__":
                         action="store_true",help='whether to update paper links etc.')
     parser.add_argument('--redo_category', type=str, default=None,
                         help='Redo a single category from scratch (clear and re-fetch). Other categories are kept as-is.')
+    parser.add_argument('--category', type=str, default=None,
+                        help='Fetch only this category (leave others unchanged).')
     args = parser.parse_args()
     config = load_config(args.config_path)
-    config = {**config, 'update_paper_links':args.update_paper_links}
+    config = {**config, 'update_paper_links':args.update_paper_links,
+              'filter_category': args.category}
 
     if args.redo_category:
         redo_category(args.redo_category, **config)
