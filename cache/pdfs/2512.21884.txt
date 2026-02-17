@@ -1,0 +1,3308 @@
+--- Page 1 ---
+Optimizing Resource Allocation for Geographically-Distributed Inference by
+Large Language Models
+Tingyang Sun1, Ting He∗1, Bo Ji2, and Parimal Parag3
+1Department of Computer Science and Engineering, Pennsylvania State University, University Park, PA, USA
+2Department of Computer Science, Virginia Tech, Blacksburg, VA, USA
+3Department of Electrical Communication Engineering, Indian Institute of Science, Bangalore, India
+Abstract
+Large language models (LLMs) have demonstrated extraordinary performance in many artificial intelli-
+gence (AI) tasks but are expensive to use, even after training, due to their requirement of high-end GPUs.
+Recently, a distributed system called PETALS was developed to lower the barrier for deploying LLMs by
+splitting the model blocks across multiple servers with low-end GPUs distributed over the Internet, which was
+much faster than swapping the model parameters between the GPU memory and other cheaper but slower lo-
+cal storage media. However, the performance of such a distributed system critically depends on the resource
+allocation, and how to do so optimally remains unknown. In this work, we present the first systematic study of
+the resource allocation problem in distributed LLM inference, with focus on two important decisions: block
+placement and request routing. Our main results include: (i) experimentally validated performance models
+that can predict the inference performance under given block placement and request routing decisions, (ii)
+a formulation of the offline optimization of block placement and request routing as a mixed integer linear
+programming (MILP) problem together with the NP-hardness proof and a polynomial-complexity algorithm
+with guaranteed performance, and (iii) an adaptation of the offline algorithm for the online setting with the
+same performance guarantee under bounded load. Through both experiments and experimentally-validated
+simulations, we have verified that the proposed solution can substantially reduce the inference time compared
+to the state-of-the-art solution in diverse settings with geographically-distributed servers. As a byproduct,
+we have also developed a light-weighted CPU-only simulator capable of predicting the performance of dis-
+tributed LLM inference on GPU servers, which can evaluate large deployments and facilitate future research
+for researchers with limited GPU access.
+Keywords: Large language model; model parallelism; block placement; request routing.
+1
+Introduction
+Large language models (LLMs) have yielded exceptional performance in many artificial intelligence (AI) tasks.
+Modern LLMs pre-trained on large datasets have demonstrated promising utility for diverse applications [1].
+However, to achieve state-of-the-art accuracy, such models often need to contain over 50 billion (50B) param-
+eters, which makes it expensive to work with these models due to the requirement of expensive hardware such
+as high-end GPUs.
+∗This work was partly supported by the National Science Foundation under award CNS-2106294. Parimal was supported by
+Qualcomm Inc. under Qualcomm University Relations 6G India, Anusandhan National Research Foundation (ANRF) under Grant
+CRG/2023/008854, and the Office of International Relations at IISc under the IISc–PSU collaboration research grant. Corresponding
+author: tinghe@psu.edu.
+1
+arXiv:2512.21884v1  [cs.DC]  26 Dec 2025
+
+
+--- Page 2 ---
+client
+server 
+swarm
+candidate links for request routing
+actual communications
+indicator of 
+placed blocks
+selected links for request routing
+Figure 1: System architecture for pipeline-parallel LLM inference using client-centric communication.
+To broaden the accessibility to LLMs, several research groups have open-sourced their pre-trained LLMs
+[2, 3, 4, 5]. However, the sheer size of these models makes it challenging to adopt them, even if no training is
+needed. Prior studies have shown that the bottleneck of running LLMs is not in the computation speed, as even a
+consumer-grade GPU like GeForce RTX 3070 has enough processing power to run a complete inference step of
+a 176B-parameter model within a second [6]. Instead, the bottleneck is in the GPU memory. A 100B-parameter
+model will require 200 GB of GPU memory to load the model parameters at the standard half precision, and many
+LLMs are even larger (e.g., GPT-3 has 175B parameters and GPT-4 has over 1.7 trillion parameters). Providing
+this much GPU memory is financially challenging for many users. Straightforward approaches to address this
+bottleneck such as compressing the model or offloading the model parameters to cheaper storage media will
+introduce undesirable side effects. For example, a compressed LLM can still be too large for consumer-grade
+GPUs and too much compression will lower the inference accuracy [7], while offloading the model parameters
+to larger but slower storage media like RAM or SSD will be very slow due to the limited bandwidth between
+such storage media and the GPU [8].
+Recently, a model-parallel approach has been proposed to address the above challenge through resource
+pooling across distributed devices. This approach distributes a model to multiple devices at the granularity of
+transformer blocks (a.k.a. pipeline parallelism [9, 10, 11]) or neurons (a.k.a. tensor parallelism [12, 13, 14]) to
+run large models on devices with small GPUs. In particular, [8] has shown that pipeline parallelism can be used
+to run LLM inference tasks over geographically-distributed servers, each with only a few GB of GPU memory,
+at a much faster rate than local parameter offloading. This is achieved by letting each server host a subset of
+consecutive blocks, and each inference request (for autoregressive sequence generation) routed through a chain of
+servers that collectively host the entire model, as illustrated in Fig. 1. To reduce the communication cost, caching
+is used pervasively in such systems. For example, in a state-of-the-art system called PETALS [8], the client of
+each request uses client-side caches to store the input history for each invoked server, so that once a server fails,
+the client can use the cached input to bring up a backup server without repeating the processing at other servers;
+meanwhile, each server uses server-side caches (a.k.a. attention caches) to store the past computation results
+for each ongoing request (i.e., the key-value pairs for the past tokens [15]), so that at each inference step (after
+the prefill phase), the client only needs to send the partially processed embedding of a single token to the next
+server and receive the processed embedding back, which only exchanges a few KB of data [8]. The client-side
+caching implies a hub-spoke communication pattern as shown in Fig. 1, where all the communications during
+an inference session are anchored at the client, who will forward the partially processed embeddings between
+consecutive servers in order to update the input cache for each server.
+In this work, we consider LLM inference over geographically-distributed servers using pipeline parallelism
+and client-centric communication as illustrated in Fig. 1. Although the feasibility of such systems has been
+validated in [8], there is a lack of fundamental understanding of how to optimally manage their performance. In
+particular, the current solution in [8] relies on heuristics for resource allocation, e.g., selecting the blocks for each
+server based on a heuristic “throughput” metric and selecting the server chain for each request based on a graph
+2
+
+
+--- Page 3 ---
+with heuristic “edge weights” [16]. It remains open how to optimize the performance of such systems, while
+taking into account the unique characteristics of GPUs and LLM inference tasks. This work aims at filling this
+gap by rigorously formulating and tackling the block placement and request routing problem for a distributed
+LLM inference system with the architecture in Fig. 1, using PETALS [8] as a concrete example. While our
+system model and evaluations are based on PETALS, our approach is applicable to any pipeline-parallel LLM
+inference systems as explained later.
+1.1
+Related Work
+Below we will briefly review existing approaches to overcome the GPU memory limitation in running large
+models and related resource allocation problems.
+Model parallelism: Model parallelism overcomes the GPU memory limitation by distributing the model
+parameters to multiple devices. It is further divided into pipeline parallelism that assigns model parameters at
+the granularity of layers [9, 10, 11], and tensor parallelism that assigns model parameters at the granularity of
+neurons [12, 13, 14]. Tensor parallelism provides more flexibility in splitting the model at the cost of a higher
+communication overhead due to the all-to-all communication between devices hosting adjacent layers, which
+makes it more suitable for distributed inference within a single multi-GPU server or a cluster of highly con-
+nected servers [17]. In contrast, pipeline parallelism only requires communication between pairs of devices at
+some loss of flexibility, which makes it more suitable for distributed inference across nodes [8]. PETALS [8]
+uses pipeline parallelism. Other than PETALS, there are a few more systems that support distributed LLM
+inference across nodes with different system characteristics. For example, vLLM with Ray Serve [18] uses ten-
+sor parallelism within each node and pipeline parallelism across nodes by letting servers processing adjacent
+blocks directly communicate partially processed tokens, Nvidia Dynamo [19] implements several LLM-specific
+execution capabilities such as disaggregating prefill&decoding phases and offloading attention caches to mem-
+ory hierarchies, and Amazon EKS [20] simplifies the execution of multi-node inference workloads through
+integration with AWS services like Amazon EFS and Elastic Fabric Adapter. These systems are mainly de-
+signed for datacenter environments with high-bandwidth low-latency connections. In contrast, PETALS [8] is
+the leading system for LLM inference in geographically-distributed environments. In this work, we focus on
+geographically-distributed LLM inference and thus build our system model after PETALS, but our solution is
+generally applicable to any pipeline-parallel LLM inference systems, possibly with minor adaptations (e.g., see
+Remark after (1)). While the extension of our solution to tensor parallelism is nontrivial, we note that tensor
+parallelism is generally considered impractical for geographically-distributed settings.
+Parameter offloading: Parameter offloading overcomes the GPU memory limitation by swapping model
+parameters between the GPU memory and a slower but larger storage, typically RAM or SSD [21, 22, 23].
+When using the model for inference, model parameters are loaded into the GPU just before being used, which
+in theory allows a server with a small GPU to process any large models that fit into its storage. The drawback of
+parameter offloading is the overhead in loading and unloading the model parameters, which can take a substantial
+amount of time (e.g., at least 11 seconds per token for a 175B-parameter model [8]). For large models (with
+50B+ parameters), parameter offloading was shown to be at least an order of magnitude slower than model
+parallelism [8].
+Service function chaining: Under pipeline parallelism, each inference request is served by a chain of servers
+as illustrated in Fig. 1, which makes the corresponding resource allocation problem (e.g., how to place blocks
+and how to route requests) analogous to the problem of service function (SF) placement and flow routing in
+the context of service function chaining (SFC) [24]. SFC provides application-specific services for in-transit
+traffic through a chain of SFs. SFC placement and routing has been actively studied in recent years, typically
+with an objective of minimizing operation cost, maximizing flow rate, optimizing Quality of Service (QoS), or
+optimizing a combination of these metrics [25]. The problems are usually NP-hard and solved by polynomial-
+time heuristics without guaranteed performance [26, 25], except for a few special cases such as [27, 28, 29] with
+3
+
+
+--- Page 4 ---
+approximation guarantee. Despite the conceptual similarity, our problem is fundamentally different from SFC
+placement and routing. First of all, the two domains have very different properties, e.g., different SFs may have
+heterogeneous resource requirements [26, 27, 30] and some SFs may change the flow rate [31] or branch an input
+flow into multiple output flows [30], while each LLM typically has identically structured transformer blocks that
+require the same amount of resource and input data size. Moreover, the bottleneck resource in LLM inference is
+GPU memory, which differs from the bottleneck resource in SFC (i.e., CPU cycles) in that: (i) the need of GPU
+memory is not elastic, making congestion minimization approaches like [29] inapplicable, (ii) the GPU memory
+used to host a block is shared by all the requests processed by the same block, differing from the additive resource
+consumption for CPU cycles [27, 28], and (iii) nontrivial amounts of GPU memory are needed for both hosting
+blocks and serving inference sessions (due to the need of holding attention caches), causing resource contention
+between the placement decision and the routing decision that did not exist in service function chaining or other
+traditional “placement and routing” problems. Additionally, the number of blocks in an LLM can be much
+larger than the number of SFs in a typical SFC (e.g., BLOOM-176B has 70 blocks and GPT-3 has 96 blocks),
+making the formulations for SFC that enumerate the processing units [26, 27, 28, 29] highly inefficient. Some
+LLM inference systems also have unique characteristics such as the hub-spoke communication pattern shown
+in Fig. 1. There is thus a need of studying resource allocation problems tailored to distributed LLM inference
+systems.
+1.2
+Summary of Contributions
+We perform a systematic study of the resource allocation problem in distributed LLM inference, with the fol-
+lowing contributions:
+1. We formulate a joint optimization of the placement of model blocks at servers (called block placement) and
+the selection of server chains for inference requests (called request routing) based on performance models
+experimentally validated on a real distributed LLM inference system called PETALS [8]. Our formulation
+features a compact representation of the decision variables that allows the problem to be formulated as a
+mixed integer linear programming (MILP) problem with a polynomial number of variables/constraints.
+2. We prove the NP-hardness of the formulated optimization problem, and develop a three-step algorithm
+(Alg. 1) by decomposing the joint optimization into three subproblems, each optimizing one type of de-
+cision variables, which achieves a polynomial complexity and a guaranteed average inference time per
+token.
+3. We then consider the online setting with dynamically arriving requests, for which we show that the of-
+fline algorithm can be adapted into a two-time-scale solution that solves the block placement problem
+via robust optimization and the (online) request routing problem via a variation of shortest-path routing,
+with link costs designed to approximate the total inference time (including waiting, communication, and
+computation) incurred at each server. The online algorithm inherits the same performance guarantee as
+the offline algorithm as long as the number of concurrent requests is within a design limit, which can be
+tuned to trade off the waiting time and the per-token inference time after waiting.
+4. We compare our algorithms against the state-of-the-art algorithms in [8] through both controlled exper-
+iments and experimentally-validated simulations in a variety of settings with geographically distributed
+servers. The results not only show substantial performance improvements by our algorithms (60–80%
+smaller inference times), but also provide insights on the reasons for such improvements as well as the
+potential room for further improvements. A byproduct of our evaluation is a CPU-only simulator that
+is validated to produce reasonable predictions of the actual performance of distributed LLM inference
+on GPU servers, which can enable the evaluation of large deployments and facilitate future research for
+researchers with limited GPU access.
+4
+
+
+--- Page 5 ---
+Roadmap. Section 2 introduces the problem, Section 3 presents the optimization formulation and the pro-
+posed algorithms together with their analysis, Section 4 presents the evaluation results, and Section 5 concludes
+the paper. The response to previous reviews, proofs, and other supporting materials are provided in the Ap-
+pendix.
+2
+Problem Formulation
+2.1
+Target Application Scenario
+We consider geographically-distributed inference by a pre-trained LLM with a decoder-only architecture [32],
+which is commonly adopted by state-of-the-art LLMs (e.g., GPT and its variants [32, 33, 1]). The LLM is
+composed of thin input/output layers to map each input token to an embedding and each output embedding to a
+probability distribution of the next token, as well as multiple layers of identically structured transformer blocks
+(hereafter referred to as blocks), each containing a multi-headed self-attention sub-layer, a fully connected feed-
+forward sub-layer, and corresponding layer normalizations [32]. The input/output layers only contain a small
+percentage of the model parameters (e.g., < 3% for BLOOM-176B [8]) and can thus be hosted by the client.
+The blocks contain most of the model parameters and are thus delegated to the servers [8]. Given a pre-trained
+LLM with 𝐿blocks, we consider a distributed system with client-side and server-side caching like PETALS [8],
+which uses this LLM to serve autoregressive sequence generation requests (hereafter referred to as requests)
+via a hub-spoke communication pattern as shown in Fig. 1. In this work, we focus on supporting short-prompt
+long-response queries, where users ask concise questions to obtain detailed and comprehensive answers. This
+is a common type of queries, particularly in educational and technical contexts, and adheres to the best practices
+in using LLMs [34, 35].
+2.2
+System Model
+Suppose that the system contains a set of servers 𝑉𝑠and a set of clients 𝑉𝑐, communicating through TCP connec-
+tions according to the architecture shown in Fig. 1. Each client represents an ingress point for inference requests,
+which can be a host owned by end users or a proxy server submitting requests on behalf of end users. While it
+is possible for a server to directly forward its output to the next server to continue processing, PETALS [8] lets
+the client perform such forwarding as in Fig. 1, in order to maintain client-side caches of the input history for
+each invoked server to achieve fault tolerance.
+Request model: For each inference request, the client initiates an inference session. Due to the one-one
+correspondence between inference requests and inference sessions, hereafter we will use “request” and “session”
+interchangeably. We will first consider the offline case with a given set of requests to understand the structure
+of the problem, and then address the online case with sequentially arriving requests. To formulate the offline
+case, we use R to denote the total set of inference requests and R𝑐to denote the set of requests from client
+𝑐∈𝑉𝑐. Each request has up to 𝑙𝐼
+max input tokens and generates up to 𝑙max output tokens1, where 𝑙𝐼
+max and 𝑙max are
+system parameters with 𝑙𝐼
+max +𝑙max upper-bounded by the maximum sequence length supported by the LLM. For
+short-prompt long-response queries, we have 𝑙𝐼
+max ≪𝑙max. To formulate the online case, we need to additionally
+model the state of each server as detailed in Section 3.3.2.
+Inference time model: Each server 𝑗∈𝑉𝑠has a per-block processing time of up to 𝜏𝐼
+𝑗(𝑙𝐼
+max) during the prefill
+phase (i.e., phase for processing the input to generate the first token) and a per-token-per-block processing time of
+𝜏𝑗during the decoding phase (i.e., phase for autoregressively generating the remaining tokens). Our experiments
+have validated 𝜏𝐼
+𝑗(𝑙𝐼
+max) to be independent of the output length 𝑙max and 𝜏𝑗to be independent of both the input
+1The actual number of generated tokens may be smaller if the end-of-sequence token is detected, but the maximum number of output
+tokens specified in the request is used in resource allocation.
+5
+
+
+--- Page 6 ---
+length 𝑙𝐼
+max and the output length 𝑙max (see Fig. 11–12). Moreover, the connection between each client 𝑐and
+each server 𝑗has a per-input round trip time (RTT) of up to 𝑡𝐼
+𝑐𝑗(𝑙𝐼
+max), representing the communication time
+(including serialization/deserialization, propagation, queueing, and transmission delays) for transmitting one
+input sequence from the client to the server and the processed input sequence from the server back to the client.
+Similarly, the connection also has a per-token RTT of 𝑡𝑐𝑗, representing the communication time for transmitting
+one token from the client to the server and the processed token from the server back to the client. This means
+that if a request from client 𝑐with input length 𝑙𝐼
+max and output length 𝑙max is processed by a chain of servers 𝑝
+with each server 𝑗∈𝑝processing 𝑘𝑗blocks, it will incur a total inference time (including all the client-server
+communication time and all the server processing time) of
+Õ
+𝑗∈𝑝
+
+𝑡𝐼
+𝑐𝑗(𝑙𝐼
+max) + 𝑘𝑗𝜏𝐼
+𝑗(𝑙𝐼
+max)
+
++ (𝑙max −1)
+Õ
+𝑗∈𝑝
+(𝑡𝑐𝑗+ 𝑘𝑗𝜏𝑗),
+(1)
+where Í
+𝑗∈𝑝
+
+𝑡𝐼
+𝑐𝑗(𝑙𝐼
+max) + 𝑘𝑗𝜏𝐼
+𝑗(𝑙𝐼
+max)
+
+is the time to query the servers for the first token, and Í
+𝑗∈𝑝(𝑡𝑐𝑗+ 𝑘𝑗𝜏𝑗)
+is the time to query the servers for each of the remaining tokens. In the case of exceptions (e.g., out-of-memory
+error), additional delays will apply; see Section 3.3.2 for details. In addition, each session incurs some delays
+at the client due to local computations such as tokenizing the input sequence and extracting the next token from
+each embedding processed by the servers, but since these delays are not affected by the resource allocation at
+servers (see Section 2.3), they only contribute a constant shift which is ignored in our model. Remark: The above
+model assumes client-centric communication as in Fig. 1. If adjacently traversed servers directly communicate
+as in [18], the communication times will become Í
+(𝑖, 𝑗)∈𝑝𝑡𝐼
+𝑖𝑗(𝑙𝐼
+max) for the first token and Í
+(𝑖, 𝑗)∈𝑝𝑡𝑖𝑗for each
+of the subsequent tokens, where 𝑡𝐼
+𝑖𝑗(𝑙𝐼
+max)/𝑡𝑖𝑗is the per-input/per-token one-way delay from node 𝑖to node 𝑗.
+Our optimization formulation and solution are easily amendable to allow direct server-server communications
+by simply replacing the client-server RTT 𝑡𝑐𝑗with the server-server one-way delay 𝑡𝑖𝑗.
+Memory consumption model: Each server 𝑗∈𝑉𝑠has a GPU memory of 𝑀𝑗, which denotes the effective
+memory capacity for storing model parameters and attention caches (see Remark after (2)). The size of each
+block is 𝑠𝑚(bytes), given by the number of model parameters per block times the number of bytes per parameter.
+In addition, each server holds an attention cache of the past key-value pairs for each ongoing request routed
+through the server and each block it processes for that request. For a total sequence length of 𝑙𝐼
+max + 𝑙max, each
+attention cache stores two tensors (one for the keys and one for the values), each containing 𝑑model · (𝑙𝐼
+max +𝑙max)
+parameters, where 𝑑model is the embedding dimension of the LLM. Thus, the size of each attention cache is
+𝑠𝑐:= 2𝑑model · (𝑙𝐼
+max + 𝑙max) · dtype_bytes (bytes), where ‘dtype_bytes’ is the number of bytes per parameter in
+the cache (usually dtype_bytes = 2). This means that a server 𝑗storing 𝑚𝑗blocks and processing 𝑘𝑟
+𝑗blocks for
+each request 𝑟has a total memory consumption of
+𝑠𝑚𝑚𝑗+ 𝑠𝑐
+Õ
+𝑟∈R
+𝑘𝑟
+𝑗.
+(2)
+Remark: In addition to storing the model parameters for the hosted blocks and the attention caches, the GPU
+memory also needs to hold the CUDA context (depending on the CUDA version and the device) as well as a
+small number of intermediate variables generated during inference (assuming in-place updating), but this space
+is invariant to the number of placed blocks and the number of hosted inference sessions, and can thus be modeled
+as a constant overhead in the memory consumption. In practice, there is also some waste of GPU memory due
+to memory fragmentation. Thus, the memory capacity 𝑀𝑗is the effective memory for resource allocation and
+should be slightly smaller than the physical memory capacity to avoid the out-of-memory errors.
+Experimental validation: We have validated the above models through various experiments based on
+PETALS [8] and BLOOM-176B [3]. As an example, Fig. 2 compares the per-token inference time incurred
+at a given server according to our model in (1) with the average time measured from 10 Monte Carlo runs of
+controlled experiments with various #processed blocks and #concurrent requests, in a basic setting of co-located
+6
+
+
+--- Page 7 ---
+10
+15
+20
+25
+30
+35
+40
+45
+50
+Number of Blocks
+0
+1
+2
+3
+4
+5
+6
+Inference Time (s)
+Modeled
+Real – 1 Concurrent Request
+Real – 10 Concurrent Requests
+Real – 20 Concurrent Requests
+Real - 30 Concurrent Requests
+(a) first token
+10
+15
+20
+25
+30
+35
+40
+45
+50
+Number of Blocks
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+Inference Time (s)
+Modeled
+Real – 1 Concurrent Request
+Real – 10 Concurrent Requests
+Real – 20 Concurrent Requests
+Real - 30 Concurrent Requests
+(b) each of remaining tokens
+Figure 2: Inference time vs. #processed blocks on A100 for: (a) first token; (b) each of remaining tokens
+(𝑙𝐼
+max = 20, 𝑙max = 128).
+10
+15
+20
+25
+30
+35
+40
+45
+50
+Number of Blocks
+10000
+20000
+30000
+40000
+50000
+60000
+70000
+80000
+Memory Usage (MiB)
+Modeled - 1 Concurrent Request
+Modeled - 10 Concurrent Requests
+Modeled - 20 Concurrent Requests
+Modeled - 30 Concurrent Requests
+Real - 1 Concurrent Request
+Real - 10 Concurrent Requests
+Real - 20 Concurrent Requests
+Real - 30 Concurrent Requests
+(a) total memory usage
+10
+15
+20
+25
+30
+35
+40
+45
+50
+Number of Blocks
+0
+2000
+4000
+6000
+8000
+10000
+12000
+Memory Usage (MiB)
+Modeled - 1 Concurrent Request
+Modeled - 10 Concurrent Requests
+Modeled - 20 Concurrent Requests
+Modeled - 30 Concurrent Requests
+Real - 1 Concurrent Request
+Real - 10 Concurrent Requests
+Real - 20 Concurrent Requests
+Real - 30 Concurrent Requests
+(b) memory used by attention caches
+Figure 3: Memory consumption vs. #blocks on A100 for: (a) total memory usage; (b) attention caches (𝑙𝐼
+max =
+20, 𝑙max = 128).
+server and client (where the communication time is just the time for serializing and deserializing tokens), and
+similar results hold under other settings with network delays. The results validate the accuracy of our proposed
+model in capturing the linear dependency of the inference time on the number of processed blocks. The results
+also indicate that the inference time for one request is largely independent of the number of concurrent requests
+at the same server (as long as they all fit into the GPU memory), thanks to the massive parallel computing
+capability of GPU. Fig. 11 and 12 in B.1 provide similar comparisons with respect to the input/output length,
+respectively, again validating the accuracy of our inference time model. Fig. 3a compares the GPU memory
+consumption predicted by (2) with the actual allocated GPU memory, which validates the accuracy of (2). A
+closer examination reveals that the first term in (2) (memory used to store blocks) is much larger than the second
+term (memory used to store attention caches), and only the second term depends on the number of concurrent
+requests as shown in Fig. 3b. Nevertheless, it is crucial to model the impact of concurrent requests on mem-
+ory consumption, as the GPU memory is typically the bottleneck resource in LLM inference (see Remark in
+Section 2.3).
+2.3
+Resource Allocation Problem
+We study the joint optimization of how to place the blocks at the servers, referred to as “block placement”, and
+how to select the chain of servers for each request, referred to as “request routing”. Our objective is to mini-
+7
+
+
+--- Page 8 ---
+Notation
+Description
+𝑎𝑗, 𝑚𝑗
+index of first block & #blocks placed on server 𝑗
+𝑓𝑟
+𝑖𝑗, 𝑓𝑟
+𝑝
+indicator for request 𝑟to be routed on link (𝑖, 𝑗) or path 𝑝
+𝐿
+total #blocks in the LLM under consideration
+𝑉𝑐,𝑉𝑠
+set of clients/servers
+(𝑉, 𝐸)
+logical topology for joint block placement and request routing
+(𝑉𝑐, 𝐸𝑐
+𝒂,𝒎)
+logical topology for request routing for client 𝑐under block placement (𝒂, 𝒎) (see Alg. 1)
+R, R𝑐
+set of all the requests or requests from client 𝑐
+𝑙𝐼
+max, 𝑙max
+maximum #tokens in an input/output sequence
+𝑠𝑚, 𝑠𝑐
+size per block and size per attention cache
+𝑀𝑗, 𝑓𝑗
+total memory and maximum #parallel sessions at server 𝑗
+𝜏𝐼
+𝑗(𝑙𝐼
+max), 𝜏𝑗
+per-block processing time at server 𝑗during prefill or decoding phase
+𝑡𝐼
+𝑐𝑗(𝑙𝐼
+max), 𝑡𝑐𝑗
+per-input/per-token RTT between client 𝑐and server 𝑗
+𝑡𝑐,𝐼
+𝑖𝑗(𝑙𝐼
+max), 𝑡𝑐
+𝑖𝑗
+per-token inference time of a first/later token at server 𝑗for a request from client 𝑐routed through (𝑖, 𝑗)
+e𝑡𝑗, 𝑡∗𝑗
+amortized inference time and maximum per-token RTT for server 𝑗(see (14))
+𝐶𝑏,𝑇𝑏
+total capacity (in terms of #sessions) and total amortized inference time for block 𝑏(see Alg. 1)
+(𝑇𝑗
+𝑟(𝑡), 𝑀𝑗
+𝑟(𝑡))𝑅𝑗(𝑡)
+𝑟=1
+state of server 𝑗at time 𝑡(see Section 3.3.2)
+𝑡𝑊
+𝑖𝑗(𝑡)
+waiting time for link (𝑖, 𝑗) at time 𝑡(see (20))
+Table 1: Main notations (first two rows: free decision variables; rest: input parameters or dependent variables).
+mize the average time in serving each request within the resource constraints, with focus on the GPU memory
+constraint. Table 1 lists the main notations used in our presentation.
+Remark 1: The objective of this work is to optimize the inference performance in terms of inference time for
+a given set of available GPU resources. Other performance measures, e.g., cost of renting GPUs or robustness
+in the face of unreliable nodes, are left for future work.
+Remark 2: In theory, there are other resource constraints besides GPU memory that can limit how the infer-
+ence requests can be served. For example, each server has a limited processing capacity, and each client-server
+connection has a limited throughput. In practice, however, GPU memory is usually the bottleneck resource that
+will be saturated before other resources. For example, for BLOOM-176B [3], a server with an A100 (80 GB)
+GPU and 100 Mbits/s bandwidth can process over 700 tokens/second when hosting the maximum number of
+blocks according to [8] (53 blocks) and transfer over 400 tokens/second, which should be enough for over 80
+concurrent sessions without causing notable queueing delays, but the available GPU memory only allows 21
+concurrent sessions for 𝑙𝐼
+max = 20 and 𝑙max = 128, and even fewer for longer sequences. We will thus focus on
+the GPU memory constraint.
+3
+Joint Block Placement and Request Routing (BPRR)
+Based on the experimentally validated model (Section 2.2), we will first study BPRR in an offline setting to
+understand the properties of the problem (Section 3.2), and then use the understanding to develop a solution for
+the online setting (Section 3.3).
+3.1
+Preliminaries
+Logical topology for routing: To facilitate the optimization formulation, we construct a logical topology 𝐺=
+(𝑉, 𝐸) as a directed graph illustrated in Fig. 4, where the node set 𝑉:= 𝑉𝑆
+𝑐∪𝑉𝑠∪𝑉𝐷
+𝑐contains the servers 𝑉𝑠,
+the copies of clients 𝑉𝑆
+𝑐viewed as sources of requests (called S-clients), and the copies of clients 𝑉𝐷
+𝑐viewed
+as destinations of requests (called D-clients). We will use 𝑐∈𝑉𝑆
+𝑐and 𝑐′ ∈𝑉𝐷
+𝑐to denote the S-client and the
+D-client corresponding to a real client 𝑐∈𝑉𝑐. Define 𝑡𝑐𝑐′ := 0 and 𝜏𝑐′ := 0. The link set 𝐸includes the
+8
+
+
+--- Page 9 ---
+Servers 𝑉𝑉𝑠𝑠
+S-client
+𝑐𝑐∈𝑉𝑉𝑐𝑐𝑆𝑆
+D-client
+𝑐𝑐′ ∈𝑉𝑉𝑐𝑐𝐷𝐷
+Selected/candidate links on feasible routes
+Figure 4: Logical topology 𝐺for request routing and route feasibility condition.
+links connecting each S-client with the servers allowed to host the first block, the links between servers allowed
+to be adjacent on a chain, and the links connecting the servers allowed to host the last block to each D-client.
+Typically, this leads to full connectivity within 𝑉𝑠and complete bipartite connectivity between 𝑉𝑠and 𝑉𝑆
+𝑐/𝑉𝐷
+𝑐.
+The split of clients into S-clients and D-clients will facilitate the formulation for request routing.
+Route feasibility condition: It is easy to see that an optimal block placement should only place consecutive
+blocks at each server, as non-consecutive blocks will increase the number of communications between the client
+and the server that introduces unnecessary delay. This type of block placement implies that each server can be
+traversed at most once by each inference session, implying a simple routing path. A path 𝑝in 𝐺is feasible for
+routing the requests from client 𝑐if it leads from the corresponding S-client to the corresponding D-client and
+traverses a chain of servers that collectively host all the blocks of the LLM in order, as illustrated in Fig. 4.
+Since each server should host consecutive blocks, we can represent the block placement at each server 𝑗∈𝑉𝑠
+by the first block 𝑎𝑗and the number of blocks 𝑚𝑗, i.e., server 𝑗stores the blocks in {𝑎𝑗, . . . , 𝑎𝑗+𝑚𝑗−1}, where2
+𝑎𝑗, 𝑚𝑗∈[𝐿] and 𝑎𝑗+ 𝑚𝑗−1 ≤𝐿. It is possible for the same block to be placed at multiple servers traversed by
+an inference session. In this case, we assume that the first server hosting the block will process it according to
+[36]. That is, if a session traverses server 𝑖immediately before server 𝑗, the blocks processed at server 𝑗will be
+{max(𝑎𝑗, 𝑎𝑖+ 𝑚𝑖), . . . , 𝑎𝑗+ 𝑚𝑗−1}. A chain of servers is feasible for request routing if and only if the block
+placement satisfies the following condition.
+Lemma 3.1. Assume that each node 𝑗∈𝑉stores all the blocks in {𝑎𝑗, . . . , 𝑎𝑗+ 𝑚𝑗−1}, where each S-client
+𝑐∈𝑉𝑆
+𝑐stores a dummy block 0 (i.e., 𝑎𝑐:= 0, 𝑚𝑐:= 1), and each D-client 𝑐′ ∈𝑉𝐷
+𝑐stores another dummy block
+𝐿+ 1 (i.e., 𝑎𝑐′ := 𝐿+ 1, 𝑚𝑐′ := 1). Then a 𝑐-to-𝑐′ path 𝑝in 𝐺is a feasible routing path for client 𝑐if and only if
+𝑎𝑗≤𝑎𝑖+ 𝑚𝑖≤𝑎𝑗+ 𝑚𝑗−1,
+∀(𝑖, 𝑗) ∈𝑝.
+(3)
+Remark: Intuitively, the condition (3) states that a path is feasible for request routing if and only if after
+processing all the blocks at the previous servers, the next block can always be found at the next server on the
+path.
+Performance models: Lemma 3.1 allows us to explicitly model how the inference performance depends on
+block placement and request routing. Specifically, according to Section 2.2, Lemma 3.1 implies that a request
+from client 𝑐routed through a feasible path 𝑝traversing link (𝑖, 𝑗) will incur a per-token inference time of
+𝑡𝑐
+𝑖𝑗:= 𝑡𝑐𝑗+ 𝜏𝑗(𝑎𝑗+ 𝑚𝑗−𝑎𝑖−𝑚𝑖)
+(4)
+at server 𝑗after the first token generation (including both computation and communication), where 𝑎𝑗+ 𝑚𝑗−
+𝑎𝑖−𝑚𝑖is the number of blocks that are processed for this request at server 𝑗. The first token will incur a larger
+per-token inference time of 𝑡𝑐,𝐼
+𝑖𝑗(𝑙𝐼
+max) := 𝑡𝐼
+𝑐𝑗(𝑙𝐼
+max) + 𝜏𝐼
+𝑗(𝑙𝐼
+max)(𝑎𝑗+ 𝑚𝑗−𝑎𝑖−𝑚𝑖) at server 𝑗.
+2Throughout this work, we use [𝑘] for a positive integer 𝑘to denote the set {1, . . . , 𝑘}.
+9
+
+
+--- Page 10 ---
+Meanwhile, by Lemma 3.1, each request routed through link (𝑖, 𝑗) ∈𝐸will require 𝑠𝑐(𝑎𝑗+ 𝑚𝑗−𝑎𝑖−𝑚𝑖)
+of dedicated memory at server 𝑗for the attention caches. This together with the memory for storing 𝑚𝑗blocks
+leads to a total memory consumption of
+𝑠𝑚𝑚𝑗+ 𝑠𝑐
+Õ
+𝑖:(𝑖, 𝑗)∈𝐸
+𝑓𝑖𝑗(𝑎𝑗+ 𝑚𝑗−𝑎𝑖−𝑚𝑖)
+(5)
+at server 𝑗, where 𝑓𝑖𝑗is the number of requests routed (concurrently) over link (𝑖, 𝑗).
+3.2
+Offline Setting
+We first consider the offline setting with a given set of requests to understand the properties of the problem.
+3.2.1
+Vanilla Formulation
+As explained in Section 3.1, the block placement can be concisely encoded by 𝒂:= (𝑎𝑗) 𝑗∈𝑉𝑠and 𝒎:= (𝑚𝑗) 𝑗∈𝑉𝑠,
+which jointly determine which paths are feasible for request routing according to Lemma 3.1. Let 𝑃𝑐(𝒂, 𝒎)
+denote the set of feasible routing paths for client 𝑐under the block placement (𝒂, 𝒎). Due to the server-side
+attention caches, the chain of servers should remain the same for all the tokens of the same sequence. We ensure
+this by controlling routing at the granularity of requests, represented by 𝑓𝑟
+𝑝∈{0, 1} that indicates the selection
+of path 𝑝∈𝑃𝑐(𝒂, 𝒎) for request 𝑟∈R𝑐. Then we formulate the joint block placement and request routing
+problem (BPRR) as
+min
+𝒇,𝒂,𝒎
+Õ
+𝑐∈𝑉𝑐
+Õ
+𝑟∈R𝑐
+Õ
+𝑝∈𝑃𝑐(𝒂,𝒎)
+𝑓𝑟
+𝑝
+Õ
+(𝑖, 𝑗)∈𝑝
+𝑡𝑐
+𝑖𝑗
+(6a)
+s.t.
+𝑠𝑚𝑚𝑗+ 𝑠𝑐
+Õ
+𝑐∈𝑉𝑐
+Õ
+𝑟∈R𝑐
+Õ
+𝑝∈𝑃𝑐(𝒂,𝒎):
+(𝑖, 𝑗)∈𝑝,∃𝑖
+𝑓𝑟
+𝑝(𝑎𝑗+ 𝑚𝑗−𝑎𝑖−𝑚𝑖) ≤𝑀𝑗, ∀𝑗∈𝑉𝑠,
+(6b)
+Õ
+𝑝∈𝑃𝑐(𝒂,𝒎)
+𝑓𝑟
+𝑝= 1, ∀𝑐∈𝑉𝑐, 𝑟∈R𝑐,
+(6c)
+𝑎𝑗+ 𝑚𝑗−1 ≤𝐿, ∀𝑗∈𝑉𝑠,
+(6d)
+𝑓𝑟
+𝑝∈{0, 1}, 𝑎𝑗, 𝑚𝑗∈[𝐿],
+(6e)
+where the objective (6a) is to minimize the total (and hence the average) per-token inference time over all the
+requests when ignoring the first token, constraint (6b) ensures that the requests can be served within the GPU
+memory at each server (where Í
+𝑐∈𝑉𝑐
+Í
+𝑟∈R𝑐
+Í
+𝑝∈𝑃𝑐(𝒂,𝒎):𝑗∈𝑝𝑓𝑟
+𝑝is the number of requests routed to server 𝑗),
+constraint (6c) ensures that each request is routed to a feasible path, and constraints (6d)–(6e) ensure the feasi-
+bility of the block placement.
+Remark: Strictly speaking, to minimize the average time in serving each request, we should minimize
+Õ
+𝑐∈𝑉𝑐
+Õ
+𝑟∈R𝑐
+Õ
+𝑝∈𝑃𝑐(𝒂,𝒎)
+𝑓𝑟
+𝑝
+©­
+«
+Õ
+(𝑖, 𝑗)∈𝑝
+𝑡𝑐,𝐼
+𝑖𝑗(𝑙𝐼
+max) + (𝑙max −1)
+Õ
+(𝑖, 𝑗)∈𝑝
+𝑡𝑐
+𝑖𝑗
+ª®
+¬
+,
+(7)
+which is the total time to complete all the requests. Minimizing (7) is equivalent to minimizing an objective
+function of the form (6a), except that 𝑡𝑐
+𝑖𝑗needs to be redefined as follows:
+ 1
+𝑙max
+𝑡𝐼
+𝑐𝑗(𝑙𝐼
+max) + 𝑙max −1
+𝑙max
+𝑡𝑐𝑗
+
++
+ 1
+𝑙max
+𝜏𝐼
+𝑗(𝑙𝐼
+max) + 𝑙max −1
+𝑙max
+𝜏𝑗
+
+(𝑎𝑗+ 𝑚𝑗−𝑎𝑖−𝑚𝑖),
+(8)
+10
+
+
+--- Page 11 ---
+which denotes the average per-token inference time incurred by a request from client 𝑐at link (𝑖, 𝑗) over all the
+tokens. In the case of 𝑙𝐼
+max ≪𝑙max, (8) reduces to (4). Even in the general case, all our results remain applicable
+when redefining 𝑡𝑐
+𝑖𝑗as in (8). We will thus focus on solving (6). While we have used the maximum input/output
+length to simplify our formulation, it is easily extensible to the case of heterogeneous input/output lengths as
+explained in B.2.
+3.2.2
+MILP Formulation
+The vanilla formulation (6) is not computationally tractable because of the implicit and nonlinear dependency
+of the routing variable 𝒇on the block placement variables 𝒂and 𝒎. Moreover, given a block placement (𝒂, 𝒎),
+the number of feasible paths in 𝑃𝑐(𝒂, 𝒎) can be exponential. These limitations motivate us to seek a more
+tractable formulation. Below we will show that by introducing appropriate auxiliary variables, we can convert the
+nonlinear exponential-sized optimization (6) into a MILP with polynomial numbers of variables and constraints.
+To avoid an exponential number of routing variables, we replace the path-level routing variable 𝑓𝑟
+𝑝by a
+link-level routing variable 𝑓𝑟
+𝑖𝑗∈{0, 1}, which indicates if request 𝑟is routed over link (𝑖, 𝑗) ∈𝐸(meaning that
+the request will be processed by server 𝑖and server 𝑗consecutively). This simplifies the objective function (6a)
+into
+Õ
+𝑐∈𝑉𝑐
+Õ
+𝑟∈R𝑐
+Õ
+(𝑖, 𝑗)∈𝐸
+𝑓𝑟
+𝑖𝑗
+
+𝑡𝑐𝑗+ 𝜏𝑗(𝑎𝑗+ 𝑚𝑗−𝑎𝑖−𝑚𝑖)
+
+.
+(9)
+We can guarantee all the requests to be properly routed by imposing a flow conservation constraint
+Õ
+𝑖∈𝑉
+𝑓𝑟
+𝑗𝑖=
+Õ
+𝑖∈𝑉
+𝑓𝑟
+𝑖𝑗+ 𝑑𝑐
+𝑗,
+∀𝑐∈𝑉𝑐, 𝑟∈R𝑐, 𝑗∈𝑉,
+(10)
+where 𝑑𝑐
+𝑗is a constant, defined as 1 if 𝑗= 𝑐(S-client for client 𝑐), −1 if 𝑗= 𝑐′ (D-client for client 𝑐), and 0
+otherwise. This ensures that each request will be routed from its S-client to its D-client in the logical topology
+𝐺(Fig. 4).
+To model the dependency between request routing and block placement, we leverage Lemma 3.1, which
+states that it is feasible to route a request from node 𝑖to node 𝑗if and only if 𝑎𝑗≤𝑎𝑖+ 𝑚𝑖≤𝑎𝑗+ 𝑚𝑗−1. Thus,
+we can ensure route feasibility by requiring
+𝑎𝑗𝑓𝑟
+𝑖𝑗≤𝑎𝑖+ 𝑚𝑖,
+∀𝑟∈R, (𝑖, 𝑗) ∈𝐸,
+(11)
+(𝑎𝑖+ 𝑚𝑖) 𝑓𝑟
+𝑖𝑗≤𝑎𝑗+ 𝑚𝑗−1, ∀𝑟∈R, (𝑖, 𝑗) ∈𝐸,
+(12)
+where R := Ð
+𝑐∈𝑉𝑐R𝑐denotes the total set of requests. This ensures that a request is routed over (𝑖, 𝑗) only if
+the condition in Lemma 3.1 is satisfied.
+However, using the above objective and constraints directly will lead to a nonlinear optimization due to
+the bilinear terms 𝑎𝑗𝑓𝑟
+𝑖𝑗, 𝑎𝑖𝑓𝑟
+𝑖𝑗, 𝑚𝑗𝑓𝑟
+𝑖𝑗, and 𝑚𝑖𝑓𝑟
+𝑖𝑗in the objective function (9) and constraints like (11)–(12).
+Fortunately, because 𝑓𝑟
+𝑖𝑗is binary, we can convert them into linear forms by introducing auxiliary variables
+𝛼𝑟
+𝑖𝑗, 𝛽𝑟
+𝑖𝑗, 𝛾𝑟
+𝑖𝑗, 𝛿𝑟
+𝑖𝑗and the corresponding linear constraints (31)–(34) as detailed in B.3.
+11
+
+
+--- Page 12 ---
+Combining all the above allows us to rewrite the BPRR problem in (6) as follows:
+min
+𝒇,𝒂,𝒎,
+𝜶,𝜷,𝜸,𝜹
+Õ
+𝑐∈𝑉𝑐
+Õ
+𝑟∈R𝑐
+Õ
+(𝑖, 𝑗)∈𝐸
+
+𝑡𝑐𝑗𝑓𝑟
+𝑖𝑗+ 𝜏𝑗(𝛼𝑟
+𝑖𝑗+ 𝛾𝑟
+𝑖𝑗−𝛽𝑟
+𝑖𝑗−𝛿𝑟
+𝑖𝑗)
+
+(13a)
+s.t.
+𝑠𝑚𝑚𝑗+ 𝑠𝑐
+Õ
+𝑐∈𝑉𝑐
+Õ
+𝑟∈R𝑐
+Õ
+𝑖:(𝑖, 𝑗)∈𝐸
+(𝛼𝑟
+𝑖𝑗+ 𝛾𝑟
+𝑖𝑗−𝛽𝑟
+𝑖𝑗−𝛿𝑟
+𝑖𝑗) ≤𝑀𝑗, ∀𝑗∈𝑉𝑠,
+(13b)
+Õ
+𝑖∈𝑉
+𝑓𝑟
+𝑗𝑖=
+Õ
+𝑖∈𝑉
+𝑓𝑟
+𝑖𝑗+ 𝑑𝑐
+𝑗, ∀𝑐∈𝑉𝑐, 𝑟∈R𝑐, 𝑗∈𝑉,
+(13c)
+𝑎𝑗+ 𝑚𝑗−1 ≤𝐿, ∀𝑗∈𝑉𝑠,
+(13d)
+𝛼𝑟
+𝑖𝑗≤𝑎𝑖+ 𝑚𝑖, ∀𝑟∈R, (𝑖, 𝑗) ∈𝐸,
+(13e)
+𝛽𝑟
+𝑖𝑗+ 𝛿𝑟
+𝑖𝑗≤𝑎𝑗+ 𝑚𝑗−1, ∀𝑟∈R, (𝑖, 𝑗) ∈𝐸,
+(13f)
+(31)–(34),
+(13g)
+𝑓𝑟
+𝑖𝑗∈{0, 1}, 𝑎𝑗, 𝑚𝑗∈[𝐿], 𝛼𝑟
+𝑖𝑗, 𝛽𝑟
+𝑖𝑗, 𝛾𝑟
+𝑖𝑗, 𝛿𝑟
+𝑖𝑗≥0,
+(13h)
+where (13a) is the linearized expression of the total inference time, (13b) models the GPU memory capacity,
+(13c) ensures flow conservation, (13d) ensures block placement feasibility, (13e)–(13f) ensure route feasibility,
+and (13g) defines the auxiliary variables used to linearize the objective function and the constraints. As explained
+in B.3, 𝛼𝑟
+𝑖𝑗= 𝑎𝑗𝑓𝑟
+𝑖𝑗, 𝛽𝑟
+𝑖𝑗= 𝑎𝑖𝑓𝑟
+𝑖𝑗, 𝛾𝑟
+𝑖𝑗= 𝑚𝑗𝑓𝑟
+𝑖𝑗, and 𝛿𝑟
+𝑖𝑗= 𝑚𝑖𝑓𝑟
+𝑖𝑗. Plugging these into (13a) and (13b) recovers
+the original objective (6a) and memory constraint (6b), except that the path-level routing variable 𝑓𝑟
+𝑝is replaced
+by the link-level routing variable 𝑓𝑟
+𝑖𝑗. The flow conservation constraint (13c) together with the route feasibility
+constraints (13e)–(13f) and the integer constraint on 𝑓𝑟
+𝑖𝑗(13h) ensures that each request is routed on a single
+feasible path as in (6c). The overall optimization is a MILP, where 𝒂, 𝒎(block placement) and 𝒇(request
+routing) are free variables, and the others are dependent variables.
+Remark: The MILP (13) has 𝑂(|R| · |𝐸|) variables, dominated by the routing variable 𝒇and the auxiliary
+variables 𝜶, 𝜷, 𝜸, and 𝜹. As the number of links |𝐸| is bounded by 𝑂(|𝑉𝑠|(|𝑉𝑐|+|𝑉𝑠|)), the number of variables is
+in 𝑂(|R|·|𝑉𝑠|(|𝑉𝑐|+|𝑉𝑠|)). Similarly, the number of constraints is also in 𝑂(|R|·|𝐸|) = 𝑂(|R|·|𝑉𝑠|(|𝑉𝑐|+|𝑉𝑠|)),
+dominated by (13e)–(13g). Thus, even if BPRR can be formulated as a MILP, the size of the MILP will grow
+linearly in the number of requests/clients and quadratically in the number of servers, making it challenging to
+solve.
+Formally, we have shown via a reduction from the optimization version of the partition problem [37] that
+the BPRR problem is hard to solve to optimality as stated below.
+Theorem 3.2. The BPRR problem as formulated in (6) or (13) is NP-hard.
+Remark: In fact, the reduction in the proof of Theorem 3.2 leads to a special case of BPRR with a single
+client (|𝑉𝑐| = 1). This case represents a common deployment scenario where end users query the system through
+a proxy (e.g., a Flask web server as in [36]). We have proved that the BPRR problem remains NP-hard even in
+this special case.
+3.2.3
+Algorithm Design
+The NP-hardness of BPRR implies the need of efficient suboptimal algorithms. Although the MILP formulation
+in (13) allows us to apply existing heuristics for MILP, e.g., LP relaxation plus rounding, such a heuristic still
+has limited scalability due to the large size of the LP, and more importantly, it does not even guarantee a feasible
+solution3. To efficiently solve large instances of the BPRR problem, we propose a three-step algorithm called
+3Specifically, the fractional solution ( ˜𝒇, ˜𝒂, ˜𝒎) to the LP relaxation of (13) may not lead to a feasible integer solution after rounding,
+as the rounded block placement (𝒂, 𝒎) may not place each block on at least one server. This is because the auxiliary variables 𝜶, 𝜷, 𝜸, 𝜹
+used to linearize the problem can only enforce feasibility when 𝒇is binary.
+12
+
+
+--- Page 13 ---
+Algorithm 1: Conservative Greedy BPRR (CG-BPRR)
+input : set of clients 𝑉𝑐, set of requests Ð
+𝑐∈𝑉𝑐R𝑐, #blocks 𝐿, size per block 𝑠𝑚, size per cache 𝑠𝑐, set of servers
+𝑉𝑠, parameters for each 𝑗∈𝑉𝑠including GPU memory 𝑀𝑗, processing time 𝜏𝑗, and per-token RTTs
+(𝑡𝑐𝑗)𝑐∈𝑉𝑐
+output
+:
+Block placement (𝒂, 𝒎) and request routing 𝒇
+// conservative assignment of #blocks per server:
+𝑚𝑗←min(⌊𝑀𝑗/(𝑠𝑚+ 𝑠𝑐|R|)⌋, 𝐿), ∀𝑗∈𝑉𝑠, where |R| = Í
+𝑐∈𝑉𝑐|R𝑐|
+1 // greedy block placement:
+𝐶𝑏←0, 𝑇𝑏←e𝑡0|R|, ∀𝑏∈[𝐿]
+2 for each server 𝑗∈𝑉𝑠in increasing order ofe𝑡𝑗3 do
+if ∃𝑏∈[𝐿] with 𝐶𝑏< |R|
+4
+then
+𝑎𝑗←arg max𝑎∈[𝐿−𝑚𝑗+1]: 𝐶𝑏<|R|, ∃𝑏∈{𝑎,...,𝑎+𝑚𝑗−1}
+Í𝑎+𝑚𝑗−1
+𝑏′=𝑎
+𝑇𝑏′
+5
+else
+𝑎𝑗←arg min𝑎∈[𝐿−𝑚𝑗+1](𝐶𝑎, . . . , 𝐶𝑎+𝑚𝑗−1)
+6
+𝑇𝑏←𝑇𝑏−(e𝑡0 −e𝑡𝑗) min
+
+max(|R| −𝐶𝑏, 0), 𝑓𝑗
+
+, ∀𝑏∈{𝑎𝑗, . . . , 𝑎𝑗+ 𝑚𝑗−1}
+7
+𝐶𝑏←𝐶𝑏+ 𝑓𝑗,
+∀𝑏∈{𝑎𝑗, . . . , 𝑎𝑗+ 𝑚𝑗−1}
+8
+// shortest-path request routing:
+for each client 𝑐∈𝑉𝑐do
+𝐺𝑐
+𝒂,𝒎←the feasible routing topology for client 𝑐under block placement (𝒂, 𝒎), with a node/link set
+(𝑉𝑐, 𝐸𝑐
+𝒂,𝒎) and a cost of 𝑡𝑐
+𝑖𝑗for each (𝑖, 𝑗) ∈𝐸𝑐
+𝒂,𝒎
+9
+𝑝𝑐←shortest path from the S-client to the D-client in
+𝐺𝑐
+𝒂,𝒎
+10
+𝑓𝑟
+𝑖𝑗←⊮((𝑖, 𝑗) ∈𝑝𝑐)4, ∀𝑟∈R𝑐, (𝑖, 𝑗) ∈𝐸
+11
+Conservative Greedy BPRR (CG-BPRR) as shown in Alg. 1, by decomposing the BPRR problem into the three
+subproblems of optimizing 𝒎, 𝒂, and 𝒇sequentially, as explained below.
+Step 1: First, we set the number of blocks per server conservatively (line 1) to make sure that each server
+will have enough remaining GPU memory to hold the attention caches even if all the requests are routed through
+it. This is because according to the memory consumption model in (5), the memory consumption at server 𝑗
+is upper-bounded by 𝑠𝑚𝑚𝑗+ 𝑠𝑐|R|𝑚𝑗(achieved if all the requests are routed to it and all the hosted blocks
+are processed), and thus storing min(⌊𝑀𝑗/(𝑠𝑚+ 𝑠𝑐|R|)⌋, 𝐿) blocks on server 𝑗will guarantee the maximum
+memory consumption to be feasible.
+Step 2: Next, we greedily place a set of continuous blocks {𝑎𝑗, . . . , 𝑎𝑗+ 𝑚𝑗−1} at each server 𝑗in the
+descending order of “server speeds” so that each placement improves the performance for the worst-performing
+blocks (lines 2–8). Specifically, we measure the speed of server 𝑗by the amortized inference time defined as
+e𝑡𝑗:= 1
+𝑚𝑗
+max
+𝑐∈𝑉𝑐(𝑡𝑐𝑗+ 𝜏𝑗𝑚𝑗) = 𝜏𝑗+ 𝑡∗𝑗
+𝑚𝑗
+,
+(14)
+where 𝑡∗𝑗:= max𝑐∈𝑉𝑐𝑡𝑐𝑗is the maximum per-token RTT between any client and server 𝑗. Since max𝑐∈𝑉𝑐(𝑡𝑐𝑗+
+𝜏𝑗𝑚𝑗) is an upper bound on the per-token inference time incurred at server 𝑗,e𝑡𝑗denotes the amortized maximum
+inference time per block at server 𝑗, amortized over the blocks hosted by this server. The amortization allows
+us to compare the speeds of servers with different memory capacities.
+Under such amortization, we consider a relaxed request routing problem, where each request is routed among
+servers on a block-by-block basis and incurs a per-block inference timee𝑡𝑗at server 𝑗. It is clear that the relaxed
+request routing must use up the capacity of a faster server (with a smaller amortized inference time) before
+going to a slower server for each block. Meanwhile, under 𝑚𝑗computed in Step 1, each server 𝑗can guarantee
+4We use ⊮(·) to denote the indicator function.
+13
+
+
+--- Page 14 ---
+to process up to
+𝑓𝑗:=
+ 𝑀𝑗−𝑠𝑚𝑚𝑗
+𝑠𝑐𝑚𝑗
+
+≥|R|
+(15)
+requests concurrently without running out of memory5, which defines a capacity of the server. It means that
+under the relaxed request routing, only the fastest server hosting block 𝑏will be used to process the block for all
+the requests.
+Thus, to make the best use of fast servers, we place blocks on servers in the increasing order ofe𝑡𝑗, where each
+server 𝑗receives the set of continuous blocks that “need service the most”. To measure this, we use a variable
+𝐶𝑏to track the total capacity of servers hosting block 𝑏, and another variable 𝑇𝑏to track the total amortized
+inference time all the requests spend on block 𝑏under the optimal relaxed routing. That is, 𝐶𝑏is the sum of 𝑓𝑗’s
+over all the servers satisfying 𝑎𝑗≤𝑏≤𝑎𝑗+𝑚𝑗−1 (line 8), and 𝑇𝑏= e𝑡𝑗|R| if server 𝑗is the fastest server hosting
+block 𝑏. To ensure that 𝑇𝑏is well-defined before block 𝑏is placed on any server, we introduce a dummy server
+0 (assuming 0 ∉𝑉𝑠) with a large capacity 𝑓0 := |R| and a large amortized inference time e𝑡0 > e𝑡𝑗(∀𝑗∈𝑉𝑠),
+which initially hosts all the blocks. Introducing this dummy server allows us to meaningfully initialize 𝑇𝑏before
+any real block placement (line 2), and its large inference time ensures that 𝑇𝑏(as updated in line 7) will be
+equal to the actual total amortized inference time for block 𝑏when 𝐶𝑏≥|R|. Our idea is to measure the “need
+of service” by the total amortized inference time, i.e., the next fastest server will receive the set of continuous
+blocks with the maximum Í𝑎𝑗+𝑚𝑗−1
+𝑏=𝑎𝑗
+𝑇𝑏. One subtle point in applying this idea is that since the relaxed request
+routing always uses the fastest server for each block, 𝑇𝑏will stop changing after block 𝑏is placed, which can
+cause subsequent servers to be assigned the same blocks over and over again. To avoid such waste of servers,
+we will only select the blocks according to Í𝑎𝑗+𝑚𝑗−1
+𝑏=𝑎𝑗
+𝑇𝑏if this set contains at least one unserved block (line 5);
+otherwise, we will select the set of continuous blocks with the minimum capacities (line 6), where “arg min”
+selects the first value of 𝑎in the lexicographical order of sorted (𝐶𝑎, . . . , 𝐶𝑎+𝑚𝑗−1).
+The rationale of Step 2 is that it minimizes the average inference time under the relaxed request routing.
+Lemma 3.3. The block placement in lines 2–8 of Alg. 1 minimizes the average per-token inference time over
+all the requests under the relaxed request routing, assuming that “arg max” in line 5 breaks ties in favor of the
+smallest index.
+Remark: As shown in the proof of Lemma 3.3, Step 2 of CG-BPRR generates an intuitive block placement
+that uses the “fastest servers” to cover all the blocks sequentially. That is, if 𝑗∈𝑉𝑠denotes the 𝑗-th fastest server
+in terms of e𝑡𝑗, then 𝑎𝑘= Í𝑘−1
+𝑗=1 𝑚𝑗+ 1 for all 𝑘= 1, . . . , 𝐾−1 and 𝑎𝐾= 𝐿−𝑚𝐾+ 1, where 𝐾:= min{𝑘:
+Í𝑘
+𝑗=1 𝑚𝑗≥𝐿}.
+Step 3: Finally, we compute the request routing under the block placement (𝒂, 𝒎) given by the previous
+steps, assuming the block placement to be feasible (i.e., every block is hosted by at least one server).
+Given a feasible block placement (𝒂, 𝒎), the (conditionally) optimal request routing that minimizes the
+average inference time is given by a subproblem of (13) as follows
+min
+𝒇
+Õ
+𝑐∈𝑉𝑐
+Õ
+𝑟∈R𝑐
+Õ
+(𝑖, 𝑗)∈𝐸
+𝑡𝑐
+𝑖𝑗𝑓𝑟
+𝑖𝑗
+(16a)
+s.t. 𝑠𝑐
+Õ
+𝑐∈𝑉𝑐
+Õ
+𝑟∈R𝑐
+Õ
+𝑖:(𝑖, 𝑗)∈𝐸
+𝑓𝑟
+𝑖𝑗(𝑎𝑗+ 𝑚𝑗−𝑎𝑖−𝑚𝑖) ≤𝑀𝑗−𝑠𝑚𝑚𝑗, ∀𝑗∈𝑉𝑠,
+(16b)
+(13c), (11)–(12),
+(16c)
+𝑓𝑟
+𝑖𝑗∈{0, 1}, ∀𝑟∈R, (𝑖, 𝑗) ∈𝐸,
+(16d)
+5The actual number of requests server 𝑗runs concurrently may be larger when not all the 𝑚𝑗blocks are processed at this server for
+some requests.
+14
+
+
+--- Page 15 ---
+S-client
+𝑐
+…
+D-client
+𝑐′
+Server 1
+Server 𝐿2
+S-client
+𝑐
+Server 1
+Server 𝐿
+…
+D-client
+𝑐′
+(a) Optimal BPRR
+(b) CG-BPRR
+Figure 5: Example for suboptimality of CG-BPRR (Alg. 1).
+where we have plugged in 𝑡𝑐
+𝑖𝑗as defined in (4) as a constant. Generally, this is an integer linear programming
+(ILP) problem with 𝑂(|R| · |𝐸|) variables and 𝑂(|R| · |𝐸|) constraints, which is no easier to solve than (13).
+However, under the block placement computed by CG-BPRR, we can convert the problem into a simple shortest-
+path routing problem as stated below.
+Lemma 3.4. Suppose that the block placement computed by lines 1–8 of Alg. 1 is feasible. Then under this
+block placement, the shortest-path request routing in lines 8–11 is optimal for (16).
+Remark: As explained in Section 3.3, when applying CG-BPRR, the number of requests |R| is actually a
+design parameter that can be tuned to ensure the feasibility of the block placement.
+3.2.4
+Performance Analysis
+We now analyze the overall performance of CG-BPRR (Alg. 1) in terms of both the complexity and the average
+inference time.
+Complexity: The complexity can be dominated by either greedy block placement (lines 2–8) or shortest-
+path request routing (lines 8–11). Each for loop in lines 4–8 takes time 𝑂(𝐿𝑚) if line 5 is executed (where
+𝑚:= max 𝑗∈𝑉𝑠𝑚𝑗) or 𝑂(𝐿𝑚log 𝑚) if line 6 is executed, both in 𝑂(𝐿2 log 𝐿). Each for loop in lines 9–11 takes
+time 𝑂(|R𝑐| · |𝐸|), dominated by line 11. The overall complexity of Alg. 1 is thus 𝑂(|𝑉𝑠|𝐿2 log 𝐿+ |R| · |𝐸|) =
+𝑂 |𝑉𝑠|  𝐿2 log 𝐿+ |R|(|𝑉𝑐| + |𝑉𝑠|) (recall that |𝐸| = 𝑂(|𝑉𝑠|(|𝑉𝑐|+|𝑉𝑠|))), which is polynomial in the problem
+size.
+Suboptimality: First of all, due to its conservative assignment of blocks, CG-BPRR may not give a feasible
+solution when a feasible solution exists. For example, we may have a large number of servers (|𝑉𝑠| ≥𝐿|R|) but
+also a large number of requests, such that 𝑠𝑚+ 𝑠𝑐|R| > 𝑀𝑗and 𝑠𝑚+ 𝑠𝑐≤𝑀𝑗(∀𝑗∈𝑉𝑠). Then CG-BPRR will
+be unable to place any block, but it is still feasible to satisfy all the requests by placing one block per server and
+routing each request to a disjoint set of 𝐿servers.
+Moreover, CG-BPRR can be suboptimal in comparison to the optimal solution even when it is feasible.
+Consider an example with |𝑉𝑐| = 1 client and |𝑉𝑠| = 𝐿2 servers, where each 𝑗∈𝑉𝑠has a per-token RTT of
+𝑡𝑐𝑗≡𝑡to the client, a per-block processing time of 𝜏𝑗≡𝜏, and a GPU memory of 𝑀𝑗≡(𝐿+ 1)𝑠𝑚. Suppose
+that 𝑠𝑚= 𝐿𝑠𝑐, and the number of requests is |R| = 𝐿𝑠𝑚/𝑠𝑐= 𝐿2. Then CG-BPRR will place only one block
+per server and route each request through a chain of 𝐿servers as illustrated in Fig. 5b, incurring an average
+per-token inference time of 𝑇𝑔:= 𝐿(𝑡+ 𝜏). However, the optimal solution is to place all the blocks on each
+server and route only one request to each server as illustrated in Fig. 5a, incurring an average per-token inference
+time of 𝑇𝑜:= 𝑡+ 𝜏𝐿< 𝑇𝑔.
+Performance guarantee: Nevertheless, CG-BPRR provides a guaranteed average inference time as long as
+its block placement is feasible.
+Theorem 3.5. Without loss of generality, assume that the servers have been sorted into an increasing order of
+amortized inference times (i.e., e𝑡1 ≤. . . ≤e𝑡|𝑉𝑠|). Let 𝐾:= min{𝑘: Í𝑘
+𝑗=1 𝑚𝑗≥𝐿} be the number of iterations
+15
+
+
+--- Page 16 ---
+of lines 3–8 until all the blocks are placed on at least one server. If CG-BPRR gives a feasible solution (i.e.,
+𝐾< ∞), then its average per-token inference time 𝑇𝑔is bounded by
+𝑇𝑔≤
+𝐾
+Õ
+𝑗=1
+e𝑡𝑗𝑚𝑗−𝜏𝐾©­
+«
+𝐾
+Õ
+𝑗=1
+𝑚𝑗−𝐿ª®
+¬
+,
+(17)
+wheree𝑡𝑗is defined as in (14) and 𝑚𝑗is computed as in line 1 of Alg. 1.
+Remark: The upper bound in (17) has an intuitive meaning that it is the per-token inference time under the
+worst-case demand, where all the requests come from a client 𝑐that simultaneously achieves 𝑡𝑐𝑗= 𝑡∗𝑗for all
+𝑗∈𝑉𝑠(i.e., farthest away from all the servers), and are routed through the chain of servers 1, . . . , 𝐾. This
+worst-case guarantee will facilitate the adaptation of CG-BPRR for the online setting as explained below.
+In addition to the upper bound in (17), we also provide a lower bound on the minimum average per-token
+inference time in B.4, which together with the upper bound yields a bounded approximation ratio for CG-BPRR.
+3.3
+Online Setting
+In practice, requests usually arrive dynamically, and block placement and request routing are usually performed
+at different time scales: block placement should be at a large time scale to avoid excessive overhead due to
+frequently loading/unloading blocks, and request routing should be at a small time scale to provide timely service
+to dynamically arriving requests. Nevertheless, the key ideas in CG-BPRR can be applied in the online setting
+through a two-time-scale solution as follows.
+3.3.1
+Block Placement via Robust Optimization
+Due to its large overhead, one block placement solution should be able to serve a variety of request scenarios
+with reasonable performance. We address this requirement by treating the block placement problem as a robust
+optimization problem, with the goal of minimizing the worst-case average per-token inference time for a target
+range of scenarios. To this end, we note that the block placement steps in CG-BPRR (i.e., lines 1–8), referred
+to as Conservative Greedy Block Placement (CG-BP), are already solving a robust optimization. Specifically,
+given a maximum number of concurrent requests |R| that the system aims to support, CG-BP places blocks
+according to the worst case that all the requests are from a client that is farthest away from all the servers (i.e.,
+with a per-token RTT of 𝑡∗𝑗, ∀𝑗∈𝑉𝑠). Thus, the performance bound in Theorem 3.5 still applies as stated below.
+Corollary 3.6. If CG-BP (i.e., lines 1–8 of Alg. 1) gives a feasible block placement for |R| requests, then during
+online inference, the average per-token inference time under the optimal request routing will always be bounded
+by (17) as long as the number of concurrent requests6 is no more than |R|.
+Remark: The parameter |R| here is a design parameter that denotes the number of requests the system guar-
+antees to serve concurrently and can be tuned to ensure the feasibility of CG-BP. Specifically, given the set of
+servers and their memory capacities, it is easy to see that the block placement given by lines 1–8 of Alg. 1 is
+feasible if and only if
+Õ
+𝑗∈𝑉𝑠
+min(⌊𝑀𝑗/(𝑠𝑚+ 𝑠𝑐|R|)⌋, 𝐿) ≥𝐿.
+(18)
+6In the online setting, “concurrent requests” refer to requests that are simultaneously active (i.e., submitted but unfinished) but do
+not necessarily arrive simultaneously.
+16
+
+
+--- Page 17 ---
+To satisfy the condition (18), it suffices for |R| to satisfy
+|R| ≤
+Í
+𝑗∈𝑉𝑠𝑀𝑗−𝑠𝑚(𝐿+ |𝑉𝑠|)
+𝑠𝑐(𝐿+ |𝑉𝑠|)
+
+,
+(19)
+which provides an upper bound on the number of requests that the system can guarantee to serve concurrently
+under CG-BP. Meanwhile, increasing |R| has a negative effect of decreasing 𝑚𝑗(∀𝑗∈𝑉𝑠), which can increase
+the path length and hence the inference time. Thus, the parameter |R| effectively controls the “throughput-delay
+tradeoff” of the system. When the number of concurrent requests exceeds |R|, the new request may have to
+wait for some of the existing requests to finish (as detailed in Section 3.3.2). Therefore, |R| could be tuned to
+optimize the tradeoff between the waiting time and the inference time after waiting. A configuration method that
+empirically works well is as follows: (i) estimate the mean and the standard deviation (std) of the number of new
+requests during the processing of a given request, and (ii) set |R| to the minimum of the mean plus the std and
+the upper bound in (19). Such estimation can be further adjusted, on a time scale suitable for block placement,
+to accommodate time-varying demands.
+3.3.2
+Request Routing via Individually Optimal Scheduling
+Given the block placement by CG-BP, online request routing strives to schedule each incoming request to a
+feasible path to complete the request as soon as possible. If the number of concurrent requests is within |R| (the
+number of concurrent requests CG-BP plans for), then there will be no memory contention, and the new request
+can be routed optimally as in lines 8–11 of Alg. 1. If the number of concurrent requests exceeds |R|, however,
+then the new request may have to wait for some existing requests to finish, in which case it is necessary to know
+the system state in handling the existing requests.
+To this end, we track the state of each server as follows. Let (𝑇𝑗
+𝑟(𝑡), 𝑀𝑗
+𝑟(𝑡))𝑅𝑗(𝑡)
+𝑟=1
+denote the state of server
+𝑗at time 𝑡, where 𝑅𝑗(𝑡) is the number of existing (and unfinished) requests routed through server 𝑗, 𝑇𝑗
+𝑟(𝑡) is
+the remaining time7 for a request 𝑟∈R 𝑗(𝑡), and 𝑀𝑗
+𝑟(𝑡) is the number of attention caches hosted on server 𝑗
+for request 𝑟(i.e., #blocks 𝑗processes for 𝑟). Without loss of generality, suppose that the existing requests have
+been sorted into increasing order of 𝑇𝑗
+𝑟(𝑡). Then for a new request arriving at time 𝑡, the waiting time for link
+(𝑖, 𝑗) ∈𝐸to be available for routing the request (i.e., the time until server 𝑗has enough cache space for a new
+request routed through (𝑖, 𝑗)) is given by
+𝑡𝑊
+𝑖𝑗(𝑡) := min
+
+
+𝑇𝑗
+𝑘(𝑡) :
+ 𝑀𝑗−𝑠𝑚𝑚𝑗
+𝑠𝑐
+
+−
+𝑅𝑗(𝑡)
+Õ
+𝑟=𝑘+1
+𝑀𝑗
+𝑟(𝑡) ≥𝑎𝑗+ 𝑚𝑗−𝑎𝑖−𝑚𝑖
+
+
+,
+(20)
+where𝑇𝑗
+0 (𝑡) := 0. That is, 𝑡+𝑡𝑊
+𝑖𝑗(𝑡) is the earliest time for server 𝑗to have enough memory for the new request if it
+is routed from server 𝑖. The earliest time a path 𝑝is available for the request is then given by 𝑡+max(𝑖, 𝑗)∈𝑝𝑡𝑊
+𝑖𝑗(𝑡).
+Given the current system state at time 𝑡, we formulate the individually optimal (i.e., myopic) scheduling of
+a new request arriving from client 𝑐at time 𝑡as
+min
+𝒇,𝑡𝑊
+𝑡𝑊+ 𝑙max
+Õ
+(𝑖, 𝑗)∈𝐸𝑐𝒂,𝒎
+𝑡𝑐
+𝑖𝑗𝑓𝑖𝑗
+(21a)
+s.t.
+𝑡𝑊
+𝑖𝑗(𝑡) 𝑓𝑖𝑗≤𝑡𝑊, ∀(𝑖, 𝑗) ∈𝐸𝑐
+𝒂,𝒎,
+(21b)
+Õ
+𝑖∈N+( 𝑗;𝒂,𝒎)
+𝑓𝑗𝑖−
+Õ
+𝑖∈N−( 𝑗;𝒂,𝒎)
+𝑓𝑖𝑗= 𝑑𝑐
+𝑗, ∀𝑗∈𝑉𝑐,
+(21c)
+𝑓𝑖𝑗∈{0, 1},
+∀(𝑖, 𝑗) ∈𝐸𝑐
+𝒂,𝒎,
+(21d)
+7We can estimate the remaining time for an existing request 𝑟using its completion time by (21a) when scheduling 𝑟minus the elapsed
+time.
+17
+
+
+--- Page 18 ---
+where the main variable is 𝑓𝑖𝑗∈{0, 1} that indicates whether to route the request through link (𝑖, 𝑗). The
+objective (21a) is to minimize the total waiting plus inference time for this request8, (21b) ensures that all the
+invoked servers have enough memory when the session starts, and (21c) is the flow conservation constraint, with
+N+( 𝑗; 𝒂, 𝒎) and N −( 𝑗; 𝒂, 𝒎) denoting the outgoing/incoming neighbors of 𝑗in the feasible routing topology
+𝐺𝑐
+𝒂,𝒎for client 𝑐under the given block placement (𝒂, 𝒎), and 𝑑𝑐
+𝑗denoting the constant defined in (10). While
+the second term of (21a) has approximated the total inference time by #output tokens multiplied by the time
+between tokens, it can be refined to model the actual total inference time by redefining 𝑡𝑐
+𝑖𝑗as in (8).
+While (21) is a MILP that is hard to solve directly, we can simplify it by relaxing 𝑡𝑊into its upper bound
+Í
+(𝑖, 𝑗)∈𝐸𝑐𝒂,𝒎𝑡𝑊
+𝑖𝑗(𝑡) 𝑓𝑖𝑗, which reduces (21) into a shortest-path routing problem with waiting-penalized link cost
+𝑡𝑊
+𝑖𝑗(𝑡) + 𝑙max𝑡𝑐
+𝑖𝑗for each (𝑖, 𝑗) ∈𝐸𝑐
+𝒂,𝒎. We refer to this solution as Waiting-penalized Shortest-path Request
+Routing (WS-RR).
+Corollary 3.7. Let 𝑝𝑐(𝑡) denote the path selected by WS-RR for client 𝑐at time 𝑡. Then the cost of this path
+Í
+(𝑖, 𝑗)∈𝑝𝑐(𝑡)
+
+𝑡𝑊
+𝑖𝑗(𝑡) + 𝑙max𝑡𝑐
+𝑖𝑗
+
+is an upper bound on the completion time of a request 𝑟∗arriving from client 𝑐at
+time 𝑡. Moreover, if the number of concurrent requests at time 𝑡is within |R| (the number of requests used by
+CG-BP in computing the block placement), then 𝑝𝑐(𝑡) is optimal under the given block placement.
+3.3.3
+Summary of Online BPRR
+Alg. 2 in B.5 summarizes our proposed two-time-scale solution for the online setting that combines CG-BP and
+WS-RR. Together, Corollaries 3.6 and 3.7 imply that this combined solution can guarantee a request completion
+time that is bounded by
+
+
+𝑙max
+Í𝐾
+𝑗=1e𝑡𝑗𝑚𝑗−𝜏𝐾
+Í𝐾
+𝑗=1 𝑚𝑗−𝐿
+
+if #concurrent requests ≤|R|,
+Í
+(𝑖, 𝑗)∈𝑝𝑐(𝑡)
+
+𝑡𝑊
+𝑖𝑗(𝑡) + 𝑙max𝑡𝑐
+𝑖𝑗
+
+o.w.,
+(22)
+where the first bound is independent of the system state while the second bound is dependent. We note that
+while individually optimal scheduling may not be globally optimal, in our solution it is just used to provide a
+feasible solution in the exceptional case when #concurrent requests > |R| and thus suffices under properly set
+|R|.
+4
+Performance Evaluation
+We evaluate the performance of the proposed algorithms against the state of the art through both controlled ex-
+periments based on the PETALS system [8] and data-driven simulations based on a simulator we have developed
+that has been cross-validated with the experiment results.
+4.1
+Evaluation Setup
+Evaluation environment: We employ two cross-validated evaluation environments:
+1) PETALS-based distributed system: This environment runs real LLM inference workloads on a modified ver-
+sion of PETALS [8] that can take any block placement and request routing decisions as inputs. We deploy two
+copies of this system: (i) a smaller deployment on a server with 3 A100 (80 GB) GPUs, where we leverage the
+8In PETALS implementation [16], there is another delay due to retrying inference at each server according to binary exponential
+backoff with a maximum backoff time (by default 60 s), causing the actual time from the request arrival to the start of inference to be
+nonlinear and mildly larger than 𝑡𝑊. We have ignored the retry delay to linearize the formulation (21) but considered such delay in our
+simulation (see Section 4.1).
+18
+
+
+--- Page 19 ---
+Cluster0 (CPU)
+Cluster1 (2 A100s)
+Cluster2 (7 MIGs)
+Cluster0 (CPU)
+5 ms, 1 Gbit/s
+100 ms, 100 Mbit/s
+100 ms, 100 Mbit/s
+Cluster1 (2 A100s)
+100 ms, 100 Mbit/s
+5 ms, 1 Gbit/s
+100 ms, 100 Mbit/s
+Cluster2 (7 MIGs)
+100 ms, 100 Mbit/s
+100 ms, 100 Mbit/s
+5 ms, 1 Gbit/s
+Table 2: System configuration for experimentation (entries denote RTT and bandwidth).
+AboveNet
+BellCanada
+GTS-CE
+#nodes
+23
+48
+149
+#links
+62
+130
+386
+link capacities (Gbps)
+1
+1
+1
+link delays (ms)
+[0.100, 13.800]
+[0.078, 6.160]
+[0.005, 1.081]
+Table 3: Topologies used in simulation.
+multi-instance GPU technology [38] to partition one of the A100 GPUs into 7 smaller virtual GPUs (referred
+to as MIGs) that together with the remaining A100s provide 9 servers with one GPU each, and (ii) a larger
+deployment on a server with 8 A100 (80 GB) GPUs, where we partition three of the A100s into 21 MIGs that
+together with the remaining A100s provide 26 servers with one GPU each. We use the CPUs to emulate the
+clients. We use the namespace and the traffic control features of Linux [39] to simulate network latency and
+bandwidth between the nodes as specified in “System configuration” below.
+2) MATLAB-based simulator: To overcome the limited scale of the experiments due to limited GPU resources,
+we develop a customized simulator in MATLAB that implements the block placement and request routing logic
+of both the original algorithm in PETALS [8] and the proposed algorithm. The simulator has been engineered
+to replicate the decision of the real system under the same system state, and validated to approximate the over-
+all experiment results over multiple requests (see Section 4.2). We have open-sourced our simulator code9 to
+facilitate future research on distributed LLM inference for researchers with limited GPU access..
+System configuration: We employ BLOOM-176B [3] as the LLM, which is one of the largest open-source
+LLMs, and configure our evaluation environment to mimic a clustered or scattered deployment scenario as
+follows.
+For the clustered scenario, we configure the smaller-scale deployment into three clusters with heterogeneous
+hardware capabilities:
+• Cluster0: a cluster containing clients remote to all the servers;
+• Cluster1: a cluster containing two high-performance servers represented by the A100 GPUs as well as
+clients local to these servers;
+• Cluster2: a cluster containing seven low-performance servers represented by the MIGs as well as clients
+local to these servers.
+We add the servers to the system in a random order, and follow the prior work [8] in configuring the networking
+parameters for intra/inter-cluster communications as presented in Table 2.
+For the scattered scenario, we simulate three topologies of different sizes from the Internet Topology Zoo [40]
+with link capacities and delays from [41], as presented in Table 3. We compute the RTTs between nodes accord-
+ing to the cumulative delays along the delay-based shortest paths. In each simulated network, we randomly select
+𝐶nodes as the locations of servers, 𝜂fraction of which (randomly selected) are equipped with high-performance
+servers represented by A100s and the rest are equipped with MIGs. In the experiments, we use AboveNet for
+the smaller-scale deployment and BellCanada/GTS-CE for the larger-scale deployment, where 𝐶and 𝜂are set
+based on #GPUs of each type in each deployment; in the simulations, we vary 𝐶and 𝜂to evaluate their impacts.
+9Our simulator code is available at: https://github.com/TingyangSunJeff/LLM_inference_simulator/tree/main.
+19
+
+
+--- Page 20 ---
+Client Location Algorithm
+0.1 requests/s
+0.5 requests/s
+𝑙max = 64
+𝑙max = 128
+𝑙max = 64
+𝑙max = 128
+Cluster0
+PETALS
+6.23 (5.33)
+4.76 (4.74)
+6.28 (5.33)
+5.14 (4.74)
+Proposed
+1.92 (1.59)
+1.43 (0.92)
+2.00 (1.59)
+1.34 (0.92)
+Cluster1
+PETALS
+5.44 (5.17)
+4.60 (4.58)
+5.56 (5.17)
+4.79 (4.58)
+Proposed
+1.78 (1.65)
+1.04 (0.83)
+1.88 (1.65)
+1.11 (0.83)
+Cluster2
+PETALS
+5.30 (4.85)
+4.85 (4.07)
+5.34 (4.85)
+5.25 (4.07)
+Proposed
+1.79 (1.59)
+1.31 (0.92)
+1.94 (1.59)
+1.37 (0.92)
+Table 4: Average per-token inference time (s) under the configuration in Table 2 (𝑙𝐼
+max = 20; 100 requests;
+MATLAB results shown in parentheses).
+We generate 𝑁𝑅requests according to a Poisson process with rate 𝜆from one of the clusters (in clustered
+scenario) or a randomly selected node not hosting any server (in scattered scenario), which represents a proxy
+that queries the system on behalf of end users (e.g., a Flask web server as in [36]). Unless stated otherwise, we
+set the design parameter |R| as discussed after Corollary 3.6. Our experiment results are averaged over 5 Monte
+Carlo runs and our simulation results are averaged over 20 Monte Carlo runs.
+Benchmark: We compare the proposed two-time-scale algorithm (Alg. 2) with the original block placement
+and request routing algorithm in PETALS [8], where block placement is performed sequentially by letting each
+newly-added server choose a consecutive range of the most under-served blocks as measured by a heuristic
+throughput metric, and request routing is performed by letting each client build a graph with heuristic edge
+weights based on network latency and processing time10, and then use a Dijkstra-like algorithm to find the
+shortest path that traverses the required blocks in order. We set the target number of concurrent requests to the
+expected number of arrivals during the first inference session plus one standard deviation.
+Metrics: Our primary performance metric is the average inference time per token for all the tokens, excluding
+the local processing times at the client (as they are not affected by the resource allocation at servers). In addition,
+we also measure the average inference times for the first token and each of the remaining tokens, respectively,
+for additional insights, as well as the average running time of each algorithm.
+4.2
+Experiment Results and Simulator Validation
+4.2.1
+Inference Time
+Clustered scenario: Tables 4, 7, and 8 present the average inference times for all the tokens, the first token
+in each sequence, and the remaining tokens, respectively, under various client locations (Cluster 0, 1, or 2),
+BPRR algorithms (PETALS [8] or the proposed), request rates, and sequence lengths. The results show that:
+(i) the proposed algorithm (Alg. 2) achieves significantly (60–70%+) smaller average inference times compared
+to the original algorithm in PETALS in all the tested cases, and (ii) our MATLAB simulator produces results
+that are roughly consistent with the actual experiments. A closer look shows that the performance improvement
+mainly comes from the time for the first token (Table 7), for which our algorithm achieves an order-of-magnitude
+reduction. Although the improvement in the inference time for the remaining tokens is smaller (Table 8), the
+overall improvement is dominated by the time reduction for the first token. Comparing the results across dif-
+ferent settings, we further see that: (i) increasing the output length can reduce the average per-token time due
+10Unlike 𝐺𝑐
+𝒂,𝒎(𝑡) in Alg. 2 that uses our validated performance models to compute edge weights, the routing algorithm in PETALS
+uses heuristic weights, which causes the sum weight along a path to differ from the actual inference time; see [16] for details.
+20
+
+
+--- Page 21 ---
+Topology
+Algorithm
+0.1 requests/s
+0.5 requests/s
+𝑙max = 64
+𝑙max = 128
+𝑙max = 64
+𝑙max = 128
+AboveNet
+PETALS
+4.98 (4.75)
+4.03 (3.88)
+5.26 (5.11)
+4.58 (4.10)
+Proposed
+1.86 (1.63)
+1.44 (1.36)
+1.97 (1.83)
+1.35 (1.05)
+BellCanada
+PETALS
+6.31 (6.03)
+3.82 (3.49)
+6.74 (6.19)
+4.16 (3.41)
+Proposed
+1.33 (1.41)
+1.26 (0.92)
+1.49 (1.41)
+1.11 (0.92)
+GTS-CE
+PETALS
+7.05 (6.12)
+4.69 (3.47)
+6.89 (5.97)
+4.89 (3.37)
+Proposed
+1.38 (1.41)
+0.95 (0.91)
+1.35 (1.40)
+1.07 (0.91)
+Table 5: Average per‐token inference time (s) under the topologies in Table 3 (𝑙𝐼
+max = 20; 100 requests; MATLAB
+results shown in parentheses).
+to amortizing the first token’s inference time over more tokens, and (ii) the client location can affect the perfor-
+mance, e.g., a client in Cluster1 has relatively smaller inference times than a client in Cluster0 under the same
+algorithm due to its proximity to high-performance servers, but the difference is small as the communication
+time is only a small fraction of the total inference time (e.g., sending one embedding for BLOOM-176B across
+two clusters only takes about 0.12 s).
+Scattered scenario: Tables 5, 9, and 10 present the corresponding results under the network topologies in
+Table 3. The results show qualitatively similar observations as before, e.g., the proposed algorithm significantly
+reduces the inference times in a diverse set of cases with different numbers of servers, different topologies, and
+different loads (controlled by request rate and sequence length). This validates the generalizability of our obser-
+vations. We also see bigger improvements for the larger networks (e.g., 60–70% improvement for AboveNet and
+around 80% improvement for GTS-CE), suggesting promising performance improvement for large deployments.
+Remark: We have examined the specific block placement and request routing decisions made by the two
+algorithms to understand the causes of the observed performance difference. The primary cause turns out to
+be the difference in how the GPU memory is allocated between model blocks and attention caches: PETALS
+uses a fixed allocation of attention cache space without considering concurrent sessions [16], which causes it to
+frequently run out of memory and incur waiting times for incoming requests; in contrast, our solution is designed
+to handle a certain number of concurrent sessions, which allows it to avoid waiting when properly configured,
+leading to the significant reduction in the time for the first token. These different memory allocations manifest
+in the number of blocks placed at each server, where PETALS places 53 blocks on A100 and 4 blocks on
+MIG, whereas our algorithm (CG-BP) only places 41 blocks on A100 and 3 blocks on MIG. We also note that
+although our simulator implements the same decision making logic as the real system, it cannot perfectly predict
+the time for executing the decisions due to complex runtime factors (e.g., memory fragmentation and low-level
+scheduling) not captured by our system model, which is the cause of the mildly different results. Nevertheless,
+the simulated performance is overall predictive of the actual performance observed in our experiments.
+4.2.2
+Algorithm Running Time
+Table 6 shows the average running time of each algorithm evaluated in Tables 4–5. To ensure a fair comparison
+and separate the decision making time from the time of implementing the decisions, we evaluate the running
+times of both our algorithm and the original algorithm in PETALS [8] based on their MATLAB implementation.
+Both solutions are fast enough so that the decision making time is negligible compared to the actual inference
+time.
+21
+
+
+--- Page 22 ---
+Scenario
+PETALS
+Proposed
+Clustered
+0.0186 ± 0.0013
+0.0216 ± 0.0004
+AboveNet
+0.0190 ± 0.0081
+0.0333 ± 0.0128
+BellCanada
+0.0291 ± 0.0011
+0.0287 ± 0.0018
+GTS-CE
+0.0350 ± 0.0020
+0.0320 ± 0.0012
+Table 6: Algorithm running time (s) (algorithm running time is independent of client location, request rate, and
+sequence length).
+Number of servers (C)
+6
+10
+15
+20
+22
+Avg per-token inference time (s)
+0
+1
+2
+3
+4
+5
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(a) AboveNet
+Number of servers (C)
+10
+15
+20
+25
+40
+Avg per-token inference time (s)
+0
+1
+2
+3
+4
+5
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(b) BellCanada
+Number of servers (C)
+10
+15
+20
+25
+40
+Avg per-token inference time (s)
+0
+1
+2
+3
+4
+5
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(c) GTS-CE
+Figure 6: Inference time per token when varying #servers 𝐶(𝜂= 0.2, 𝜆= 0.5, 𝑁𝑅= 100, 𝑙𝐼
+max = 20, 𝑙max = 128).
+Fraction of A100 servers
+0.1
+0.2
+0.3
+0.4
+0.5
+Avg per-token inference time (s)
+0
+1
+2
+3
+4
+5
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(a) AboveNet
+Fraction of A100 servers
+0.1
+0.2
+0.3
+0.4
+0.5
+Avg per-token inference time (s)
+0
+1
+2
+3
+4
+5
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(b) BellCanada
+Fraction of A100 servers
+0.01
+0.03
+0.06
+0.1
+0.3
+Avg per-token inference time (s)
+0
+1
+2
+3
+4
+5
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(c) GTS-CE
+Figure 7: Inference time per token when varying the fraction of high-performance servers 𝜂(𝐶= 0.4 · #nodes,
+𝜆= 0.5, 𝑁𝑅= 100, 𝑙𝐼
+max = 20, 𝑙max = 128).
+Request rate (requests/s)
+0.05
+0.1
+0.5
+1
+2
+Avg per-token inference time (s)
+0
+5
+10
+15
+20
+25
+30
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(a) AboveNet
+Request rate (requests/s)
+0.05
+0.1
+0.5
+1
+2
+Avg per-token inference time (s)
+0
+5
+10
+15
+20
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(b) BellCanada
+Request rate (requests/s)
+0.1
+0.5
+1
+2
+3
+Avg per-token inference time (s)
+0
+5
+10
+15
+20
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(c) GTS-CE
+Figure 8: Inference time per token when varying request rate 𝜆(𝐶= 0.4 · #nodes, 𝑁𝑅= 200𝜆, 𝜂= 0.2,
+𝑙𝐼
+max = 20, 𝑙max = 128).
+4.3
+Results of Experimentally-validated Simulations
+We now use the validated MATLAB simulator to evaluate a wider range of scenarios based on the topologies
+in Table 3. Fig. 6–7 show the average inference time per token (over all the tokens) as we vary the available re-
+sources in terms of either #servers or the fraction of high-performance servers. Fig. 8–9 show the corresponding
+22
+
+
+--- Page 23 ---
+Output sequence length
+64
+128
+256
+384
+512
+Avg per-token inference time (s)
+0
+2
+4
+6
+8
+10
+12
+14
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(a) AboveNet
+Output sequence length
+64
+128
+256
+384
+512
+Avg per-token inference time (s)
+0
+5
+10
+15
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(b) BellCanada
+Output sequence length
+64
+128
+256
+384
+512
+Avg per-token inference time (s)
+0
+1
+2
+3
+4
+5
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(c) GTS-CE
+Figure 9: Inference time per token when varying the sequence length 𝑙max (𝐶= 0.4 · #nodes, 𝜂= 0.2, 𝜆= 0.5,
+𝑁𝑅= 100, 𝑙𝐼
+max = 20).
+results as we vary the demands in terms of the request rate or the sequence length. As additional benchmarks, we
+simulate three variations of PETALS’ algorithm in addition to the original version in [8]: (1) applying PETALS’
+block placement algorithm to servers in an optimized order computed by line 1 of our Alg. 2 (‘Optimized Or-
+der’), (2) applying PETALS’ block placement algorithm but placing the same number of blocks per server as
+our algorithm (‘Optimized Number’), and (3) optimizing the request routing according to the MILP (21) under
+the block placement given by PETALS (‘Optimized RR’). Besides additional benchmarks, these variations also
+serve the purpose of an ablation study as they each contain one aspect of our proposed solution.
+First of all, all the simulations confirm that the proposed algorithm can significantly accelerate the inference
+in comparison to the original algorithm in PETALS.
+Moreover, these results suggest that: (i) optimizing the allocation of GPU memory between model blocks
+and attention caches as in ‘Optimized Number’ can improve the inference time in most cases, particularly under
+relatively high demands; (ii) optimizing the order of block placement across servers as in ‘Optimized Order’
+may help in some cases, but does not always improve the inference time; (iii) similarly, optimizing request rout-
+ing as in ‘Optimized RR’ may help in some cases, but can worsen the performance for long sequences (Fig. 9).
+In contrast, our proposed solution that combines all these ideas is able to improve the performance in all the
+tested cases. This observation highlights the importance of systematically formulating and solving the resource
+allocation problem in distributed LLM inference systems. Meanwhile, the fact that ‘Optimized Order’ and ‘Op-
+timized RR’ can sometimes underperform the original algorithm in PETALS suggests the suboptimality of the
+greedy block placement and myopic request scheduling strategy, which leaves potential room for improvement
+in future work.
+Furthermore, comparing across the simulated cases indicates a trend that the performance improvement
+achieved by our proposed solution is larger in more resource-constrained scenarios (e.g., fewer servers/high-
+performance servers or higher request rate), in which case good resource allocation is more important. We note
+that in practice, the demands usually grow with the system size. Thus, we further simulate a case of propor-
+tionally increasing #servers and request rate in Fig. 13, which shows a clear trend of widening performance gap
+between our solution and PETALS, indicating the potential for our solution to achieve even greater performance
+improvements in larger deployments. We also conduct a sensitivity analysis with respect to the load parameter
+|R| as shown in Fig. 14, which shows that while the configuration of this parameter affects the performance of
+our solution, its impact is mild and our solution remains superior to the benchmarks over a wide range of actual
+loads.
+Meanwhile, our algorithm has slightly higher running times than the original algorithm in PETALS in some
+cases (see Fig. 15–20 in C.2), but the difference is negligible compared to the actual inference time.
+23
+
+
+--- Page 24 ---
+5
+Conclusion
+In this work, we systematically studied the problem of performance optimization for geographically-distributed
+LLM inference, using PETALS as a concrete example. Using experimentally validated performance models, we
+formulated the optimal offline block placement and request routing problem as a MILP, proved its NP-hardness,
+and developed a polynomial-complexity algorithm with guaranteed performance. We then adapted our algorithm
+into a two-time-scale solution for the online setting with a guaranteed completion time under bounded load. Our
+experiments and cross-validated simulations in diverse settings not only confirmed the capability of the proposed
+algorithm in significantly reducing the inference times, but also provided insights on the key factors driving
+such improvement. In addition to the developed algorithm, this work also produced a light-weighted CPU-only
+simulator capable of predicting the performance of distributed LLM inference on profiled GPU servers, which
+will be open-sourced to facilitate future research on the performance of LLM for researchers with limited GPU
+access.
+References
+[1] Tom B. Brown, Benjamin Mann, Nick Ryder, et al. Language models are few-shot learners. In International
+Conference on Neural Information Processing Systems, 2020.
+[2] Susan Zhang, Stephen Roller, Naman Goyal, et al. OPT: Open pre-trained transformer language models.
+arXiv preprint arXiv:2205.01068, 2022.
+[3] Teven Le Scao, Angela Fan, Christopher Akiki, et al. BLOOM: A 176B-parameter open-access multilin-
+gual language model, 2023.
+[4] Hugo Touvron, Thibaut Lavril, Gautier Izacard, et al. Llama: Open and efficient foundation language
+models, 2023.
+[5] Hugo Touvron, Louis Martin, Kevin Stone, et al. Llama 2: Open foundation and fine-tuned chat models,
+2023.
+[6] NVIDIA. Ampere GA102 GPU Architecture, 2020.
+[7] Feiyang Chen, Ziqian Luo, Lisang Zhou, Xueting Pan, and Ying Jiang. Comprehensive survey of model
+compression and speed up for vision transformers. arXiv preprint arXiv:2404.10407, 2024.
+[8] Alexander Borzunov, Max Ryabinin, Artem Chumachenko, et al. Distributed inference and fine-tuning of
+large language models over the internet. In Advances in Neural Information Processing Systems, volume 36,
+pages 12312–12331, 2023.
+[9] Yanping Huang, Youlong Cheng, Ankur Bapna, et al. Gpipe: Efficient training of giant neural networks
+using pipeline parallelism. In Advances in Neural Information Processing Systems, volume 32, 2019.
+[10] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, et al. Pipedream: generalized pipeline parallelism
+for dnn training. In Proceedings of the 27th ACM Symposium on Operating Systems Principles, page 1–15,
+2019.
+[11] Bowen Yang, Jian Zhang, Jonathan Li, et al. Pipemare: Asynchronous pipeline parallel dnn training. In
+Proceedings of Machine Learning and Systems, pages 269–296, 2021.
+[12] Alex Krizhevsky, Ilya Sutskever, and Geoffrey E. Hinton. ImageNet classification with deep convolutional
+neural networks. Communications of the ACM, 60(6):84–90, May 2017.
+24
+
+
+--- Page 25 ---
+[13] Tal Ben-Nun and Torsten Hoefler. Demystifying parallel and distributed deep learning: An in-depth con-
+currency analysis. ACM Comput. Surv., 52(4), Aug 2019.
+[14] Zhenheng Tang, Shaohuai Shi, Xiaowen Chu, Wei Wang, and Bo Li. Communication-efficient distributed
+deep learning: A comprehensive survey. CoRR, abs/2003.06307, 2020.
+[15] Ashish Vaswani, Noam Shazeer, Niki Parmar, et al. Attention is all you need. In Proceedings of the 31st
+International Conference on Neural Information Processing Systems, page 6000–6010, 2017.
+[16] BigScience Workshop. Petals. https://github.com/bigscience-workshop/petals, 2025. Source
+code repository.
+[17] vLLM Project. vllm: Distributed inference and serving. https://docs.vllm.ai/en/stable/index.html.
+Accessed: 2025-09-01.
+[18] A. Sprenger.
+Ray vllm inference.
+https://github.com/asprenger/ray_vllm_inference.
+Ac-
+cessed: 2025-09-01.
+[19] NVIDIA.
+A
+datacenter
+scale
+distributed
+inference
+serving
+framework.
+https://github.com/ai-dynamo/dynamo. Accessed: 2025-09-01.
+[20] Amazon Web Services. Amazon elastic kubernetes service. https://aws.amazon.com/eks/. Ac-
+cessed: 2025-09-01.
+[21] Bharadwaj Pudipeddi, Maral Mesmakhosroshahi, Jinwen Xi, and Sujeeth Bharadwaj. Training large neural
+networks with constant memory using a new execution algorithm. CoRR, abs/2002.05645, 2020.
+[22] Jie Ren, Samyam Rajbhandari, Reza Yazdani Aminabadi, et al. ZeRO-Offload: Democratizing Billion-
+Scale model training. In 2021 USENIX Annual Technical Conference (USENIX ATC 21), pages 551–564,
+Jul 2021.
+[23] Samyam Rajbhandari, Olatunji Ruwase, Jeff Rasley, Shaden Smith, and Yuxiong He.
+ZeRO-infinity:
+breaking the GPU memory wall for extreme scale deep learning. In Proceedings of the International
+Conference for High Performance Computing, Networking, Storage and Analysis, 2021.
+[24] Ahmed M. Medhat, Tarik Taleb, Asma Elmangoush, et al. Service function chaining in next generation
+networks: State of the art and research challenges. IEEE Communications Magazine, 55(2):216–223,
+2017.
+[25] Weihan Chen, Xia Yin, Zhiliang Wang, Xingang Shi, and Jiangyuan Yao. Placement and routing optimiza-
+tion problem for service function chain: State of art and future opportunities. In Xingming Sun, Jinwei
+Wang, and Elisa Bertino, editors, Artificial Intelligence and Security, pages 176–188, Singapore, 2020.
+Springer Singapore.
+[26] Insun Jang, Dongeun Suh, Sangheon Pack, and György Dán. Joint optimization of service function place-
+ment and flow distribution for service function chaining. IEEE Journal on Selected Areas in Communica-
+tions, 35(11):2532–2541, 2017.
+[27] Qixia Zhang, Yikai Xiao, Fangming Liu, John C.S. Lui, Jian Guo, and Tao Wang. Joint optimization of
+chain placement and request scheduling for network function virtualization. In IEEE 37th International
+Conference on Distributed Computing Systems (ICDCS), pages 731–741, 2017.
+25
+
+
+--- Page 26 ---
+[28] Linqi Guo, John Pang, and Anwar Walid. Joint placement and routing of network function chains in data
+centers. In IEEE INFOCOM 2018 - IEEE Conference on Computer Communications, pages 612–620,
+2018.
+[29] Xiaojun Shang, Zhenhua Liu, and Yuanyuan Yang. Network congestion-aware online service function
+chain placement and load balancing. In Proceedings of the 48th International Conference on Parallel
+Processing, 2019.
+[30] Maryam Jalalitabar, Yang Wang, and Xiaojun Cao. Branching-aware service function placement and rout-
+ing in network function virtualization. In IEEE Conference on Network Function Virtualization and Soft-
+ware Defined Networks (NFV-SDN), pages 1–6, 2019.
+[31] Wenrui Ma, Oscar Sandoval, Jonathan Beltran, Deng Pan, and Niki Pissinou. Traffic aware placement of
+interdependent nfv middleboxes. In IEEE Conference on Computer Communications (INFOCOM), pages
+1–9, 2017.
+[32] Alec Radford, Karthik Narasimhan, Tim Salimans, and Ilya Sutskever. Improving language understanding
+by generative pre-training. 2018.
+[33] Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Language models
+are unsupervised multitask learners. 2019.
+[34] Mediatech
+Group.
+The
+impact
+of
+prompt
+length
+on
+llm
+performance:
+A
+data-driven
+study.
+https://mediatech.group/prompt-engineering/
+the-impact-of-prompt-length-on-llm-performance-a-data-driven-study/.
+Accessed:
+2025-09-01.
+[35] Reddit /r/PromptEngineering.
+Shorter prompts lead to 40% better code generation by llms.
+https://www.reddit.com/r/PromptEngineering/comments/1do6wx4/shorter_prompts_
+lead_to_40_better_code_generation/. Accessed: 2025-09-01.
+[36] Alexander Borzunov, Dmitry Baranchuk, Tim Dettmers, et al. Petals: Collaborative inference and fine-
+tuning of large models, 2023.
+[37] Brian Hayes. Computing science: The easiest hard problem. American Scientist, 90(2):113–117, 2002.
+[38] NVIDIA Corporation.
+Nvidia multi-instance gpu user guide.
+https://docs.nvidia.com/
+datacenter/tesla/mig-user-guide/index.html, 2025.
+[39] Daniel Schubert, Benedikt Jaeger, and Max Helm. Network emulation using linux network namespaces.
+Network, 57, 2019.
+[40] Simon Knight, Hung X Nguyen, Nickolas Falkner, Rhys Bowden, and Matthew Roughan. The internet
+topology zoo. IEEE Journal on Selected Areas in Communications, 29(9):1765–1775, 2011.
+[41] Steven Gay, Pierre Schaus, and Stefano Vissicchio. Repetita: Repeatable experiments for performance
+evaluation of traffic-engineering algorithms. arXiv preprint arXiv:1710.08665, 2017.
+[42] Gurobi Optimization, LLC. Gurobi optimization. https://www.gurobi.com/. Accessed: 2025-09-01.
+26
+
+
+--- Page 27 ---
+…
+𝑏
+𝑇𝑏/|ℛ|
+…
+…
+…
+1
+𝑚1
+𝑚1 + 𝑚2
+෍
+𝑗=1
+𝐾−1
+𝑚𝑗
+𝐿
+ǁ𝑡1
+ǁ𝑡2
+ǁ𝑡𝐾−1
+ǁ𝑡𝐾
+…
+…
+…
+…
+Figure 10: Illustration of 𝑇𝑏in Alg. 1 after placing all the blocks.
+A
+Supporting Proofs
+Proof of Lemma 3.1. Denote the sequence of servers on 𝑝by 𝑖1, . . . , 𝑖𝑛. For the first hop (𝑐, 𝑖1), 𝑎𝑖1 ≤𝑎𝑐+𝑚𝑐=
+1 ≤𝑎𝑖1 + 𝑚𝑖1 −1 implies that block 1 is hosted by server 𝑖1, i.e., the first 𝑎𝑖1 + 𝑚𝑖1 −1 blocks can be found
+in order by traversing 𝑝up to 𝑖1. Similarly, if the first 𝑎𝑖𝑘+ 𝑚𝑖𝑘−1 blocks (𝑘∈[𝑛−1]) can be found in
+order up to 𝑖𝑘, then 𝑎𝑖𝑘+1 ≤𝑎𝑖𝑘+ 𝑚𝑖𝑘≤𝑎𝑖𝑘+1 + 𝑚𝑖𝑘+1 −1 implies that the first 𝑎𝑖𝑘+1 + 𝑚𝑖𝑘+1 −1 blocks can be
+found in order up to 𝑖𝑘+1. Thus, the first 𝑎𝑖𝑛+ 𝑚𝑖𝑛−1 blocks can be found in order up to 𝑖𝑛. Moreover, since
+𝐿+ 1 = 𝑎𝑐′ ≤𝑎𝑖𝑛+ 𝑚𝑖𝑛≤𝑎𝑐′ + 𝑚𝑐′ −1 = 𝐿+ 1, 𝑎𝑖𝑛+ 𝑚𝑖𝑛−1 = 𝐿. Thus, all the blocks can be found in order
+along path 𝑝, i.e., 𝑝is feasible.
+Proof of Theorem 3.2. We prove this theorem by a reduction from the optimization version of the partition
+problem [37]. Given a set of positive integers𝑊with Δ := (Í
+𝑤∈𝑊𝑤)/2, the optimization version of the partition
+problem aims at finding a partition of 𝑊into 𝑊1 and 𝑊2 such that | Í
+𝑤∈𝑊1 𝑤−Í
+𝑤∈𝑊2 𝑤| is minimized. Without
+loss of generality, assume all the numbers in 𝑊to be even and upper-bounded by11 Δ. We construct an instance
+of the BPRR problem as follows: set the total number of blocks to 𝐿= 2; construct a single client 𝑉𝑐:= {𝑐} with
+|R𝑐| = Δ; construct a server 𝑗for each 𝑤𝑗∈𝑊, and set 𝑠𝑚, 𝑠𝑐, and 𝑀𝑗such that 𝑠𝑚+ 𝑠𝑐𝑤𝑗= 𝑀𝑗< 2𝑠𝑚; set
+𝑡𝑗:= 𝑡𝑐𝑗+ 𝜏𝑗= 1 for each 𝑤𝑗∈𝑊; construct another server 0 (assuming 𝑤0 ∉𝑊) with 𝑠𝑚+ 𝑠𝑐Δ = 𝑀0 < 2𝑠𝑚
+and 𝑡0 := 𝑡𝑐0 + 𝜏0 = 2. This construction is possible as long as 𝑠𝑚/𝑠𝑐> Δ (which implies 𝑠𝑚/𝑠𝑐> 𝑤𝑗,
+∀𝑤𝑗∈𝑊). For any partition (𝑊1, 𝑊2) with Í
+𝑤∈𝑊1 𝑤≥Í
+𝑤∈𝑊2 𝑤, let 𝜖:= 1
+2 (Í
+𝑤∈𝑊1 𝑤−Í
+𝑤∈𝑊2 𝑤), i.e.,
+Í
+𝑤∈𝑊1 𝑤= Δ + 𝜖and Í
+𝑤∈𝑊2 𝑤= Δ −𝜖. The assumption of 𝑊containing only even numbers ensures that Δ
+and 𝜖are both nonnegative integers. By construction, every server can only store one block, server 𝑗for each
+𝑤𝑗∈𝑊can serve 𝑤𝑗parallel sessions with a per-token inference time of 𝑡𝑗= 1, and server 0 can serve Δ
+parallel sessions with a per-token inference time of 𝑡0 = 2. It is easy to see that the optimal objective value of
+the constructed instance of BPRR conditioned on placing block 1 at the servers in 𝑆1 := { 𝑗: 𝑤𝑗∈𝑊1} and
+block 2 at the servers in 𝑆2 := { 𝑗: 𝑤𝑗∈𝑊2} ∪{0} is 2Δ + 𝜖, achieved by routing the maximum #requests to
+the faster servers before using server 0. Thus, minimizing the subset sum difference for the partition problem
+is equivalent to minimizing the objective value of the corresponding BPRR problem. The proof completes by
+noting that the optimization version of the partition problem is NP-hard [37].
+Proof of Lemma 3.3. As servers are considered in the increasing order of e𝑡𝑗(line 3), the value of 𝑇𝑏for each
+block 𝑏only changes once from e𝑡0|R| to e𝑡𝑗𝑏|R|, when block 𝑏is placed for the first time on a server 𝑗𝑏∈
+𝑉𝑠. Therefore, with “arg max” breaking ties in favor of smaller index, line 5 will select continuous blocks for
+each server before all the blocks are placed, i.e., server 1 will host blocks 1, . . . , 𝑚1, server 2 will host blocks
+𝑚1 + 1, . . . , 𝑚1 + 𝑚2, etc. This continues until server 𝐾:= min{𝑘: Í𝑘
+𝑗=1 𝑚𝑗≥𝐿}, for which the “arg max”
+in line 5 will be achieved at the last possible index 𝑎𝐾= 𝐿−𝑚𝐾+ 1. The resulting 𝑇𝑏’s form a monotone
+11The first assumption is because we can scale all the numbers by 2 without changing the solution. The second assumption is because
+if ∃𝑤∗∈𝑊such that 𝑤∗> Δ, then the optimal solution is simply 𝑊1 = {𝑤∗} and 𝑊2 = 𝑊\ {𝑤∗}, and thus it suffices to consider
+instances where 𝑤≤Δ for all 𝑤∈𝑊.
+27
+
+
+--- Page 28 ---
+increasing piece-wise constant series as shown in Fig. 10. Under the conservative setting of 𝑚𝑗in line 1 and this
+block placement, the relaxed request routing will simply route all the |R| requests through the first 𝐾servers,
+achieving an average per-token inference time of
+𝐾
+Õ
+𝑗=1
+𝑚𝑗e𝑡𝑗−e𝑡𝐾(
+𝐾
+Õ
+𝑗=1
+𝑚𝑗−𝐿),
+(23)
+where the second term is to adjust for the Í𝐾
+𝑗=1 𝑚𝑗−𝐿blocks hosted on both server 𝐾−1 and server 𝐾, as they
+will only be processed at server 𝐾−1. Meanwhile, since these are the fastest servers (in terms of e𝑡𝑗) that can
+host the entire model, the minimum per-token inference time under the relaxed request routing is lower-bounded
+by (23). This completes the proof.
+Proof of Lemma 3.4. Due to the conservative calculation of the number of blocks per server (line 1), the GPU
+memory capacity will always be satisfied, i.e., (16b) can be ignored. This decouples (16) into |𝑉𝑐| independent
+routing problems for each client.
+For each client 𝑐, the route feasibility constraints (11)–(12) can be enforced by limiting its request routing to
+a subgraph 𝐺𝑐
+𝒂,𝒎= (𝑉𝑐, 𝐸𝑐
+𝒂,𝒎) of 𝐺, where 𝑉𝑐only contains the servers 𝑉𝑠and the S-client/D-client of 𝑐, and
+𝐸𝑐
+𝒂,𝒎only contains feasible routing links, i.e., (𝑖, 𝑗) ∈𝐸𝑐
+𝒂,𝒎if and only if (3) is satisfied. Each link (𝑖, 𝑗) ∈𝐸𝑐
+𝒂,𝒎
+has a routing cost of 𝑡𝑐
+𝑖𝑗. It is easy to see that the subproblem of (16) for client 𝑐is equivalent to the problem of
+finding the shortest (i.e., least-cost) path from the S-client to the D-client in 𝐺𝑐
+𝒂,𝒎(line 10). In absence of the
+capacity constraint (16b), the optimal paths for all the requests from the same client are the same (line 11). This
+completes the proof.
+Proof of Theorem 3.5. Recall that 𝑡∗𝑗:= max𝑐∈𝑉𝑐𝑡𝑐𝑗. Since by Lemma 3.4 the shortest-path request routing
+is optimal under the block placement by CG-BPRR, the average per-token inference time 𝑇𝑔achieved by CG-
+BPRR is upper-bounded by the average per-token inference time under any request routing that is feasible under
+the block placement given by CG-BPRR. Specifically, consider a solution that routes all the requests through
+the chain of servers 1, . . . , 𝐾. By the proof of Lemma 3.3, server 1 will host the first 𝑚1 blocks, server 2 will
+host the next 𝑚2 blocks, etc., and server 𝐾will host the last 𝑚𝐾blocks. Thus, servers 1, . . . , 𝐾collectively host
+all the blocks. Moreover, due to the conservative computation of 𝑚𝑗in line 1 of Alg. 1, each server has enough
+capacity to serve all the requests concurrently. Thus, the above routing is feasible. Under this solution, server 𝑗
+(𝑗= 1, . . . , 𝐾−1) processes 𝑚𝑗blocks, yielding a per-token inference time of
+𝑡𝑐𝑗+ 𝜏𝑗𝑚𝑗≤𝑡∗𝑗+ 𝜏𝑗𝑚𝑗= 𝑚𝑗e𝑡𝑗,
+∀𝑐∈𝑉𝑐.
+(24)
+Meanwhile, server 𝐾only processes the last 𝐿−Í𝐾−1
+𝑗=1 𝑚𝑗blocks, yielding a per-token inference time of
+𝑡𝑐𝐾+ 𝜏𝐾(𝐿−
+𝐾−1
+Õ
+𝑗=1
+𝑚𝑗) ≤𝑡∗𝐾+ 𝜏𝐾(𝐿−
+𝐾−1
+Õ
+𝑗=1
+𝑚𝑗) = 𝑡∗𝐾
+ Í𝐾
+𝑗=1 𝑚𝑗−𝐿
+𝑚𝐾
+!
++ (𝐿−
+𝐾−1
+Õ
+𝑗=1
+𝑚𝑗)e𝑡𝐾, ∀𝑐∈𝑉𝑐.
+(25)
+The average per-token inference time 𝑇
+𝑔under the above routing solution is thus upper-bounded by
+𝑇
+𝑔≤
+𝐾−1
+Õ
+𝑗=1
+𝑚𝑗e𝑡𝑗+ 𝑡∗𝐾
+ Í𝐾
+𝑗=1 𝑚𝑗−𝐿
+𝑚𝐾
+!
++ (𝐿−
+𝐾−1
+Õ
+𝑗=1
+𝑚𝑗)e𝑡𝐾
+=
+𝐾
+Õ
+𝑗=1
+e𝑡𝑗𝑚𝑗−©­
+«
+𝐾
+Õ
+𝑗=1
+𝑚𝑗−𝐿ª®
+¬
+
+e𝑡𝐾−𝑡∗𝐾
+𝑚𝐾
+
+=
+𝐾
+Õ
+𝑗=1
+e𝑡𝑗𝑚𝑗−𝜏𝐾©­
+«
+𝐾
+Õ
+𝑗=1
+𝑚𝑗−𝐿ª®
+¬
+,
+(26)
+28
+
+
+--- Page 29 ---
+20
+30
+40
+50
+60
+70
+80
+90
+100
+Input Length (tokens)
+0
+1
+2
+3
+4
+5
+6
+Inference Time (s)
+Modeled
+Real – 1 Concurrent Request
+Real – 10 Concurrent Requests
+Real – 20 Concurrent Requests
+Real - 30 Concurrent Requests
+(a) first token
+20
+30
+40
+50
+60
+70
+80
+90
+100
+Input Length (tokens)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+Inference Time (s)
+Modeled
+Real – 1 Concurrent Request
+Real – 10 Concurrent Requests
+Real – 20 Concurrent Requests
+Real - 30 Concurrent Requests
+(b) each of remaining tokens
+Figure 11: Inference time vs. input length on A100: (a) for first token generation (b) for rest of token generation
+(40 blocks, 𝑙max = 128).
+where (26) is because e𝑡𝐾−𝑡∗𝐾/𝑚𝐾= 𝜏𝐾by the definition in (14). The proof is completed by noting that
+𝑇𝑔≤𝑇
+𝑔.
+Proof of Corollary 3.6. The result is directly applied by Theorem 3.5. Specifically, if the number of concurrent
+requests is no more than |R|, then the block placement by CG-BP ensures that there is no memory contention
+between requests, i.e., each request can be routed independently of the others. Since the average per-token
+inference time under the feasible but possibly suboptimal request routing through servers 1, . . . , 𝐾is already
+bounded by (17) as shown in the proof of Theorem 3.5, the average per-token inference time under the optimal
+request routing must be bounded by (17).
+Proof of Corollary 3.7. The first claim follows from the fact that the completion time of 𝑟∗(i.e., the time from
+its arrival to its completion) if scheduled to path 𝑝𝑐(𝑡) is
+max
+(𝑖, 𝑗)∈𝑝𝑐(𝑡) 𝑡𝐴
+𝑖𝑗+ 𝑙max
+Õ
+(𝑖, 𝑗)∈𝑝𝑐(𝑡)
+𝑡𝑐
+𝑖𝑗≤
+Õ
+(𝑖, 𝑗)∈𝑝𝑐(𝑡)
+
+𝑡𝐴
+𝑖𝑗(𝑡) + 𝑙max𝑡𝑐
+𝑖𝑗
+
+.
+(27)
+The second claim follows from the fact that there is no waiting time if the number of concurrent requests
+is within |R|, i.e., 𝑡𝐴
+𝑖𝑗(𝑡) ≡0 ∀(𝑖, 𝑗). In this case, the bound (27) is tight, i.e., the cost of a path equals the
+completion time on this path. By definition, 𝑝𝑐(𝑡) minimizes the path cost, and thus it achieves the minimum
+completion time.
+B
+Other Supporting Materials
+B.1
+Additional Results on Performance Model Validation
+In addition to the number of processed blocks as in Fig. 2, we have also evaluated the inference time incurred
+at a given server under varying input/output length as shown in Fig. 11–12. These results have validated our
+inference time model by confirming that the inference time for the first token only depends on the input length
+𝑙𝐼
+max but not the output length 𝑙max, and the inference time for each of the subsequent tokens does not depend on
+either the input or the output length. Besides A100, we have also validated our performance models on an MIG,
+which shows similar results.
+29
+
+
+--- Page 30 ---
+32
+64
+128
+256
+512
+Output Length (tokens)
+0
+1
+2
+3
+4
+5
+6
+7
+8
+Inference Time (s)
+Modeled
+Real – 1 Concurrent Request
+Real – 10 Concurrent Request
+Real – 20 Concurrent Requests
+Real – 30 Concurrent Requests
+(a) first token
+32
+64
+128
+256
+512
+Output Length (tokens)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+Inference Time (s)
+Modeled
+Real – 1 Concurrent Request
+Real – 10 Concurrent Request
+Real – 20 Concurrent Requests
+Real – 30 Concurrent Requests
+(b) each of remaining tokens
+Figure 12: Inference time vs. output length on A100: (a) for first token generation (b) for rest of token generation
+(40 blocks, 𝑙𝐼
+max = 20).
+B.2
+Extension to Heterogeneous Input/Output Lengths
+In the heterogeneous case where each request 𝑟∈R has an input length 𝑙𝐼
+𝑟and an output length 𝑙𝑟, the attention
+cache size becomes heterogeneous 𝑠𝑟
+𝑐:= 2𝑑model · (𝑙𝐼
+𝑟+ 𝑙𝑟) · dtype_bytes (bytes). Our formulation (6) can be
+easily extended by replacing the objective function (6a) with
+Õ
+𝑐∈𝑉𝑐
+Õ
+𝑟∈R𝑐
+Õ
+𝑝∈𝑃𝑐(𝒂,𝒎)
+𝑓𝑟
+𝑝𝑙𝑟
+Õ
+(𝑖, 𝑗)∈𝑝
+𝑡𝑟
+𝑖𝑗,
+(28)
+where 𝑡𝑟
+𝑖𝑗denotes the per-token inference time incurred by request 𝑟at link (𝑖, 𝑗) averaged over all the tokens
+generated for this request, and the constraint (6b) with
+𝑠𝑚𝑚𝑗+
+Õ
+𝑐∈𝑉𝑐
+Õ
+𝑟∈R𝑐
+𝑠𝑟
+𝑐
+Õ
+𝑝∈𝑃𝑐(𝒂,𝒎):
+(𝑖, 𝑗)∈𝑝,∃𝑖
+𝑓𝑟
+𝑝(𝑎𝑗+ 𝑚𝑗−𝑎𝑖−𝑚𝑖) ≤𝑀𝑗, ∀𝑗∈𝑉𝑠.
+(29)
+Similar to (8), 𝑡𝑟
+𝑖𝑗is defined as:
+ 1
+𝑙𝑟
+𝑡𝐼
+𝑐𝑗(𝑙𝐼
+𝑟) + 𝑙𝑟−1
+𝑙𝑟
+𝑡𝑐𝑗
+
++
+ 1
+𝑙𝑟
+𝜏𝐼
+𝑗(𝑙𝐼
+𝑟) + 𝑙𝑟−1
+𝑙𝑟
+𝜏𝑗
+
+(𝑎𝑗+ 𝑚𝑗−𝑎𝑖−𝑚𝑖).
+(30)
+When 𝑙𝐼
+𝑟≪𝑙𝑟for all 𝑟∈R, (30) can be simplified to (4), where 𝑐is the client sending request 𝑟.
+Since this change only affects some constant scaling factors, we can still convert the resulting optimization
+into a MILP as in Section 3.2.2. With 𝑠𝑐:= max𝑟𝑠𝑟
+𝑐, CG-BPRR can still be used to obtain a feasible solution in
+the offline setting. We note that since in practice the requests arrive dynamically, the precise input/output length
+for each request is unknown ahead of time. In this sense, our proposed solution based on (6) allocates resources
+according to the maximum input and output lengths to ensure feasibility while trying to optimize the worst-case
+performance, where the maximum input and output lengths are system parameters announced to the clients.
+B.3
+Linearization of Bilinear Terms
+To linearize the bilinear terms 𝑎𝑗𝑓𝑟
+𝑖𝑗, 𝑎𝑖𝑓𝑟
+𝑖𝑗, 𝑚𝑗𝑓𝑟
+𝑖𝑗, and 𝑚𝑖𝑓𝑟
+𝑖𝑗, we introduce auxiliary variables 𝛼𝑟
+𝑖𝑗, 𝛽𝑟
+𝑖𝑗, 𝛾𝑟
+𝑖𝑗, 𝛿𝑟
+𝑖𝑗≥
+0 as well as the following linear constraints. Specifically, using the constraints
+−(𝐿+ 1) 𝑓𝑟
+𝑖𝑗+ 𝛼𝑟
+𝑖𝑗≤0,
+(31a)
+−𝑎𝑗+ 𝛼𝑟
+𝑖𝑗≤0,
+(31b)
+𝑎𝑗+ (𝐿+ 1) 𝑓𝑟
+𝑖𝑗−𝛼𝑟
+𝑖𝑗≤𝐿+ 1,
+(31c)
+30
+
+
+--- Page 31 ---
+Algorithm 2: Two-time-scale BPRR for Online Setting
+input : set of clients 𝑉𝑐, target #requests |R|, #blocks 𝐿, size per block 𝑠𝑚, size per cache 𝑠𝑐, set of servers 𝑉𝑠,
+parameters for each 𝑗∈𝑉𝑠including GPU memory 𝑀𝑗, processing time 𝜏𝑗, and per-token RTTs
+(𝑡𝑐𝑗)𝑐∈𝑉𝑐
+output
+:
+Block placement (𝒂, 𝒎) and request routing 𝒇
+// Conservative Greedy Block Placement (CG-BP):
+𝑚𝑗←min(⌊𝑀𝑗/(𝑠𝑚+ 𝑠𝑐|R|)⌋, 𝐿), ∀𝑗∈𝑉𝑠;
+𝐶𝑏←0, 𝑇𝑏←e𝑡0|R|, ∀𝑏∈[𝐿];
+for each server 𝑗∈𝑉𝑠in increasing order ofe𝑡𝑗1 do
+if ∃𝑏∈[𝐿] with 𝐶𝑏< |R| then
+𝑎𝑗←arg max𝑎∈[𝐿−𝑚𝑗+1]: 𝐶𝑏<|R|, ∃𝑏∈{𝑎,...,𝑎+𝑚𝑗−1}
+Í𝑎+𝑚𝑗−1
+𝑏′=𝑎
+𝑇𝑏′;
+else
+𝑎𝑗←arg min𝑎∈[𝐿−𝑚𝑗+1](𝐶𝑎, . . . , 𝐶𝑎+𝑚𝑗−1);
+𝑇𝑏←𝑇𝑏−(e𝑡0 −e𝑡𝑗) min
+
+max(|R| −𝐶𝑏, 0), 𝑓𝑗
+
+, ∀𝑏∈{𝑎𝑗, . . . , 𝑎𝑗+ 𝑚𝑗−1};
+𝐶𝑏←𝐶𝑏+ 𝑓𝑗, ∀𝑏∈{𝑎𝑗, . . . , 𝑎𝑗+ 𝑚𝑗−1};
+// Waiting-penalized Shortest-path Request Routing (WS-RR):
+for each new request 𝑟arriving from client 𝑐at time 𝑡do
+𝐺𝑐
+𝒂,𝒎(𝑡) ←the feasible routing topology for client 𝑐under block placement (𝒂, 𝒎), with a node/link set
+(𝑉𝑐, 𝐸𝑐
+𝒂,𝒎) and a waiting-penalized cost of 𝑡𝑊
+𝑖𝑗(𝑡) + 𝑙max𝑡𝑐
+𝑖𝑗for each (𝑖, 𝑗) ∈𝐸𝑐
+𝒂,𝒎;
+𝑝𝑐(𝑡) ←shortest path from the S-client to the D-client in 𝐺𝑐
+𝒂,𝒎(𝑡);
+𝑓𝑟
+𝑖𝑗←⊮((𝑖, 𝑗) ∈𝑝𝑐(𝑡)), ∀(𝑖, 𝑗) ∈𝐸;
+we can ensure that 𝛼𝑟
+𝑖𝑗= 𝑎𝑗𝑓𝑟
+𝑖𝑗for both 𝑓𝑟
+𝑖𝑗= 0 and 𝑓𝑟
+𝑖𝑗= 1 (the ‘𝐿+ 1’ is to cover the case of 𝑎𝑗= 𝐿+ 1 for
+𝑗∈𝑉𝐷
+𝑐). Similarly, we can ensure that 𝛽𝑟
+𝑖𝑗= 𝑎𝑖𝑓𝑟
+𝑖𝑗by the constraints
+−𝐿𝑓𝑟
+𝑖𝑗+ 𝛽𝑟
+𝑖𝑗≤0,
+(32a)
+−𝑎𝑖+ 𝛽𝑟
+𝑖𝑗≤0,
+(32b)
+𝑎𝑖+ 𝐿𝑓𝑟
+𝑖𝑗−𝛽𝑟
+𝑖𝑗≤𝐿,
+(32c)
+𝛾𝑟
+𝑖𝑗= 𝑚𝑗𝑓𝑟
+𝑖𝑗by the constraints
+−𝐿𝑓𝑟
+𝑖𝑗+ 𝛾𝑟
+𝑖𝑗≤0,
+(33a)
+−𝑚𝑗+ 𝛾𝑟
+𝑖𝑗≤0,
+(33b)
+𝑚𝑗+ 𝐿𝑓𝑟
+𝑖𝑗−𝛾𝑟
+𝑖𝑗≤𝐿,
+(33c)
+and 𝛿𝑟
+𝑖𝑗= 𝑚𝑖𝑓𝑟
+𝑖𝑗by the constraints
+−𝐿𝑓𝑟
+𝑖𝑗+ 𝛿𝑟
+𝑖𝑗≤0,
+(34a)
+−𝑚𝑖+ 𝛿𝑟
+𝑖𝑗≤0,
+(34b)
+𝑚𝑖+ 𝐿𝑓𝑟
+𝑖𝑗−𝛿𝑟
+𝑖𝑗≤𝐿.
+(34c)
+B.4
+Approximation Ratio of CG-BPRR
+In addition to the upper bound in Theorem 3.5, we can also lower-bound the inference time as follows. Let
+𝑚𝑗:= min(⌊𝑀𝑗/(𝑠𝑚+ 𝑠𝑐)⌋, 𝐿) denote the maximum number of blocks that can be placed at server 𝑗(while still
+31
+
+
+--- Page 32 ---
+able to serve at least one request), ande𝑡𝑗,𝑐:= 𝜏𝑗+𝑡𝑐𝑗/𝑚𝑗denote the minimum amortized inference time that server
+𝑗can provide for generating a token for client 𝑐. Let 𝑗(𝑐)
+𝑘
+denote a server index such thate𝑡𝑗(𝑐)
+1
+,𝑐≤· · · ≤e𝑡𝑗(𝑐)
+|𝑉𝑠|,𝑐.
+Lemma B.1. The minimum per-token inference time for client 𝑐is lower-bounded by
+𝑇𝑜
+𝑐:=
+𝐾𝑐−1
+Õ
+𝑘=1
+e𝑡𝑗(𝑐)
+𝑘
+,𝑐𝑚𝑗(𝑐)
+𝑘
++e𝑡𝑗(𝑐)
+𝐾𝑐,𝑐
+ 
+𝐿−
+𝐾𝑐−1
+Õ
+𝑘=1
+𝑚𝑗(𝑐)
+𝑘
+!
+,
+(35)
+where 𝐾𝑐:= min{𝐾: Í𝐾
+𝑘=1 𝑚𝑗(𝑐)
+𝑘
+≥𝐿}. Thus, the minimum average per-token inference time 𝑇𝑜for the
+requests {R𝑐}𝑐∈𝑉𝑐is lower-bounded by 𝑇𝑜≥
+1
+|R|
+Í
+𝑐∈𝑉𝑐|R𝑐|𝑇𝑜
+𝑐.
+Proof of Lemma B.1. It suffices to prove that the per-token inference time for client 𝑐is lower-bounded by (35).
+First, we note that the minimum per-token inference time is lower if we relax the request routing to block-by-block
+routing with a per-block inference timee𝑡𝑗,𝑐at server 𝑗, because in reality a request cannot be served more than
+𝑚𝑗blocks at server 𝑗and has to incur the entire client-server RTT 𝑡𝑐𝑗even if being processed by only a subset
+of the blocks at server 𝑗. Then, under such relaxed request routing, the minimum inference time for a token is
+achieved by routing to the fastest servers that collectively hold all the blocks, which are servers 𝑗(𝑐)
+1
+, . . . , 𝑗(𝑐)
+𝐾𝑐.
+That is, processing the first Í𝐾𝑐−1
+𝑘=1
+𝑚𝑗(𝑐)
+𝑘
+blocks at servers 𝑗(𝑐)
+1
+, . . . , 𝑗(𝑐)
+𝐾𝑐−1, and the remaining 𝐿−Í𝐾𝑐−1
+𝑘=1
+𝑚𝑗(𝑐)
+𝑘
+blocks at server 𝑗(𝑐)
+𝐾𝑐. This corresponds to the per-token inference time given in (35), which then lower-bounds
+the actual per-token inference time achievable for client 𝑐under any feasible BPRR solution.
+Combining Theorem 3.5 and Lemma B.1 yields an upper bound on 𝑇𝑔/𝑇𝑜, which is the approximation ratio
+for CG-BPRR.
+B.5
+Two-time-scale Algorithm for Online BPRR
+For completeness, we summarize the proposed BPRR algorithm for the online setting in Alg. 2, which is adapted
+from the CG-BPRR algorithm for the offline setting (Alg. 1). While Alg. 2 only runs CG-BP once at the be-
+ginning, it can be easily extended to adapt the block placement by invoking CG-BP again when the observed
+number of concurrent requests deviates significantly from the previously targeted value.
+C
+Additional Evaluation Results
+C.1
+Additional Experiment Results
+Tables 7–8 present the breakdown of the total average inference time in Table 4 into the inference time for the
+first token and the inference time for each of the remaining tokens. Similarly, Tables 9–10 provide the breakdown
+of the total average inference time in Table 5.
+C.2
+Additional Simulation Results
+To evaluate the performance of our solution as the system scales, we proportionally increase the number of
+servers and the request rate as in Fig. 13, and the result shows a trend of widening performance gap between our
+solution and PETALS.
+We further evaluate the sensitivity of our solution to the configuration of the load parameter |R|. Under a
+fixed |R| computed for a predicted rate 𝜆𝑏𝑎𝑠𝑒, Fig. 14 shows the performance under different actual rates, which
+shows that in comparison with setting |R| according to the actual rates as in Fig. 8, using a fixed |R| can lead
+to increased inference time when the actual rate is higher than expected, due to not reserving enough memory
+32
+
+
+--- Page 33 ---
+Client Location
+Algorithm
+0.1 requests/s
+0.5 requests/s
+𝑙max = 64
+𝑙max = 128
+𝑙max = 64
+𝑙max = 128
+Cluster0
+PETALS
+275.51 (252.61)
+455.61 (427.72)
+315.53 (252.61)
+508.52 (427.72)
+Proposed
+60.43 (73.51)
+62.98 (60.91)
+66.94 (73.51)
+69.62 (60.91)
+Cluster1
+PETALS
+236.34 (252.51)
+463.39 (424.94)
+298.27 (252.51)
+489.85 (424.06)
+Proposed
+55.47 (85.50)
+59.67 (72.06)
+57.37 (85.50)
+65.96 (72.06)
+Cluster2
+PETALS
+245.70 (251.95)
+470.33 (404.42)
+259.69 (251.95)
+480.43 (404.42)
+Proposed
+50.96 (73.51)
+55.72 (60.91)
+55.36 (73.51)
+59.86 (60.91)
+Table 7: Average inference time for the first token (s) under the configuration in Table 2 (𝑙𝐼
+max = 20; 100 requests;
+MATLAB results shown in parentheses).
+Client Location
+Algorithm
+0.1 requests/s
+0.5 requests/s
+𝑙max = 64
+𝑙max = 128
+𝑙max = 64
+𝑙max = 128
+Cluster0
+PETALS
+1.96 (1.40)
+1.21 (1.41)
+1.37 (1.40)
+1.18 (1.41)
+Proposed
+0.99 (0.45)
+0.94 (0.45)
+0.96 (0.45)
+0.81 (0.45)
+Cluster1
+PETALS
+1.78 (1.25)
+0.99 (1.27)
+0.91 (1.25)
+0.97 (1.27)
+Proposed
+0.93 (0.32)
+0.58 (0.26)
+0.98 (0.32)
+0.60 (0.26)
+Cluster2
+PETALS
+1.49 (0.93)
+1.18 (0.91)
+1.29 (0.93)
+1.51 (0.91)
+Proposed
+1.01 (0.45)
+0.88 (0.45)
+1.09 (0.45)
+0.91 (0.45)
+Table 8: Average inference time for the remaining token (s) under the configuration in Table 2 (𝑙𝐼
+max = 20; 100
+requests; MATLAB results shown in parentheses).
+Topology
+Algorithm
+0.1 requests/s
+0.5 requests/s
+𝑙max = 64
+𝑙max = 128
+𝑙max = 64
+𝑙max = 128
+AboveNet
+PETALS
+270.96 (254.74)
+408.59 (316.21)
+279.38 (264.81)
+486.68 (412.72)
+Proposed
+76.48 (73.69)
+89.15 (104.19)
+81.65 (81.12)
+91.41 (75.78)
+BellCanada
+PETALS
+360.94 (353.12)
+382.01 (354.06)
+378.10 (353.46)
+417.17 (353.72)
+Proposed
+53.42 (62.75)
+59.73 (62.68)
+63.78 (62.67)
+66.84 (62.70)
+GTS-CE
+PETALS
+393.93 (353.48)
+478.71 (354.05)
+389.35 (353.46)
+505.90 (353.79)
+Proposed
+55.30 (62.84)
+58.59 (62.66)
+58.17 (62.65)
+61.22 (62.65)
+Table 9: Average inference time for the first token (s) under the topologies in Table 3 (𝑙𝐼
+max = 20; 100 requests;
+MATLAB results shown in parentheses).
+33
+
+
+--- Page 34 ---
+Topology
+Algorithm
+0.1 requests/s
+0.5 requests/s
+𝑙max = 64
+𝑙max = 128
+𝑙max = 64
+𝑙max = 128
+AboveNet
+PETALS
+0.77 (0.79)
+0.84 (0.92)
+0.91 (0.98)
+0.78 (0.88)
+Proposed
+0.67 (0.52)
+0.75 (0.55)
+0.70 (0.57)
+0.64 (0.46)
+BellCanada
+PETALS
+0.69 (0.53)
+0.84 (0.73)
+0.80 (0.68)
+0.91 (0.66)
+Proposed
+0.50 (0.44)
+0.79 (0.44)
+0.51 (0.44)
+0.59 (0.44)
+GTS-CE
+PETALS
+0.92 (0.61)
+0.96 (0.71)
+0.83 (0.44)
+0.95 (0.67)
+Proposed
+0.52 (0.43)
+0.50 (0.42)
+0.49 (0.42)
+0.59 (0.43)
+Table 10: Average inference time for the remaining tokens (s) under the topologies in Table 3 (𝑙𝐼
+max = 20; 100
+requests; MATLAB results shown in parentheses).
+Number of servers
+6
+10
+15
+20
+22
+Avg per-token inference time (s)
+0
+2
+4
+6
+8
+10
+12
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(a) AboveNet
+Number of servers
+9
+15
+20
+25
+40
+Avg per-token inference time (s)
+0
+5
+10
+15
+20
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(b) BellCanada
+Number of servers
+9
+15
+20
+25
+40
+Avg per-token inference time (s)
+0
+5
+10
+15
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(c) GTS-CE
+Figure 13: Inference time per token when varying the number of servers 𝐶and rate 𝜆= (0.1/9) · 𝐶(𝑁𝑅= 100,
+𝜂= 0.2, 𝑙𝐼
+max = 20, 𝑙max = 128).
+Actual rate (requests/s)
+0.05
+0.1
+0.5
+1
+2
+Avg per-token inference time (s)
+0
+5
+10
+15
+20
+25
+30
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(a) AboveNet
+Actual rate (requests/s)
+0.05
+0.1
+0.5
+1
+2
+Avg per-token inference time (s)
+0
+5
+10
+15
+20
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(b) BellCanada
+Actual rate (requests/s)
+0.1
+0.5
+1
+2
+3
+Avg per-token inference time (s)
+0
+5
+10
+15
+20
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(c) GTS-CE
+Figure 14: Inference time per token when setting |R| according to 𝜆𝑏𝑎𝑠𝑒and varying actual request rate 𝜆
+(𝐶= 0.4 · #nodes, 𝜆𝑏𝑎𝑠𝑒= 0.5, 𝑁𝑅= 200 · 𝜆, 𝜂= 0.2, 𝑙𝐼
+max = 20, 𝑙max = 128).
+for attention caches and thus causing some requests to incur extensive waiting. Nevertheless, the increase for
+our solution (‘Proposed’) is much smaller than that for the BPRR algorithm of PETALS (‘Optimized Number’),
+demonstrating the robustness of our solution to load prediction.
+Fig. 15–19 show the running time of each algorithm in the simulations of Fig. 6–9. The results show that
+both the proposed algorithm (‘Proposed’) and the original algorithm in [8] (‘Petals’) are fast enough so that their
+execution costs negligible time compared to the actual inference time. The running time for ‘Optimized RR’ is
+substantially higher than the others as in this case we directly solve the MILP (21) by the Gurobi optimizer [42].
+The same observation holds in Fig. 20, which corresponds to the case in Fig. 13 as we proportionally increase
+both the number of servers and the request rate.
+34
+
+
+--- Page 35 ---
+6
+10
+15
+20
+22
+Number of servers
+10!3
+10!2
+10!1
+100
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(a) AboveNet
+10
+15
+20
+25
+40
+Number of servers
+10!3
+10!2
+10!1
+100
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(b) BellCanada
+10
+15
+20
+25
+40
+Number of servers
+10!3
+10!2
+10!1
+100
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(c) GTS-CE
+Figure 15: Algorithm running time when varying #servers 𝐶(𝜂= 0.2, 𝜆= 0.5, 𝑁𝑅= 100, 𝑙𝐼
+max = 20,
+𝑙max = 128).
+0.1
+0.2
+0.3
+0.4
+0.5
+Fraction of A100 servers
+10!3
+10!2
+10!1
+100
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(a) AboveNet
+0.1
+0.2
+0.3
+0.4
+0.5
+Fraction of A100 servers
+10!3
+10!2
+10!1
+100
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(b) BellCanada
+0.01
+0.03
+0.06
+0.1
+0.3
+Fraction of A100 servers
+10!2
+10!1
+100
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(c) GTS-CE
+Figure 16: Algorithm running time when varying frac. of high-performance servers 𝜂(𝐶= 0.4·#nodes, 𝜆= 0.5,
+𝑁𝑅= 100, 𝑙𝐼
+max = 20, 𝑙max = 128).
+0.05
+0.1
+0.5
+1
+2
+Request rate (requests/s)
+10!3
+10!2
+10!1
+100
+101
+102
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(a) AboveNet
+0.05
+0.1
+0.5
+1
+2
+Request rate (requests/s)
+10!3
+10!2
+10!1
+100
+101
+102
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(b) BellCanada
+0.1
+0.5
+1
+2
+3
+Request rate (requests/s)
+10!2
+10!1
+100
+101
+102
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(c) GTS-CE
+Figure 17: Algorithm running time when varying request rate 𝜆with 𝑁𝑅= 200 · 𝜆(𝐶= 0.4 · #nodes, 𝜂= 0.2,
+𝑙𝐼
+max = 20, 𝑙max = 128).
+0.05
+0.1
+0.5
+1
+2
+Actual rate (requests/s)
+10!3
+10!2
+10!1
+100
+101
+102
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(a) AboveNet
+0.05
+0.1
+0.5
+1
+2
+Actual rate (requests/s)
+10!3
+10!2
+10!1
+100
+101
+102
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(b) BellCanada
+0.1
+0.5
+1
+2
+3
+Actual rate (requests/s)
+10!2
+10!1
+100
+101
+102
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(c) GTS-CE
+Figure 18: Algorithm running time when varying actual rate 𝜆(𝐶= 0.4 · #nodes, 𝜆𝑏𝑎𝑠𝑒= 0.5, 𝑁𝑅= 200 · 𝜆,
+𝜂= 0.2, 𝑙𝐼
+max = 20, 𝑙max = 128).
+35
+
+
+--- Page 36 ---
+64
+128
+256
+384
+512
+Output sequence length
+10!3
+10!2
+10!1
+100
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(a) AboveNet
+64
+128
+256
+384
+512
+Output sequence length
+10!3
+10!2
+10!1
+100
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(b) BellCanada
+64
+128
+256
+384
+512
+Output sequence length
+10!2
+10!1
+100
+101
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(c) GTS-CE
+Figure 19: Algorithm running time when varying the sequence length 𝑙max (𝐶= 0.4 · #nodes, 𝜂= 0.2, 𝜆= 0.5,
+𝑁𝑅= 100, 𝑙𝐼
+max = 20).
+6
+10
+15
+20
+22
+Number of servers
+10!3
+10!2
+10!1
+100
+101
+102
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(a) AboveNet
+9
+15
+20
+25
+40
+Number of servers
+10!2
+10!1
+100
+101
+102
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(b) BellCanada
+9
+15
+20
+25
+40
+Number of servers
+10!2
+10!1
+100
+101
+102
+Avg runtime (s)
+Petals
+Opt Num
+Opt Order
+Opt RR
+Proposed
+(c) GTS-CE
+Figure 20: Algorithm running time when varying the number of servers 𝐶and rate 𝜆= (0.1/9) · 𝐶(𝑁𝑅= 100,
+𝜂= 0.2, 𝑙𝐼
+max = 20, 𝑙max = 128).
+36

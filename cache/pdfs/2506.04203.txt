@@ -1,0 +1,1548 @@
+--- Page 1 ---
+CASCADIA: An Efficient Cascade Serving System for Large
+Language Models
+Youhe Jiang1∗, Fangcheng Fu2∗, Wanru Zhao3∗, Stephan Rabanser4,
+Jintao Zhang5, Nicholas D. Lane3, Binhang Yuan1†
+1HKUST, 2Shanghai Jiaotong University, 3University of Cambridge,
+4Princeton University, 5Tsinghua University
+∗Equal contribution, †Corresponding author
+Abstract
+Recent advances in large language models (LLMs) have intensified the need to deliver both rapid
+responses and high-quality outputs. More powerful models yield better results but incur higher
+inference latency, whereas smaller models are faster yet less capable. Recent work proposes balancing
+this latency–quality trade-off using model cascades, which route simpler queries to smaller models
+and more complex ones to larger models. However, enabling efficient cascade serving remains
+challenging. Current frameworks lack effective mechanisms for handling (i) the huge and varying
+resource demands of different LLMs, (ii) the inherent heterogeneity of LLM workloads, and (iii)
+the co-optimization of system deployment and routing strategy. Motivated by these observations,
+we introduce CASCADIA, a novel cascade serving framework designed explicitly to schedule request
+routing and deploy model cascades for fast, quality-preserving LLM serving. CASCADIA employs a
+bi-level optimization method: at the deployment level, it uses a mixed-integer linear program to select
+resource allocations and parallelism strategies based on LLM information and workload characteristics;
+at the routing level, it applies a Chebyshev-guided method to iteratively co-optimize the routing
+strategy and the system deployment produced by the deployment level. Our extensive evaluation on
+diverse workload traces and different model cascades (DeepSeek and the Llama series) demonstrates
+that CASCADIA significantly outperforms both single-model deployments and the state-of-the-art
+cascade serving baseline, achieving up to 4× (2.3× on average) tighter latency SLOs and up to 5×
+(2.4× on average) higher throughput while maintaining target answer quality.
+1
+Introduction
+Different Models
+40
+60
+80
+100
+Quality
+92
+78
+67
+Different Models
+2
+6
+10
+14
+Latency (s)
+11.1
+2.3
+0.4
+DeepSeek-671B
+DeepSeek-dist-70B
+DeepSeek-dist-7B
+Figure 1
+Average response quality and
+latencies of different DeepSeek models.
+Quality is judged by GPT-4o using the LLM-
+as-a-Judge framework [1].
+Large language models (LLMs) such as DeepSeek-R1 [2], OpenAI
+o3 [3], Claude [4], Gemini [5] and Llama-3 [6] have demonstrated
+outstanding performance across a wide range of real-world appli-
+cations (e.g., chatbots, healthcare and education) [7–9], largely in-
+fluence human lives. However, serving LLMs can be costly [10–12],
+since significant computational resources (e.g., GPUs) are required
+to meet certain service demands, such as meeting certain latency
+deadlines (i.e., SLO attainment—the proportion of requests served
+within a specified response-time target) and generation throughput.
+In this paper, we explore an alternative solution that strategically
+1
+arXiv:2506.04203v2  [cs.DC]  29 Sep 2025
+
+
+--- Page 2 ---
+utilizes model cascades to better balance the response latency and quality trade-offs inherent in LLM serving.
+Cascade model serving refers to a serving architecture where multiple models of varying sizes and capabilities
+are arranged in a sequential pipeline, creating a hierarchy of models that process requests with increasing
+levels of sophistication [13–18]. As shown in Figure 1, larger models typically provide higher response quality
+but also incur greater latency, which in turn leads to increased energy consumption and compute usage [19].
+In this approach, incoming requests are initially handled by smaller, computationally efficient models that can
+rapidly process simpler requests. Only when these lightweight models determine that a request exceeds their
+capabilities or requires higher-quality responses does the system escalate the request to larger, more powerful
+models in the cascade. This progressive delegation mechanism enables service providers to optimize system
+performance by matching request complexity with appropriate model capacity, thereby significantly reducing
+computational costs while maintaining high-quality responses for complex request. Several recent studies
+have focused on optimizing LLM serving using model cascades [13–15, 20, 21].
+The cascade model serving architecture, which adaptively routes simpler and more complex requests to smaller
+and larger models, respectively, presents significant opportunities for optimizing the cost-efficiency of LLM
+serving. In this work, we focus specifically on the setting where service providers host and manage every
+model in the cascade themselves. However, effectively adapting this paradigm to LLM scenarios is much
+harder to implement than to propose, as we enumerate below:
+• Model heterogeneity. LLMs require large amounts of compute and memory, and different models have
+varying resource demands for efficient serving [22]. With a fixed resource pool, suboptimal allocation
+across models in the cascade can degrade overall serving efficiency.
+• Workload heterogeneity. LLM workloads exhibit considerable heterogeneity [23–25]. Models within the
+cascade often face incoming requests with varying characteristics (e.g., input/output lengths, arrival
+rates) and favor different deployment strategies (e.g., replication, parallel configuration), further adding
+complexity to optimal system deployment.
+• Cascade-aware load balancing. The request routing strategy directly impacts the system load of each
+model in the cascade. For instance, if more requests are routed to a particular model, its load increases;
+the resource allocation and deployment strategy for that model should then be adjusted to balance loads
+across all models. Consequently, the deployment of multiple models must be co-optimized with the
+routing strategy to manage load across the cascade.
+In order to overcome these challenges, we propose CASCADIA, a novel cascade serving system that is optimized
+for LLM characteristics and that co-optimizes the deployment of multiple models in the cascade together with
+the request routing strategy. Our contributions are as follows:
+• Contribution 1. We formulate cascade serving—covering system deployment and request routing—as a
+constrained optimization problem. To solve it, we propose a bi-level approach that jointly optimizes
+deployment and routing. The deployment level uses mixed-integer linear programming (MILP) to
+determine the optimal deployment plan given a routing strategy, while the routing level applies a
+Chebyshev-guided method to optimize routing, balancing latency and quality.
+• Contribution 2. We implement CASCADIA, an efficient cascade serving system tailored to LLMs. CASCADIA
+enables an adaptive model cascade paradigm that allocates resources and routes requests across a
+hierarchy of model sizes (e.g., small, medium, and large), thereby balancing response latency and output
+quality. Within each cascade stage, CASCADIA supports various parallelism strategies (e.g., tensor and
+pipeline parallelism), which allows it to automatically select the optimal strategy based on model size,
+incoming workload, and routing decisions.
+• Contribution 3. We empirically evaluate CASCADIA by comparing it to both single-model and existing
+cascade serving systems across a variety of scenarios, including diverse workload traces (e.g., coding
+and mathematics), different model cascades (DeepSeek and the Llama series), and multiple evaluation
+metrics (SLO attainment and throughput). The results show that, compared with state-of-the-art non-
+cascade and cascade solutions, CASCADIA achieves up to 4× lower latency deadlines (2.3× on average)
+and boosts system throughput by up to 5× (2.4× on average).
+2
+
+
+--- Page 3 ---
+2
+Preliminary and Related Work
+LLM inference phases and workload heterogeneity. There are two phases within LLM inference: prefill and
+decoding. During the prefill phase, the model processes the input prompt to compute the key-value (KV) cache
+and generates the first token in a single step. In contrast, the decoding phase uses the last generated token and
+the KV cache as inputs to generate subsequent tokens in a token-by-token manner. Generally, the prefill phase
+is compute-bound, while the decoding phase is memory-bound [26–30]. LLM inference workloads exhibit
+heterogeneity in input, output token lengths and request arrival rate, which is called workload heterogeneity.
+For instance, conversation workloads (short input and long output lengths) typically require more memory
+resources to handle the memory-bound decoding phase, while coding workloads (long input and short
+output lengths) demand more compute resources to manage the compute-bound prefill phase. Therefore,
+appropriately allocating resources based on workload demands is critical for optimal performance [31, 32].
+Cascade model inference. Current LLMs come in various sizes and configurations, offering a broad spectrum of
+choices. Effectively leveraging this diversity can balance trade-offs between response latency and quality during
+inference. Recent efforts propose cascade model inference to utilize models of differing complexities [33, 34].
+In such architectures, an input prompt is processed through increasingly complex models, using threshold-
+based routing that stops computation once a cheaper model produces a confident enough answer. For instance,
+FrugalGPT [14] employs a dynamic LLM cascade strategy that routes queries through progressively stronger
+models (e.g., GPT-3.5 →GPT-4) based on real-time difficulty estimation, optimizing cost-efficiency without
+sacrificing accuracy. Similarly, AutoMix [13] uses intelligent layer-wise token routing to dynamically allocate
+computation based on input difficulty. CascadeServe [15] automates and optimizes end-to-end inference with
+cascades, adjusting model deployment and request routing based on real-time system loads. However, existing
+systems overlook key LLM-specific workload characteristics and neglect the importance of co-optimizing
+system deployment with request routing (i.e., system-algorithm co-design).
+req_rate=4
+long outputs
+0.00
+4.67
+9.34
+14.01
+Throughput (req/s)
+DeepSeek-dist-7B
+req_rate=8
+long outputs
+0.00
+6.42
+12.84
+19.26
+DeepSeek-dist-7B
+req_rate=4
+long outputs
+0.00
+0.87
+1.74
+2.61
+DeepSeek-dist-70B
+req_rate=8
+long outputs
+0.00
+1.50
+2.99
+4.49
+DeepSeek-dist-70B
+req_rate=4
+short outputs
+0.00
+3.29
+6.58
+9.87
+DeepSeek-dist-7B
+req_rate=4
+short outputs
+0.00
+0.93
+1.86
+2.79
+DeepSeek-dist-70B
+7B (4,1,1)
+7B (2,2,1)
+7B (2,1,2)
+70B (4,2,1)
+70B (4,1,2)
+70B (2,4,1)
+Figure 2 Benchmarked performance of different parallelism strategies across different workloads and model sizes. Long
+and short outputs represent two different workloads with average output sequence length to be 512 and 1024; the
+three-element array represents the DP, TP, and PP degrees.
+Limitations of existing cascade serving systems. We summarize the limitations of existing cascade serving systems:
+(i) Ineffective resource allocation for different model types within a cascade. Different model types have
+distinct memory and computation resource needs. For example, DeepSeek-671B typically requires more
+allocated resources than DeepSeek-dist-70B due to its larger memory and computational demands. Current
+systems ignore the importance of adjusting resource allocation according to the needs of different model types,
+leading to unbalanced system loads. (ii) Inadequate adaptation of parallelism strategies to varying workloads
+and model sizes. The optimal parallelism strategies vary across different workloads (e.g., different input and
+output request sequence lengths and request arrival rates) and model sizes. As shown in Figure 2, choosing
+the optimal parallelism strategy can achieve up to 3× higher system throughput. Current systems do not
+optimize parallelism strategies according to specific workload and model size, resulting in degraded overall
+system performance. (iii) Insufficient co-optimization between system deployment and routing strategy. The
+routing strategy decides the request portion processed by each model type within a cascade, which in turn
+determines the system loads for different model types. Existing systems neglect to adapt system deployment
+configurations based on routing outcomes, resulting in suboptimal resource usage. To address these challenges,
+a cascade serving system tailored for LLMs is necessary. Such a system must optimize end-to-end performance
+and ensure stringent SLO adherence.
+3
+
+
+--- Page 4 ---
+3
+Scheduling Algorithm in CASCADIA
+3.1
+Problem Formulation
+To optimize the cascade serving system under different LLM workloads and user-specific requirements (e.g.,
+system response quality requirements), the scheduling algorithm should determine two essential components:
+(i) The model deployment plan, which specifies the resource allocations and parallelism strategies for multiple
+model types (e.g., small, medium, large) within the cascade to minimize the system response latency (e.g.,
+p95 latency—the response time threshold below which 95% of all requests complete); and (ii) the routing
+strategy, which balances the trade-off between system response latency and quality to decide the appropriate
+model path for each incoming request. We term a solution addressing these two components as a cascade plan.
+Algorithm 1 Bi-level Scheduling Workflow
+Require: θ0: initial routing strategy; θ: routing strategy;
+qmin: quality requirement; ˜I: subsampled input work-
+load; W: workload distribution; Q: system response
+quality; N: resource limit; D: deployment plan; L:
+system response latency; J: latency-quality score; K:
+consecutive stable iterations to break
+Ensure: final routing strategy θ and deployment D
+1: θ ←θ0 /* θ0 detailed in §3.3 */
+2: while true do
+3:
+(W, Q) ←derived 1 from (θ, ˜I)
+4:
+/* Optimize deployment (§3.2) */
+5:
+(D, L) ←DeploymentSolver(W, N)
+6:
+/* Optimize routing strategy (§3.3) */
+7:
+(θ, J) ←RoutingSolver(L, Q, qmin)
+8:
+/* Terminate upon convergence */
+9:
+if J is stable for K iters then
+10:
+break
+11: return (θ, D)
+Note that the routing strategy determines the request
+distribution over different model types, which in turn
+dictates the optimal model deployment plan, while
+the model deployment plan defines the system re-
+sponse latency that feeds back into the routing de-
+cision. Given the interdependent and exponentially
+large search space, determining the optimal cascade
+plan is an NP-hard problem. To solve this problem,
+we adopt a bi-level optimization method that enables
+system–algorithm co-design, which is shown in Algo-
+rithm 1, and can be summarized as:
+• MILP-based deployment solver: Given the routing
+strategy, the deployment solver (§3.2) employs
+an mixed-integer linear programming (MILP)
+formulation to capture system resource con-
+straints and compute the optimal deployment
+plan that minimizes system response latency.
+• Chebyshev-guided routing solver: Based on the
+system response latency generated from the de-
+ployment solver and the user-specific quality requirement, the routing solver (§3.3) applies a Chebyshev-
+guided method to find the optimal routing strategy that optimizes system response latency with respect
+to the quality requirement.
+3.2
+MILP-Based Deployment Solver
+As shown in Algorithm 1, the routing strategy (obtained from routing solver) determines how many requests
+should be routed to each model in the cascade, thus determining the workload distribution among models.
+Given the workload distribution and resource limit, the deployment solver aims to determine the optimal
+deployment plan, which includes the resource allocation and parallelism strategies for models within cascades.
+An example deployment plan is shown in Figure 3.
+Assume a total of N GPUs serve a model cascade with C model types, {c1, c2, . . . , cC}, where ci denotes the
+i-th model type. The incoming workload information is denoted as W = {w1, w2, . . . , wC}, where each wi
+includes the distributions of input/output sequence lengths and the request arrival rate for the i-th model
+type. We use F = {f1, f2, . . . , fC} to denote the number of GPUs allocated per model, the total allocation
+must not exceed the resource limit, i.e., PC
+i=1 fi ≤N. Given this setup, our deployment solver (i) determines
+the parallelism strategy for each specific resource allocation fi, and (ii) uses an MILP to optimize the overall
+resource allocation F.
+Parallelism strategy search. Given the workload information wi and a specific resource allocation fi, this
+optimization determines the optimal parallelism strategy and computes the corresponding system response
+1Given θ and ˜I, W is derived by aggregating per-model routed requests (including arrival rates and sequence statistics), while Q is
+derived by aggregating quality scores of accepted outputs across all models [14].
+4
+
+
+--- Page 5 ---
+latency li for the model type i. CASCADIA provides three forms of parallelism: data parallelism (i.e., model
+replication, DP) [35], tensor model parallelism (TP) [36], and pipeline parallelism (PP) [37]. Denoting the
+degrees of data, tensor, and pipeline parallelism for the model type by dp, tp, and pp, any feasible parallelism
+strategy must satisfy the following resource constraint: (Pdpi
+j=1 tpi,j × ppi,j) ≤fi, i.e., one model type can be
+replicate into multiple replicas, each replica can have varied tensor and pipeline parallelism degrees, as shown
+in Figure 3, the summation of different parallelism degrees should be less or equal than the total number
+of GPUs assigned. Based on the workload information wi and the resource allocation fi, we iterate over all
+feasible parallelism combinations to select the strategy that minimizes the response latency li for the model
+type i. The latency li is computed using the simulator Sim(·) as li = Sim(wi, fi) 1. Note that the parallelism
+strategy optimization can be precomputed for all possible resource allocations f to provide latency lookup
+tables for the MILP formulation.
+Model Replica
+Pipeline Parallelism
+Tensor Parallelism
+Workload
+𝐰𝟏
+𝐰𝟐
+𝐰𝟑
+𝐃𝐏= 𝟐; 𝐓𝐏= 𝟐; 𝐏𝐏= 𝟐
+𝐃𝐏= 𝟐; 𝐓𝐏= 𝟐, 𝐏𝐏= 𝟐; 𝐓𝐏= 𝟐
+𝐃𝐏= 𝟏; 𝐓𝐏= 𝟐, 𝐏𝐏= 𝟑
+𝐂𝐚𝐬𝐜𝐚𝐝𝐞 𝟏: 𝐜𝟏
+𝐂𝐚𝐬𝐜𝐚𝐝𝐞 𝟐: 𝐜𝟐
+𝐂𝐚𝐬𝐜𝐚𝐝𝐞 𝟑: 𝐜𝟑
+Figure 3 Illustration of a model deployment plan.
+MILP formulation for resource allocation optimiza-
+tion. Our MILP problem formulation aims to mini-
+mize the maximum system response latency among
+all model types in the cascade. Let L denote the
+maximum latency across all model types. We dis-
+cretize the GPU allocations into candidate values
+f ∈{1, 2, . . . , N}. For each model type i and candi-
+date allocation f, we use the precomputed latency
+table from the parallelism strategy optimization to
+obtain li(f). We then introduce binary assignment
+variables xi,f, where xi,f = 1 if model type i is as-
+signed f GPUs and xi,f = 0 otherwise, for all i ∈{1, . . . , C} and feasible f. The constraints of our MILP include:
+(i) For each model type i, exactly one GPU allocation f must be selected, i.e., PN
+f=1 xi,f = 1, ∀i = 1, . . . , C;
+(ii) the total number of GPUs assigned across all model types should be equal to the available GPUs N, i.e.,
+PC
+i=1
+PN
+f=1 f xi,f = N; and (iii) the maximum latency L must be at least as large as the latency li(f) corre-
+sponding to each selected allocation, i.e., L ≥PN
+f=1 li(f) xi,f, ∀i = 1, . . . , C. We explicitly enforce variable
+domains and integrality constraints as follows: xi,f ∈{0, 1}, ∀i, f and L ≥0. If certain GPU allocations f
+are infeasible for specific model types—such as when the total memory of the allocated f GPUs is less than
+the minimum memory required by the model type—we explicitly set xi,f = 0 for these allocation pairs. Our
+objective is to minimize the maximum system response latency L, which serves as the input for the routing
+layer optimization.
+3.3
+Chebyshev-guided Routing Solver
+…
+𝐋𝐋𝐌𝟏
+𝐋𝐋𝐌𝟐
+𝐋𝐋𝐌𝐂
+𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞𝐬𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞𝐬
+𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞𝐬
+𝐑𝐨𝐮𝐭𝐞𝐫
+𝐑𝐞𝐪𝐬
+…
+𝐑𝐨𝐮𝐭𝐢𝐧𝐠 𝐌𝐚𝐧𝐚𝐠𝐞𝐦𝐞𝐧𝐭
+𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞𝐬 𝐀𝐜𝐜𝐞𝐩𝐭𝐞𝐝
+𝐂𝐚𝐬𝐜𝐚𝐝𝐞
+𝐈𝐧𝐟𝐞𝐫𝐞𝐧𝐜𝐞
+Figure 4 Threshold-based cascade routing
+workflow. The router determines whether
+a request is accepted or forwarded to
+the next model type based on predefined
+thresholds.
+As shown in Algorithm 1, the deployment plan (obtained from the
+deployment solver) determines the system response latency. Given
+the system response latency and quality requirement, the routing
+solver aims to optimize the routing strategy (i.e., co-optimize system
+latency and quality).
+Thresholds tuning and request routing. We adopt the threshold-based
+cascade routing workflow consistent with prior works [13, 14]
+(Figure 4). Initially, every incoming request is sent to the first
+(smallest) model type c1 in the cascade. A judger then evaluates
+the quality of the output responses from model types c1 to cC−1,
+and a set of thresholds H = {h1, h2, . . . , hC−1} is defined to decide
+whether the requests at each model type should be accepted or
+forwarded to the next model type. In this framework, the routing
+strategy θ is directly determined by the thresholds H, i.e., θ = θ(H).
+1We use the ETH EASL Scratchpad simulator [38] to estimate system p95 latency from workload and resource allocation. We show
+detailed simulator design (e.g., simulator inputs, batching strategy, queuing mechanism, parallelism strategy modeling) and evaluation
+in Appendix B.
+5
+
+
+--- Page 6 ---
+Each routing strategy θ is associated with a system response latency L(θ) (determined by the deployment solver
+optimization) and quality Q(θ) (determined by the judger 2). Our routing solver uses a Chebyshev-guided
+method to optimize the routing strategy. We initialize the routing strategy θ0 as proportional routing, where
+the i-th model receives 1/i of requests.
+Chebyshev-guided optimization for routing strategy. Given the routing strategy θ and user-specified quality
+requirement qmin, we employ the Chebyshev-guided method [39] to minimize the system response latency
+L(θ) with respect to qmin. First, we define a utopia point z∗
+1 (all requests processed by the largest model cC)
+and nadir point z∗
+2 (all requests processed by the smallest model c1) representing the best and worst achievable
+system response quality. Then, for a given quality requirement qmin, we minimize the system response latency
+subject to meeting the quality requirement by solving the single-objective penalty problem:
+arg min
+θ
+J(θ) = arg min
+θ
+[L(θ) + µ max{0, (qmin −Q(θ))/(z∗
+1 −z∗
+2)}]
+where J(θ) represents the latency-quality score, µ > 0 is a penalty weight that enforces the quality constraint
+(for sufficiently large µ, any minimizer of J(θ) satisfies Q(θ) ≥qmin), and z∗
+1 and z∗
+2 are used to normalize the
+quality shortfall so the penalty is dimensionless and well-conditioned across workloads. Note that our routing
+solver can also optimize system response quality under a user-specified latency requirement using a similar
+procedure, as detailed in Appendix C.
+Illustrative example for Chebyshev-guided optimization. Assume the utopia and nadir points z∗
+1 and z∗
+2 equal
+0.95 and 0.75. The user-specific quality requirement qmin is 0.90 and the penalty weight µ is 100. Consider a
+strategy θ1 with p95 latency L(θ1) = 11.0 s and overall quality Q(θ1) = 0.88. The normalized shortfall from the
+requirement is (0.90−0.88)/(0.95−0.75) = 0.02/0.20 = 0.10, yielding J(θ1) = 11.0+100×0.10 = 21.0. Consider
+another strategy θ2 with latency L(θ2) = 11.4 s and quality Q(θ2) = 0.91, which results in J(θ2) = 11.4. Strategy
+θ2 is preferable under this setting due to its significantly lower objective value. Additionally, a higher-quality
+strategy θ3 with latency L(θ3) = 12.2 s and quality Q(θ3) = 0.93 yields J(θ3) = 12.2. Although both θ2 and
+θ3 satisfy the quality requirement qmin, strategy θ2 is preferable since it achieves lower latency while meeting
+the constraint. This example demonstrates how the Chebyshev-guided method effectively penalizes infeasible
+solutions while optimizing system response latency.
+Putting them together. In our bi-level optimization framework, the routing solver (i.e., Chebyshev-guided
+optimization) iteratively searches for the next θ, invokes deployment solver (i.e., MILP optimization) to obtain
+the minimized system response latency L(θ), and then minimizes the objective function (i.e., arg minθ J(θ)).
+Finally, an optimal routing strategy θ is selected that guarantees a minimal system response latency while
+fulfilling the quality requirement.
+Impact of LLM workloads on optimal cascade plan selection. The characteristics of incoming LLM workloads
+strongly influence the selection of cascade plans. This influence stems from two key factors: (i) Request
+input/output length and arrival rate affect system response latency—longer sequences or higher loads increase
+compute demand, necessitating plan adjustments to balance latency and quality; (ii) Request complexity
+impacts system response quality—complex requests or difficult queries require larger models, necessitating
+plan adjustments to maintain quality while managing latency. Therefore, our bi-level optimization framework
+considers both system performance (e.g., deployment solver) and algorithmic behavior (e.g., routing solver),
+enabling efficient, adaptive optimization across different incoming LLM workloads. Additionally, our framework
+incorporates a re-scheduling mechanism to handle online fluctuating workloads, as detailed and tested in §4.4.
+The complete mathematical formulation for our bi-level optimization is provided in Appendix D.
+4
+Evaluation
+2Analogous to [14], we estimate Q(θ) by profiling a subsample of the input workload across all cascade models to obtain per-model
+quality score distributions. During scheduling, given any threshold vector H and the quality score distributions, we can determine which
+model’s response would be accepted for each request under routing policy θ(H), then aggregate these final model scores to compute the
+overall system quality Q(θ).
+6
+
+
+--- Page 7 ---
+4.1
+Experimental Setup
+Environments. Our experiments are conducted on 4 GPU servers, where each server is equipped with 8 NVIDIA
+H100-80GB GPUs. Within each server, the GPUs are connected via NVLink with a bandwidth of 400GB/s, and
+the servers are connected via Inifiband with a bandwidth of 200GB/s.
+Model cascade construction. We construct a model cascade using the DeepSeek series models for CASCADIA,
+which are representative and popular open-source transformer models. Specifically, we use DeepSeek-dist-7B,
+DeepSeek-dist-70B (distilled version), and DeepSeek-671B AWQ with INT4 quantized weights [40] as three
+model types within our system. We employ a GPT-4o (LLM-as-a-Judge) [1] as the judger mentioned in §3.3,
+which assesses the output responses of each model type within the cascade and assigns scores between 0 and
+100. The judging overhead 3 is included in our experiments.
+Baselines. We compare CASCADIA with two baselines:
+• Compare with stand-alone LLMs served by SGLang. We compare CASCADIA against stand-alone LLMs that
+are directly served on SGLang [41] under various response quality constraints (e.g., 90, 85, 80, 70) to
+demonstrate the effectiveness of LLM serving with model cascades. For quality requirement of 90 and
+85, we choose stand-alone DeepSeek-671B for comparison, and for quality reqirement of 80 and 70, we
+choose stand-alone DeepSeek-dist-70B for comparison. For fair comparison, we tune the parallelism
+strategy using our MILP algorithm mentioned in §3.2 for each of the stand-alone model and report the
+best values in all experiments.
+• Compare with cascade model serving system CascadeServe. We compare CASCADIA against an existing
+cascade model serving system CascadeServe. It chooses model cascade deployment plan based on
+system load (e.g., request arrival rate), enables model replication on hardware and adaptively dispatches
+incoming requests. We tune the parallelism and request routing strategies for CascadeServe based on
+the real-time system load and report the best values in all experiments.
+Traces. We follow prior work to generate workload traces based on real-world data [10, 27]. Our testing traces
+are subsampled from MT-Bench [1], a multi-turn conversation benchmark that contains multiple types of LLM
+workloads (e.g., coding, mathematics and reasoning). Each of our subsampled traces have different workload
+characteristics and different complexities as mentioned in §3.3.
+Evaluation metrics. Following previous evaluation setups [22, 28, 35], we evaluate system performance based
+on SLO attainment and system throughput. The SLO is determined empirically based on the system’s average
+single-request processing latency, and we scale it to various multiples (SLO Scale in Figure 5) to assess
+performance under different levels of operational stringency. We focus on identifying the minimum SLO Scale
+at which the system achieves 95% SLO attainment.
+4.2
+End-to-end Experimental Results
+End-to-end system performance. We evaluate the SLO attainment and throughput of CASCADIA across multiple
+traces and quality requirements, comparing it with two baselines. Results in Figure 5 and Figure 6 show that
+CASCADIA outperforms all baselines:
+• CASCADIA achieves up to 4× and on average 2.8× lower latency deadlines, and up to 5× and on average
+3× higher system throughput compared with stand-alone LLMs. For instance, when testing on trace 3
+with an average quality requirement of 85, stand-alone DeepSeek-671B requires 11.88 SLO scales to
+achieve 95% attainment, while CASCADIA with different model types that uses smaller models to process
+simpler requests only requires 3.75 SLO scales.
+• CASCADIA achieves up to 2.5× and on average 1.7× lower latency deadlines, and up to 3.3× and on
+average 1.7× higher throughput than CascadeServe. While CascadeServe optimizes model deployment
+and routing based on real-time load, it overlooks LLM-specific workload characteristics (e.g., input/output
+lengths) and request complexity, leading to sub-optimal parallelism and routing. For example, on trace
+3The judger takes a Q&A pair as input and outputs quality grades (1–2 tokens), resulting in significantly lower latency and cost than
+full request inference, typically requiring only 1–2s.
+7
+
+
+--- Page 8 ---
+10
+15
+20
+25
+30
+58
+68
+79
+90
+100
+SLO Attainment (%)
+11.73 17.39
+20.00
+Trace 1 | avg_quality=90
+6.0 9.5 13.0 16.5 20.0
+54
+65
+77
+88
+100
+7.38
+11.43 15.42
+Trace 1 | avg_quality=85
+2.0 3.2
+4.5
+5.8 7.0
+51
+63
+76
+88
+100
+3.153.70
+5.70
+Trace 1 | avg_quality=80
+1
+2
+3
+4
+5
+44
+58
+72
+86
+100
+1.44
+2.83
+4.40
+Trace 1 | avg_quality=70
+4
+9
+14
+19
+24
+46
+60
+73
+86
+100
+7.08 11.5016.12
+Trace 2 | avg_quality=90
+3.0 5.8 8.5 11.2 14.0
+44
+58
+72
+86
+100
+3.575.16
+13.08
+Trace 2 | avg_quality=85
+2.0 3.4 4.8 6.1 7.5
+SLO Scale
+54
+66
+77
+89
+100
+SLO Attainment (%)
+2.44 3.794.55
+Trace 2 | avg_quality=80
+0.5 1.6
+2.8 3.9 5.0
+SLO Scale
+36
+52
+68
+84
+100
+0.97
+2.71
+3.93
+Trace 2 | avg_quality=70
+3.0 6.2 9.5 12.8 16.0
+SLO Scale
+43
+57
+72
+86
+100
+4.516.62
+13.87
+Trace 3 | avg_quality=90
+3.0 5.2 7.5 9.8 12.0
+SLO Scale
+46
+59
+73
+86
+100
+3.75
+6.31
+11.88
+Trace 3 | avg_quality=85
+1
+2
+3
+4
+5
+SLO Scale
+44
+58
+72
+86
+100
+1.34
+2.39
+4.21
+Trace 3 | avg_quality=80
+0.5
+1.4 2.2
+3.1
+4.0
+SLO Scale
+36
+52
+68
+84
+100
+0.86 1.57
+3.47
+Trace 3 | avg_quality=70
+Cascadia
+CascadeServe
+DeepSeek-dist-70B/671B
+Figure 5 End-to-end SLO attainment results evaluating CASCADIA against two baseline systems. Each row corresponds to
+a particular LLM workload trace, and each column corresponds to a specific quality requirement. The stars indicate the
+95% SLO attainment for each system.
+0.00
+0.08
+0.15
+0.23
+0.30
+Throughput (req/sec)
+1.39×
+1.50×
+Trace 1 | avg_quality=90
+0.00
+0.14
+0.28
+0.42
+0.56
+1.55×
+2.28×
+Trace 2 | avg_quality=90
+0.00
+0.19
+0.38
+0.58
+0.77
+1.29×
+2.59×
+Trace 3 | avg_quality=90
+0.00
+0.14
+0.28
+0.41
+0.55
+1.70×
+2.09×
+Trace 1 | avg_quality=85
+0.00
+0.28
+0.56
+0.84
+1.13
+1.45×
+3.91×
+Trace 2 | avg_quality=85
+0.00
+0.26
+0.53
+0.79
+1.06
+1.68×
+3.27×
+Trace 3 | avg_quality=85
+0.00
+0.30
+0.60
+0.90
+1.21
+Throughput (req/sec)
+1.12×
+1.76×
+Trace 1 | avg_quality=80
+0.00
+0.40
+0.80
+1.20
+1.59
+1.57×
+1.93×
+Trace 2 | avg_quality=80
+0.00
+0.78
+1.57
+2.35
+3.14
+1.90×
+3.53×
+Trace 3 | avg_quality=80
+0.0
+0.7
+1.4
+2.1
+2.8
+1.89×
+3.24×
+Trace 1 | avg_quality=70
+0.00
+1.19
+2.38
+3.57
+4.76
+3.25×
+4.70×
+Trace 2 | avg_quality=70
+0.00
+1.32
+2.64
+3.96
+5.28
+1.93×
+4.99×
+Trace 3 | avg_quality=70
+Cascadia
+CascadeServe
+DeepSeek-dist-70B/671B
+Figure 6 End-to-end throughput results evaluating CASCADIA against two baseline systems across different LLM workload
+traces and quality requirements.
+1 with an average quality requirement of 90, CascadeServe needs 17.3 SLO scales to reach 95% SLO
+attainment, whereas CASCADIA requires only 11.73.
+System performance with different model cascades and serving optimizations. We further evaluate CASCADIA
+using a different model cascade by replacing the DeepSeek series with the Llama series (Llama3-8B and
+Llama3-70B). As shown in Figure 7, CASCADIA outperforms baselines by up to 3.8× and on average 2.6×,
+demonstrating strong performance across LLM cascades. We also compare CASCADIA with Sarathi-Serve [28],
+a serving system with chunked prefill optimizations. CASCADIA achieves 1.95× higher performance (1.64×
+average), validating our approach against advanced systems with scheduling optimizations. Detailed results
+are in Appendix F.
+4.3
+Case studies on Model Deployment Plans and Routing Strategies
+Case study on resource allocation and routing strategies. We benchmarked the thresholds, processing ratios and
+allocated resources for different model types across different testing cases. For instance, when testing on trace
+1 with an average quality requirement of 90, model types c1 to c3 process 100%, 94% and 50% of the total
+requests, and the assigned GPU numbers are 4, 8 and 20. When the quality requirement changes to 85, less
+requests are required to be processed by the largest model c3 (from 50% to 21%), and less resources are
+allocated to c3 accordingly (from 20 to 16). This algorithm and system co-optimization enables CASCADIA to
+adjust system resource allocation and request routing based on user requirements, ensuring balanced load
+8
+
+
+--- Page 9 ---
+3.5
+5.1
+6.8
+8.4 10.0
+SLO Scale
+56
+67
+78
+89
+100
+4.6
+6.2
+8.2
+Trace 1 | avg_quality=80
+2.0
+3.4
+4.8 6.1
+7.5
+SLO Scale
+48
+61
+74
+87
+100
+2.8
+4.8
+6.5
+Trace 2 | avg_quality=80
+1.0
+2.5
+4.0
+5.5
+7.0
+SLO Scale
+38
+54
+69
+84
+100
+1.62.6
+6.0
+Trace 3 | avg_quality=80
+1.5
+3.1
+4.8
+6.4
+8.0
+SLO Scale
+44
+58
+72
+86
+100
+2.13.1
+6.4
+Trace 1 | avg_quality=70
+1.0
+2.8
+4.5
+6.2
+8.0
+SLO Scale
+40
+55
+70
+85
+100
+1.6
+4.95.5
+Trace 2 | avg_quality=70
+1.0
+2.8
+4.5
+6.2
+8.0
+SLO Scale
+40
+55
+70
+85
+100
+1.6
+1.8
+5.1
+Trace 3 | avg_quality=70
+SLO Attainment (%)
+Cascadia
+CascadeServe
+Llama-70B
+Figure 7 End-to-end SLO attainment results evaluating CASCADIA against two baselines using a Llama cascade (Llama3-8B;
+Llama3-70B) across LLM workload traces and quality requirements.
+0.00
+0.08
+0.15
+0.23
+0.30
+Throughput (req/sec)
+1.23×
+2.10×
+Trace 1 | avg_quality=90
+0.00
+0.14
+0.28
+0.42
+0.56
+1.46×
+1.86×
+Trace 2 | avg_quality=90
+0.00
+0.19
+0.38
+0.58
+0.77
+1.32× 1.43×
+Trace 3 | avg_quality=90
+0.00
+0.14
+0.28
+0.41
+0.55
+1.58× 1.71×
+Trace 1 | avg_quality=85
+0.00
+0.28
+0.56
+0.84
+1.13
+1.42× 1.38×
+Trace 2 | avg_quality=85
+0.00
+0.26
+0.53
+0.79
+1.06
+1.63× 1.47×
+Trace 3 | avg_quality=85
+Cascadia
+Uniform Parallelism Strategy
+Uniform Resource Allocation
+Figure 9 Ablation study on resource allocation and parallelism strategy.
+across different model types to boost system performance. Additionally, when testing on trace 3 with an
+average quality requirement of 70, CASCADIA deploys a subset of model types (DeepSeek-dist-7B and -70B) to
+minimize the latencies required for requests processing. As shown in Figure 8, across different testing cases,
+CASCADIA always balances the loads among different model types to ensure optimized system performance.
+Table 2 in Appendix E demonstrates the thresholds, processing ratios and allocated resources for different
+model types across different testing cases.
+(90, 1)
+(85, 1)
+(80, 1)
+(80, 2)
+(80, 3)
+(70, 3)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Normalized Latency
+c1
+c2
+c3
+Figure 8
+Benchmarked p95 latency of each
+model type within the cascade across different
+testing cases.
+Case study on parallelism strategies. We benchmarked the par-
+allelism strategies for different model types across different
+testing cases. For example, when testing on trace 1 with an
+average quality requirement of 90, the optimal parallelism
+strategy s2 for c2 is (DP=2, TP=4). In this case, if we change
+the parallelism strategy to (DP=4, TP=2), the performance of
+this model type would drop by 33.7%. Additionally, when the
+quality requirement drops to 85, the optimal parallelism strat-
+egy s2 for c2 shifts to (DP=6, TP=2). This adjustment occurs
+because the change in quality requirements alters the LLM
+workloads, the request complexity routed and the resource
+allocated to c2. Consequently, s2 is updated to optimize the
+single model type’s performance while balancing loads across all model types within the cascade. Table 3 in
+Appendix E presents the parallelism strategies for each model type within the cascade across different test
+cases.
+Ablation study. We disable individual optimizations in CASCADIA to evaluate their impact, as shown in Figure 9:
+(i) Replacing our parallelism strategy optimization with a uniform parallelism strategy—tensor parallelism
+within each server and data parallelism across servers—reduces performance by up to 1.6× (1.4× on average).
+For example, DeepSeek-7B and DeepSeek-671B requires higher degrees of data and tensor parallelism to
+maximize throughput and parameter sharding; a uniform approach fails to accommodate these needs. (ii)
+Replacing our resource allocation optimization with uniform resource allocation reduces performance by up to
+2.1× (1.7× on average). For instance, in trace 1 with an average quality requirement of 90, DeepSeek-671B
+was originally allocated 20 GPUs, but uniform allocation assigns only 12, causing load imbalance.
+9
+
+
+--- Page 10 ---
+4.4
+Effectiveness of the Scheduling Algorithm
+Overall scheduling process. During scheduling, our Chebyshev-guided optimization (§3.3) explores different
+routing strategies to reduce response latency given a required quality. Simultaneously, our MILP-based
+optimization (§3.2) searches for resource allocations and parallelism strategies to balance load across model
+types and minimize latency. CASCADIA then selects the optimal plan—including thresholds, resource allocations,
+and parallelism strategies—based on quality requirements.
+16 GPUs
+32 GPUs
+48 GPUs
+64 GPUs
+80 GPUs
+0
+13
+26
+39
+52
+Time Cost (s)
+Trace 1
+Trace 2
+Trace 3
+Figure 10 Algorithm running time when scaling
+from smaller clusters (e.g., 16 GPUs) to larger
+clusters (e.g., 80 GPUs).
+Scheduling algorithm runtime and scalability. Figure 10 shows
+the runtime performance of CASCADIA’s scheduling algorithm,
+evaluated on a 12-core CPU instance. In our setup (32 GPUs),
+scheduling completes within 20s. For larger clusters (e.g., 80
+GPUs), it finishes within one minute. These results demon-
+strate the algorithm’s efficiency and scalability across test
+cases and cluster sizes. Moreover, the algorithm is highly par-
+allelizable, as resource allocations, parallelism, and routing
+strategies are independent—allowing execution time to scale
+down with more CPU cores.
+0.000
+0.136
+0.272
+0.409
+0.545
+Throughput (req/sec)
+1.38×
+2.18×
+avg_quality = 90
+0.000
+0.236
+0.472
+0.707
+0.943
+1.51×
+3.22×
+avg_quality = 85
+0.000
+0.475
+0.950
+1.426
+1.901
+1.56×
+2.34×
+avg_quality = 80
+0.000
+1.081
+2.162
+3.243
+4.324
+2.35×
+4.36×
+avg_quality = 70
+Cascadia
+CascadeServe
+DeepSeek-dist-70B/671B
+Figure 11 Throughput evaluation under fluctuating work-
+loads.
+Re-scheduling to adapt to online workload changes.
+As discussed in §3.3, LLM workload characteristics
+(e.g., distributions of input and output lengths, re-
+quest rate and complexity) significantly affect the
+optimal model deployment plan and routing strat-
+egy. Thus, analogous to DistServe [27], CASCADIA
+implement a re-scheduling mechanism to accom-
+modate dynamic LLM workloads. Concretely, the
+system (i) subsample and record the real-time char-
+acteristics of the incoming LLM workloads (e.g.,
+subsample 50 requests every 5 minutes and record the workload characteristics), (ii) upon detecting a sig-
+nificant shift in workload characteristics (e.g., an increase in request arrival rate or request complexity),
+the scheduling algorithm is executed again, incorporating recent historical data to produce an updated
+deployment plan and routing strategy. We evaluated our system against baselines under online fluctuating
+workloads, where the workload transitions trace 1 →trace 2 →trace 3 with segment lengths of 8, 16, and 10
+minutes, evaluated at different quality constraints. As shown in Figure 11, CASCADIA consistently outperforms
+baseline systems, achieving up to 4.4× improvement with an average of 2.2× better performance. Despite
+incurring additional scheduling overhead, CASCADIA maintains superior throughput and end-to-end efficiency
+under fluctuating workloads by dynamically optimizing cascade plans based on real-time LLM workload
+characteristics.
+5
+Conclusion
+This paper proposes CASCADIA, a cascade serving system tailored for LLMs. Its core component is a scheduling
+algorithm that jointly optimizes resource allocation, parallelism, and routing within the cascade system.
+Extensive experiments on diverse workload traces and multiple model cascades show that this co-design
+substantially reduces request latency and boosts system throughput compared with both single-model and
+existing cascade baselines, while maintaining the target answer quality.
+10
+
+
+--- Page 11 ---
+References
+[1] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin, Zhuohan
+Li, Dacheng Li, Eric Xing, et al. Judging llm-as-a-judge with mt-bench and chatbot arena. Advances in Neural
+Information Processing Systems, 36:46595–46623, 2023.
+[2] Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Ruoyu Zhang, Runxin Xu, Qihao Zhu, Shirong Ma, Peiyi Wang,
+Xiao Bi, et al. Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement learning. arXiv preprint
+arXiv:2501.12948, 2025.
+[3] OpenAI. Openai o3, 2025.
+[4] Anthropic. The claude 3 model family: Opus, sonnet, haiku, 2024.
+[5] Machel Reid, Nikolay Savinov, Denis Teplyashin, Dmitry Lepikhin, Timothy Lillicrap, Jean-baptiste Alayrac, Radu
+Soricut, Angeliki Lazaridou, Orhan Firat, Julian Schrittwieser, et al. Gemini 1.5: Unlocking multimodal understanding
+across millions of tokens of context. arXiv preprint arXiv:2403.05530, 2024.
+[6] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman, Akhil
+Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models. arXiv preprint arXiv:2407.21783,
+2024.
+[7] Jaeho Jeon and Seongyong Lee. Large language models in education: A focus on the complementary relationship
+between human teachers and chatgpt. Education and Information Technologies, 28(12):15873–15892, 2023.
+[8] Cheng Peng, Xi Yang, Aokun Chen, Kaleb E Smith, Nima PourNejatian, Anthony B Costa, Cheryl Martin, Mona G
+Flores, Ying Zhang, Tanja Magoc, et al. A study of generative large language model for medical research and
+healthcare. NPJ digital medicine, 6(1):210, 2023.
+[9] GitHub. The world’s most widely adopted ai developer tool, 2024.
+[10] Youhe Jiang, Ran Yan, Xiaozhe Yao, Yang Zhou, Beidi Chen, and Binhang Yuan. Hexgen: generative inference of
+large language model over heterogeneous environment. In Proceedings of the 41st International Conference on
+Machine Learning, pages 21946–21961, 2024.
+[11] Youhe Jiang, Ran Yan, and Binhang Yuan. Hexgen-2: Disaggregated generative inference of llms in heterogeneous
+environment. arXiv preprint arXiv:2502.07903, 2025.
+[12] Xupeng Miao, Chunan Shi, Jiangfei Duan, Xiaoli Xi, Dahua Lin, Bin Cui, and Zhihao Jia. Spotserve: Serving generative
+large language models on preemptible instances. In Proceedings of the 29th ACM International Conference on
+Architectural Support for Programming Languages and Operating Systems, Volume 2, pages 1112–1127, 2024.
+[13] Pranjal Aggarwal, Aman Madaan, Ankit Anand, Srividya Pranavi Potharaju, Swaroop Mishra, Pei Zhou, Aditya Gupta,
+Dheeraj Rajagopal, Karthik Kappaganthu, Yiming Yang, et al. Automix: Automatically mixing language models.
+Advances in Neural Information Processing Systems, 37:131000–131034, 2024.
+[14] Lingjiao Chen, Matei Zaharia, and James Zou. Frugalgpt: How to use large language models while reducing cost
+and improving performance. Transactions on Machine Learning Research.
+[15] Ferdi Kossmann, Ziniu Wu, Alex Turk, Nesime Tatbul, Lei Cao, and Samuel Madden. Cascadeserve: Unlocking model
+cascades for inference serving. arXiv preprint arXiv:2406.14424, 2024.
+[16] Steven Kolawole, Don Dennis, Ameet Talwalkar, and Virginia Smith. Revisiting cascaded ensembles for efficient
+inference. In Workshop on Efficient Systems for Foundation Models II@ ICML2024.
+[17] Luzian Lebovitz, Lukas Cavigelli, Michele Magno, and Lorenz K Muller. Efficient inference with model cascades.
+Transactions on Machine Learning Research, 2023.
+[18] Matthew Streeter. Approximation algorithms for cascading prediction models. In International conference on
+machine learning, pages 4752–4760. PMLR, 2018.
+[19] Siddharth Samsi, Dan Zhao, Joseph McDonald, Baolin Li, Adam Michaleas, Michael Jones, William Bergeron, Jeremy
+Kepner, Devesh Tiwari, and Vijay Gadepally. From words to watts: Benchmarking the energy costs of large language
+model inference. In 2023 IEEE High Performance Extreme Computing Conference (HPEC), pages 1–9. IEEE, 2023.
+11
+
+
+--- Page 12 ---
+[20] Neha Gupta, Harikrishna Narasimhan, Wittawat Jitkrittum, Ankit Singh Rawat, Aditya Krishna Menon, and Sanjiv
+Kumar. Language model cascades: Token-level uncertainty and beyond. In The Twelfth International Conference on
+Learning Representations.
+[21] Harikrishna Narasimhan, Wittawat Jitkrittum, Ankit Singh Rawat, Seungyeon Kim, Neha Gupta, Aditya Krishna
+Menon, and Sanjiv Kumar. Faster cascades via speculative decoding. arXiv preprint arXiv:2405.19261, 2024.
+[22] Jiangfei Duan, Runyu Lu, Haojie Duanmu, Xiuhong Li, Xingcheng Zhang, Dahua Lin, Ion Stoica, and Hao Zhang.
+Muxserve: flexible spatial-temporal multiplexing for multiple llm serving. In Proceedings of the 41st International
+Conference on Machine Learning, pages 11905–11917, 2024.
+[23] Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao, Xinyi Zhang, Yong Li, and Wei Lin. Llumnix: Dynamic
+scheduling for large language model serving.
+In 18th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 24), pages 173–191, 2024.
+[24] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Tianle Li, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang, Zhuohan
+Li, Zi Lin, Eric Xing, et al. Lmsys-chat-1m: A large-scale real-world llm conversation dataset. In The Twelfth
+International Conference on Learning Representations.
+[25] Wenting Zhao, Xiang Ren, Jack Hessel, Claire Cardie, Yejin Choi, and Yuntian Deng. Wildchat: 1m chatgpt interaction
+logs in the wild. In The Twelfth International Conference on Learning Representations.
+[26] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ricardo Bianchini.
+Splitwise: Efficient generative llm inference using phase splitting. In 2024 ACM/IEEE 51st Annual International
+Symposium on Computer Architecture (ISCA), pages 118–132. IEEE, 2024.
+[27] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao Zhang. {DistServe}:
+Disaggregating prefill and decoding for goodput-optimized large language model serving.
+In 18th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI 24), pages 193–210, 2024.
+[28] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav Gulavani, Alexey Tumanov,
+and Ramachandran Ramjee. Taming {Throughput-Latency} tradeoff in {LLM} inference with {Sarathi-Serve}. In
+18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24), pages 117–134, 2024.
+[29] Youhe Jiang, Fangcheng Fu, Xiaozhe Yao, Guoliang He, Xupeng Miao, Ana Klimovic, Bin Cui, Binhang Yuan, and
+Eiko Yoneki. Demystifying cost-efficiency in llm serving over heterogeneous gpus. arXiv preprint arXiv:2502.00722,
+2025.
+[30] Li Zhang, Youhe Jiang, Guoliang He, Xin Chen, Han Lv, Qian Yao, Fangcheng Fu, and Kai Chen. Efficient mixed-
+precision large language model inference with turbomind. arXiv preprint arXiv:2508.15601, 2025.
+[31] Yilong Zhao, Shuo Yang, Kan Zhu, Lianmin Zheng, Baris Kasikci, Yang Zhou, Jiarong Xing, and Ion Stoica. Blend-
+serve: Optimizing offline inference for auto-regressive large models with resource-aware batching. arXiv preprint
+arXiv:2411.16102, 2024.
+[32] Youhe Jiang, Fangcheng Fu, Xiaozhe Yao, Taiyi Wang, Bin Cui, Ana Klimovic, and Eiko Yoneki. Thunderserve:
+High-performance and cost-efficient llm serving in cloud environments. arXiv preprint arXiv:2502.09334, 2025.
+[33] Jasper Dekoninck, Maximilian Baader, and Martin Vechev. A unified approach to routing and cascading for llms. In
+Forty-second International Conference on Machine Learning, 2025.
+[34] Harikrishna Narasimhan, Wittawat Jitkrittum, Ankit Singh Rawat, Seungyeon Kim, Neha Gupta, Aditya Krishna
+Menon, and Sanjiv Kumar. Faster cascades via speculative decoding. In The Thirteenth International Conference on
+Learning Representations, 2025.
+[35] Zhuohan Li, Lianmin Zheng, Yinmin Zhong, Vincent Liu, Ying Sheng, Xin Jin, Yanping Huang, Zhifeng Chen, Hao
+Zhang, Joseph E Gonzalez, et al. {AlpaServe}: Statistical multiplexing with model parallelism for deep learning
+serving. In 17th USENIX Symposium on Operating Systems Design and Implementation (OSDI 23), pages 663–679,
+2023.
+[36] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. Megatron-
+lm: Training multi-billion parameter language models using model parallelism. arXiv preprint arXiv:1909.08053,
+2019.
+12
+
+
+--- Page 13 ---
+[37] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan Ngiam,
+Quoc V Le, Yonghui Wu, et al. Gpipe: Efficient training of giant neural networks using pipeline parallelism. Advances
+in neural information processing systems, 32, 2019.
+[38] ETH-EASL. Scratchpad, 2025.
+[39] Ralph E Steuer and Eng-Ung Choo. An interactive weighted tchebycheff procedure for multiple objective program-
+ming. Mathematical programming, 26:326–344, 1983.
+[40] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan Xiao, Xingyu Dang,
+Chuang Gan, and Song Han. Awq: Activation-aware weight quantization for on-device llm compression and
+acceleration. Proceedings of Machine Learning and Systems, 6:87–100, 2024.
+[41] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Livia Sun, Jeff Huang, Cody Hao Yu, Shiyi Cao, Christos
+Kozyrakis, Ion Stoica, Joseph E Gonzalez, et al. Sglang: Efficient execution of structured language model programs.
+Advances in Neural Information Processing Systems, 37:62557–62583, 2024.
+[42] You Peng, Youhe Jiang, Chen Wang, and Binhang Yuan. Hexgen-text2sql: Optimizing llm inference request scheduling
+for agentic text-to-sql workflow. arXiv preprint arXiv:2505.05286, 2025.
+[43] Youhe Jiang, Fangcheng Fu, Xupeng Miao, Xiaonan Nie, and Bin Cui. Osdp: Optimal sharded data parallel for
+distributed deep learning. arXiv preprint arXiv:2209.13258, 2022.
+[44] Guoliang He, Youhe Jiang, Wencong Xiao, Kaihua Jiang, Shuguang Wang, Jun Wang, Zixian Du, Zhuo Jiang, Xinlei
+Zhang, Binhang Yuan, et al. Efficient pre-training of llms via topology-aware communication alignment on more
+than 9600 gpus. arXiv preprint arXiv:2509.15940, 2025.
+[45] Ran Yan, Youhe Jiang, Xiaonan Nie, Fangcheng Fu, Bin Cui, and Binhang Yuan. Hexiscale: Accommodating large
+language model training over heterogeneous environment. arXiv preprint arXiv:2409.01143, 2024.
+[46] Xupeng Miao, Yujie Wang, Youhe Jiang, Chunan Shi, Xiaonan Nie, Hailin Zhang, and Bin Cui. Galvatron: Efficient
+transformer training over multiple gpus using automatic parallelism. arXiv preprint arXiv:2211.13878, 2022.
+[47] Yujie Wang, Youhe Jiang, Xupeng Miao, Fangcheng Fu, Shenhan Zhu, Xiaonan Nie, Yaofeng Tu, and Bin Cui.
+Improving automatic parallel training via balanced memory workload optimization. IEEE Transactions on Knowledge
+and Data Engineering, 36(8):3906–3920, 2024.
+[48] Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative decoding. In
+International Conference on Machine Learning, pages 19274–19286. PMLR, 2023.
+[49] Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Zeyu Wang, Zhengxin Zhang, Rae Ying Yee Wong,
+Alan Zhu, Lijie Yang, Xiaoxiang Shi, et al. Specinfer: Accelerating large language model serving with tree-based
+speculative inference and verification. In Proceedings of the 29th ACM International Conference on Architectural
+Support for Programming Languages and Operating Systems, Volume 3, pages 932–949, 2024.
+[50] Xiaoxuan Liu, Lanxiang Hu, Peter Bailis, Alvin Cheung, Zhijie Deng, Ion Stoica, and Hao Zhang. Online speculative
+decoding. In Forty-first International Conference on Machine Learning.
+[51] Surat Teerapittayanon and Bradley McDanel. Branchynet: Fast inference via early exiting from deep neural networks.
+In 2016 23rd international conference on pattern recognition (ICPR), pages 2464–2469. IEEE, 2016.
+[52] Haseena Rahmath P, Vishal Srivastava, Kuldeep Chaurasia, Roberto G Pacheco, and Rodrigo S Couto. Early-exit deep
+neural network-a comprehensive survey. ACM Computing Surveys, 57(3):1–37, 2024.
+13
+
+
+--- Page 14 ---
+Table 1 Simulator accuracy across parallelism configurations on Llama3-70B model under a workload with average input
+and output lengths of 1600 and 16. Errors are absolute percentage errors.
+Config (DP,TP,PP)
+Real (req/s)
+Estimated (req/s)
+Abs. % Error
+(1, 4, 1)
+0.21
+0.219
+4.29%
+(1, 2, 2)
+0.26
+0.280
+7.69%
+(1, 1, 4)
+0.27
+0.287
+6.30%
+(2, 1, 2)
+0.33
+0.347
+5.15%
+(2, 2, 1)
+0.40
+0.408
+2.00%
+(2, 4, 1)
+0.41
+0.437
+6.59%
+(2, 2, 2)
+0.55
+0.559
+1.64%
+A
+Extended Related Work
+Parallelism strategies. LLMs with huge memory and computational resource requirements typically rely on
+parallelization across multiple GPUs [35, 42–44]. There are three prevalent forms of parallelism: data
+parallelism (DP, i.e., model replication), tensor parallelism (TP) [36, 45, 46], and pipeline parallelism
+(PP) [37, 47]. DP replicates the model into multiple replicas, enabling parallel processing of requests. TP
+divides model weights and computationally intensive operations such as matrix multiplication across various
+GPUs, thereby splitting data scanning and computation to minimize LLM inference latency. PP divides the
+layers of a model into multiple stages. These stages are assigned to distinct GPUs for execution and they
+establish a pipeline. Only inter-layer activations are needed to be communicated between stages.
+Speculative decoding and early-exit in LLM inference. Speculative decoding uses a lightweight draft model
+to generate token blocks, which a larger target model verifies—leveraging model heterogeneity to reduce
+computation and latency [48–50]. Similarly, early-exit networks add decision branches at intermediate
+layers, enabling inference to stop early when confidence is high—cascading computation within a single
+model [51, 52]. In contrast, we focus firmly on cascade model inference.
+B
+Simulator Design and Validation
+Our simulator employs a round-robin strategy for request dispatching among multiple parallel models, and
+a first-come first-served strategy for per-model request processing. The single-GPU processing time is based
+on profiled characteristics like compute TFLOPS and memory bandwidth. The simulator also considers the
+phase-specific characteristics of LLMs. The prefill phase is compute-bound, so its batched processing capacity
+is determined by the sum of the individual latencies. In contrast, the decoding phase is memory-bound, and
+its batched processing capability is defined by a single latency value. This distinction has been validated in
+several studies (e.g., DistServe [27], Splitwise [26]).
+Inputs of the simulator. The simulator requires three fundamental inputs: (i) the distributions of input and
+output sequence lengths for each model type within the cascade; (ii) the request arrival rate corresponding to
+each model type within the cascade; and (iii) the resource allocation designated for each model type within
+the cascade.
+Example. Consider a workload distribution W that routes 100, 70, and 30 requests to model types 1, 2, and 3
+respectively within the cascade, with corresponding GPU allocations of 2, 4, and 2 units. In this configuration,
+we record the distributions of input and output sequence lengths for each subset of requests (100, 70, and
+30 respectively) as input files to the simulator, configure the request arrival rates and resource allocations
+according to the specified parameters, and execute the simulation. Subsequently, the simulator undergoes
+iterative execution to identify the optimal parallelism strategy based on the provided input files, request arrival
+rates, and resource allocation constraints.
+Batching strategy in our simulator. The simulator’s internal batching strategy is continuous batching, which
+iteratively batches request tokens to fully utilize the current resources. The GPU’s memory limit constrains the
+maximum batch size for continuous batching.
+14
+
+
+--- Page 15 ---
+Queuing mechanism. Our simulator maintains an individual queue for each model. Once there is free memory
+on the GPU (one request has finished), the model will fetch the next request in the queue for processing.
+Different parallelism. Tensor and pipeline parallelism both split the computation workload of a single model
+across multiple devices. For pipeline parallelism, the simulator models communication overhead by profiling
+the relationship between estimated communication volume and observed latency. For tensor parallelism,
+the simulator assumes that each operator’s computation cost ideally scales down by a factor of 1/N when
+split across N GPUs, and then adjusts this ideal cost using a speed-up coefficient K(N) obtained from micro-
+benchmarks to account for communication and synchronization overhead. All profiling is performed offline
+before scheduling begins.
+Simulator evaluation. We present the accuracy of our simulator with real-time experiments in Table 1. The table
+presents examples of our throughput estimation for the Llama3-70B model under a workload with average
+input and output lengths of 1600 and 16, respectively. The notation (1,2,2) indicates a DP degree of 1, TP
+degree of 2, and PP degree of 2. Although the estimations are not perfectly accurate, they are sufficiently
+reliable (with estimation errors within 2%–7%) for selecting optimal configurations.
+C
+Routing Solver in Latency-Constrained Case
+The routing solver can also optimize system response quality under a user-specified latency budget by solving
+arg min
+θ
+"
+−Q(θ) + ν max{0, L(θ) −Lmax}
+z⋆
+lat, max −z⋆
+lat, min
+#
+,
+where z⋆
+lat, min and z⋆
+lat, max are the best (minimum) and worst (maximum) achievable latencies, Lmax is the
+allowable latency budget, and ν > 0 scales the penalty. The same routing–deployment alternation, deployment
+solver, and convergence procedure are reused unchanged.
+D
+Complete Bi-level Optimization Formulation
+Problem setup and notation. We consider a cascade with C model types/stages indexed by {1, . . . , C} and
+labeled C = {c1, . . . , cC}, where ci denotes the i-th model type. The routing strategy is denoted by θ,
+parameterized by thresholds H = {h1, . . . , hC−1}, with Θ the feasible set of routing strategies. The GPU
+resource allocation is F = {f1, . . . , fC}, where fi ∈Z+ is the number of GPUs assigned to model type i,
+subject to a total budget N ∈Z+. The parallelism plan is S = {DPi, TPij, PPij}i,j, where DPi denotes the
+number of data-parallel replicas and, for each replica j, TPij and PPij denote its tensor- and pipeline-parallel
+degrees. Given routing θ and deployment (F, S), the estimated p95 latency is L(θ, F, S), and the system
+quality is Q(θ; ˜I) estimated by a judger using a subsampled workload ˜I. For Chebyshev-style normalization of
+quality, we use quality anchors z⋆
+1 (utopia/best achievable quality, e.g., all requests at cC) and z⋆
+2 (nadir/worst
+credible quality, e.g., all requests at c1). A user-specified quality requirement is qmin, and µ > 0 is a penalty
+weight.
+Bi-level formulation. The routing is optimized by a single scalar objective that penalizes quality shortfall,
+normalized by the utopia–nadir range, while the deployment is optimized under the GPU budget and
+parallelism feasibility:
+θ ∈arg min
+θ′∈Θ
+"
+L
+ θ′, F⋆, S⋆
++ µ max
+(
+0, qmin −Q(θ′; ˜I)
+z⋆
+1 −z⋆
+2
+) #
+,
+(F⋆, S⋆) ∈arg min
+F, S
+L(θ′, F, S)
+s.t.
+C
+X
+i=1
+fi ≤N,
+DPi
+X
+j=1
+TPijPPij = fi (i=1, . . . , C),
+fi, DPi, TPij, PPij ∈Z+.
+Tractability and solution strategy. Because the problem couples routing, resource allocation, parallelism,
+heterogeneous LLM workloads, and user-specific quality requirements, a monolithic solve is intractable. We
+15
+
+
+--- Page 16 ---
+therefore adopt a bi-level strategy: The deployment problem is solved as a MILP with latency values obtained
+from resource allocation and parallelism strategy optimization; the routing solver solves the Chebyshev-
+guided penalty problem. The two phases are executed iteratively, with the routing solver updating θ and
+the deployment solver resolving (F⋆, S⋆) accordingly, and termination declared once the routing objective
+stabilizes under a prescribed horizon.
+Interpretation. The bi-level problem decomposes into routing and deployment subproblems that are solved
+iteratively.
+Deployment solver (deployment under resource/feasibility constraints). For a fixed routing θ′, the deployment
+solver selects the latency-optimal deployment by choosing GPU allocations and parallelism plans subject to the
+budget and structural constraints:
+(F⋆, S⋆) ∈arg min
+F, S
+L(θ′, F, S)
+s.t.
+C
+X
+i=1
+fi ≤N,
+DPi
+X
+j=1
+TPijPPij = fi (i=1, . . . , C),
+fi, DPi, TPij, PPij ∈Z+.
+This solver captures both hardware limits (GPU budget N) and parallelism feasibility.
+Routing solver (routing, Chebyshev-guided optimization). Given the current deployment (F⋆, S⋆), the routing
+solver updates the routing strategy (i.e., θ) by minimizing a single scalar objective that balances latency and a
+normalized quality shortfall:
+θ ∈arg min
+θ′∈Θ
+"
+L
+ θ′, F⋆, S⋆
++ µ max
+(
+0, qmin −Q(θ′; ˜I)
+z⋆
+1 −z⋆
+2
+) #
+.
+Here, (z⋆
+1 −z⋆
+2)−1 provides Chebyshev (utopia–nadir) normalization for scale stability, and µ > 0 sets the
+severity of penalizing Q(θ′) < qmin. For sufficiently large µ (when the target is feasible), any minimizer is
+quality-compliant and the routing objective effectively reduces to minimizing latency among feasible routings.
+Coupling and procedure. The routing solver’s θ determines the workload distribution seen by each model type
+within the cascade (and hence the optimal deployment plan for the deployment solver), while the deployment
+solver’s (F⋆, S⋆) determines the latency used by the routing objective (and hence the optimal routing strategy
+for the routing solver). Alternating updates continue until the routing objective stabilizes under a prescribed
+termination horizon (e.g., best-so-far objective unchanged for K consecutive iterations).
+E
+Case studies on Model Deployment Plans and Routing Strategies
+Case study on resource allocation and routing strategies. Table 2 demonstrates the case study of thresholds,
+processing ratios and allocated resources for different model types across different testing cases.
+Table 2 Case study of the thresholds (h1, h2), processing ratios (p1, p2, p3), and allocated resources (f1, f2, f3) for each
+model type within the cascade across different testing cases. (90, 1) denotes testing on Trace 1 with an average quality
+requirement of 90.
+h1
+h2
+p1
+p2
+p3
+f1
+f2
+f3
+(90, 1)
+99
+91
+100%
+94%
+50%
+4
+8
+20
+(85, 1)
+74
+64
+100%
+62%
+21%
+4
+12
+16
+(80, 1)
+69
+25
+100%
+54%
+11%
+6
+14
+12
+(80, 2)
+61
+18
+100%
+31%
+3%
+8
+16
+8
+(80, 3)
+32
+0
+100%
+23%
+0%
+18
+14
+0
+(70, 3)
+10
+0
+100%
+5%
+0%
+24
+8
+0
+Case study on parallelism strategies. Table 3 presents a case study on parallelism strategies for each model type
+within the cascade across different test cases.
+16
+
+
+--- Page 17 ---
+Table 3 Case study of the parallelism strategies for each model type within the cascade (s1, s2, s3) across different testing
+cases.
+Parallelism Strategies
+(90, 1)
+s1: (DP=4), s2: (DP=2, TP=4), s3: (TP=4, PP=3), (TP=8)
+(85, 1)
+s1: (DP=2, TP=2), s2: (DP=6, TP=2), s3: (DP=2, TP=8)
+(80, 1)
+s1: (DP=6), s2: (DP=5, TP=2), (TP=4), s3: (TP=4, PP=3)
+(80, 2)
+s1: (DP=6), (TP=2), s2: (DP=8, TP=2), s3: (TP=8)
+(80, 3)
+s1: (DP=10), (DP=4, TP=2), s2: (DP=2, TP=4), (DP=3, TP=2), s3: -
+(70, 3)
+s1: (DP=16), (DP=4, TP=2), s2: (DP=4, TP=2), s3: -
+Table 4 End-to-end throughput results evaluating CASCADIA against Sarathi-Serve.
+Trace
+Ours
+Sarathi-Serve
+Speedup
+%Improvement
+Trace 1
+0.2529 req/s
+0.1913 req/s
+1.322
++32.20%
+Trace 2
+0.4659 req/s
+0.2385 req/s
+1.953
++95.35%
+Trace 3
+0.6406 req/s
+0.3977 req/s
+1.611
++61.08%
+F
+Comparison with Sarathi-Serve
+We evaluated Sarathi-Serve under the same experimental setup as SGLang, as described in §4.1, using traces
+1–3 with an average quality requirement of 90. We used Sarathi-Serve’s vLLM implementation (its most
+efficient variant) and tuned the chunk size to be optimal for each case. As shown in Table 4, our system
+achieves up to 1.95× higher throughput and averages a 1.64× speedup across traces.
+17

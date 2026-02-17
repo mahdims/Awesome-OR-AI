@@ -1,0 +1,1012 @@
+--- Page 1 ---
+tLoRA: Efficient Multi-LoRA Training with Elastic Shared Super-Models
+Kevin Li 1 Dibyadeep Saha 1 Avni Kanodia 1 Fan Lai 1
+Abstract
+As Low-Rank Adaptation (LoRA) becomes the
+standard approach for efficiently fine-tuning large
+language models (LLMs), shared clusters increas-
+ingly execute many concurrent LoRA training
+jobs over the same frozen backbone. While re-
+cent advances enable batching (co-locating) mul-
+tiple adapters during serving, efficient training-
+time co-location of heterogeneous LoRA adapters
+presents unique challenges. Jobs often differ in
+adapter rank, batch size, and resource allocation,
+and naïve batching can introduce synchroniza-
+tion stalls, communication overheads, and per-job
+slowdowns that are worse than executing indepen-
+dently. We introduce tLoRA, a framework that
+enables efficient batch training of multiple LoRA
+jobs. tLoRA fuses adapters that share the same
+base model into an elastic shared super-model, ex-
+ploiting existing distributed training frameworks
+to derive parallelism plans that share resources
+effectively. At the kernel level, tLoRA employs
+a fused LoRA kernel that adaptively reconstructs
+low-rank computation tiles and schedules rank-
+aware nano-batches to maximize overlap between
+computation and communication across adapters.
+At the scheduling layer, tLoRA incorporates an
+online, residual-capacity-aware scheduler that
+adaptively groups jobs to maximize collective
+throughput. Evaluations using real-world cluster
+traces demonstrate that tLoRA improves training
+throughput by 1.2–1.8x, job training completion
+time by 2.3–5.4x, and GPU utilization by 37%.
+1. Introduction
+Low-Rank Adaptation (LoRA) has emerged as a lightweight
+and effective technique for adapting large language models
+(LLMs) to diverse downstream tasks. Rather than fine-
+tuning all model parameters, LoRA freezes the pre-trained
+1Siebel School of Computing and Data Science, University of
+Illinois Urbana-Champaign, Champaign, Illinois, United States.
+Correspondence to: Fan Lai <fanlai@illinois.edu>.
+Preprint. February 16, 2026.
+backbone and inserts small, trainable low-rank matrices
+into selected attention and/or projection layers, typically ac-
+counting for less than 5% of the total model parameters (Hu
+et al., 2022). During training, only adapter parameters are
+updated, substantially reducing overhead.
+Increasingly, LoRA fine-tuning has become a prominent
+workload in modern machine learning (ML) clusters. For
+example, platforms such as CivitAI host over 100K LoRA
+adapters for a wide range of models (Luo et al., 2024). Re-
+cent studies further suggest that fine-tuning jobs constitute
+a substantial fraction of shared ML cluster workloads (Hu
+et al., 2024). These LoRA tuning tasks, submitted by indi-
+vidual or collaborative developers and teams, may explore
+different hyperparameter configurations (Zhang et al., 2023)
+or continuously adapt models to evolving data and tasks (Wu
+et al., 2025).
+Supporting large numbers of LoRA adapters at scale in-
+troduces significant efficiency challenges. Treating each
+adapter independently requires replicating the base model
+across multiple GPUs, leading to considerable memory
+and compute overhead. Recognizing that many adapters
+share the same backbone (e.g., Qwen3 model), recent
+advances (Sheng et al., 2024; Wu et al., 2024) have ex-
+plored batching multiple LoRAs during serving. By al-
+lowing adapters to share a single base model and execute
+jointly—synchronizing after each layer—these approaches
+reduce redundant memory usage and improve GPU uti-
+lization. However, despite their success at inference time,
+the problem of efficiently training heterogeneous LoRA
+adapters together remains largely unexplored.
+Despite the potential efficiency gains, batching (co-locating)
+multiple LoRA training jobs introduces several significant
+challenges. (i) Job heterogeneity: tuning jobs differ in LoRA
+rank (e.g., adapter size), batch size, and allocated resources.
+Naively batching jobs—especially those that are already
+compute-saturated—can degrade collective throughput by
+amplifying communication overheads and exacerbating im-
+balance. (ii) Batch execution interdependence: executing
+batches over a shared base model can improve hardware
+utilization, but it also introduces per-layer synchronization
+stalls. (iii) Per-job incentives: although batching can in-
+crease aggregate throughput, individual jobs—particularly
+those with abundant resources—may experience slowdowns
+1
+arXiv:2602.07263v2  [cs.LG]  13 Feb 2026
+
+
+--- Page 2 ---
+tLoRA: Efficient Multi-LoRA Training with Elastic Shared Super-Models
+under shared execution. Without explicit incentive and fair-
+ness guarantees, such degradation discourages users from
+participating in batched training (§2).
+We introduce tLoRA, a framework for efficiently batch-
+ing heterogeneous LoRA training jobs in shared clusters
+to improve collective training efficiency while respecting
+per-job progress requirements (e.g., completion deadlines).
+To achieve this, tLoRA first fuses multiple heterogeneous
+LoRA jobs into an elastic Shared Super-Model (SSM) graph,
+where nodes represent computation associated with base-
+model layers and LoRA adapters, and edges capture data-
+flow (e.g., activation) dependencies. This unified represen-
+tation allows tLoRA to seamlessly leverage existing dis-
+tributed frameworks (e.g., Megatron-LM (Narayanan et al.,
+2021) or PyTorch FSDP) to derive efficient execution plans
+across GPUs (e.g., pipeline parallelism).
+To mitigate execution stragglers arising from LoRA het-
+erogeneities, tLoRA further partitions inputs from different
+LoRA jobs into nano-batches, enabling fine-grained over-
+lap between computation and communication and reducing
+pipeline bubbles during execution. At runtime, tLoRA dy-
+namically determines which jobs to batch based on their
+residual resource capacity (e.g., unused GPU compute or
+memory when running independently), selecting group-
+ings that maximize aggregate throughput while enforcing
+per-job progress guarantees, such as starvation avoidance
+and bounded slowdown. Our evaluations using real-world
+cluster traces demonstrate that tLoRA improves training
+throughput by 1.2–1.8x, per-job completion time by 2.3-
+5.4x, and GPU utilization by up to 37% (§4).
+Overall, we make the following contributions:
+• We introduce a new SSM abstraction to unify LoRA
+training jobs, enabling efficient distributed execution.
+• We design a fused LoRA kernel that dynamically allo-
+cates low-rank computation tiles and schedules rank-
+aware nano-batches to maximize resource utilization.
+• We propose an online, residual-capacity-aware schedul-
+ing algorithm that adaptively groups LoRA jobs to im-
+prove throughput while respecting per-job progress.
+• We demonstrate the effectiveness of tLoRA through real-
+world deployments.
+2. Background and Motivation
+LoRA freezes the pre-trained backbone and inserts
+lightweight, trainable low-rank matrices into selected layers.
+As shown in Figure 1, a weight update W ←W + ∆W
+is reparameterized as ∆W = AB⊤, where A ∈Rd×r and
+B ∈Rr×k with r ≪min(d, k). This design slashes the
+number of trainable parameters from O(dk) to O(r(d+k)).
+Because many adapters share the same frozen backbone, re-
+Pretrained 
+Weights
+Wb
+Wa
+W’b
+W’a
+LoRA 1
+LoRA 2
+Outputs Outputs
+Batched Inputs
+Figure 1. Adapter heterogene-
+ity (e.g., in rank and batch
+size) creates tension between
+throughput and per-job latency
+in multi-LoRA training.
+Figure 2.
+Naïve batch LoRA
+training may hurt aggregate train-
+ing throughput. (Llama3.1-8B)
+cent serving-time systems such as dLoRA (Wu et al., 2024)
+and S-LoRA (Sheng et al., 2024) batch (co-locate) multi-
+ple LoRAs as plug-ins to a shared base model. By batch-
+ing base-model computation and fusing adapter execution,
+grouped execution amortizes kernel-launch and I/O over-
+heads, thereby improving inference efficiency.
+Extending adapter batching from inference to training in-
+troduces unique challenges arising from along three key
+dimensions: (1) LoRA Heterogeneity: varying adapter ranks,
+batch sizes, and sequence lengths, which shape gradient
+computation load; (2) Resource Heterogeneity: different
+accelerator counts or even types; and (3) User-demand Het-
+erogeneity: divergent user’s requirements on performance
+such as job completion time or latency constraints in on-
+line learning. These factors jointly determine both step
+efficiency and end-to-end convergence behavior.
+Grouped Training Introduces Execution Bubbles.
+De-
+spite its potential, naïve batching can be ineffective and even
+counterproductive. As illustrated in Figure 2, some group-
+ings of LoRA jobs improve aggregate training throughput
+relative to isolated execution. Merging and batching LoRA
+Jobs 1 and 3 increases throughput from 0.74+1.09 (isolated
+runs) to 2.36 when batched. However, other groupings lead
+to clear regressions (e.g., Jobs 1 and 2). This discrepancy
+stems from the fact that batching pools accelerators and
+distributes execution across devices, yet naïve strategies ig-
+nore heterogeneity in adapter rank, batch size, and device
+placement, potentially introducing imbalance in model par-
+allelism, amplifying synchronization delays that shift the
+performance bottleneck from computation to communica-
+tion, especially when jobs are grouped across nodes.
+This makes job grouping a nontrivial optimization problem.
+Naïve grouping can cause resource-rich jobs to subsidize
+others and suffer slower progress, discouraging participa-
+tion. With proper coordination, however, grouping enables
+dynamic resource reallocation: jobs with slack can tem-
+porarily yield capacity to accelerate others and later reclaim
+resources to reduce their own time-to-convergence.
+2
+
+
+--- Page 3 ---
+tLoRA: Efficient Multi-LoRA Training with Elastic Shared Super-Models
+3. tLoRA Design
+We present tLoRA, a heterogeneity-aware framework for
+jointly training multiple LoRA adapters with high through-
+put while respecting individual job performance require-
+ments (e.g., completion deadlines or throughput targets).
+3.1. tLoRA Overview
+Adapter Scheduler ($3.4)
+25%
+65%
+90%
+Model Fuser ($3.2)
+Base W
+W0(X)
+W’a0
+W’b0
+Adapter A
+W’a1
+W’b1
+Adapter B
+W1(X)
+GPU 0
+GPU 1
+GPU 2
+Time
+Communication
+Computation
+Kernel Fuser ($3.3)
+Max Execution Overlap
+Time
+k
+…
+…
+0
+GPU Blocks
+LoRA A
+LoRA B
+LoRA Jobs
+GPU
+Util.
+Figure 3. Lifecycle of multi-adapter LoRA training with tLoRA.
+tLoRA operates in an online setting where LoRA tuning
+jobs continuously arrive and complete over time. At its
+core, tLoRA builds on a Shared Super-Model (SSM) abstrac-
+tion that unifies a single base LLM with multiple attached
+adapters into a single executable model. This abstraction
+preserves compatibility with existing distributed training
+stacks (e.g., model-parallel frameworks) while enabling ef-
+ficient resource sharing across heterogeneous jobs.
+Using the SSM, tLoRA coordinates cluster-wide LoRA
+training through three key components. As illustrated in
+Figure 3, for each group of jobs, 1 Model Fuser (§3.2)
+consolidates the shared backbone and selected adapters into
+an SSM. The fused model captures structural heterogeneity
+across jobs (e.g., adapter rank, batch size, and sequence
+length) and is passed to an existing parallelism planner,
+which derives a distributed execution plan that minimizes
+pipeline bubbles and improves hardware utilization. During
+execution, 2 Kernel Fuser (§3.3) performs adapter-aware
+kernel fusion within the SSM. It applies load balancing
+across streaming multiprocessors (SMs), enabling effective
+overlap between computation and communication and mit-
+igating inefficiencies caused by small or irregular kernels.
+Finally, 3 Adapter Scheduler (§3.4) monitors lightweight
+runtime signals such as per-job training progress and itera-
+tion latency. At the end of each scheduling horizon, it adap-
+tively updates grouping decisions for subsequent execution:
+jobs whose progress slows beyond acceptable bounds are
+decoupled or rebalanced, while compatible jobs are merged
+to improve aggregate throughput and resource efficiency.
+We next describe how tLoRA achieves high collective train-
+ing throughput by minimizing execution bubbles across the
+model-parallel pipeline (§3.2), runtime kernels (§3.3), and
+adaptive training grouping decisions (§3.4).
+3.2. Model Fuser: Optimizing Model Parallelism
+Batch training of multiple LoRA adapters offers opportuni-
+ties to amortize backbone computation, I/O overhead (e.g.,
+loading model weights to GPU register), and improve accel-
+erator utilization, but heterogeneity in adapter rank, batch
+size, and device placement can introduce significant execu-
+tion imbalance (§2). tLoRA addresses this challenge with
+a heterogeneity-aware Model Fuser that unifies multiple
+training jobs into a single optimizable model representa-
+tion, enabling joint reasoning about model parallelism and
+downstream overlap opportunities.
+Shared Super-Model Representation
+tLoRA introduces
+a Shared Super-Model (SSM) abstraction that consolidates
+a set of LoRA training jobs sharing the same frozen back-
+bone into one composite computation graph. Given jobs
+J = {J1, . . . , JK} derived from a base model M, the
+Model Fuser performs layer-wise architectural fusion on
+shared backbone operators. LoRA adapters are retained
+as lightweight, job-specific branches attached to the fused
+backbone layers. This design enables multiple jobs to share
+compute-intensive backbone execution while preserving in-
+dependent forward/backward semantics and optimizer states.
+The resulting SSM is functionally equivalent to training each
+job independently, ensuring correctness and convergence,
+while exposing more structure for optimization.
+Rather than introducing a new model-parallel planner,
+tLoRA presents the SSM as a single composite model to
+existing planning frameworks (e.g., PyTorch Distributed,
+Metis (Um et al., 2024)). Through standard layer-wise pro-
+filing and cost modeling, these planners naturally internalize
+load heterogeneity across adapters (e.g., due to different
+batch sizes) when estimating per-layer compute and com-
+munication costs. As a result, partitioning and placement
+decisions directly embed adapter heterogeneity into the exe-
+cution plan, yielding model-parallel strategies that jointly
+optimize collective throughput and resource utilization with-
+out modifying existing infrastructures.
+3.3. Kernel Fuser: Minimizing Runtime Bubbles
+While the Model Fuser mitigates imbalance at the level of
+model parallelism, batched execution introduces additional
+challenges at the GPU execution level. When heterogeneous
+adapters are executed jointly, differences in rank, sequence
+length, and batch size lead to skewed workloads across
+threads and warps, resulting in synchronization stalls and
+underutilized streaming multiprocessors (SMs). A naïve de-
+3
+
+
+--- Page 4 ---
+tLoRA: Efficient Multi-LoRA Training with Elastic Shared Super-Models
+Figure 4. Execution of a micro-batch using our Kernel Fuser
+sign that processes each adapter independently launches one
+kernel per adapter, resulting in many GPU kernels, incur-
+ring excessive overhead, poor occupancy, and underutilizing
+GPU parallelism. Conversely, forcing all adapters into a
+single dense matrix multiplication creates a “super-kernel”
+with highly irregular, block-sparse layouts with zero regions
+depending on the adapter heterogeneity, wasting compute
+and memory bandwidth.
+As shown in Figure 4, to efficiently execute heterogeneous
+LoRA adapters, tLoRA introduces a fused batched LoRA
+kernel that avoids materializing adapter-specific weight ma-
+trices, thereby improving register and shared-memory reuse.
+For each adapter i, tokens mapped to that adapter are first
+gathered and multiplied with the down-projection matrix Ai,
+producing a compact intermediate of shape (|Xi|, ri). This
+intermediate is then immediately multiplied with the corre-
+sponding up-projection matrix Bi and scattered back to the
+output tensor, without ever materializing Wi = AiB⊤
+i or al-
+locating full-sized temporary buffers. Leveraging our SSM
+representation, tLoRA is able to exploit Triton’s auto-tuning
+to select adapter-aware block sizes and tiling strategies, max-
+imizing compute utilization across heterogeneous adapters.
+Adaptive Nano-Batching.
+Despite improved compute
+balance from kernel-level fusion, batched LoRA training
+frequently incurs cross-GPU communication (e.g., when
+pooling accelerators across multiple jobs). In such settings,
+end-to-end efficiency is often limited not by raw compute
+throughput, but by how effectively computation can be over-
+lapped with communication along the iteration critical path.
+To expose fine-grained overlap opportunities, tLoRA intro-
+duces a nano-batch abstraction at kernel execution time.
+A nano-batch partitions the current training batch—either
+a mini-batch or a micro-batch under pipeline paral-
+lelism—along the batch dimension into smaller execution
+units. Concretely, for a group of LoRA jobs with batch sizes
+{Bi}, tLoRA divides their combined batch into N nano-
+batches, each containing approximately P
+i Bi/N samples.
+Samples in a nano-batch are processed together by the fused
+LoRA kernel before proceeding to the next nano-batch.
+Choosing the appropriate nano-batch size is non-trivial.
+With a too large nano-batch size, computation proceeds
+in long phases that delay communication, reducing overlap;
+with a too small nano-batch size, kernel launch overhead
+dominates and compute resources become underutilized.
+The optimal nano-batch size for maximum compute and
+communication overlap may also vary depending on the
+accelerator architecture and the inter-GPU connection band-
+width of the cluster, which is difficult to predict analytically
+without runtime profiling or empirical tuning. From an
+optimization perspective, the iteration time can be viewed
+as
+Titer ≈max
+ N
+X
+n=1
+Tcomp(n),
+N
+X
+n=1
+Tcomm(n)
+!
+,
+(1)
+where effective pipelining aims to minimize the critical path
+by overlapping Tcomp and Tcomm across nano-batches. The
+optimal N depends on adapter composition, batch hetero-
+geneity, accelerator characteristics, and network conditions.
+Rather than relying on a static cost model, tLoRA
+adapts the nano-batch size online using an Additive-
+Increase/Multiplicative-Decrease (AIMD) controller driven
+by end-to-end execution feedback. Let Tt denote the end-to-
+end batch completion time at scheduling horizon t. Starting
+from a conservative nano-batch size Nt, tLoRA updates
+Nt+1 =
+(
+Nt + α,
+if Tt ≤Tt−1 −τ,
+max{1, ⌊βNt⌋},
+otherwise,
+(2)
+where α is an additive step size (α=4 by default), β ∈(0, 1)
+is a multiplicative backoff factor (β=1/2 by default), and
+τ is a stability margin to filter noise. Intuitively, tLoRA in-
+creases granularity when finer pipelining reduces the critical
+path, and backs off when additional nano-batches elongate
+the step. This feedback-driven adaptation converges quickly
+(in O(log N) steps to reduce from N to 1). This implies
+negligible overhead relative to thousands of training itera-
+tions, especially noting that each adjustment step still makes
+forward training progress. Our evaluations show that our
+adaptive policy consistently outperforms manually tuned
+nano-batch sizes (§4.3).
+3.4. Adapter Scheduler: Maximizing Cluster
+Throughput
+While the Model Fuser and Kernel Fuser optimize the train-
+ing throughput for each LoRA group, the overall cluster
+throughput hinges on how multiple LoRA fine-tuning jobs
+are grouped and scheduled over time. Let each active job
+j be characterized by a residual resource vector rj (e.g.,
+unused GPU compute or memory) and an urgency score
+uj that captures its progress pressure, such as slowdown
+relative to standalone execution. For any candidate group
+G ⊆J , we define their joint throughput bT(G). The sched-
+uler aims to identify groups that maximize bT(G) while
+4
+
+
+--- Page 5 ---
+tLoRA: Efficient Multi-LoRA Training with Elastic Shared Super-Models
+ensuring that no job violates its progress constraint (e.g.,
+completion deadlines or bounded slowdown), i.e.,
+max
+G⊆J
+bT(G)
+s.t.
+∀j ∈G, ∆j(G) ≤∆max
+j
+,
+(3)
+where ∆j(G) denotes the slowdown incurred by job j when
+executed in group G. Directly solving this problem is in-
+tractable, since the space of possible groupings grows expo-
+nentially, and each grouping induces a different distributed
+execution plan with distinct performance characteristics.
+tLoRA introduces a heterogeneity-aware Adapter Scheduler
+that dynamically determines (i) which LoRA jobs should be
+grouped, (ii) when to merge or decouple existing groups, and
+(iii) how to respect per-job progress requirements (e.g., com-
+pletion deadlines or bounded slowdown). Our key insight is
+that efficiency gains arise primarily from complementarity
+in residual resource usage. Jobs with unused compute or
+memory capacity can be paired with resource-hungry jobs to
+reduce idle time, whereas grouping similarly saturated jobs
+yields little benefit and often harms progress. tLoRA there-
+fore focuses on exploiting such complementarities while
+explicitly avoiding harmful combinations.
+Algorithm 1 illustrates tLoRA’s batch LoRA training algo-
+rithm. For each LoRA job, we iteratively identify resource
+complementary partners that maximize joint throughput
+and group their execution (Line 4-15). Once finalized, the
+group is compiled into a shared super-model, performing
+distributed execution (Line 18). At the underlying per-
+iteration execution, tLoRA exploits heterogeneity-aware
+LoRA fused kernels to adapt GPU block allocation to each
+LoRA for maximizing communication and computation
+overlap (Lines 22–24). We next introduce how tLoRA
+groups heterogeneous LoRAs into batch execution.
+Hierarchical Incremental Grouping.
+To enable scalable
+grouping decisions, tLoRA adopts a hierarchical incremen-
+tal grouping policy that progressively merges jobs with com-
+plementary utilization patterns (Line 5). Because grouping
+across broader resource tiers (e.g., across GPU nodes or
+ranks) incurs increasing communication overhead, tLoRA
+follows a bottom-up strategy: it first forms groups within
+individual nodes, then considers merging across nodes, and
+finally across ranks. Within each tier, grouping proceeds
+incrementally until additional merges no longer improve
+predicted efficiency; the resulting group is then finalized
+and lifted to the next tier. This hierarchical process dramati-
+cally prunes the combinatorial search space, analogous to
+merge sort, while preserving the most beneficial grouping
+opportunities in practice.
+When grouping within a tier, for each job (or an intermediate
+job group), tLoRA maintains lightweight profiling statistics
+that capture residual hardware resources (e.g., GPU utiliza-
+tion) across its allocated machines. After identifying resid-
+Algorithm 1 tLoRA LoRA Batching Algorithm
+1: Input: Job Queue J , Cluster Resources C
+2: while J ̸= ∅do
+3:
+// Phase 1: Adapter Scheduler (§3.4): Hierarchical Group.
+4:
+// Sort jobs by Urgency (desc) and Residuals (asc)
+5:
+J ←SORT(J | uj ↓, rj ↑)
+6:
+jseed ←J .pop_front()
+7:
+// Find resource-complementary job to maximize group
+throughput
+8:
+k∗←arg maxk{THROUGHPUT({jseed} ∪J [k])}
+9:
+if k∗> 0 then
+10:
+// Merge beneficial partners and re-insert for further
+grouping
+11:
+gnew ←MERGE({jseed} ∪J [k∗])
+12:
+J .insert(gnew);
+J ←J \ J [k∗]
+13:
+continue
+14:
+else
+15:
+gfinal ←{jseed}
+16:
+end if
+17:
+// Phase 2: Model Fuser (§3.2): SSM Compilation
+18:
+SSSM ←Mbase ⊕{Adapter(j) | j ∈gfinal}
+19:
+Πplan ←PARALLELPLANNER(SSSM, C)
+20:
+// Phase 3: Kernel Fuser (§3.3): Adaptive Execution
+21:
+while step t < Tschedule do
+22:
+FUSEDKERNELLAUNCH(SSSM, Πplan, Nnano)
+23:
+(ηutil, δstall) ←MONITOR_SPEED()
+24:
+KERNEL_UPDATE(ηutil, δstall)
+25:
+end while
+26:
+Update J with progress of gfinal
+27: end while
+ual resources, tLoRA sorts jobs by their residual resource
+availability in ascending order. Starting from the left-most
+(most resource-constrained) job, the scheduler performs a
+binary-cut search on the right-hand portion of the sorted
+list to find the cutoff where adding more jobs no longer
+improves the joint efficiency. The scheduler then forms the
+group, updates the grouped group’s residual profile, and rein-
+serts it into the queue. This incremental pack-and-reinsert
+loop repeats until no further beneficial merges are found,
+and each finalized group is compiled into an SSM (§3.2).
+This hierarchy dramatically prunes the combinatorial search
+space while preserving the most beneficial merges.
+To prevent pathological slowdowns of individual jobs (i.e.,
+ensuring ∆j(G) ≤∆max
+j
+), tLoRA assigns each job an
+urgency score, ∆j(G), that reflects its proximity to vio-
+lating a progress constraint, such as slowdown relative to
+standalone execution. Jobs with higher urgency are given
+higher scheduling priority and placed earlier (leftmost) in
+the incremental grouping queue. This ordering biases group-
+ing decisions toward compensating progress-critical jobs
+with resource-abundant ones: jobs later in the queue ex-
+5
+
+
+--- Page 6 ---
+tLoRA: Efficient Multi-LoRA Training with Elastic Shared Super-Models
+pose greater residual capacity, which can be leveraged to
+accelerate earlier, more constrained jobs. In fact, our design
+enables elastic contribution: jobs may temporarily release
+unused resources to benefit others and later grab more re-
+sources than their provisioned in isolation from other jobs to
+accelerate their own completion. Our evaluation shows that
+this progress-aware scheduling improves not only aggregate
+training throughput but also per-job convergence time.
+Complexity Analysis.
+For K active jobs, exhaustive
+grouping is exponential in K. In contrast, tLoRA’s hier-
+archical incremental policy runs in O(K log K) time per
+scheduling round: sorting costs O(K log K), and each
+merge involves O(log K) reinsertion. In practice, this en-
+ables responsive scheduling in dynamic, online clusters
+while capturing the majority of attainable efficiency gains.
+4. Evaluation
+We implement tLoRA on PyTorch 2.5 with Triton 3.5.1,
+developing a custom Triton kernel to efficiently support
+batched LoRA execution. tLoRA natively supports existing
+distributed model execution (e.g., tensor parallelism) across
+GPUs without altering training semantics (i.e., lossless).
+Experimental results show that tLoRA improves training
+throughput by 38%, reduces per-job time-to-convergence
+by 2.3×, and increases average GPU utilization by 37%.
+4.1. Methodology
+Workloads, Models, and Tasks.
+Following prior ad-
+vances (Wu et al., 2024; Ye et al., 2025), we adopt a
+two-level evaluation methodology that combines micro-
+benchmarks on real hardware with large-scale trace-driven
+emulation. We run micro-benchmarks on a testbed equipped
+with 12 NVIDIA A100 GPUs, which offers accurate per-job
+LoRA training speed profiles too. Jobs arrive following
+the production GPU traces from ACMETrace (Hu et al.,
+2024), which captures realistic multi-tenant cluster behav-
+ior, including job arrivals, GPU allocations, and execution
+durations, but does not natively include LoRA-specific at-
+tributes. To bridge this gap, we adopt LoRA configurations
+informed by prior LoRA serving studies (Wu et al., 2024).
+Concretely, for each job we randomly sample the LoRA rank
+from 2, 4, 8, 16 and the batch size from 1, 2, 4, 8 based on
+the original GPU allocation from the trace. Jobs randomly
+select either Llama-3-8B or Qwen-3-8B as base models.
+For large-scale evaluations, we use the collected per-job
+speed profile in the micro-benchmark, together with a
+production-grade distributed GPU training simulator (Strati
+et al., 2025). The simulator reports the training speed of
+different model architectures and hardware settings. We
+note that the simulator is widely used and the simulation
+error is within 3% (Appendix A.1). tLoRA’s optimization
+(a) Training throughput.
+(b) Job completion time.
+Figure 5. tLoRA improves training throughput and completion.
+is lossless, does not alter the training accuracy. By default,
+jobs are trained on the GSM8K dataset, a math dataset of
+sim8.5k grade-school-level questions. We report the evalua-
+tion results on a 128-GPU cluster by default.
+Due to the space limit, we include detailed experiment setup
+details (e.g., parameters) in Appendix A.1.
+Baselines.
+We compare against the following advances:
+• mLoRA (Ye et al., 2025): a state-of-the-art batched
+LoRA training system. mLoRA batches adapters using
+simple heuristics, such as grouping jobs as long as mem-
+ory capacity permits, but does not explicitly account for
+heterogeneity across adapter jobs.
+• Megatron (Narayanan et al., 2021): a widely used,
+highly optimized distributed LLM training framework.
+While Megatron provides efficient model parallelism, it
+trains each LoRA job independently.
+• tLoRA w/o Scheduler: an ablation of tLoRA that re-
+places the proposed Adapter Scheduler with mLoRA’s
+batching policy.
+• tLoRA w/o Kernel Fuser: an ablation of tLoRA that
+disables the fused heterogeneous LoRA kernel.
+Metrics.
+We report three primary metrics: (i) Train-
+ing Throughput (samples/sec), defined as the cluster-wide
+throughput aggregated over all active jobs; (ii) Job Com-
+pletion Time, measured as the wall-clock time from job
+submission to training completion; and (iii) GPU Utiliza-
+tion, computed as the average utilization across all GPUs.
+All reported results are averaged over five independent runs.
+4.2. End-to-End Performance
+tLoRA improves cluster training throughput.
+Figure 5a
+shows that tLoRA improves cluster-wide training through-
+put by 41% over mLoRA under online workloads, where
+LoRA training jobs arrive dynamically and complete at dif-
+ferent times. We observe two key effects. First, mLoRA
+often underperforms Megatron despite batching, as it groups
+jobs solely based on memory availability and ignores the
+communication overhead induced by co-location, which can
+6
+
+
+--- Page 7 ---
+tLoRA: Efficient Multi-LoRA Training with Elastic Shared Super-Models
+(a) Average GPU SM util.
+(b) Job colocation proportions.
+Figure 6. tLoRA improves GPU utilization by effectively co-
+locating heterogeneous LoRA jobs.
+(a) Training throughput.
+(b) Job completion time.
+Figure 7. Performance breakdown.
+negate compute gains. Second, tLoRA consistently achieves
+higher throughput by combining SSM-based compilation
+with fused, rank-aware nano-batching, which jointly reduce
+pipeline bubbles and kernel launch overheads.
+tLoRA improves job training completion time.
+Fig-
+ure 5b shows that tLoRA reduces job completion time
+(JCT) by 5.4× on average. Job completion time includes
+both queueing delay after submission and training conver-
+gence time during execution. These gains arise from two
+complementary mechanisms. First, tLoRA co-locates jobs
+with complementary resource demands, enabling resource-
+abundant jobs to accelerate resource-constrained ones and
+improving cluster-wide utilization. Second, the progress-
+aware adapter scheduler dynamically prioritizes jobs ex-
+periencing slowdown under resource sharing, preventing
+starvation and eliminating long-tailed JCT. Ablation stud-
+ies further confirm that tLoRA consistently improves JCT
+across diverse real-world traces and system load conditions.
+tLoRA improves GPU utilizations.
+Figure 6a shows
+that tLoRA improves GPU utilization up to 37%, reduc-
+ing idle/fragmented capacity. tLoRA completes more train-
+ing steps per GPU-hour by batching LoRA training jobs,
+thereby improving overall training throughput.
+(a) Impact of nano-batch size.
+(b) Impact of job arrival pattern.
+Figure 8. Ablation studies on nano-batch size and arrival pattern.
+4.3. Ablation Studies
+Performance Breakdown.
+Figure 6b dives into the group-
+ing decisions across different jobs, where we analyze how
+jobs of different sizes are grouped with others. We define
+small jobs to be the jobs within bottom 33% of compute cost
+based on their profiles (rank, batch size), medium to be the
+next third, and large to be the most costly 33%. We notice
+that small and large jobs are mostly grouped, which is un-
+derstandable as they are often complementary to each other.
+Similarly, jobs of medium sizes have a smaller grouping ra-
+tio, because they have limited idle resources and co-location
+benefit. In contrast, mLoRA’s first-come-first-out (FIFO)
+policy naively co-locates jobs. Despite a higher grouping
+ratio, it achieves 5.4× slower training completion due to its
+much higher proportion of suboptimal co-location pairings.
+Beyond scheduling, Figure 7 further isolates the contri-
+bution of tLoRA’s kernel-level optimizations. Replacing
+the fused heterogeneous LoRA kernel with the PyTorch-
+native kernel weakens the benefits of job co-location. In
+the unfused design, adapter updates repeatedly materialize
+small intermediate tensors and issue multiple per-adapter
+GEMMs, incurring high kernel launch overhead and poor
+data reuse. This fragmentation prevents effective overlap
+across adapters and amplifies execution bubbles.
+Impact of nano-batch size.
+tLoRA leverages an AIMD
+controller to decide the number of nano-batches, thereby
+optimizing GPU compute and communication overlap. Fig-
+ure 8a shows that compared to fixed nano-batch sizes,
+tLoRA’s adaptive design achieves higher end-to-end train-
+ing throughput, confirming its effectiveness.
+Impact of online deployment traces.
+Figure 8b evalu-
+ates tLoRA under different arrival processes by replaying
+multiple months of ACMETrace while fixing job param-
+eterization and cluster size. The first month exhibits the
+sparsest arrivals, resulting in shorter JCT since compatible
+co-location partners are more readily available; however,
+overall cluster throughput is slightly lower due to low con-
+7
+
+
+--- Page 8 ---
+tLoRA: Efficient Multi-LoRA Training with Elastic Shared Super-Models
+(a) Impact of scaling arrival rate.
+(b) Impact of cluster size.
+Figure 9. Ablation studies on arrival rate and cluster size.
+tention and fewer opportunities for effective batching. In
+contrast, Months 2 and 3 feature increasingly bursty arrivals,
+with approximately 2× and 4× higher job concurrency. De-
+spite this increased pressure, tLoRA consistently sustains
+near-peak cluster throughput by adapting job grouping.
+Impact of System Load.
+To stress-test the scheduler un-
+der varying load, we scale the job inter-arrival times by
+replaying the same trace with accelerated arrivals (e.g., 2×
+and 5× sooner) as well as slowed arrivals, as shown in Fig-
+ure 9a. As arrivals become denser, queuing effects intensify
+and average job completion time increases. Conversely,
+under sparser arrivals, cluster throughput decreases mod-
+estly due to underutilized batching opportunities, but job
+completion time improves. Importantly, tLoRA achieves
+consistently 1.2–1.8× better throughput.
+Impact of cluster size.
+Figure 9b evaluates tLoRA across
+clusters with varying numbers of available GPUs, using
+the same replayed workload and the simulator. With fewer
+GPUs, tLoRA maintains throughput proportional to the
+available capacity by continuously selecting runnable jobs
+and adapting grouping decisions to the tighter resource bud-
+get. As cluster size increases, tLoRA scales to higher ab-
+solute throughput while preserving stable job completion
+times. These results demonstrate that tLoRA’s performance
+benefits are robust across cluster provisioning levels.
+5. Related Work
+LoRA Training and Serving Optimizations.
+Adapters
+are used to adapt large models by learning small additional
+modules rather than updating all weights. LoRA (Hu et al.,
+2022) introduced low-rank matrices to represent adaptation
+updates, significantly reducing memory usage and compute
+effort during fine-tuning. NanoFlow (Zhu et al., 2025) fo-
+cuses on serving systems; it splits inference requests into
+nano-batches and uses operation-level scheduling to over-
+lap compute, memory, and network resources inside a de-
+vice. Spindle (Wang et al., 2025) addresses multi-task/multi-
+modal model training by sequencing tasks into execution
+waves and dynamically distributing computation to handle
+heterogeneity. In contrast, tLoRA accounts for the hetero-
+geneity of LoRA jobs to identify complementary job groups,
+while respecting per-job progress.
+Model Parallelism.
+Some works focus on improving par-
+allelism performance, but they do not design fused LoRA
+adapter kernels. For example, Alpa (Zheng et al., 2022) au-
+tomates both inter- and intra-operator parallelism for model
+training by exploring search spaces of parallel execution
+and coordinating via a runtime system. NanoFlow (Zhu
+et al., 2025) demonstrates intra-device overlap of operations
+inside a device for serving, but does not involve adapter
+training kernels or LoRA-type batching. Sailor (Strati et al.,
+2025) explores distributed training over dynamic and hetero-
+geneous clusters, selecting device placements and training
+configurations via simulation and profiling, rather than fo-
+cusing on GPU kernel design for adapter operations. These
+works contribute important insights into scheduling, place-
+ment, and resource use under heterogeneity, even though
+they do not include batched adapter kernels or interleav-
+ing of different adapter ranks inside a GPU in the way a
+LoRA-kernel-fusion work would.
+ML Job Scheduling.
+Another group of work considers
+how to schedule and place training jobs in multi-GPU or
+multi-node settings. For example, Spindle (Wang et al.,
+2025) uses wavefront scheduling to align computation
+waves across tasks, improving utilization under multi-task,
+multi-modal training workloads. Likewise, Sailor (Strati
+et al., 2025) uses configuration search and simulation to
+choose placements in heterogeneous clusters, optimizing
+throughput and cost under dynamic hardware and network
+conditions. These contributions show how scheduling and
+placement choices affect efficiency across jobs, though they
+generally assume that execution kernels or adapter behaviors
+are given rather than co-optimized with scheduling.
+6. Conclusion
+This paper presents tLoRA, a heterogeneity-aware frame-
+work for efficiently training multiple LoRA adapters in
+shared GPU clusters. By unifying concurrent tuning jobs
+through a Shared Super-Model abstraction, introducing
+a fused heterogeneous LoRA kernel with adaptive nano-
+batching, and coordinating jobs via a progress-aware sched-
+uler, tLoRA transforms multi-LoRA training from isolated
+jobs into a jointly optimized learning workload. Our design
+preserves the semantics and convergence behavior of inde-
+pendent training while substantially improving collective
+throughput, GPU utilization, and per-job completion time
+under realistic multi-tenant traces.
+8
+
+
+--- Page 9 ---
+tLoRA: Efficient Multi-LoRA Training with Elastic Shared Super-Models
+References
+Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang,
+L., and Chen, W. LoRA: Low-rank adaptation of large
+language models. In ICLR, 2022. https://arxiv.
+org/abs/2106.09685.
+Hu, Q., Ye, Z., Wang, Z., Wang, G., Zhang, M., Chen, Q.,
+Sun, P., Lin, D., Wang, X., Luo, Y., Wen, Y., and Zhang,
+T. Characterization of large language model development
+in the datacenter. In NSDI, 2024. https://arxiv.
+org/abs/2403.07648.
+Luo, M., Wong, J., Trabucco, B., Huang, Y., Gonzalez,
+J. E., Chen, Z., Salakhutdinov, R., and Stoica, I. Stylus:
+Automatic adapter selection for diffusion models. In
+NeurIPS, 2024. https://arxiv.org/abs/2404.
+18928.
+Narayanan, D., Shoeybi, M., Casper, J., LeGresley, P., Pat-
+wary, M., Korthikanti, V., Vainbrand, D., Kashinkunti,
+P., Bernauer, J., Catanzaro, B., Phanishayee, A., and
+Zaharia, M. Efficient large-scale language model train-
+ing on gpu clusters using megatron-lm. In SC, 2021.
+https://arxiv.org/abs/2104.04473.
+Sheng, Y., Cao, S., Li, D., Hooper, C., Lee, N., Yang, S.,
+Chou, C., Zhu, B., Zheng, L., Keutzer, K., Gonzalez, J. E.,
+and Stoica, I. S-LoRA: Serving thousands of concurrent
+LoRA adapters. In MLSys, 2024. https://arxiv.
+org/abs/2311.03285.
+Strati, F., Zhang, Z., Manos, G., Sánchez Périz, I., Hu, Q.,
+Chen, T., Buzcu, B., Han, S., Delgado, P., and Klimovic,
+A. Sailor: Automating distributed training over dynamic,
+heterogeneous, and geo-distributed clusters. In SOSP,
+2025. https://arxiv.org/abs/2504.17096.
+Um, T., Oh, B., Kang, M., Lee, W.-Y., Kim, G., Kim,
+D., Kim, Y., Muzzammil, M., and Jeon, M.
+Metis:
+Fast automatic distributed training on heterogeneous
+gpus.
+In ATC24, 2024.
+https://www.usenix.
+org/system/files/atc24-um.pdf.
+Wang, Y., Zhu, S., Fu, F., Miao, X., Zhang, J., Zhu, J.,
+Hong, F., Li, Y., and Cui, B. Spindle: Efficient distributed
+training of multi-task large models via wavefront schedul-
+ing. In ASPLOS, 2025. https://arxiv.org/abs/
+2409.03365.
+Wu, B., Zhu, R., Zhang, Z., Sun, P., Liu, X., and
+Jin, X.
+dLoRA: Dynamically orchestrating requests
+and adapters for LoRA LLM serving.
+In OSDI,
+2024.
+https://www.usenix.org/system/
+files/osdi24-wu-bingyang.pdf.
+Wu, Y., Piao, H., Huang, L.-K., Wang, R., Li, W., Pfister, H.,
+Meng, D., Ma, K., and Wei, Y. Sd-lora: Scalable decou-
+pled low-rank adaptation for class incremental learning.
+In ICLR, 2025. https://arxiv.org/abs/2501.
+13198.
+Ye, Z., Li, D., Hu, Z., Lan, T., Sha, J., Zhang, S., Duan,
+L., Zuo, J., Lu, H., Zhou, Y., and Tang, M. mlora: Fine-
+tuning lora adapters via highly-efficient pipeline paral-
+lelism in multiple gpus. 2025. https://arxiv.org/
+abs/2312.02515.
+Zhang, Q., Chen, M., Bukharin, A., Karampatziakis, N.,
+He, P., Cheng, Y., Chen, W., and Zhao, T.
+Adalora:
+Adaptive budget allocation for parameter-efficient fine-
+tuning. In ICLR, 2023. https://arxiv.org/abs/
+2303.10512.
+Zheng, L., Li, Z., Zhang, H., Zhuang, Y., Chen, Z., Huang,
+Y., Wang, Y., Xu, Y., Zhuo, D., Xing, E. P., Gonza-
+lez, J. E., and Stoica, I. Alpa: Automating inter- and
+intra-operator parallelism for distributed deep learning.
+In OSDI, 2022. https://arxiv.org/abs/2201.
+12023.
+Zhu, K., Zhao, Y., Zhao, L., Zuo, G., Gu, Y., Xie, D., Gao,
+Y., Xu, Q., Tang, T., Ye, Z., Kamahori, K., Lin, C.-Y.,
+Wang, S., Krishnamurthy, A., and Kasikci, B. NanoFlow:
+Towards optimal large language model serving through-
+put. In OSDI, 2025. https://arxiv.org/abs/
+2408.12757.
+9
+
+
+--- Page 10 ---
+tLoRA: Efficient Multi-LoRA Training with Elastic Shared Super-Models
+Figure 10. Simulator average iteration accuracy by model.
+Figure 11. Impact of arrival trace on job completion time.
+A. Appendix
+A.1. Experiment settings
+Each adapter specification (rank r, batch size, maximum
+sequence length, step budget, and GPU count) is fixed at
+submission time and not altered by tLoRA. By default, we
+run on a cluster size of 128 GPUs using the first month of
+data from the trace_seren.csv provided by ACMETrace. We
+use micro-benchmarks from the Sailor training simulator
+to extrapolate training times and find beneficial co-location
+pairs. Because the simulator runs real forward and back-
+wards passes on layers of the model using Megatron-LM
+for model parallelism, then extrapolates execution time of
+the whole model by taking advantage of the homogeneity of
+transformer layers, we find that it is very accurate, as shown
+in Figure 10.
+The cluster enforces a global concurrency cap of up to 128
+runnable jobs based on GPU availability. When several
+jobs arrive simultaneously, tLoRA must (i) decide which
+jobs start immediately, (ii) decide whether not to co-locate
+adapters with other compatible adapters available. Com-
+patible adapters are those whose memory footprints and
+sequence lengths can be jointly satisfied without violating
+device memory limits. We measure per-iteration time once
+job group placement is stable and the GPU is warmed up.
+A.2. Job completion time ablation studies
+Similar to §4.3, we show that tLoRA maintains its perfor-
+mance under varying load conditions.
+Figure 12. Impact of scaling arrival rate on job completion time.
+Figure 13. Impact of cluster size on job completion time.
+Impact of online deployment traces
+Months 2 and 3
+contain much denser bursts of jobs when compared to Month
+1, leading to some reduction in average job completion
+time as jobs must queue for available GPU resources, even
+with co-location. We see that the cluster GPU resources
+are quickly saturated by much denser job arrival patterns
+leading to a flatter job completion time shown in Figure 11.
+However, as noted in §4.3, tLoRA maintains near-peak
+throughput, indicating that it is still able to make optimal co-
+locating and scheduling decisions despite the much longer
+job queues.
+Impact of System Load.
+Similarly, when scaling the job
+arrival rate, high arrival rates lead to longer job completion
+times as the available computing resources are more quickly
+saturated. This is reflected in the much flatter job completion
+time curves shown in Figure 12 for 2× and 5× arrival rates.
+On the other hand, when arrivals are slowed, the average
+job completion time does not suffer, as seen by the job
+completion CDF of the 0.5× curve being slightly better
+than the default.
+Impact of cluster size.
+Finally, even with reduced cluster
+sizes, tLoRA is able to maintain proportional job completion
+time, as it more intelligently selects jobs to co-locate and
+execute to maximize efficiency with limited resources. Fig-
+ure 13 confirms this scalability; as the cluster size decreases
+from 256 to 32 GPUs, the completion time curves shift
+rightward in consistent, predictable intervals rather than di-
+verging exponentially. While the slope naturally flattens for
+the 32-GPU configuration due to lower resource availability,
+the steady gradient across all scenarios indicates that the
+scheduler successfully avoids the resource starvation and
+heavy-tail latency often seen in constrained environments.
+10

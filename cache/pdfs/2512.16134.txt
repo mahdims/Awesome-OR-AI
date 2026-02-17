@@ -1,0 +1,968 @@
+--- Page 1 ---
+STAGGERED BATCH SCHEDULING: CO-OPTIMIZING TIME-TO-FIRST-TOKEN
+AND THROUGHPUT FOR HIGH-EFFICIENCY LLM INFERENCE
+Jian Tian 1 Shuailong Li 1 Yang Cao 1 Wenbo Cui 1 Minghan Zhu 1 Wenkang Wu 1 Jianming Zhang 1
+Yanpeng Wang 1 Zhiwen Xiao 1 Zhenyu Hou 1 Dou Shen 1
+ABSTRACT
+The evolution of Large Language Model (LLM) serving towards complex, distributed architectures—specifically
+the P/D-separated, large-scale DP+EP paradigm—introduces distinct scheduling challenges. Unlike traditional
+deployments where schedulers can treat instances as black boxes, DP+EP architectures exhibit high internal
+synchronization costs. We identify that immediate request dispatching in such systems leads to severe in-engine
+queuing and parallelization bubbles, degrading Time-to-First-Token (TTFT). To address this, we propose
+Staggered Batch Scheduling (SBS), a mechanism that deliberately buffers requests to form optimal execution
+batches. This temporal decoupling eliminates internal queuing bubbles without compromising throughput.
+Furthermore, leveraging the scheduling window created by buffering, we introduce a Load-Aware Global
+Allocation strategy that balances computational load across DP units for both Prefill and Decode phases. Deployed
+on a production H800 cluster serving DeepSeek-V3, our system reduces TTFT by 30-40% and improves
+throughput by 15-20% compared to state-of-the-art immediate scheduling baselines.
+1
+INTRODUCTION
+The exponential scaling of Large Language Models
+(LLMs)—from hundreds of billions to trillions of parame-
+ters—has necessitated a fundamental shift in inference archi-
+tectures. While Sparse Mixture-of-Experts (MoE) models
+have successfully reduced activation costs, they introduce
+significant memory access challenges. To bridge the gap
+between arithmetic intensity and memory bandwidth, ad-
+vanced deployment paradigms like DP+EP (Data Paral-
+lelism + Expert Parallelism), exemplified by the DeepSeek-
+V3 architecture, have emerged. Unlike traditional Tensor
+Parallelism (TP), DP+EP decouples the inference roles, uti-
+lizing massive parallel groups (e.g., EP size of 320 for De-
+code ) to handle high-concurrency workloads.
+However, this architectural complexity exposes a critical
+inefficiency in current scheduling systems. Traditional
+schedulers operate under a ”continuous service” assump-
+tion, dispatching requests immediately upon arrival. While
+effective for monolithic instances, this approach fails in
+P/D-separated DP+EP clusters. Our analysis reveals that
+the Prefill phase operates effectively as a non-preemptive,
+discrete batch process. Immediate dispatching ignores
+the ”busy state” of the engine, forcing requests to queue
+internally within the inference instance (Device-side Queu-
+ing). This results in Head-of-Line (HOL) blocking, where
+1Baidu Inc. Beijing, China. Correspondence to: Jian Tian
+<tianjian01@baidu.com>.
+idle resources in other instances remain unutilized while
+requests wait in a saturated engine’s private queue.
+To address this, we propose Staggered Batch Scheduling
+(SBS), a novel paradigm tailored for large-scale DP+EP
+clusters. By introducing a precise, adaptive waiting win-
+dow, SBS aggregates requests into optimal batches before
+dispatch. This counter-intuitive strategy—waiting to ac-
+celerate—effectively eliminates device-side queuing and
+minimizes Time to First Token (TTFT). Furthermore, the
+buffering window empowers the scheduler with a global
+view, enabling a Load-Aware Global Allocation mech-
+anism critical for resolving the intrinsic load imbalance
+across DP units in both the Prefill and Decode phases.
+Specifically, our contributions are:
+• Architectural Characterization: We identify the ”dis-
+crete batching” nature of the Prefill phase in DP+EP
+systems and demonstrate formally why immediate dis-
+patching is suboptimal for TTFT.
+• Staggered Batch Scheduling (SBS): We propose an
+adaptive, interval-based scheduling algorithm that elim-
+inates device-side queuing latencies. This reduces
+TTFT by 30-40% in production environments with-
+out sacrificing throughput.
+• Load-Aware Global Allocation: Exploiting the global
+view provided by the batching window, we intro-
+duce a unified allocation strategy for both Prefill and
+Decode phases. This optimization mitigates phase-
+arXiv:2512.16134v1  [cs.DC]  18 Dec 2025
+
+
+--- Page 2 ---
+Staggered Batch Scheduling: Co-optimizing Time-to-First-Token and Throughput for High-Efficiency LLM Inference
+specific load imbalances, boosting Prefill throughput
+by 12.9%–22.8% and enhancing Decode throughput
+by ∼15%.
+2
+RELATED WORK
+The performance optimization of large language model
+(LLM) inference systems critically depends on the deep
+co-design of scheduling strategies and system architecture.
+Inherent heterogeneity among inference phases renders
+traditional load-balancing strategies suboptimal. As the
+core of distributed inference architectures, the scheduling
+subsystem must dynamically balance TTFT(Time-To-First-
+Token), TPOT(Time-Per-Output-Token), and overall system
+throughput. At the same time, It must also support dis-
+tributed inference services at scale, managing models with
+hundreds of billions of parameters and highly variable work-
+loads.
+PD disaggregation architectures.
+PD disaggregation
+serves as a foundational architecture in distributed LLM
+inference, which decouples the compute-intensive prefill
+stage from the memory-intensive decode stage by assigning
+them to dedicated instance pools. Splitwise (Patel et al.,
+2024) pioneered this approach with a three-tier pool de-
+sign—comprising a prefill pool, a decode pool, and a hybrid
+pool—and achieved up to 1.76× higher throughput and 15%
+lower power consumption under the same cost by transfer-
+ring the KV cache over the network. Subsequent studies
+have further refined this architecture. For example, chunked
+prefill was introduced to alleviate bottlenecks in mixed-
+length request processing (Hu et al., 2024b; Agrawal et al.,
+2024); instance flipping enabled dynamic role-switching be-
+tween prefill and decode instances (Zhong et al., 2024); and
+a shared memory pool reduced redundant computation in
+multi-turn dialogues through unified KV cache management
+(Hu et al., 2024a).
+Scheduling under Hybrid Parallelism. In parallel to dis-
+aggregation, another major architectural direction exploits
+hybrid parallelism to support ever-larger models. Scaling
+model size has been shown to enhance model capabilities
+(Brown et al., 2020; Touvron et al., 2023; Hoffmann et al.,
+2022).
+Mixture-of-Experts (MoE) architectures further
+pushed model scale boundaries (Dai et al., 2024; Rajbhan-
+dari et al., 2022; Zoph et al., 2022). The DP+EP (Data Par-
+allelism + Expert Parallelism) hybrid architecture became a
+key breakthrough (Organization, 2024), keeping attention
+modules under data parallelism while employing expert par-
+allelism for MoE layers. However, while DP+EP reduces
+memory footprint per device, it introduces scheduling chal-
+lenges: All-to-All communication amplifies single-device
+failure impact, and load imbalance constrains throughput.
+To address these, scheduling strategies focused on system ef-
+ficiency and locality optimization have been proposed. The
+Locality-aware Fair Scheduler (Cao et al., 2025) introduced
+the Deficit Longest Prefix Matching (DLPM) algorithm, im-
+proving single-machine throughput by 2.87x. Its distributed
+variant, D²LPM, uses a decentralized architecture with a
+global radix tree and deficit counters, reducing P99 latency
+by 7.18x. However, D²LPM lacks responsiveness to runtime
+workload dynamics. To solve dynamic imbalance, Llumnix
+(Sun et al., 2024) introduced cross-instance fine-grained re-
+quest rescheduling with a near-zero-overhead KV migration
+mechanism, achieving 6.4x TTFT improvement, 12.1x P99
+latency improvement, and up to 36% cost savings.
+Prefix Cache-Aware Scheduling. In dialogue, RAG, and
+multi-tenant scenarios, many requests share common pre-
+fixes such as conversation history or system prompts, re-
+sulting in redundant KV cache computation. Preble (Sri-
+vatsa et al., 2024) systematically optimized distributed prefix
+cache sharing by introducing a prefix tree and the E² schedul-
+ing algorithm, which balances reuse of existing caches with
+exploration of new sharing opportunities. Its global-local
+two-tier scheduler reduced average latency by 1.5–14.5×
+under shared-prefix workloads. SGL-Router (Zheng et al.,
+2024) employed an approximate prefix tree and cache affin-
+ity score to enable communication-free routing, improving
+throughput by 1.9× and cache hit rate by 3.8×. Together,
+these works mark a shift from simple load balancing to
+intelligent, prefix-aware routing.
+3
+ANALYSIS
+3.1
+Scheduling Granularity: From Monolithic
+Instances to DP-Attention Units
+In traditional centralized deployment paradigms, a mono-
+lithic inference instance serves as the atomic scheduling
+unit. Since a single instance handles both Prefill and Decode
+phases autonomously, schedulers typically map requests 1:1
+to instances. However, the evolution toward P/D disag-
+gregated architectures necessitates decoupling these roles:
+dedicated pools handle the compute-bound Prefill phase
+(one-time processing) and the memory-bound Decode phase
+(autoregressive generation) separately.
+This granularity is further refined in large-scale DP+EP
+(Data Parallelism + Expert Parallelism) architectures. For
+example, in the DeepSeek-V3 deployment, a single Prefill
+instance operates with distinct parallel strategies for its com-
+ponents (e.g., Expert weights are shared across ranks, while
+Attention layers are replicated). Specifically, in a 32-GPU
+setup configured with Tensor Parallelism (TP = 4), the
+Data Parallelism degree reaches DP = 8. Consequently,
+the finest-grained scheduling unit shifts from the ”whole
+instance” to the individual DP-Attention processing unit.
+This architectural shift implies that a scheduler must manage
+resources at the sub-instance level to fully exploit hardware
+
+
+--- Page 3 ---
+Staggered Batch Scheduling: Co-optimizing Time-to-First-Token and Throughput for High-Efficiency LLM Inference
+parallelism.
+(a) Traditional Monolithic Architecture: The scheduler
+treats the entire inference instance as a single atomic
+unit. This coarse granularity masks internal resource
+fragmentation.
+(b) DP+EP Disaggregated Architecture: In large-
+scale deployments, the scheduling unit shifts to the fine-
+grained DP-Attention Group. This exposes the need for
+sub-instance resource management to handle the com-
+plex mapping between Data Parallelism (DP) and Expert
+Parallelism (EP).
+Figure 1. Evolution of Scheduling Granularity.
+3.2
+Queuing Dynamics and Head-of-Line Blocking
+In traditional deployments, inference instances are of-
+ten modeled as continuous service queues (approximating
+M/M/1 systems), where immediate dispatch minimizes la-
+tency. While this holds for the Decode phase due to its
+short Time-Per-Output-Token (TPOT), the Prefill phase in
+DP+EP architectures exhibits fundamentally different char-
+acteristics:
+1. Discrete Gated Service: A Prefill instance operates
+as a non-preemptive, discrete batch processor. Once a
+forward pass begins, the engine enters a ”locked” state
+and cannot accept new inputs until the current batch
+completes.
+2. Batch-Insensitive Latency: Within capacity limits,
+the execution time for a batch is largely dominated by
+the longest sequence and synchronization overhead,
+rather than the batch size itself.
+Under these conditions, an Immediate Dispatch strategy
+becomes counter-productive. It blindly pushes requests to
+busy instances, causing them to accumulate in the engine’s
+internal input queue. This results in Head-of-Line (HOL)
+blocking, where a request effectively waits for the full du-
+ration of the current batch execution (T) inside the device,
+unobservable and unmanageable by the scheduler.
+We analyze this using a simplified model: assuming uni-
+formly arriving requests and N inference instances with
+processing time T.
+• Immediate Dispatch: Requests are assigned imme-
+diately. The expected waiting time effectively occurs
+inside the engine (Device-side Queuing), averaging
+T/2 regardless of cluster size N.
+• Staggered Batch Dispatch: The scheduler buffers re-
+quests for a short interval (T/N) to form a batch. This
+shifts the waiting time to the Scheduler-side Queue.
+By enforcing this staggered interval, the expected total queu-
+ing delay drops from T/2 to T/2N. For large-scale clus-
+ters (e.g., N > 10), this theoretically yields an order-of-
+magnitude reduction in waiting latency. As illustrated in
+Figure 2(b), The scheduler buffers requests in a Scheduler-
+side Queue to form optimal batches. This eliminates internal
+HOL blocking, ensuring that requests enter the engine only
+when resources are ready, thereby minimizing total wait
+time.
+We formalize the inference dynamics using Queuing Theory.
+Ideally, an N-instance cluster should function as an M/D/S
+system (Markovian arrival, Deterministic service, S = N
+servers), maximizing resource pooling. However, under
+Immediate Dispatch, the scheduler prematurely binds re-
+quests to specific instances, effectively degrading the system
+into N isolated Gated M/D/1 queues.
+Unlike the Decode phase which approximates a continuous
+flow, the Prefill phase’s Gated M/D/1 nature implies that
+service cannot commence until a batch is fully formed and
+the pipeline clears. Consequently, a request assigned to a
+busy instance suffers from Head-of-Line blocking, with an
+expected waiting time dominated by the single instance’s
+cycle time (T/2).
+By enforcing a synchronized scheduling interval, our strat-
+egy effectively virtualizes the cluster back into a unified
+M/D/S system. This shifts the queue from the fragmented
+device-side (unmanageable) to the global scheduler-side
+(manageable), reducing the expected latency from T/2 to
+T/(2N).
+
+
+--- Page 4 ---
+Staggered Batch Scheduling: Co-optimizing Time-to-First-Token and Throughput for High-Efficiency LLM Inference
+(a) Immediate Dispatch (Baseline): Requests are assigned
+instantly upon arrival. Because the engine is non-preemptive,
+requests accumulate in the Device-side Queue (red blocks),
+causing Head-of-Line (HOL) blocking and high latency.
+(b) Staggered Batched Scheduler(Ours): Incoming requests
+(represented by colored circles) are grouped into batches before
+being submitted to an available engine. When new requests
+(e.g., purple, yellow) arrive, they are directed to an engine that is
+ready or will soon be ready. This ”staggered batch” scheduling
+significantly reduces ”Waiting Time” by preventing requests
+from accumulating in a queue.
+Figure 2. Impact of Dispatch Strategy on Queuing Dynamics.
+3.3
+Synchronization Overhead and The Batching
+Opportunity
+While traditional load balancing (e.g., Round-Robin or
+Least-Outstanding-Requests) suffices for monolithic in-
+stances, it fails in distributed DP+EP systems due to strict
+synchronization requirements.
+In a DP+EP architecture, the Mixture-of-Experts (MoE)
+layers require All-to-All communication, meaning the
+MLP computation for a layer cannot proceed until all DP-
+Attention workers complete their attention mechanism. Con-
+sequently, the system throughput is bound by the slowest DP
+worker (the straggler effect). If workloads are unevenly dis-
+tributed among DP units, faster units must idle-wait for the
+straggler, leading to significant synchronization overhead
+and resource wastage.
+Achieving ideal load balance across DP units requires a
+Figure 3. Synchronization Overhead under Immediate Dis-
+patch. Due to the strict synchronization barrier in DP+EP ar-
+chitectures, the system throughput is bottlenecked by the slowest
+DP unit (Straggler). Greedy assignment leads to load imbalance,
+resulting in significant Parallelization Bubbles (marked as ”Waste”)
+where faster DPs idle-wait for stragglers .
+global view of pending requests. Immediate dispatch strate-
+gies, being inherently greedy, assign requests sequentially
+based on the instantaneous system state, often resulting in
+suboptimal local decisions.
+However, the Staggered Batch Scheduling strategy pro-
+posed in Section 3.2 introduces a critical side-effect: the
+Batching Window. By buffering requests to optimize la-
+tency, the scheduler inadvertently gains a temporal window
+to observe a pool of pending requests. This transforms
+the scheduling problem from a sequential, online decision
+process into a mini-batch global optimization problem.
+This window enables us to apply sophisticated allocation al-
+gorithms (e.g., sorting and bin-packing) to distribute the
+workload evenly across DP-Attention units.
+Thus, the
+”waiting period”—initially introduced to reduce queuing
+latency—simultaneously serves as the enabler for fine-
+grained, sync-aware load balancing, co-optimizing both
+TTFT and throughput.
+Figure 4. Mitigation of Straggler Effect via Batched Bin-
+Packing. By buffering requests to form a batch, the Staggered
+Batch Scheduler gains a global view to apply ”Water-Filling”
+allocation (Algorithm 2). This ensures uniform workload distri-
+bution across DP units, filling the bubbles seen in Figure 3 and
+maximizing effective compute utilization .
+4
+DESIGN AND IMPLEMENTATION
+Our proposed Staggered Batch Scheduler (SBS) operates
+around a unified closed-loop feedback control mechanism.
+As illustrated in Figure 5, the system organizes the end-to-
+
+
+--- Page 5 ---
+Staggered Batch Scheduling: Co-optimizing Time-to-First-Token and Throughput for High-Efficiency LLM Inference
+end inference workflow through three tightly coordinated
+planes: the Control Plane (main scheduling loop), the State
+Plane (global state and feedback system), and the Resource
+Plane (inference instance pool).
+Figure 5. System Architecture of the Staggered Batch Sched-
+uler (SBS). The system is centered around a Main Schedule Loop
+that governs request dispatching. (1) Inference Instances, each
+consisting of multiple Data Parallel (DP) units, execute forward
+passes. Upon completion of a pass, they asynchronously send an
+EndForward Signal containing payload statistics (remaining token
+count and execution time) back to the scheduler. (2) The Global
+State & Feedback System acts as the source of truth, maintaining
+the Global State Matrix (⟨Cavail, Bi, Ki⟩) updated by instance
+feedback, and dynamically calculating the optimal interval (Iopt)
+via Algorithm 1. (3) The Schedule Loop waits for a dual trigger
+condition: the elapse of the calculated interval Iopt, AND the re-
+ceipt of an EndForward notification from the next target instance.
+Once triggered, the scheduler batches pending requests and dis-
+patches them to all DPs of the selected instance via the Policy
+Engine(Algorithm 2 & 3), initiating the next cycle.
+4.1
+Adaptive Scheduling Interval & Synchronization
+4.1.1
+Throughput-Adaptive Interval Estimation
+The efficacy of SBS hinges on the precise alignment of
+the dispatch interval with the cluster’s aggregate service
+rate. A static interval is insufficient for online environments
+characterized by high traffic volatility (> 100% peak-to-
+trough variance).
+We formulate the interval estimation as a dynamic control
+problem to balance system throughput against TTFT. The
+optimal scheduling interval, Iopt, is dynamically derived to
+match the request arrival rate with the cluster’s aggregate
+processing capacity. We define this relationship as:
+Iopt =
+¯Tfwd + Lnet
+Nactive
+where ¯Tfwd represents the moving average of the forward
+pass execution time, Lnet denotes the network latency for
+request distribution, and Nactive is the current number of
+healthy inference instances.
+To ensure stability against transient jitter, the scheduler
+maintains a sliding window of reported execution times
+(Wstats), applying a moving average filter to update ¯Tfwd.
+This feedback loop allows the scheduler to converge rapidly
+to the optimal cadence following auto-scaling events or
+workload shifts.
+During system initialization, due to the lack of online run-
+time data, a default value derived from offline stress testing
+is used as the initial value for ¯Tfwd. As the system contin-
+ues to operate, the scheduling interval rapidly converges to
+the optimal value for the current environment through the
+aforementioned adaptive update mechanism.
+Algorithm 1 Throughput-Adaptive Interval Control Loop
+Require: Wsize: Maximum size of the sliding window;
+Lnet: Estimated network overhead latency; Tdefault:
+Initial fallback execution time.
+Ensure: Optimal scheduling interval Iopt.
+1: Global State:
+2:
+W ←∅{Sliding window for execution times}
+3:
+¯Tfwd ←Tdefault {Smoothed forward time}
+4:
+Nactive ←GetActiveInstances()
+5:
+6: function RecomputeInterval
+7:
+if Nactive > 0 then
+8:
+Iopt ←( ¯Tfwd + Lnet)/Nactive
+9:
+Update System Timer with Iopt
+10:
+end if
+11: end function
+12:
+13: {Triggered upon receiving ’EndForward’ signal from
+any instance}
+14: function OnEndForward(tmeasured)
+15:
+W.Enqueue(tmeasured)
+16:
+if Size(W) > Wsize then
+17:
+W.Dequeue() {Evict oldest sample}
+18:
+end if
+19:
+¯Tfwd ←Mean(W) {Apply moving average filter}
+20:
+RecomputeInterval
+21: end function
+22:
+23: {Triggered by Auto-scaler or Health-check events}
+24: function OnTopologyChange(Nnew)
+25:
+Nactive ←Nnew
+26:
+RecomputeInterval {Immediate adaptation to capac-
+ity shift}
+27: end function
+4.1.2
+Robust State Synchronization Protocol
+Relying solely on estimated intervals for request dispatching
+is susceptible to synchronization drift caused by transient
+workload fluctuations and variable execution times. Al-
+though the adaptive interval algorithm converges rapidly,
+transient estimation errors may still degrade performance or,
+
+
+--- Page 6 ---
+Staggered Batch Scheduling: Co-optimizing Time-to-First-Token and Throughput for High-Efficiency LLM Inference
+in extreme cases, lead to cluster-wide deadlocks. To guaran-
+tee system liveness and maximize resource utilization, we
+implement a Multi-tier State Synchronization Protocol
+that supplements the interval estimation. This protocol em-
+ploys a triple-check mechanism to ensure the accuracy and
+robustness of readiness judgments:
+1. Quiescence Polling (Initialization Path): The sched-
+uler continuously monitors the task depth of instance
+queues. A zero-task state acts as an immediate trigger
+for readiness. This mechanism is particularly effec-
+tive for minimizing latency during system initialization
+(cold starts) and for rapid recovery following the com-
+pletion of a batch.
+2. Asynchronous Completion Signaling (Fast Path):
+Serving as the standard cooperative mechanism, in-
+stances proactively push an EndForward event to the
+scheduler upon completing a forward pass. This event-
+driven approach serves as the primary, low-latency
+trigger for updating load status and signaling instance
+readiness.
+3. Liveness Watchdog (Safety Path): To tolerate net-
+work partitions or silent instance faults where EndFor-
+ward events are lost, a watchdog timer is armed upon
+dispatch. The timeout threshold is set to Ttimeout =
+5 × ¯T. Expiration of this timer forces a state reset,
+preventing distributed deadlocks and ensuring system
+liveness.
+This three-pronged strategy provides a comprehensive safe-
+guard against abnormal scenarios. Notably, the watchdog
+mechanism enables graceful degradation: under worst-case
+conditions (e.g., complete loss of contact with an instance),
+the system automatically reverts to a fixed-interval batch
+processing mode. This design effectively prevents global
+blocking, guarantees fundamental service availability, and
+demonstrates high system robustness.
+4.2
+Batched Prefill Dispatching
+In large-scale DP+EP architectures, the strict synchroniza-
+tion barrier across Data Parallel (DP) units implies that
+the end-to-end latency of a batch is dictated by the heaviest
+workload (the straggler). While inference engines typically
+employ chunked prefill to decompose long sequences into
+manageable execution units, traditional schedulers remain
+agnostic to this fine-grained decomposition. They allocate
+resources based on the coarse-grained total request length
+rather than the actual chunk capacity. This granularity mis-
+match between scheduler perception and execution reality
+leads to severe load imbalance and resource fragmentation.
+To resolve this, we establish a precise Dynamic Capac-
+ity Model and design a two-level allocation algorithm that
+proactively balances load at the chunk level.
+Algorithm 2 Prioritized Batch Allocation Algorithm
+(PBAA)
+Require: Qpending: Unassigned requests from previous
+cycles; Qnew: Newly arrived requests; D: Set of DP
+units with available capacity C(d)
+avail; Nlimit: Maximum
+tolerable waiting cycles
+Ensure: Assignment mapping M.
+1: function GreedyDispatch(Q)
+2:
+Sort Q by length L(r) in descending order {Reduce
+fragmentation}
+3:
+for r ∈Q do
+4:
+define Capacity(r, d):
+5:
+Basic Mode: C(d)
+avail −L(r)
+6:
+Cache-Aware: C(d)
+avail −(L(r) −Lhit(r, d))
+7:
+d∗←arg maxd∈D Capacity(r, d) {Select optimal
+DP}
+8:
+if C(d∗)
+avail > 0 then
+9:
+M ←M ∪{r →d∗}
+10:
+C(d∗)
+avail ←Capacity(r, d∗)
+11:
+else
+12:
+Qnext ←Qnext ∪{r}
+13:
+end if
+14:
+end for
+15: end function
+16:
+17: M ←∅, Qnext ←∅
+18: {Phase 1: Prioritize Legacy}
+19: GreedyDispatch(Qpending)
+20:
+21: {Phase 2: Assign New Arrivals}
+22: GreedyDispatch(Qnew)
+23:
+24: {Phase 3: Overload detection}
+25: for r ∈Qnext do
+26:
+r.wait ←r.wait + 1
+27:
+if r.wait > Nlimit then
+28:
+Trigger FlowControl(Throttle/Reject)
+29:
+end if
+30: end for
+31: return M, Qnext
+4.2.1
+Fine-Grained DP Capacity Modeling
+The scheduler maintains a real-time state vector for every
+DP unit di in the cluster. We define the Real-time Available
+Capacity (C(i)
+avail) as:
+C(i)
+avail = Cchunk −U (i)
+flight −R(i)
+queued
+Here, Cchunk is the hardware-constrained maximum token
+capacity per forward pass, U (i)
+flight represents tokens in tran-
+sit (dispatched but unacknowledged), and R(i)
+queued denotes
+the backlog currently buffered on the device. This model
+
+
+--- Page 7 ---
+Staggered Batch Scheduling: Co-optimizing Time-to-First-Token and Throughput for High-Efficiency LLM Inference
+provides a precise view of ”dispatchable headroom,” en-
+abling the scheduler to fill bubbles in the parallel pipeline.
+4.2.2
+Capacity-Constrained Greedy Allocation
+We propose the Prioritized Batch Allocation Algorithm
+(PBAA) to map a buffered batch of requests Q to available
+DP units D. As detailed in Algorithm 2, the process operates
+in three phases:
+1. Starvation Prevention: Pending requests from pre-
+vious cycles are prioritized to strictly enforce First-
+Come-First-Serve (FCFS) fairness.
+2. Straggler-Aware Bin Packing: We employ a greedy
+heuristic that assigns the most computationally inten-
+sive requests (longest sequences) to the DP unit with
+the highest available capacity Cavail.
+dtarget = arg max
+d∈D (C(d)
+avail)
+This ”Water-Filling” strategy proactively balances the
+load before execution begins, minimizing intra-layer
+synchronization wait times.
+3. Overload Protection: If a request fails allocation for
+N consecutive cycles, it triggers a flow control mech-
+anism (e.g., throttling) to prevent system-wide satura-
+tion.
+Optimization for Context Caching: In cache-enabled sce-
+narios, the objective function shifts from raw capacity to
+effective computational cost. The selection criterion is
+refined to maximize the cache hit rate:
+dtarget = arg max
+d∈D [C(d)
+avail −(Len(r) −Lenhit(r, d))]
+This directs requests to DPs retaining relevant KV caches,
+significantly reducing redundant attention computation.
+4.3
+Dual-Objective Batched Decode Scheduling
+4.3.1
+The Coupled Load Imbalance Challenge
+Unlike Prefill, the Decode phase is autoregressive, creating
+a unique Coupled Load Imbalance problem:
+• Memory Imbalance: The heavy-tailed distribution of
+sequence lengths can exhaust KV cache memory on
+specific DP units (stragglers).
+• Batch-Size Imbalance: Uneven request counts lead to
+low GPU utilization and communication inefficiencies.
+Existing strategies that optimize only one dimension often
+exacerbate the other. We propose a coordinated strategy
+that jointly optimizes both dimensions using the global view
+provided by the batching window.
+Algorithm 3 IQR-Aware Lexicographical Decode Schedul-
+ing
+Require: R: Batch of decode requests to be scheduled; N:
+Set of decode DP units, each with state ⟨Bi, Ki⟩; k:
+IQR multiplier threshold (typically 1.5).
+Ensure: Updated DP units states and assignment mapping.
+1: function LexCompare(i, j):
+2:
+return (Bi < Bj) or (Bi = Bj and Ki < Kj)
+3:
+4: function ScheduleBatch(R, N)
+5:
+Sort R by total sequence length in descending order
+{Fill-the-valley strategy}
+6:
+for each request r ∈R do
+7:
+Step 1: Outlier Detection (Masking)
+8:
+K ←{Kn | n ∈N} {Snapshot of current KV
+loads}
+9:
+Q1, Q3 ←Percentile(K, 25), Percentile(K, 75)
+10:
+Thoutlier ←Q3 + k · (Q3 −Q1)
+11:
+Nsafe ←{n ∈N | Kn ≤Thoutlier}
+12:
+if Nsafe = ∅then
+13:
+{Fallback if all DP units saturated}
+14:
+Nsafe ←N
+15:
+end if
+16:
+Step 2: Lexicographical Selection
+17:
+i∗←null
+18:
+for n ∈Nsafe do
+19:
+if i∗= null or LexCompare(n, i∗) then
+20:
+i∗←n
+21:
+end if
+22:
+end for
+23:
+Step 3: Assignment & state Update
+24:
+Assign r to DP unit i∗
+25:
+Bi∗←Bi∗+ 1
+26:
+Ki∗←Ki∗+ Length(r)
+27:
+end for
+28: end function
+4.3.2
+Outlier-Resilient Load Balancing
+The distribution of KVCache lengths in conversational work-
+loads is typically heavy-tailed, rendering mean-variance
+based metrics unstable. To robustly identify straggler DP
+units without over-sensitivity to normal variance, we employ
+the Interquartile Range (IQR) method.
+By defining a dynamic exclusion threshold Thoutlier =
+Q3 + k · IQR, the scheduler effectively masks DP units
+at risk of memory exhaustion or computational saturation.
+This ”Mask-then-Select” approach creates a safe decision
+space for the subsequent lexicographical optimization of
+batch size and compute load.
+To maximize the efficacy of this masking strategy, we imple-
+ment Length-Based Pre-Sorting: requests within a batch
+
+
+--- Page 8 ---
+Staggered Batch Scheduling: Co-optimizing Time-to-First-Token and Throughput for High-Efficiency LLM Inference
+are sorted in descending order of total sequence length. This
+structure facilitates a ”fill-the-valley” placement strategy,
+prioritizing heavy requests while the decision space is still
+abundant.
+4.3.3
+Lexicographical Multi-Objective Selection
+For the DP units remaining in the ”safe decision space”
+(post-masking), we model the assignment as a Lexicograph-
+ical Optimization problem. We define the state vector for
+DP unit i as Vi = ⟨Bi, Ki⟩, where Bi is the batch size
+and Ki is the KV cache length. The optimal DP unit i∗is
+selected by hierarchical minimization:
+i∗= arg
+min
+i∈Dvalid⟨Bi, Ki⟩
+This logic prioritizes balancing the Batch Size (Bi) to maxi-
+mize parallel efficiency, while using KV Cache load (Ki) as
+a tie-breaker to manage memory pressure. This hierarchical
+approach ensures the cluster converges towards an equilib-
+rium where both compute utilization and memory footprint
+are optimized.
+5
+EXPERIMENTS
+5.1
+TTFT Optimization
+Experimental Setup: We evaluated the proposed Staggered
+Batch Scheduling (SBS) on a production cluster equipped
+with NVIDIA H800 GPUs. The cluster topology followed a
+3:1 Prefill-to-Decode (3P1D) ratio, utilizing the DeepSeek-
+V3 model. Each inference instance was configured with
+Prefill Chunk Size (3K), Tensor Parallelism (TP = 4), Data
+Parallelism (DP = 8), and Expert Parallelism (EP = 32).
+The evaluation workload comprised requests with input
+token lengths ranging from 0 to 3K (mean: 1K).
+We compared the average Time-to-First-Token (TTFT)
+and internal queuing latency of SBS against a baseline
+immediate-dispatch scheduler. To establish a reference ca-
+pacity, we first benchmarked the baseline to determine its
+peak QPS that satisfies the TTFT Service Level Objective
+(SLO). Subsequently, we evaluated both systems under iden-
+tical QPS conditions across load levels ranging from 40%
+to 100% of this peak. As shown in Figure 6(a), SBS consis-
+tently outperforms the baseline. By substantially reducing
+internal queuing delay, SBS achieves up to a 40% reduction
+in TTFT at sub-80% load levels.
+We further extended the evaluation to long-context scenarios
+(3K-64K input tokens, mean 6.7K) using a configuration
+with a 16K Prefill Chunk Size. Figure 6(b) demonstrates
+that SBS maintains its performance advantage even under
+high variance in input lengths, validating its robustness for
+complex, production-grade workloads.
+(a) Input Token Length(0-3K): SBS maintains a
+consistent TTFT advantage across all load levels.
+(b) Input Token Length(3K-64K): Under high-
+variance inputs (up to 64K tokens), SBS effectively
+suppresses tail latency, demonstrating robustness
+in complex production scenarios.
+Figure 6. Prefill Performance Evaluation
+5.2
+Load Balancing Effects
+5.2.1
+Prefill Load Balancing and Throughput
+To quantify the efficacy of the ”Water-Filling” allocation
+strategy (Algorithm 2), we conducted controlled experi-
+ments comparing Baseline and SBS modes under fixed
+mean-TTFT constraints.
+Table 1 details the maximum sustainable QPS and average
+Prefill Chunk Utilization—a metric quantifying the percent-
+age of theoretical token capacity utilized per forward pass.
+The results demonstrate that SBS effectively converts frag-
+mented ”parallelization bubbles” into usable throughput.
+By employing aggressive batching and bin-packing, Pre-
+fill Chunk Utilization surged from 52% to 88%. This
+substantial gain in resource efficiency translates directly
+into system capacity, boosting overall QPS by 12.9% to
+22.8% across different prefill chunk size configurations.
+These findings confirm the efficacy of SBS in mitigating
+load imbalance across DP units.
+5.2.2
+Decode Load Balancing and Throughput
+We evaluated the Decode phase on an H800 cluster con-
+figured with TP=1, DP=32 and EP=32, handling a repre-
+
+
+--- Page 9 ---
+Staggered Batch Scheduling: Co-optimizing Time-to-First-Token and Throughput for High-Efficiency LLM Inference
+Table 1. Prefill Chunk Utilization and Total System Throughput Comparison.
+Scenario
+Batch
+QPS
+Chunk Util. (%)
+∆QPS (%)
+∆Chunk Util. (pp)
+Chunk 3K (mean-TTFT=0.8s)
+Off
+57
+51.83
+–
+–
+On
+70
+88.7
++22.8
++36.9
+Chunk 5K (mean-TTFT=1.0s)
+Off
+70
+53.0
+–
+–
+On
+79
+88.0
++12.9
++35.0
+Table 1. By eliminating parallelization bubbles via batched bin-packing, SBS increases Prefill Chunk Utilization from ∼52% to ∼88%.
+This improved resource saturation directly drives a 12.9% to 22.8% boost in maximum sustainable QPS compared to the baseline.
+sentative workload with combined input and output lengths
+of approximately 2.5K tokens and an average batch size
+of 35. We compared our IQR-Aware Lexicographical
+Scheduling against a standard immediate-dispatch baseline.
+Figure 7. Efficacy of IQR-Aware Load Balancing on Decode
+Phase. The visualization compares the distribution of KV Cache
+loads across DP units over time. Top (Baseline): Standard schedul-
+ing results in a heavy-tailed distribution with wide variance (red
+band), indicating frequent stragglers. Bottom (SBS): Our IQR-
+Aware strategy compresses the load variance (green band), keeping
+KV Cache usage tightly clustered around the mean. This reduction
+in load disparity (±1σ range reduced by 40%) directly mitigates
+the synchronization overhead.
+Straggler Suppression: As shown in Figure 7, the baseline
+strategy resulted in a heavy-tailed distribution of KV Cache
+loads, with a standard deviation band (±1σ) spanning 40k
+to 130k tokens, and peak outliers approaching 150k. In
+contrast, our IQR-Aware approach effectively compressed
+the load variance, stabilizing the ±1σ range between 60k
+and 100k tokens and eliminating extreme outliers.
+Throughput Gain: The improved load balance directly
+reduced the ”straggler effect” in the synchronization bar-
+rier. Consequently, the aggregated Decode Throughput
+increased by 15%. These results validate that jointly opti-
+mizing the coupled dimensions of compute load and mem-
+ory footprint directly translates into superior system capacity
+and resource utilization.
+Figure 8. Impact of Load Balancing on Decode Throughput.
+By effectively suppressing straggler DP units (as evidenced in
+Figure 7), the SBS strategy minimizes idle wait times caused by
+synchronization barriers. This optimization converts previously
+wasted parallelization bubbles into productive token generation,
+resulting in a 15% increase in aggregate Decode throughput.
+6
+CONCLUSION
+In this work, we addressed the scheduling inefficiencies in-
+herent in P/D-separated, large-scale DP+EP inference archi-
+tectures. We demonstrated that the coupling of immediate
+dispatch strategies with high-synchronization parallel
+execution is the root cause of latency degradation.
+Our proposed solution, Staggered Batch Scheduling (SBS),
+fundamentally shifts the scheduling paradigm from contin-
+uous dispatch to discrete, window-based allocation. By
+proactively buffering requests, SBS eliminates internal queu-
+ing latencies and parallelization bubbles, reducing TTFT
+by up to 40%. Furthermore, Leveraging the batching win-
+dow, we deploy a global allocation mechanism across both
+phases. It boosts Prefill throughput by 12.9%–22.8% via
+bin-packing, and improves Decode throughput by ∼15%
+by resolving the coupled challenges of KV-cache variance
+and batch size imbalance.
+As LLMs continue to scale towards trillion-parameter mix-
+tures of experts, the principles of discrete scheduling syn-
+chronization and global-view load shaping presented here
+provide a scalable path for next-generation inference sys-
+tems.
+
+
+--- Page 10 ---
+Staggered Batch Scheduling: Co-optimizing Time-to-First-Token and Throughput for High-Efficiency LLM Inference
+REFERENCES
+Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra,
+N., Gulavani, B., Tumanov, A., and Ramjee, R. Taming
+{Throughput-Latency} tradeoff in {LLM} inference with
+{Sarathi-Serve}. In 18th USENIX Symposium on Operat-
+ing Systems Design and Implementation (OSDI 24), pp.
+117–134, 2024.
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D.,
+Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G.,
+Askell, A., et al. Language models are few-shot learners.
+Advances in neural information processing systems, 33:
+1877–1901, 2020.
+Cao, S., Wang, Y., Mao, Z., Hsu, P.-L., Yin, L., Xia, T.,
+Li, D., Liu, S., Zhang, Y., Zhou, Y., et al. Locality-
+aware fair scheduling in llm serving.
+arXiv preprint
+arXiv:2501.14312, 2025.
+Dai, D., Deng, C., Zhao, C., Xu, R., Gao, H., Chen, D., Li, J.,
+Zeng, W., Yu, X., Wu, Y., et al. Deepseekmoe: Towards
+ultimate expert specialization in mixture-of-experts lan-
+guage models. arXiv preprint arXiv:2401.06066, 2024.
+Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E.,
+Cai, T., Rutherford, E., Casas, D. d. L., Hendricks, L. A.,
+Welbl, J., Clark, A., et al. Training compute-optimal
+large language models. arXiv preprint arXiv:2203.15556,
+2022.
+Hu, C., Huang, H., Hu, J., Xu, J., Chen, X., Xie, T., Wang,
+C., Wang, S., Bao, Y., Sun, N., et al. Memserve: Con-
+text caching for disaggregated llm serving with elastic
+memory pool. arXiv preprint arXiv:2406.17565, 2024a.
+Hu, C., Huang, H., Xu, L., Chen, X., Xu, J., Chen, S., Feng,
+H., Wang, C., Wang, S., Bao, Y., et al. Inference without
+interference: Disaggregate llm inference for mixed down-
+stream workloads.
+arXiv preprint arXiv:2401.11181,
+2024b.
+Organization, L.
+Sglang 0.4: Enhancing llm inference
+with parallel attention and more.
+LMSYS Blog, De-
+cember 2024. URL https://lmsys.org/blog/
+2024-12-04-sglang-v0-4. Accessed: 2024-11-
+26.
+Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, ´I., Maleki,
+S., and Bianchini, R. Splitwise: Efficient generative llm
+inference using phase splitting. In 2024 ACM/IEEE 51st
+Annual International Symposium on Computer Architec-
+ture (ISCA), pp. 118–132. IEEE, 2024.
+Rajbhandari, S., Li, C., Yao, Z., Zhang, M., Aminabadi,
+R. Y., Awan, A. A., Rasley, J., and He, Y. Deepspeed-moe:
+Advancing mixture-of-experts inference and training to
+power next-generation ai scale. In International con-
+ference on machine learning, pp. 18332–18346. PMLR,
+2022.
+Srivatsa, V., He, Z., Abhyankar, R., Li, D., and Zhang, Y.
+Preble: Efficient distributed prompt scheduling for llm
+serving. arXiv preprint arXiv:2407.00023, 2024.
+Sun, B., Huang, Z., Zhao, H., Xiao, W., Zhang, X., Li, Y.,
+and Lin, W. Llumnix: Dynamic scheduling for large
+language model serving. In 18th USENIX symposium on
+operating systems design and implementation (OSDI 24),
+pp. 173–191, 2024.
+Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,
+M.-A., Lacroix, T., Rozi`ere, B., Goyal, N., Hambro, E.,
+Azhar, F., et al. Llama: Open and efficient foundation lan-
+guage models. arXiv preprint arXiv:2302.13971, 2023.
+Zheng, L., Yin, L., Xie, Z., Sun, C. L., Huang, J., Yu, C. H.,
+Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., et al.
+Sglang: Efficient execution of structured language model
+programs. Advances in neural information processing
+systems, 37:62557–62583, 2024.
+Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X.,
+and Zhang, H. {DistServe}: Disaggregating prefill and
+decoding for goodput-optimized large language model
+serving. In 18th USENIX Symposium on Operating Sys-
+tems Design and Implementation (OSDI 24), pp. 193–210,
+2024.
+Zoph, B., Bello, I., Kumar, S., Du, N., Huang, Y., Dean,
+J., Shazeer, N., and Fedus, W. St-moe: Designing stable
+and transferable sparse expert models. arXiv preprint
+arXiv:2202.08906, 2022.

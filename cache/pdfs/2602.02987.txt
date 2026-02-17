@@ -1,0 +1,4170 @@
+--- Page 1 ---
+Large-Scale LLM Inference with Heterogeneous
+Workloads: Prefill-Decode Contention and
+Asymptotically Optimal Control
+Ruihan Lina, Zean Hanb, Zezhen Dingc, Jiheng Zhangd
+Department of Industrial Engineering and Decision Analytics, The Hong Kong University of Science and Technology
+arlinah@connect.ust.hk, bzhanax@connect.ust.hk, czdingah@connect.ust.hk, djiheng@ust.hk
+Abstract.
+Large Language Models (LLMs) are rapidly becoming critical infrastructure for enterprise applications,
+driving unprecedented demand for GPU-based inference services. A key operational challenge arises from the
+two-phase nature of LLM inference: a compute-intensive prefill phase that processes user input, followed by a
+memory-bound decode phase that generates output tokens. When these phases share GPU resources, prefill tasks
+throttle the processing speed of concurrent decodes, creating state-dependent contention. This contention is further
+complicated by workload heterogeneity, as different applications exhibit vastly different input and output lengths.
+We develop a stochastic control framework for scheduling heterogeneous LLM workloads across large GPU
+clusters. We formulate LLM inference as a multiclass many-server queueing network with state-dependent service
+rates, grounded in empirical iteration-time measurements. We analyze the fluid approximation of this system
+and solve steady-state linear programs that characterize optimal resource allocation. We design gate-and-route
+policies that regulate prefill admission and decode routing, and prove that they are asymptotically optimal in
+the many-GPU limit under both bundled and separate token-pricing schemes. We further extend the framework
+to incorporate Service Level Indicators (SLIs) such as latency and fairness, providing a general approach to
+constrained scheduling. Numerical experiments calibrated to empirical iteration-time data demonstrate that our
+policies outperform standard serving heuristics.
+Key words: Stochastic control, Queueing network, Large language models, Revenue management
+1.
+Introduction
+Large Language Models (LLMs) have emerged as a foundational technology in contemporary artificial
+intelligence, leading to a substantial increase in computational demand (Zhao et al. 2025). To accommodate this
+growth, production-scale infrastructures have expanded correspondingly, frequently requiring the concurrent
+utilization of thousands of GPUs to sustain worldwide inference workloads (Kwon et al. 2023, Aminabadi
+et al. 2022). Since commercial LLM services predominantly adopt per-token pricing (OpenAI 2025, Google
+Cloud 2025, Anthropic 2025, Google 2025, DeepSeek 2025), revenue is closely tied to the volume and
+composition of tokens processed, making efficient resource allocation critical for both profitability and user
+experience.
+Prefill–decode contention. A distinguishing feature of LLM inference is that each request proceeds in
+two stages: a prefill stage, in which the model processes the user’s input prompt, followed by a decode stage,
+1
+arXiv:2602.02987v1  [cs.DC]  3 Feb 2026
+
+
+--- Page 2 ---
+2
+in which it generates output tokens autoregressively. Modern serving systems batch multiple requests on the
+same GPU to exploit the GPU’s parallel processing capability, but these two stages interact in nontrivial
+ways when sharing GPU resources. Prefill is compute-intensive and, when present in a batch, dominates the
+iteration time and thereby throttles the processing speed of co-located decode tasks; decode, in contrast, is
+memory-bound and proceeds faster when running alone (Kwon et al. 2023, Agrawal et al. 2024). Moreover,
+iteration time grows roughly linearly in the amount of prefill work, so adding a second prefill to a batch
+would nearly double the iteration time without improving parallelism. For this reason, practical systems
+process at most one prefill per GPU at a time. This prefill-decode contention creates a fundamental scheduling
+tension: admitting more prefills increases the rate at which new requests enter the system but slows down all
+concurrent decodes, and the scheduler must carefully balance how many GPUs are devoted to prefill versus
+decode-only operation.
+Workload heterogeneity. Real-world LLM services do not see a single homogeneous stream of requests.
+They serve a mix of applications, such as summarization, creative writing, and question answering, which
+differ widely in typical input and output lengths (Sun et al. 2024, Zheng et al. 2024, Zhao et al. 2024). For
+example, summarization tasks average over 1,000 input tokens with moderate output, while creative writing
+requires fewer than 100 input tokens yet generates over 900 output tokens on average (see Table EC.1 in
+the e-companion for detailed statistics). This heterogeneity amplifies the scheduling challenge: a class with
+long prefills and short decodes (e.g., summarization) consumes GPU time during prefill but releases decode
+capacity quickly, whereas a class with short prefills and long decodes (e.g., creative writing) admits quickly
+but occupies decode slots for extended periods. Maximizing revenue requires serving an appropriate mix of
+both to balance pipeline utilization. Consequently, this multiclass resource allocation problem is not well
+served by simple static priority rules such as first-come-first-served or shortest-job-first; instead, it calls for
+finer control over how resources are distributed across classes.
+This paper addresses the following question: How should a large-scale LLM inference system jointly
+control admission and scheduling across multiple request classes to maximize token-based revenue while
+respecting service level indicators (SLIs)? Answering this question requires overcoming several challenges.
+First, the state-dependent service rates arising from prefill-decode contention create analytical difficulties
+that preclude direct application of standard queueing results. Second, heterogeneous workloads induce a
+multiclass resource allocation problem where the optimal policy depends on the composition of the workload
+mix. Third, practical systems must balance revenue maximization against SLIs such as latency and fairness
+across request classes.
+Our approach. We model the system as a multiclass many-server queueing network where each GPU
+operates in one of two modes: mixed (running one prefill alongside decodes) or solo (decode-only). Service
+rates are state-dependent, specifically, decodes run slower in mixed mode due to intensive computation
+
+
+--- Page 3 ---
+3
+of prefill, and we derive these rates from empirical iteration-time measurements in Section 2.2, capturing
+essential GPU physics in a tractable analytical framework.
+Because production LLM clusters typically comprise hundreds to thousands of GPUs, we study the system
+through fluid approximation in the many-server regime, which is a standard and well-established approach
+in operations research for analyzing large-scale stochastic networks. In this scaling, stochastic fluctuations
+average out and the system trajectory converges to a deterministic limit, yielding both analytical tractability
+and high accuracy at scale. The fluid model reduces to a steady-state linear program (LP) whose solution
+prescribes how to partition cluster capacity between mixed and solo modes and how to distribute workload
+across request classes.
+We translate the fluid solution into implementable control via a gate-and-route architecture: a prefill
+gate regulates admission by tracking class-level occupancy targets from the LP, and a decode router directs
+completed prefills to available GPU slots. This decomposition into static planning (solving the LP) and
+dynamic control (enforcing LP targets) is central to our design and underpins the asymptotic optimality
+results we establish.
+Our contributions. We make the following contributions.
+1. Multiclass many-server model with prefill-decode contention. We develop a queueing network where
+each GPU operates in mixed or solo mode, with state-dependent service rates that capture how prefill
+operations throttle co-located decodes. The service-rate parameters are calibrated from controlled
+experiments on production hardware (A100 GPUs) to closely reflect real system behavior.
+2. Fluid approximation and LP-based planning. We establish convergence of the scaled stochastic system
+to a deterministic fluid limit in the many-server regime. The steady-state analysis reduces to a linear
+program that prescribes optimal capacity partitioning between mixed and solo modes and class-level
+occupancy targets. This LP formulation provides analytical tractability and serves as the foundation for
+the control policies we develop.
+3. Asymptotically optimal control policies. We translate the LP solution into implementable gate-and-
+route policies and prove their asymptotic optimality. Under bundled charging (revenue credited upon
+completion), an occupancy-tracking gate suffices; under separate charging (revenue credited after
+each phase), a priority-based policy is needed to counteract incentive distortions that would otherwise
+shift congestion downstream. The framework naturally extends to incorporate service-level indicators
+(fairness, latency) as constraints or penalties, and we show that enforcing fairness at the prefill stage is
+more revenue-costly than at the decode stage. Simulation experiments confirm that per-GPU revenue
+converges to the fluid optimum as the cluster scales and that our policies consistently outperform
+industry-standard heuristics.
+
+
+--- Page 4 ---
+4
+1.1.
+Literature Review
+Efficient LLM inference serving has become a critical systems challenge as production deployments face
+mounting demands for throughput, latency, and resource efficiency. Early systems work concentrated on
+improving performance on single GPUs through architectural innovations. Iteration-level batching made
+it practical to schedule at token granularity (Yu et al. 2022), while paged attention reduced KV-cache
+fragmentation and enabled high utilization under dynamic workloads (Kwon et al. 2023). Chunked prefill
+further enabled interleaving prefill chunks with ongoing decodes (Agrawal et al. 2024).
+As deployments scaled from single-device prototypes to large-scale production clusters, designers began
+allowing the prefill and decode stages to be executed on different GPUs to better match the compute-bound
+prefill phase with the memory-bandwidth-bound decode phase (Patel et al. 2024, Zhong et al. 2024). This
+transition from single-GPU optimization to cluster-scale orchestration raises new questions that go beyond
+engineering heuristics: how should a service provider allocate GPU capacity and route requests across GPUs
+under heterogeneous workloads to maximize long-run revenue while considering customized service-level
+indicators? Existing serving stacks acknowledge these trade-offs but do not yet provide a formal framework
+for revenue-driven resource allocation at scale.
+This operational challenge has attracted growing attention from the operations research (OR) and operations
+management (OM) communities. Multiple survey articles underscore the growing intersection of AI/LLM
+and OR/OM, covering foundational frameworks for AI and operations (Dai and Swaminathan 2026), LLM
+foundations and algorithmic innovations (Zhao et al. 2025), efficient inference techniques (Zhou et al. 2024),
+serving system advances and opportunities (Li et al. 2024), and the intersection of queueing theory and
+predictive scheduling for LLMs (Mitzenmacher and Shahout 2025). Within this broad landscape, research
+efforts unfold along two complementary directions. On one hand, researchers are exploring how LLMs
+can enhance traditional OR/OM workflows. For instance, Simchi-Levi et al. (2025) leverage generative AI
+to democratize optimization, Huang et al. (2025) train LLMs for automated optimization modeling, and
+Simchi-Levi et al. (2026) apply LLMs to supply chain decision-making. On the other hand, and more directly
+relevant to our work, is the growing body of research that applies OR/OM methodologies to improve LLM
+inference itself. Within this OR-for-LLM strand, efforts can be further categorized into two areas: improving
+the quality of LLM outputs, such as aggregating responses via higher-order information beyond majority
+voting (Ai et al. 2025) or applying online learning frameworks to address missing covariates in pre-trained
+AI model assisted decision-making (Hu and Simchi-Levi 2025), and accelerating LLM inference through
+principled resource allocation and scheduling, which is the central focus of the present paper.
+In the context of accelerating LLM inference, a recent strand of work employs competitive analysis from the
+online algorithms community to formalize LLM serving. Zhou and coauthors model KV-cache-constrained
+batching and benchmark online schedulers against a hindsight integer program. They show that under fully
+adversarial arrivals, no deterministic online algorithm achieves a constant competitive ratio; under additional
+
+
+--- Page 5 ---
+5
+assumptions, they provide a polynomial-time scheduler with a constant competitive ratio (Jaillet et al. 2025).
+Follow-up work obtains constant-competitive policies when heterogeneous prefill/decode lengths are modeled
+directly (Wang et al. 2025) and logarithmic-competitive guarantees under interval predictions of decode
+length via an adaptive policy (A min) contrasted with a conservative upper-bound policy (A max) (Chen
+et al. 2025).
+Meanwhile, the advancement of queueing theory provides an analytical framework for stochastic systems
+and control design. In many-server settings, fluid approximations provide tractable first-order descriptions for
+capacity planning and performance analysis (Whitt 2006, Zhang 2013), including accuracy guarantees for
+sizing under impatience (Bassamboo and Randhawa 2010) and asymptotically optimal scheduling structures
+for multiclass systems with abandonment (Atar et al. 2010, Long et al. 2020, 2024). Subsequent work enriches
+these models by exploiting within-queue heterogeneity, allowing dependence between service requirements
+and patience (Bassamboo and Randhawa 2016, Wu et al. 2019), and analyzing state-dependent service rates
+and slowdowns (Dong et al. 2015). In parallel, delay estimation and information-sharing frameworks have been
+developed to manage latency considerations in complex service systems (Ibrahim and Whitt 2009, Ibrahim
+2018). Finally, the literature addresses methodological concerns such as robustness to model/input uncertainty
+in simulation (Lam 2016, Ghosh and Lam 2019), alongside control-oriented heavy-traffic perspectives on
+dynamic admission/sequencing (Harrison and Zeevi 2004, Ata 2006) and state-space-collapse analyses in
+parallel-server networks (Dai and Tezcan 2011).
+Applying these queueing tools to LLM inference, there are growing contemporary theoretical works
+that employ stochastic modeling and fluid approximations. Ao et al. (2025) model KV-memory growth
+and batch-time linearity and propose threshold-based policies (WAIT and Nested WAIT) that approach
+fluid-optimal throughput on a single GPU while keeping latency and time-to-first-token bounded; their analysis
+highlights how batching composition and memory constraints jointly drive performance. Complementary
+results argue that work-conserving rules achieve optimal throughput under simplified token-time abstractions
+(Li et al. 2025), and empirical iteration-time models justify treating per-iteration latency as a piecewise
+linear function of tokens advanced (Li et al. 2025). These works provide valuable theoretical foundations for
+understanding single-GPU scheduling dynamics.
+In contrast, our work focuses on cluster-scale serving with multiple GPUs, which introduces distinct
+modeling considerations. First, in disaggregated multi-GPU deployments where decode tasks can be isolated
+on dedicated servers, the performance characteristics differ from single-GPU mixed batching: decode
+throughput becomes primarily memory-bandwidth bound rather than compute-bound, exhibiting minimal
+degradation with batch size. This motivates the piecewise characterization of prefill and decode service
+rates described by Li et al. (2025), which aligns more closely with the hardware-level asymmetry between
+the two phases. Second, cluster-scale optimization often calls for a many-server framework where capacity
+scales by increasing the number of GPUs (𝑛→∞) while maintaining constant per-device performance, as
+
+
+--- Page 6 ---
+6
+opposed to scaling the service rate of a single GPU to infinity as in traditional heavy-traffic analysis. Finally,
+our emphasis on revenue maximization under heterogeneous workloads and customizable SLI constraints
+complements the throughput-centric perspective of prior work, offering service providers a framework for
+balancing commercial objectives with quality-of-service guarantees.
+To realize this vision, we construct a multiclass many-server fluid approximation where service rates are
+derived directly from an empirical token-time law. By modeling job classes via expected rather than exact
+lengths, our framework remains robust to per-request mispredictions while capturing the essential system
+dynamic: admitting prefills forces co-located decodes into a slower mixed mode. The resulting steady-state
+optimization problem parametrizes a two-level control policy, consisting of a prefill gate and a decode router,
+that provably achieves asymptotic optimality in the many-GPU limit.
+1.2.
+Organization
+The remainder of the paper is organized as follows. Section 2 introduces the iteration-time abstraction, the
+multiclass many-server stochastic network with mixed and solo decode modes, and the bundled revenue
+objective. Section 3 develops the many-GPU fluid limit, formulates the steady-state linear program (LP) over
+per-GPU occupancies, and establishes structural properties such as decode-buffer elimination. Section 4
+constructs the occupancy-anchored gate-and-route policy, proves its asymptotic optimality under bundled
+pricing, and then analyzes the separate prefill/decode charging scheme together with the corresponding
+prioritize-and-route policy. Section 5 extends the fluid LP to an SLI-aware formulation that integrates fairness
+and latency proxies, and shows convergence of the stochastic occupancies to the SLI-optimal fluid solution.
+Section 6 presents numerical experiments with calibrated parameters and synthetic multiclass workloads,
+validating the fluid predictions and exploring revenue–SLO tradeoffs. Section 7 concludes and discusses
+directions for extending the framework. Technical proofs and additional lemmas are collected in the electronic
+companion.
+2.
+Problem Formulation
+This section develops the queueing model in three parts. Section 2.1 provides background on modern LLM
+inference systems. Section 2.2 characterizes GPU iteration time. Section 2.3 derives the resulting service
+rates and embeds them into a many-server stochastic network, specifying the state, flows, admissible controls,
+capacity coupling, and revenue objectives.
+2.1.
+Preliminaries: Modern LLM Inference Systems
+Two stages of LLM inference. We formally introduce the two stages in LLM inference, namely prefill
+and decode. In the prefill stage, the model reads the entire input prompt once and, layer by layer, builds an
+internal representation of all input tokens. Implementations store per-token intermediate states in a key–value
+(KV) cache so that, in the subsequent decode stage, the model can generate output tokens one by one by
+
+
+--- Page 7 ---
+7
+attending to this cache instead of recomputing all past KV values (Shazeer 2019, Dai et al. 2019, Kwon et al.
+2023). Empirical studies show that these two stages stress the hardware differently: prefill behaves like a
+large, single-shot matrix computation, while decode repeatedly accesses and extends the KV cache and is
+more sensitive to memory traffic (Kwon et al. 2023, Agrawal et al. 2024). This asymmetry is the root cause
+of the scheduling trade-offs that we model.
+Continuous batching. State-of-the-art serving systems do not run one request at a time per GPU.
+Instead, they use continuous or iteration-level batching: in each short iteration, the GPU advances many active
+requests by one output token in parallel, then repeats this process for the next token (Yu et al. 2022, Kwon
+et al. 2023). In practice, these systems impose a fixed upper bound on how many requests can be batched on a
+GPU, chosen for engineering reasons such as avoiding out-of-memory errors and reducing dynamic memory
+management overhead (Kwon et al. 2023, Agrawal et al. 2024). We denote this constant by 𝐵.
+Chunked prefill and GPU modes. Long prompts make it inefficient to run prefill in isolation. Recent
+systems therefore chunk prefills into smaller pieces (with each 𝐶tokens) that can be interleaved with decode
+work on the same GPU (Agrawal et al. 2024). Measurements show that once a prefill chunk is present in
+an iteration, it tends to dominate the iteration time; running additional prefills in parallel on the same GPU
+brings no extra benefit because compute capacity is already saturated (Agrawal et al. 2024). Following this
+evidence, we adopt the standard assumption that each GPU runs at most one prefill chunk at a time.
+Figure 1 summarizes the resulting GPU-level architecture, which resembles key elements of systems such
+as vLLM and Sarathi-Serve (Kwon et al. 2023, Agrawal et al. 2024). New requests from all classes first enter
+prefill queues. A host-side Prefill Scheduler selects some queued requests and starts their prefill stage on
+GPUs that are not currently running another prefill. While a prefill is in progress, that GPU is in a mixed
+mode: one slot is occupied by the prefill chunk, and the remaining at most 𝐵−1 slots can be used to advance
+decodes from decode-ready requests of various classes. When the prefill finishes, the request moves into the
+decode buffer, representing the set of requests ready to decode, with their KV caches typically kept resident
+in GPU memory. The GPU then returns to a solo decode mode, where all activated slots are devoted to
+decode. A separate Decode Scheduler continuously fills empty slots on both mixed and solo GPUs from the
+multiclass decode buffer. Because a mixed-mode GPU shares its compute and memory bandwidth between
+a large prefill and several decodes, the per-token progress of those decodes is slower than on a solo GPU;
+admitting more prefills thus increases the rate at which new requests enter decode but slows down decodes
+sharing the same GPU.
+2.2.
+Token Processing on GPUs
+To build a tractable stochastic model, we first characterize GPU iteration time. In each iteration, the GPU
+processes a batch that may contain both prefill and decode tasks: all decode tasks in the batch each generate
+one output token, and if a prefill chunk is present, the GPU processes one chunk of its input tokens. The
+iteration time is defined as the duration required to complete this batch processing step.
+
+
+--- Page 8 ---
+8
+GPU CLUSTER POOL (n GPUs)
+Prefill Task
+Decode Task
+Prefill Buffer
+Class 1
+(Coding)
+Qn
+p,1(t)
+Class 2
+(General)
+Qn
+p,2(t)
+Class I
+(Finance)
+Qn
+p,I(t)
+...
+nλ1
+nλ2
+nλI
+Prefill
+Scheduler
+Decode Buffer
+Class 1
+Qn
+d,1(t)
+Class 2
+Qn
+d,2(t)
+Class I
+Qn
+d,I(t)
+...
+Decode
+Scheduler
+GPU #k
+STATE: MIXED GPU
+Prefill
+Empty
+GPU #j
+STATE: SOLO GPU
+Target
+(Prefill)
+Empty
+B
+Admit
+Prefill Completed
+Admit Prefill
+Prefill Finishes
+Figure 1
+Schematic of the Dynamic GPU Scheduling Architecture. The system manages a cluster of 𝑛GPUs
+with batch size 𝐵. GPUs transition between the Solo State (decode-only) and Mixed State (one prefill + decodes)
+based on assignments from the Prefill Scheduler. Completed prefills enter a virtual Decode Buffer, from which
+the Decode Scheduler populates available slots in either state.
+Iteration time. A key empirical finding, documented by Li et al. (2025), is that iteration time depends on
+the total number of tokens processed in a batch:
+𝜏(𝑏′) = 𝑐+ 𝑎· max{0, 𝑏′ −𝑏0}.
+(1)
+Here, 𝑏′ denotes the effective token count for the iteration, equal to the prefill chunk size plus the number of
+concurrent decode tasks. The constant 𝑐> 0 captures fixed overheads (e.g., kernel launches), 𝑎> 0 is the
+marginal cost per token, and 𝑏0 ≥0 is a threshold below which overheads dominate. This formula captures
+two operating regimes:
+• Decode-only iteration: In a decode-only batch, the effective token count 𝑏′ equals the batch size, which
+is typically smaller than 𝑏0. The max term in Equation (1) then vanishes, and the iteration time reduces
+to a near-constant value
+𝜏solo = 𝜏(𝑏′) = 𝑐,
+for 𝑏′ ≤𝑏0.
+(2)
+• Mixed-batch iteration: When a batch includes a prefill chunk of size 𝐶, the chunk dominates the
+effective token count (i.e., 𝑏′ ≈𝐶). For practical chunk sizes where 𝐶> 𝑏0, iteration time grows linearly
+
+
+--- Page 9 ---
+9
+in 𝐶. This is consistent with empirical observations from Sarathi-Serve, where decode iteration time is
+largely independent of batch size but prefill iteration time scales linearly with chunk size (Agrawal et al.
+2024).
+Our experiments in Section 6.1 confirm both regimes: Figure 3 shows that iteration time remains nearly flat
+for small batch sizes and grows linearly in 𝐶once a prefill chunk is present.
+Since practical chunk sizes typically satisfy 𝐶≥𝑏0, we adopt the linear form for mixed-batch iteration
+time:
+𝜏mix(𝐶) = 𝛼+ 𝛽𝐶,
+where 𝛼:= 𝑐−𝑎𝑏0 and 𝛽:= 𝑎> 0.
+(3)
+This two-regime abstraction captures the key prefill–decode interaction while remaining analytically tractable.
+2.3.
+The Stochastic Model
+We now embed the iteration-time characterization from Section 2.2 into a multiclass many-server stochastic
+network. The model is indexed by the number of GPUs 𝑛∈N.
+Primitives and service parameters. Requests belong to a finite set of classes I := {1, . . . , 𝐼}. A
+class-𝑖request is characterized by its representative prompt length 𝑃𝑖and decode length 𝐷𝑖(in tokens). The
+system consists of 𝑛homogeneous GPUs. Each GPU can host at most 𝐵∈N concurrent decode streams and
+at most one prefill at a time. Prefill is executed in fixed-size chunks of 𝐶> 0 tokens per iteration.
+Recall from Section 2.2 that the iteration time is 𝜏solo = 𝑐in decode-only mode and 𝜏mix(𝐶) = 𝛼+ 𝛽𝐶
+when a prefill chunk is present. For notational convenience, write 𝜏:= 𝜏mix(𝐶) for the mixed-iteration time.
+Service rates are derived as follows.
+• Prefill rate. A prefill job of length 𝑃𝑖tokens advances 𝐶tokens per iteration, each taking time 𝜏.
+Completing the prefill requires (𝑃𝑖/𝐶) iterations, so the mean service time is (𝑃𝑖/𝐶)𝜏and the rate is
+𝜇𝑝,𝑖= 𝐶
+𝑃𝑖𝜏.
+• Mixed decode rate. In mixed mode, a decode job produces one token per iteration. A class-𝑖job needs
+𝐷𝑖tokens, so the mean service time is 𝐷𝑖𝜏and the rate is
+𝜇𝑚,𝑖=
+1
+𝐷𝑖𝜏.
+• Solo decode rate. In decode-only mode, each token takes 𝜏solo seconds. Defining 𝛾:= 1/𝜏solo to be the
+token generation rate per slot, the mean service time for 𝐷𝑖tokens is 𝐷𝑖/𝛾and the rate is
+𝜇𝑠,𝑖= 𝛾
+𝐷𝑖
+.
+We collect these rates as
+𝜇𝑝,𝑖= 𝐶
+𝑃𝑖𝜏,
+𝜇𝑚,𝑖=
+1
+𝐷𝑖𝜏,
+𝜇𝑠,𝑖= 𝛾
+𝐷𝑖
+.
+(4)
+
+
+--- Page 10 ---
+10
+For analytical tractability, we model prefill, mixed decode, and solo decode service times as independent
+exponential random variables with rates 𝜇𝑝,𝑖, 𝜇𝑚,𝑖, and 𝜇𝑠,𝑖, respectively, for each class 𝑖∈I.
+We assume Poisson arrivals: in the 𝑛th system, class-𝑖arrivals form a Poisson process with rate 𝜆𝑛
+𝑖:= 𝑛𝜆𝑖,
+where 𝜆𝑖> 0 is the nominal arrival rate per GPU, so the total offered load grows proportionally with 𝑛.
+Customers are impatient in both the prefill and decode queues: any class-𝑖job that is waiting is endowed with
+an independent exponential patience time with rate 𝜃𝑖≥0. Interarrival times, service times, and patience
+times are assumed mutually independent across all jobs and classes.
+State and control processes. Fix 𝑛∈N. For each class 𝑖∈I and time 𝑡≥0, denote by 𝑄𝑛
+𝑝,𝑖(𝑡) the
+number of class-𝑖jobs waiting for prefill, by 𝑋𝑛
+𝑖(𝑡) the number in prefill service, by 𝑄𝑛
+𝑑,𝑖(𝑡) the number
+waiting for decode (prefill completed), and by 𝑌𝑛
+𝑚,𝑖(𝑡) and 𝑌𝑛
+𝑠,𝑖(𝑡) the numbers in mixed and solo decode,
+respectively. These processes are right-continuous, integer-valued, and change by unit jumps when individual
+jobs enter or leave the corresponding stage. The total class-𝑖content in prefill and decode is
+𝑍𝑛
+𝑝,𝑖(𝑡) := 𝑄𝑛
+𝑝,𝑖(𝑡) + 𝑋𝑛
+𝑖(𝑡),
+𝑍𝑛
+𝑑,𝑖(𝑡) := 𝑄𝑛
+𝑑,𝑖(𝑡) +𝑌𝑛
+𝑚,𝑖(𝑡) +𝑌𝑛
+𝑠,𝑖(𝑡).
+(5)
+The cumulative primitive counting processes are defined as follows. Let 𝐴𝑛
+𝑖(𝑡) be the total number of
+exogenous arrivals of class-𝑖jobs by time 𝑡. Let 𝐵𝑛
+𝑝,𝑖(𝑡) and 𝐵𝑛
+𝑑,𝑖(𝑡) denote the total abandonments from the
+prefill and decode queues of class 𝑖. Let 𝑆𝑛
+𝑝,𝑖(𝑡) be the total prefill completions, and 𝑆𝑛
+𝑑,𝑚,𝑖(𝑡) and 𝑆𝑛
+𝑑,𝑠,𝑖(𝑡)
+the total mixed and solo decode completions; the total decode completions are
+𝑆𝑛
+𝑑,𝑖(𝑡) := 𝑆𝑛
+𝑑,𝑚,𝑖(𝑡) + 𝑆𝑛
+𝑑,𝑠,𝑖(𝑡).
+(6)
+These counting processes admit a standard random time-change representation. Let
+{𝑁𝐴,𝑖, 𝑁𝐵𝑝,𝑖, 𝑁𝐵𝑑,𝑖, 𝑁𝑝,𝑖, 𝑁𝑑,𝑚,𝑖, 𝑁𝑑,𝑠,𝑖}𝑖∈I
+be mutually independent unit-rate Poisson processes. Then, for each 𝑖∈I and 𝑡≥0,
+𝐴𝑛
+𝑖(𝑡) = 𝑁𝐴,𝑖
+ 𝜆𝑛
+𝑖𝑡,
+𝐵𝑛
+𝑝,𝑖(𝑡) = 𝑁𝐵𝑝,𝑖
+∫𝑡
+0
+𝜃𝑖𝑄𝑛
+𝑝,𝑖(𝑠) 𝑑𝑠
+
+,
+(7)
+𝐵𝑛
+𝑑,𝑖(𝑡) = 𝑁𝐵𝑑,𝑖
+∫𝑡
+0
+𝜃𝑖𝑄𝑛
+𝑑,𝑖(𝑠) 𝑑𝑠
+
+,
+𝑆𝑛
+𝑝,𝑖(𝑡) = 𝑁𝑝,𝑖
+∫𝑡
+0
+𝜇𝑝,𝑖𝑋𝑛
+𝑖(𝑠) 𝑑𝑠
+
+,
+(8)
+𝑆𝑛
+𝑑,𝑚,𝑖(𝑡) = 𝑁𝑑,𝑚,𝑖
+∫𝑡
+0
+𝜇𝑚,𝑖𝑌𝑛
+𝑚,𝑖(𝑠) 𝑑𝑠
+
+,
+𝑆𝑛
+𝑑,𝑠,𝑖(𝑡) = 𝑁𝑑,𝑠,𝑖
+∫𝑡
+0
+𝜇𝑠,𝑖𝑌𝑛
+𝑠,𝑖(𝑠) 𝑑𝑠
+
+.
+(9)
+Equations (7)–(9) state that each cumulative count is driven by a unit-rate Poisson process with the
+corresponding integrated intensity.
+Scheduling decisions are encoded through cumulative control processes. For each class 𝑖, let 𝑈𝑛
+𝑝,𝑖(𝑡) be the
+number of jobs admitted into prefill service by time 𝑡, and 𝑈𝑛
+𝑑,𝑚,𝑖(𝑡) and 𝑈𝑛
+𝑑,𝑠,𝑖(𝑡) the numbers admitted into
+mixed and solo decode. Mode switches between decode submodes are counted by
+𝑀𝑛
+𝑠→𝑚,𝑖(𝑡) and 𝑀𝑛
+𝑚→𝑠,𝑖(𝑡),
+(10)
+
+
+--- Page 11 ---
+11
+the cumulative numbers of class-𝑖decodes switched from solo to mixed and from mixed to solo by time
+𝑡. These mode-switch processes are endogenous: they have no external Poisson clocks and are induced by
+changes in prefill activity on each GPU. In particular, solo-to-mixed switches occur when a prefill is admitted
+to a GPU that was previously in pure decode mode, and mixed-to-solo switches occur when that prefill
+completes; these transitions are structural consequences of the prefill dynamics rather than direct control
+actions of the scheduling policy.
+For later use, define the aggregate in-service counts
+𝑋𝑛(𝑡) :=
+∑︁
+𝑖
+𝑋𝑛
+𝑖(𝑡),
+𝑌𝑛
+𝑚(𝑡) :=
+∑︁
+𝑖
+𝑌𝑛
+𝑚,𝑖(𝑡),
+𝑌𝑛
+𝑠(𝑡) :=
+∑︁
+𝑖
+𝑌𝑛
+𝑠,𝑖(𝑡),
+(11)
+and similarly 𝑀𝑛
+𝑠→𝑚(𝑡) := Í
+𝑖𝑀𝑛
+𝑠→𝑚,𝑖(𝑡) and 𝑀𝑛
+𝑚→𝑠(𝑡) := Í
+𝑖𝑀𝑛
+𝑚→𝑠,𝑖(𝑡). The per-GPU physical constraints
+imply
+0 ≤𝑋𝑛(𝑡) ≤𝑛,
+(12)
+0 ≤𝑌𝑛
+𝑚(𝑡) ≤(𝐵−1) 𝑋𝑛(𝑡),
+(13)
+0 ≤𝑌𝑛
+𝑠(𝑡) ≤𝐵 𝑛−𝑋𝑛(𝑡).
+(14)
+Equation (12) enforces at most one prefill per GPU, while (13)–(14) bound mixed and solo decodes according
+to whether a GPU is running a prefill.
+Admissible policies. We now formalize the notion of a policy. Let
+𝜋𝑛:=
+
+𝑄𝑛
+𝑝,𝑄𝑛
+𝑑, 𝑋𝑛,𝑌𝑛
+𝑚,𝑌𝑛
+𝑠, 𝐴𝑛, 𝐵𝑛
+𝑝, 𝐵𝑛
+𝑑, 𝑆𝑛
+𝑝, 𝑆𝑛
+𝑑,𝑚, 𝑆𝑛
+𝑑,𝑠, 𝑈𝑛
+𝑝,𝑈𝑛
+𝑑,𝑚,𝑈𝑛
+𝑑,𝑠, 𝑀𝑛
+𝑠→𝑚, 𝑀𝑛
+𝑚→𝑠
+
+denote the collection of all non-primitive processes in the 𝑛th system (state, cumulative flows, and control
+processes), where each symbol stands for the vector over classes 𝑖∈I. Let Π𝑛denote the set of policies that
+satisfy the admissibility conditions below:
+(i) the resulting state processes satisfy the capacity constraints (12)–(14) and balance equations (15)-(19)
+for all 𝑡≥0;
+(ii) the policy is event-driven, i.e., each control process 𝑈𝑛
+·,𝑖(𝑡) can change only at arrival epochs,
+abandonment epochs, service-completion epochs, or at 𝑡= 0;
+(iii) within each class, prefill and decode queues are served in first-come-first-served order, and service is
+non-preemptive.
+We say that any 𝜋𝑛∈Π𝑛is an admissible policy, under which the state processes are then uniquely
+determined from the primitives and the controls via the balance equations (15)–(19).
+
+
+--- Page 12 ---
+12
+Balance equations. Under any policy 𝜋𝑛∈Π𝑛, the state and cumulative processes satisfy the following
+flow-balance identities for all 𝑖∈I and 𝑡≥0:
+𝑄𝑛
+𝑝,𝑖(𝑡) = 𝑄𝑛
+𝑝,𝑖(0) + 𝐴𝑛
+𝑖(𝑡) −𝑈𝑛
+𝑝,𝑖(𝑡) −𝐵𝑛
+𝑝,𝑖(𝑡),
+(15)
+𝑋𝑛
+𝑖(𝑡) = 𝑋𝑛
+𝑖(0) +𝑈𝑛
+𝑝,𝑖(𝑡) −𝑆𝑛
+𝑝,𝑖(𝑡),
+(16)
+𝑄𝑛
+𝑑,𝑖(𝑡) = 𝑄𝑛
+𝑑,𝑖(0) + 𝑆𝑛
+𝑝,𝑖(𝑡) −𝑈𝑛
+𝑑,𝑚,𝑖(𝑡) −𝑈𝑛
+𝑑,𝑠,𝑖(𝑡) −𝐵𝑛
+𝑑,𝑖(𝑡),
+(17)
+𝑌𝑛
+𝑚,𝑖(𝑡) =𝑌𝑛
+𝑚,𝑖(0) +𝑈𝑛
+𝑑,𝑚,𝑖(𝑡) −𝑆𝑛
+𝑑,𝑚,𝑖(𝑡) + 𝑀𝑛
+𝑠→𝑚,𝑖(𝑡) −𝑀𝑛
+𝑚→𝑠,𝑖(𝑡),
+(18)
+𝑌𝑛
+𝑠,𝑖(𝑡) =𝑌𝑛
+𝑠,𝑖(0) +𝑈𝑛
+𝑑,𝑠,𝑖(𝑡) −𝑆𝑛
+𝑑,𝑠,𝑖(𝑡) + 𝑀𝑛
+𝑚→𝑠,𝑖(𝑡) −𝑀𝑛
+𝑠→𝑚,𝑖(𝑡).
+(19)
+Equation (15) says that the prefill queue-length equals its initial content plus arrivals, minus admissions and
+abandonments. Equation (16) tracks prefill jobs in service as admissions minus completions. Equation (17)
+balances the decode queue as completed prefills minus admissions into decode and abandonments. Equa-
+tions (18)–(19) track mixed and solo decodes as admissions minus completions, plus net inflow from mode
+switches.
+Adding (18) and (19) eliminates the mode-switch terms and yields
+𝑌𝑛
+𝑚,𝑖(𝑡) +𝑌𝑛
+𝑠,𝑖(𝑡) =𝑌𝑛
+𝑚,𝑖(0) +𝑌𝑛
+𝑠,𝑖(0) +𝑈𝑛
+𝑑,𝑚,𝑖(𝑡) +𝑈𝑛
+𝑑,𝑠,𝑖(𝑡) −𝑆𝑛
+𝑑,𝑚,𝑖(𝑡) −𝑆𝑛
+𝑑,𝑠,𝑖(𝑡),
+(20)
+so mode switches only redistribute ongoing decodes between mixed and solo, without changing their total
+number.
+Revenue models and objective functions. Commercial LLM services predominantly use token-
+based pricing. We consider two revenue models that differ in when revenue is recognized.
+(1) Bundled charging scheme. The provider charges a single price per request based on the total number of
+tokens, and revenue is recognized only when the entire request completes (after decode). For class 𝑖,
+𝑤𝑖:= 𝑐𝑝𝑃𝑖+ 𝑐𝑑𝐷𝑖,
+(21)
+where 𝑐𝑝, 𝑐𝑑≥0 are unit prices per prefill and decode token. The per-GPU average reward over [0,𝑇] under
+policy 𝜋𝑛is
+𝑅𝑛(𝑇; 𝜋𝑛) := 1
+𝑛𝑇E𝜋𝑛
+"
+𝐼∑︁
+𝑖=1
+𝑤𝑖𝑆𝑛
+𝑑,𝑖(𝑇)
+#
+.
+(22)
+Only completed requests contribute to (22); prefill work without decode completion yields no revenue.
+(2) Separate charging scheme. Alternatively, prefill and decode tokens may be billed and recognized separately.
+The corresponding per-GPU average reward is
+˜𝑅𝑛(𝑇; 𝜋𝑛) := 1
+𝑛𝑇E𝜋𝑛
+"
+𝐼∑︁
+𝑖=1
+ 𝑐𝑝𝑃𝑖𝑆𝑛
+𝑝,𝑖(𝑇) + 𝑐𝑑𝐷𝑖𝑆𝑛
+𝑑,𝑖(𝑇)
+#
+.
+(23)
+
+
+--- Page 13 ---
+13
+Both objectives depend on token throughput but induce different scheduling incentives: in particular, the
+separate scheme (23) may encourage aggressive prefill admissions to harvest immediate prefill revenue at the
+expense of downstream decode congestion. Asymptotically optimal control for (22) and (23) will be studied
+in Section 4.
+3.
+Fluid Approximation and Steady-State Planning
+In large-scale LLM deployments, providers typically operate hundreds or thousands of GPUs in parallel.
+At this scale, the system state is high-dimensional and stochastic, with arrivals, service completions, and
+abandonments fluctuating across time and devices, making direct stochastic optimization analytically
+intractable and hard to interpret. We therefore adopt a many-GPU fluid approximation: consider a sequence
+of systems indexed by the number of GPUs 𝑛, scale all queue lengths and in-service counts by 1/𝑛, and let
+𝑛→∞. In this limit, random fluctuations average out and the network is described by a deterministic set of
+flow-balance equations and capacity constraints. Steady-state solutions of this fluid model specify per-GPU
+occupancies, which serve as planning targets for the stochastic control policies in Section 4.
+Fluid-scaled processes. For any stochastic process 𝑊𝑛(𝑡) in the 𝑛-th system, we define its fluid-scaled
+version by
+¯𝑊𝑛(𝑡) := 1
+𝑛𝑊𝑛(𝑡),
+𝑡≥0.
+We use an overbar to indicate such scaled processes (e.g., ¯𝑄𝑛
+𝑝,𝑖(𝑡), ¯𝑋𝑛
+𝑖(𝑡), ¯𝑌𝑛
+𝑚,𝑖(𝑡)), and we write the
+corresponding lowercase letters (e.g., 𝑞𝑝,𝑖(𝑡), 𝑥𝑖(𝑡), 𝑦𝑚,𝑖(𝑡)) for generic deterministic fluid trajectories that
+arise as limits of these scaled processes in Section 2.3. These functions satisfy, for all 𝑡≥0 and all 𝑖∈I, the
+flow-balance equations:
+𝑞𝑝,𝑖(𝑡) = 𝑞𝑝,𝑖(0) + 𝑎𝑖(𝑡) −𝑢𝑝,𝑖(𝑡) −𝑏𝑝,𝑖(𝑡),
+(24)
+𝑥𝑖(𝑡) = 𝑥𝑖(0) + 𝑢𝑝,𝑖(𝑡) −𝑠𝑝,𝑖(𝑡),
+(25)
+𝑞𝑑,𝑖(𝑡) = 𝑞𝑑,𝑖(0) + 𝑠𝑝,𝑖(𝑡) −𝑢𝑑,𝑚,𝑖(𝑡) −𝑢𝑑,𝑠,𝑖(𝑡) −𝑏𝑑,𝑖(𝑡),
+(26)
+𝑦𝑚,𝑖(𝑡) = 𝑦𝑚,𝑖(0) + 𝑢𝑑,𝑚,𝑖(𝑡) −𝑠𝑑,𝑚,𝑖(𝑡) + 𝑚𝑠→𝑚,𝑖(𝑡) −𝑚𝑚→𝑠,𝑖(𝑡),
+(27)
+𝑦𝑠,𝑖(𝑡) = 𝑦𝑠,𝑖(0) + 𝑢𝑑,𝑠,𝑖(𝑡) −𝑠𝑑,𝑠,𝑖(𝑡) + 𝑚𝑚→𝑠,𝑖(𝑡) −𝑚𝑠→𝑚,𝑖(𝑡).
+(28)
+Here 𝑞𝑝,𝑖(𝑡) and 𝑞𝑑,𝑖(𝑡) are the prefill and decode queue contents, 𝑥𝑖(𝑡), 𝑦𝑚,𝑖(𝑡) and 𝑦𝑠,𝑖(𝑡) are the in-service
+masses in prefill, mixed decode and solo decode, 𝑢𝑝,𝑖(𝑡), 𝑢𝑑,𝑚,𝑖(𝑡) and 𝑢𝑑,𝑠,𝑖(𝑡) are the cumulative admissions
+into these stages, 𝑏𝑝,𝑖(𝑡) and 𝑏𝑑,𝑖(𝑡) are cumulative abandonments, 𝑠𝑝,𝑖(𝑡), 𝑠𝑑,𝑚,𝑖(𝑡) and 𝑠𝑑,𝑠,𝑖(𝑡) are
+cumulative service completions, and 𝑚𝑠→𝑚,𝑖(𝑡), 𝑚𝑚→𝑠,𝑖(𝑡) are cumulative mode switches between decode
+submodes.
+
+
+--- Page 14 ---
+14
+The primitive arrivals, abandonments, and service completions evolve at their mean rates:
+𝑎𝑖(𝑡) = 𝜆𝑖𝑡,
+(29)
+𝑏𝑝,𝑖(𝑡) =
+∫𝑡
+0
+𝜃𝑖𝑞𝑝,𝑖(𝑠) 𝑑𝑠,
+𝑏𝑑,𝑖(𝑡) =
+∫𝑡
+0
+𝜃𝑖𝑞𝑑,𝑖(𝑠) 𝑑𝑠,
+(30)
+𝑠𝑝,𝑖(𝑡) =
+∫𝑡
+0
+𝜇𝑝,𝑖𝑥𝑖(𝑠) 𝑑𝑠,
+(31)
+𝑠𝑑,𝑚,𝑖(𝑡) =
+∫𝑡
+0
+𝜇𝑚,𝑖𝑦𝑚,𝑖(𝑠) 𝑑𝑠,
+𝑠𝑑,𝑠,𝑖(𝑡) =
+∫𝑡
+0
+𝜇𝑠,𝑖𝑦𝑠,𝑖(𝑠) 𝑑𝑠.
+(32)
+Equation (29) gives the deterministic arrival rate, (30) the abandonment flows from the prefill and decode
+queues, and (31)–(32) the prefill and decode completion flows driven by the in-service masses.
+Let
+𝑥(𝑡) :=
+∑︁
+𝑖
+𝑥𝑖(𝑡),
+𝑦𝑚(𝑡) :=
+∑︁
+𝑖
+𝑦𝑚,𝑖(𝑡),
+𝑦𝑠(𝑡) :=
+∑︁
+𝑖
+𝑦𝑠,𝑖(𝑡),
+and similarly 𝑢𝑝(𝑡) := Í
+𝑖𝑢𝑝,𝑖(𝑡) and 𝑠𝑝(𝑡) := Í
+𝑖𝑠𝑝,𝑖(𝑡). The per-GPU capacity constraints in the fluid model
+are
+0 ≤𝑥(𝑡) ≤1,
+(33)
+0 ≤𝑦𝑚(𝑡) ≤(𝐵−1) 𝑥(𝑡),
+(34)
+0 ≤𝑦𝑠(𝑡) ≤𝐵 1 −𝑥(𝑡),
+(35)
+which mirror the prefill and decode caps in (12)–(14) after scaling by 𝑛.
+Finally, admission feasibility holds at the fluid level. For all 0 ≤𝑠≤𝑡and all 𝑖∈I,
+𝑢𝑑,𝑚,𝑖(𝑠,𝑡) + 𝑢𝑑,𝑠,𝑖(𝑠,𝑡) ≤𝑞𝑑,𝑖(𝑠) + 𝑠𝑝,𝑖(𝑠,𝑡) −𝑏𝑑,𝑖(𝑠,𝑡),
+(36)
+𝑢𝑝,𝑖(𝑠,𝑡) ≤𝑞𝑝,𝑖(𝑠) + 𝑎𝑖(𝑠,𝑡) −𝑏𝑝,𝑖(𝑠,𝑡),
+(37)
+where 𝑢𝑝,𝑖(𝑠,𝑡) := 𝑢𝑝,𝑖(𝑡) −𝑢𝑝,𝑖(𝑠) and 𝑎𝑖(𝑠,𝑡), 𝑠𝑝,𝑖(𝑠,𝑡), 𝑏𝑝,𝑖(𝑠,𝑡), etc. are defined analogously. Inequal-
+ities (36)–(37) state that, over any time interval [𝑠,𝑡], admissions into each stage cannot exceed the fluid
+already present in the corresponding buffer plus the net inflow into that buffer.
+ASSUMPTION 1 (Convergence of initial state). The initial states of fluid-scaled processes converge to a
+deterministic state:   ¯𝑄𝑛
+𝑝,𝑖(0), ¯𝑄𝑛
+𝑑,𝑖(0), ¯𝑋𝑛
+𝑖(0), ¯𝑌𝑛
+𝑚,𝑖(0), ¯𝑌𝑛
+𝑠,𝑖(0) ⇒(𝑞𝑝,𝑖(0), 𝑞𝑑,𝑖(0),𝑥𝑖(0), 𝑦𝑚,𝑖(0), 𝑦𝑠,𝑖(0));
+THEOREM 1 (Fluid limit). Fix any finite horizon 𝑇> 0. The sequence of fluid-scaled stochastic processes
+¯X𝑛(𝑡) :=  { ¯𝑄𝑛
+𝑝,𝑖, ¯𝑄𝑛
+𝑑,𝑖, ¯𝑋𝑛
+𝑖, ¯𝑌𝑛
+𝑚,𝑖, ¯𝑌𝑛
+𝑠,𝑖}𝑖∈I, { ¯𝑆𝑛
+𝑝,𝑖, ¯𝑆𝑛
+𝑑,𝑚,𝑖, ¯𝑆𝑛
+𝑑,𝑠,𝑖}𝑖∈I, { ¯𝐵𝑛
+𝑝,𝑖, ¯𝐵𝑛
+𝑑,𝑖}𝑖∈I,
+{ ¯𝑈𝑛
+𝑝,𝑖, ¯𝑈𝑛
+𝑑,𝑚,𝑖, ¯𝑈𝑛
+𝑑,𝑠,𝑖}𝑖∈I, { ¯𝑀𝑛
+𝑠→𝑚,𝑖−¯𝑀𝑛
+𝑚→𝑠,𝑖}𝑖∈I
+
+is tight in D([0,𝑇], R𝑑) under the Skorokhod 𝐽1 topology, where 𝑑is the total dimension of the vector above.
+Moreover, any subsequential weak limit ¯X(𝑡) is almost surely continuous and, on [0,𝑇], satisfies the fluid
+model equations (24)–(28) with (29)–(32), the capacity constraints (33)–(35), with initial state given by z0.
+
+
+--- Page 15 ---
+15
+Fluid Reward Objectives. Consistent with the revenue models defined in Section 2, we formulate the
+fluid control objectives for the two charging schemes separately.
+(1) Bundled Objective. Under the bundled scheme, value is realized only upon request completion. Thus, the
+objective maximizes the weighted throughput of the decode phase:
+𝑅(𝑇) := 1
+𝑇
+∫𝑇
+0
+𝐼∑︁
+𝑖=1
+𝑤𝑖(𝑦𝑚,𝑖(𝜏)𝜇𝑚,𝑖+ 𝑦𝑠,𝑖(𝜏)𝜇𝑠,𝑖) 𝑑𝜏,
+(38)
+where 𝑤𝑖= 𝑐𝑝𝑃𝑖+ 𝑐𝑑𝐷𝑖is the total reward for a completed class-𝑖request. Note that the prefill activity 𝑥𝑖(𝜏)
+contributes to the objective only indirectly by feeding the decode queue.
+(2) Separate Objective. Under the separate scheme, the system accumulates value continuously as tokens are
+processed in both phases. The objective becomes:
+˜𝑅(𝑇) := 1
+𝑇
+∫𝑇
+0
+𝐼∑︁
+𝑖=1
+h
+(𝑐𝑝𝑃𝑖)
+| {z }
+prefill value
+𝜇𝑝,𝑖𝑦𝑝,𝑖(𝜏) + (𝑐𝑑𝐷𝑖)
+|  {z  }
+decode value
+(𝑦𝑚,𝑖(𝜏)𝜇𝑚,𝑖+ 𝑦𝑠,𝑖(𝜏)𝜇𝑠,𝑖)
+i
+𝑑𝜏.
+(39)
+3.1.
+Fluid Control Problem
+We first consider the bundle objective (the separate charging scheme will be discussed in Section 4.2) and
+solve a steady-state (fluid) optimization to choose the optimal long-run occupancy shares and the routing
+of prefilled tasks across mixed and solo decode pools. This formulation intentionally abstracts away the
+transient effects of stochastic variability in interarrival, prefill, and decode times (and abandonment/patience,
+if present), and instead enforces constraints only in terms of average arrival and service rates. The solution
+delivers capacity-splitting targets that will guide the stochastic control policy developed in the next section.
+max
+{𝑥𝑖, 𝑦𝑚,𝑖, 𝑦𝑠,𝑖, 𝑞𝑝,𝑖, 𝑞𝑑,𝑖}
+𝐼∑︁
+𝑖=1
+𝑤𝑖
+ 𝑦𝑚,𝑖𝜇𝑚,𝑖+ 𝑦𝑠,𝑖𝜇𝑠,𝑖
+
+s.t.
+𝐼∑︁
+𝑖=1
+𝑥𝑖≤1,
+(Prefill Capacity)
+𝐼∑︁
+𝑖=1
+𝑦𝑚,𝑖≤(𝐵−1)
+𝐼∑︁
+𝑖=1
+𝑥𝑖,
+(Mixed Decode Capacity)
+𝐼∑︁
+𝑖=1
+𝑦𝑠,𝑖≤𝐵
+
+1 −
+𝐼∑︁
+𝑖=1
+𝑥𝑖
+
+,
+(Solo Decode Capacity)
+𝜆𝑖−𝜃𝑖𝑞𝑝,𝑖= 𝜇𝑝,𝑖𝑥𝑖,
+∀𝑖,
+(Prefill Flow Balance)
+𝜇𝑝,𝑖𝑥𝑖−𝜃𝑖𝑞𝑑,𝑖= 𝜇𝑚,𝑖𝑦𝑚,𝑖+ 𝜇𝑠,𝑖𝑦𝑠,𝑖,
+∀𝑖,
+(Decode Flow Balance)
+𝑥𝑖, 𝑦𝑚,𝑖, 𝑦𝑠,𝑖, 𝑞𝑑,𝑖, 𝑞𝑝,𝑖≥0,
+∀𝑖.
+(Non-negativity)
+(40)
+
+
+--- Page 16 ---
+16
+The linear program (40) describes the steady-state fluid model for routing prefill and decode work of
+multiple classes across GPUs with batch size 𝐵. The decision variables are long-run, per-GPU averages: 𝑥𝑖is
+the fraction of time a GPU devotes to class-𝑖prefill; 𝑦𝑚,𝑖and 𝑦𝑠,𝑖are the average class-𝑖decode occupancies
+in mixed mode and solo mode; and 𝑞𝑝,𝑖and 𝑞𝑑,𝑖are the average prefill and decode queue masses.
+The capacity constraints in the first three lines of (40) enforce the per-GPU limits: at most one prefill can
+run on a GPU, and, conditional on whether a prefill is present, at most 𝐵−1 (mixed) or 𝐵(solo) decodes
+can be served in parallel. The flow-balance constraints for each class 𝑖state that, in steady state, arrivals
+net of prefill abandonments equal the prefill completion rate, and that prefill completions, net of decode
+abandonments, are exactly matched by the total decode completion rate. The objective in the first line of (40)
+maximizes the per-GPU long-run reward by weighting class-𝑖decode completions in mixed and solo modes
+with 𝑤𝑖= 𝑐𝑝𝑃𝑖+ 𝑐𝑑𝐷𝑖, the total value of a completed request under bundled pricing.
+PROPOSITION 1 (Decode-buffer elimination). Assume 𝛾𝜏≥(𝐵−1)/𝐵(solo decode more efficient).
+Then the steady-state fluid LP admits an optimal solution with 𝑞★
+𝑑,𝑖= 0 for all 𝑖.
+The condition in Proposition 1 is natural: solo decode is strictly more efficient than mixed decode. Since
+revenue is generated only when a request finishes decode, fluid mass held in the decode buffer yields no
+reward and only delays completions. We prove that any LP solution with 𝑞𝑑,𝑖> 0 can be improved by moving
+this backlog upstream while keeping the capacity constraints, which weakly increases the completion rate;
+hence, at optimality, the decode buffer is empty in steady state.
+A key implication for control is that the optimal reward rate is determined by occupancy proportions,
+i.e. how much GPU time is spent on prefill and how decode slots are filled. In a backlogged system, the
+fluid-optimal plan keeps both prefill and decode fully utilized and fixes the fraction of GPUs running prefills
+at its target level. The remaining design question is how to route completed prefills between mixed and solo
+decode so that capacity is saturated without building a decode backlog. This leads to a simple gate-and-route
+architecture: a prefill gate that regulates the target prefill occupancy (and class mix) and a decode router that
+splits work between mixed and solo decodes to keep slots busy while preventing persistent decode queues.
+4.
+Stochastic Control Policy
+Building upon the fluid-optimal solution, we now develop an implementable control framework for the
+stochastic 𝑛-GPU system. Our approach operationalizes the fluid prescriptions by decomposing the scheduling
+problem into two hierarchical stages: a static resource partitioning phase that fixes the cluster configuration,
+and a dynamic control phase that manages job admission and routing in real time. We first introduce the
+occupancy-based Gate-and-Route policy in Section 4.1, which regulates prefill occupancies and decode
+routing to attain the fluid-optimal throughput under the bundled objective. We then extend this architecture to
+the separate charging scheme in Section 4.2, where we develop a counterpart optimal policy and analyze how
+stage-based revenue recognition fundamentally reshapes scheduling incentives across heterogeneous request
+classes relative to the bundled objective.
+
+
+--- Page 17 ---
+17
+4.1.
+Bundled Charging Scheme
+The design of this policy is inspired by the structural insight from Proposition 1, which reveals that the
+relative efficiency gain of solo decoding is class-independent. This property suggests a decomposition of the
+complex scheduling problem. We can statically partition the cluster resources to ensure that the aggregate
+decode capacity is critically loaded in the fluid limit, capable of fully digesting the downstream workload
+generated by the optimal prefill throughput. With the decode stage dimensioned to clear the traffic naturally,
+the burden of optimization shifts upstream. Consequently, we focus our fine-grained dynamic control on the
+prefill admission to strictly regulate the job mix and occupancy, allowing the decode stage to operate under a
+simple work-conserving discipline (FCFS) while still guiding the system toward the fluid-optimal state.
+Static Planning Let 𝑛be the number of GPUs and 𝐵the per-GPU decode stream cap. Take any optimal
+per-GPU solution of the steady-state fluid LP, denoted by  𝑥★
+𝑖, 𝑦★
+𝑚,𝑖, 𝑦★
+𝑠,𝑖, 𝑞★
+𝑝,𝑖
+
+𝑖∈I.
+Fix the number of mixed GPUs as
+𝑀:=
+l
+𝑛
+∑︁
+𝑖∈I
+𝑥★
+𝑖
+m
+,
+choose any subset Gmix ⊂{1, . . . , 𝑛} with |Gmix| = 𝑀, and set Gsolo := {1, . . . , 𝑛} \ Gmix. A GPU 𝑔∈Gmix
+permanently reserves one slot for prefill (or equivalently, those GPUs prioritize new prefill over decode jobs)
+and may run at most (𝐵−1) decodes; a GPU 𝑔∈Gsolo never runs prefills and may run at most 𝐵decodes.
+Dynamic Control Let 𝑋𝑛
+𝑖(𝑡) denote the number of class-𝑖prefill tasks currently in service and 𝑄𝑛
+𝑝,𝑖(𝑡)
+denote the prefill queue length at time 𝑡.
+Upstream (prefill) gate on mixed GPUs. Prefills run only on Gmix. Whenever a mixed GPU 𝑔∈Gmix
+has its reserved prefill slot idle, identify the set of classes with waiting jobs, Iwait = {𝑖∈I : 𝑄𝑛
+𝑝,𝑖(𝑡−) > 0}. If
+Iwait is empty, the slot remains idle. Otherwise, compute the occupancy deviation index for each candidate
+class:
+𝜉𝑖(𝑡−) := 1
+𝑥★
+𝑖
+ 𝑋𝑛
+𝑖(𝑡−) −𝑛𝑥★
+𝑖
+.
+The scheduler admits the head-of-line prefill of the class 𝑖★that minimizes this deviation:
+𝑖★∈arg min
+𝑖∈Iwait
+𝜉𝑖(𝑡−).
+If there are multiple classes achieving the minimum deviation, ties are broken by selecting the class with the
+largest queue deviation 𝛿𝑖(𝑡−) := 𝑄𝑛
+𝑝,𝑖(𝑡−) −𝑄†
+P,𝑖. Service is non-preemptive and FCFS within each class.
+The gate is a negative–feedback rule around the fluid targets 𝑥★
+𝑖: classes whose prefill occupancy exceeds
+their target (large 𝜉𝑖) are held back, while under-served classes (smallest 𝜉𝑖) are pulled up by being admitted
+first. Since the total mixed prefill capacity Í
+𝑖𝑥★
+𝑖is fixed by the static planning, not all classes can be above
+target at once, and repeatedly correcting the most deviated class keeps the long-run average occupancies
+fluctuating in a small neighborhood of the fluid-optimal levels.
+
+
+--- Page 18 ---
+18
+Downstream (decode) routing. Maintain a single decode buffer with class-𝑖queue length 𝑄𝑛
+𝑑,𝑖(𝑡).
+When a class-𝑖job requires decode (either immediately after prefill completion or upon a decode completion
+elsewhere), route as follows:
+1. If some GPU in Gsolo has a free decode slot, place the job uniformly at random among such GPUs.
+2. Otherwise, if some GPU in Gmix has a free decode slot, place it randomly among such GPUs.
+3. Otherwise, append the job to the decode buffer (FCFS across class).
+The key insight is that, from a token-level viewpoint, the decode stage only needs to keep up with the
+stream of decode tokens created by the prefill gate. Once the policy stabilizes this token production rate and
+keeps decode compute fully utilized, the decode workload is always consumable, and the detailed class mix
+becomes secondary. This is why a simple work-conserving rule such as FCFS is sufficient at decode.
+Two mechanisms make this intuition rigorous. Static planning fixes the mixed versus solo partition so that
+decode is never overloaded in the fluid limit, and in the binding case it is critically loaded at an LP-optimal
+point with zero steady-state decode buffer. GPU physics further implies that the relative speed advantage of
+solo decoding over mixed decoding is the same across classes, which lets us translate capacity between solo
+and mixed in a class-agnostic way and treat decode as effectively homogeneous in heavy traffic. Theorem 2
+formalizes this insight by proving that the resulting gate-and-route policy, with FCFS decoding, achieves
+asymptotic optimality.
+THEOREM 2 (Asymptotic optimality of occupancy-based Gate-and-Route Policy). Let 𝑅★denote
+the optimal objective value of the steady-state fluid routing LP, and let Assumptions 1 hold. Then the
+occupancy-based Gate-and-Route policy 𝜋𝑛,★is asymptotically optimal:
+liminf
+𝑇→∞liminf
+𝑛→∞𝑅𝑛(𝑇; 𝜋𝑛,★) = 𝑅★.
+4.2.
+Separate Charging Scheme
+The bundled-revenue formulation studied above serves as our primary benchmark and aligns with the objective
+of maximizing the throughput of completed requests. To complement this view, we also study a separate
+charging objective in which value is recognized separately at prefill and decode. This variant lets us derive
+a counterpart optimal policy and clarify how the timing of revenue recognition changes the incentives for
+admission and routing. Formally, we define the per-GPU time-averaged reward as follows.
+˜𝑅𝑛(𝑇; 𝜋𝑛) :=
+1
+𝑛𝑇E𝜋𝑛
+" 𝐼∑︁
+𝑖=1
+
+𝑐𝑝𝑃𝑖𝑆𝑛
+𝑝,𝑖(𝑇) + 𝑐𝑑𝐷𝑖𝑆𝑛
+𝑑,𝑖(𝑇)
+#
+,
+(41)
+where 𝑐𝑝, 𝑐𝑑≥0 are unit prices, and 𝑆𝑛
+𝑝,𝑖(𝑇) and 𝑆𝑛
+𝑑,𝑖(𝑇) are cumulative prefill and decode completions for
+class 𝑖by time 𝑇.
+In steady state, we optimize the corresponding fluid objective over the same feasibility constraints as
+the bundled LP (i.e., (40)). Substituting the service-rate definitions shows that the objective coefficients
+
+
+--- Page 19 ---
+19
+are class-independent, so the separate-charging LP depends on (𝑥𝑖, 𝑦𝑚,𝑖, 𝑦𝑠,𝑖) only through the aggregate
+occupancies:
+max
+(𝑥,𝑦,𝑞) 𝑐𝑝
+𝐶
+𝜏
+𝐼∑︁
+𝑖=1
+𝑥𝑖+ 𝑐𝑑
+𝜏
+𝐼∑︁
+𝑖=1
+𝑦𝑚,𝑖+ 𝑐𝑑𝛾
+𝐼∑︁
+𝑖=1
+𝑦𝑠,𝑖.
+(42)
+These structural properties yield three key insights for policy design under separate charging. First, since
+prefill occupancy earns the same marginal reward 𝑐𝑝𝐶/𝜏across all classes, the pricing structure itself does
+not prioritize any specific class mix in the prefill stage. Second, because solo-mode decode iterations are
+faster than mixed-mode ones (𝛾> 1/𝜏), solo decode occupancy is strictly more valuable per unit time. A
+revenue-maximizing controller should thus prioritize saturating solo capacity.
+Finally, unlike the bundled scheme where revenue is deferred, separate charging incentivizes the system to
+maintain a high ”inventory” of downstream work. To keep the more valuable decode slots busy, the prefill
+gate should favor classes with a larger decode-to-prefill ratio 𝐷𝑖/𝑃𝑖, as they generate more future decode
+revenue per unit of prefill capacity consumed. This logic motivates the static priority index used in the
+Prioritize-and-Route policy described below. Notably, the separate-charging optimum may tolerate persistent
+decode backlogs, as these backlogs serve as a buffer to ensure continuous decode revenue.
+4.2.1.
+Prioritize-and-Route policy Under the separate-charging objective we reuse the same gate-
+and-route architecture as in the bundled scheme; the only change is the prefill admission rule (priority). We
+briefly summarize the modifications.
+Static planning. Solve the separate-charging LP (42). We define the prefill queue targets and partition the
+GPUs into 𝐺mix and 𝐺solo following the identical procedure as in the bundled case, using the optimal prefill
+occupancies ˜𝑥★
+𝑖to determine the partition size ˜𝑀.
+Dynamic control. The downstream decode routing is unchanged, and the only modification is the upstream
+prefill gate on 𝐺mix. Whenever a reserved prefill slot becomes idle and some prefill queue is nonempty, we
+admit the head-of-line job from the class with the largest decode-to-prefill ratio:
+𝑖★∈argmax
+𝑖∈I
+n 𝐷𝑖
+𝑃𝑖
+o
+,
+breaking ties arbitrarily. Service remains FCFS within each class.
+THEOREM 3 (Asymptotic optimality under separate charging). Let ˜𝑅★be the optimal value of the
+steady-state fluid LP (42), and let ˜𝑅𝑛(𝑇; 𝜋𝑛) be the per-GPU separate-charging reward in (41). Assume
+Assumption 1 holds.
+For each 𝑛∈N, define the prioritize-and-route policy ˜𝜋𝑛,★as above, then ˜𝜋𝑛,★is asymptotically optimal
+for the separate-charging objective:
+liminf
+𝑇→∞liminf
+𝑛→∞
+˜𝑅𝑛(𝑇; ˜𝜋𝑛,★) = ˜𝑅★.
+
+
+--- Page 20 ---
+20
+The Revenue-Congestion Trade-off and Operational Risks. While Theorem 3 guarantees
+asymptotic optimality for the separate-charging objective, the underlying incentive shift comes from the
+structure of (42): revenue is recognized at prefill and decode separately, so a revenue-driven controller may
+exploit any available prefill capacity even when decode is already congested. This decoupling changes where
+congestion accumulates. Under bundled charging, the policy tends to regulate admissions so that the prefill
+buffer absorbs overload while the downstream decode buffer remains comparatively lean. Under separate
+charging, the system may instead build substantial decode backlogs to keep decode slots continuously busy,
+as illustrated in Figure 2. Operationally, this is problematic because it can lead to memory pressure and
+create long post-prefill waits and, in extreme cases, requests that complete prefill (and generate revenue) but
+experience severely delayed decode or abandon before completion. This motivates augmenting the revenue
+objective with explicit service constraints. Accordingly, in Section 5 we extend the framework to maximize
+revenue subject to SLI constraints, and in Section 6 we use shadow-price analysis to quantify the resulting
+economic trade-offs.
+0
+100
+200
+300
+OPT=300.2
+Revenue
+0
+0.2
+0.4
+0.6
+0.8
+1
+1.2
+0
+5
+10
+Arrival Rate (λ)
+Queue Length
+C0 Prefill
+C0 Decode
+C1 Prefill
+C1 Decode
+0
+100
+200
+300
+400
+500
+OPT=452.9
+Revenue
+0
+0.2
+0.4
+0.6
+0.8
+1
+1.2
+0
+5
+10
+Arrival Rate (λ)
+Queue Length
+C0 Prefill
+C0 Decode
+C1 Prefill
+C1 Decode
+Figure 2
+Comparison of Revenue and Queue Lengths under Bundled vs. Separate Charging Schemes (C0:
+class 0, C1: class 1).
+5.
+SLI-Aware Optimization and Control Policy
+While the preceding sections focused on revenue maximization, practical deployments must also adhere to
+different Service Level Indicators (SLIs), such as fairness and latency limits. In this section, we show that our
+fluid-based planning framework can naturally accommodate these operational requirements. By formulating
+SLIs as explicit constraints (or penalty terms) within the steady-state optimization, we can generate SLI-aware
+target occupancies without altering the fundamental structure of the control policy. This approach offers a
+flexible way to trade off revenue against diverse service guarantees. We focus our exposition on the bundled
+charging setting, though the methodology extends directly to other objectives.
+
+
+--- Page 21 ---
+21
+SLIs are widely used in practice, but we emphasize that in our framework they are defined at the level
+of the steady-state fluid variables. A service-level indicator (SLI) is a user-facing performance metric (e.g.,
+fairness or latency) computed from the system’s steady-state behavior. In our framework, an SLI is modeled
+as either (i) a hard constraint of the form 𝑔(x,y,q) ≤𝜂, or (ii) a soft penalty term subtracted from the revenue
+objective, both expressed in terms of the steady-state variables in the fluid optimization problem.
+A central modeling principle we adopt throughout this section is that a reasonable SLI should not
+rely on persistent decode-buffer buildup. Indeed, in our setting decode-buffer mass generates no value
+under completion-based reward, but it increases waiting time and, more importantly, can lead to severe
+GPU-memory pressure due to KV-cache residency and migration. Accordingly, we impose the following
+standing assumption for the SLI-aware planning problem: the chosen SLI specification is such that the
+optimization admits an optimal solution with 𝑞★
+𝑑,𝑖= 0 for all 𝑖(decode-buffer elimination). For completeness,
+we provide an extension that allows 𝑞★
+𝑑,𝑖> 0 in the electronic companion; this case is particularly relevant
+under separate charging. To this end, we illustrate several canonical SLI specifications and then present the
+corresponding SLI-aware planning problem and control policy.
+Resource fairness (prefill and decode) Fairness SLIs control the dispersion of prefill occupancies
+{𝑥𝑖}𝑖∈I and solo decode occupancies {𝑦𝑠,𝑖}𝑖∈I. While attractive at a high level, fairness constraints can be
+costly in our setting because they directly constrain the workload mix (𝒙and/or 𝒚𝑠). This can force the system
+away from a hardware-efficient operating point and create a structural mismatch between prefill output and
+downstream decode capacity, leading to idling/under-utilization and a reduction in revenue. This effect is
+quantified in the Pareto frontiers in Section 6 (Fig. 8): Prefill Fairness has a steep shadow price (Fig. 8a),
+whereas Decode Fairness is comparatively cheap (Fig. 8b).
+Prefill Fairness.
+max
+𝑖, 𝑗∈I{𝑥𝑖−𝑥𝑗} ≤𝜂1,
+𝑞𝑑,𝑖= 0, ∀𝑖∈I.
+(43)
+Equivalently, the same fairness preference can be modeled in the objective via a penalty term
+𝑙1 = 𝜂′
+1 max
+𝑖, 𝑗∈I{𝑥𝑖−𝑥𝑗},
+(44)
+with weight 𝜂′
+1 > 0 that tunes the trade-off between revenue and Prefill Fairness.
+Decode Fairness.
+max
+𝑖, 𝑗∈I{𝑦𝑠,𝑖−𝑦𝑠, 𝑗} ≤𝜂2,
+𝑞𝑑,𝑖= 0, ∀𝑖∈I.
+(45)
+In penalty form, we instead add
+𝑙2 = 𝜂′
+2 max
+𝑖, 𝑗∈I{𝑦𝑠,𝑖−𝑦𝑠, 𝑗},
+(46)
+with weight 𝜂′
+2 > 0; larger 𝜂′
+2 places more emphasis on equalizing solo decode usage across classes.
+
+
+--- Page 22 ---
+22
+Average Time per Output Token While the worst-case Time per Output Token is governed by the
+chunk size 𝐶, the average TPOT depends on the cluster-wide balance between prefill and decode activity.
+Each unit of prefill occupancy 𝑥𝑖introduces mixed-mode iterations that slow co-resident decodes. A natural
+SLI is to cap the average TPOT:
+𝜏(𝐵−1) Í𝐼
+𝑖=1 𝑥𝑖+ 1
+𝛾𝐵 1 −Í𝐼
+𝑖=1 𝑥𝑖
+
+(𝐵−1) Í𝐼
+𝑖=1 𝑥𝑖+ 𝐵 1 −Í𝐼
+𝑖=1 𝑥𝑖
+
+≤𝜂3,
+(47)
+for some target 𝜂3 > 0. In this formulation we retain the standard capacity constraints in (40), so idling is
+permitted when the TPOT cap is tight; the revenue objective still discourages unnecessary idling whenever
+additional work can be served.
+Alternatively, we can incorporate TPOT directly into the objective by penalizing total prefill load:
+𝑙3 = 𝜂′
+3
+𝜏(𝐵−1) Í𝐼
+𝑖=1 𝑥𝑖+ 1
+𝛾𝐵 1 −Í𝐼
+𝑖=1 𝑥𝑖
+
+(𝐵−1) Í𝐼
+𝑖=1 𝑥𝑖+ 𝐵 1 −Í𝐼
+𝑖=1 𝑥𝑖
+ ,
+(48)
+where 𝜂′
+3 > 0 controls the strength of the revenue–latency trade-off.
+5.1.
+SLI-Aware Gate-and-Route Control Policy
+To incorporate SLIs into the steady-state optimization, we augment the objective of Section 3.1 (or Section 4.2
+for separate charging) by subtracting a weighted sum of penalty terms:
+max
+(x,y,q)∈FK
+𝐼∑︁
+𝑖=1
+𝑤𝑖
+ 𝜇𝑚,𝑖𝑦𝑚,𝑖+ 𝜇𝑠,𝑖𝑦𝑠,𝑖
+ −
+∑︁
+𝑘∈K
+𝑙𝑘,
+(49)
+where K indexes the active SLIs and 𝑙𝑘are chosen from (44), (46), (48), or other application-specific
+penalties. We append the SLI-specific constraints to the feasibility constraints from Section 3.1, and denote
+the feasibility region by FK.
+To realize the targets (𝑦★
+𝑚,𝑖, 𝑦★
+𝑠,𝑖) derived from the SLI-aware planning problem, we employ a randomized
+decode router. For clarity of exposition, we focus on the zero-buffer case (𝑞★
+𝑑,𝑖= 0) in this section, which
+avoids memory pressure and simplifies the tracking mechanism. An extension that accommodates persistent
+decode queues (𝑞★
+𝑑,𝑖> 0) is provided in Section EC.6.
+Static planning. This phase follows the identical procedure as defined in Section 4, determining the
+cluster-level queue targets 𝑄†
+P,𝑖and the GPU partition sets (Gmix and Gsolo) based on the optimal solution
+(𝑥★
+𝑖, 𝑦★
+𝑚,𝑖, 𝑦★
+𝑠,𝑖, 𝑞★
+𝑝,𝑖) of the corresponding SLI-aware optimization problem in (49).
+Dynamic control. The prefill gate remains the same as the Gate-and-Route policy in Section 4.1. The
+decode router splits the decode buffer into mixed and solo components and computes the class-𝑖solo
+probability
+𝑝𝑠,𝑖:=
+
+
+𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+,
+if 𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖> 0,
+1,
+otherwise.
+
+
+--- Page 23 ---
+23
+Upon prefill or decode completion of class 𝑖, draw 𝑈∼Unif(0,1); route to Gsolo if 𝑈≤𝑝𝑠,𝑖and to Gmix
+otherwise, placing the decode uniformly at random among GPUs in the targeted group with free slots (or
+queuing in the corresponding buffer if none available). Note that here we logically split the decode buffer into
+mixed buffer and solo buffer instead of a single decode buffer mentioned in Section 4.
+The router implements a randomized load split that mirrors the fluid targets: each class-𝑖decode is sent to
+solo or mixed with probability 𝑝𝑠,𝑖chosen so that the long-run fraction of class-𝑖service provided by solo
+vs. mixed matches (𝑦★
+𝑠,𝑖, 𝑦★
+𝑚,𝑖). As many decodes are routed over time, the law of large numbers forces the
+realized occupancies  𝑦𝑛
+𝑚,𝑖/𝑛, 𝑦𝑛
+𝑠,𝑖/𝑛 to track these target proportions, effectively “reshuffling” decode work
+until the stochastic system hovers around the desired steady-state levels.
+The asymptotic optimality guarantee of Theorem 2 extends to the SLI-aware policy under mild regularity
+on the optimization problem (bounded penalties, etc.).
+THEOREM 4 (Occupancy Convergence and Asymptotic Optimality of SLI-Aware Policy). Let
+(𝑥★
+𝑖, 𝑦★
+𝑚,𝑖, 𝑦★
+𝑠,𝑖, 𝑞★
+𝑝,𝑖, 𝑞★
+𝑑,𝑖)𝑖∈I denote an optimal solution of the SLI-aware LP (49) with active SLI set K and
+corresponding penalties {𝑙𝑘}𝑘∈K and constraints. Assume the SLI-aware LP satisfies Slater’s condition
+and each penalty 𝑙𝑘is bounded and Lipschitz continuous in the decision variables. Further assume that the
+selected optimal solution satisfies 𝑞★
+𝑑,𝑖= 0 for all 𝑖(e.g., by including 𝑞𝑑,𝑖= 0 in the constraints). Under the
+SLI-aware control policy, the scaled steady-state occupancies converge:
+lim
+𝑛→∞
+1
+𝑛E
+
+𝑋(𝑛)
+𝑖
+
+= 𝑥★
+𝑖,
+lim
+𝑛→∞
+1
+𝑛E
+
+𝑌(𝑛)
+𝑚,𝑖
+
+= 𝑦★
+𝑚,𝑖,
+lim
+𝑛→∞
+1
+𝑛E
+
+𝑌(𝑛)
+𝑠,𝑖
+
+= 𝑦★
+𝑠,𝑖,
+for all 𝑖∈I, and the per-GPU SLI-aware objective value converges to optimality:
+lim
+𝑛→∞
+1
+𝑛E
+" 𝐼∑︁
+𝑖=1
+𝑤𝑖
+
+𝜇𝑚,𝑖𝑌(𝑛)
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑌(𝑛)
+𝑠,𝑖
+
+−𝑛
+∑︁
+𝑘∈K
+𝑙𝑘
+ 𝑿(𝑛)/𝑛,𝒀(𝑛)
+𝑚/𝑛,𝒀(𝑛)
+𝑠
+/𝑛
+#
+=
+𝐼∑︁
+𝑖=1
+𝑤𝑖
+
+𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+
+−
+∑︁
+𝑘∈K
+𝑙𝑘
+ 𝒙★, 𝒚★
+𝑚, 𝒚★
+𝑠
+,
+where 𝑿(𝑛) = (𝑋(𝑛)
+1
+, . . . , 𝑋(𝑛)
+𝐼
+) and similarly for 𝒀(𝑛)
+𝑚, 𝒀(𝑛)
+𝑠
+.
+6.
+Numerical Experiments
+In this section, we evaluate the performance of the proposed Gate-and-Route policy through event-driven
+simulations calibrated with real-world LLM inference profiles. We compare our approach against standard
+industry heuristics across varying cluster sizes, demonstrating that our fluid-based control effectively
+maximizes system throughput and revenue while satisfying SLI constraints in the long run. We also conduct
+sensitivity analysis to understand the tradeoff between SLIs, GPU configurations, and revenue.
+
+
+--- Page 24 ---
+24
+64
+128
+256
+512
+1024
+2048
+Chunk Size (C)
+0.02
+0.04
+0.06
+0.08
+0.10
+0.12
+0.14
+Time (s/Iteration)
+Mean ±1 Std Range
+Mean Iteration Time
+Fitted Line: 
+= 0.017406 + 0.000062C
+64
+128
+256
+512
+1024
+2048
+Chunk Size (C)
+0.02
+0.03
+0.04
+0.05
+0.06
+0.07
+0.08
+0.09
+Time (s/Iteration)
+Mean ±1 Std Range
+Mean Iteration Time
+Fitted Line: 
+= 0.015241 + 0.000036C
+Figure 3
+Calibration of mixed-iteration hyperparameters (𝛼, 𝛽) for Qwen-8B (left) and Qwen-4B (right). Dots
+show the empirical mean iteration time 𝜏for each chunk size 𝐶, and the solid line is the OLS fit 𝜏= 𝛼+ 𝛽𝐶. For
+Qwen-8B, the fitted line is 𝜏= 0.0174 + 6.2 × 10−5 𝐶with 𝑅2 = 0.998; for Qwen-4B, it is 𝜏= 0.0152 + 3.6 × 10−5 𝐶with
+𝑅2 = 0.997.
+6.1.
+Calibration of Hyperparameters
+We begin by calibrating the iteration-time parameters 𝛼, 𝛽, and 𝛾used in the subsequent numerical
+experiments. Our measurements are conducted on a server equipped with 4× NVIDIA A100-SXM4-40GB
+GPUs; detailed hardware and software specifications are reported in the EC (Table EC.3). In practice, we use
+vLLM version 0.11.0 to evaluate two models: Qwen-4B and Qwen-8B, and for each model we measure both
+mixed and solo decode modes.
+For mixed-mode calibration, we vary the prefill chunk size 𝐶and record the mean iteration time 𝜏on a
+single GPU, then fit a linear model 𝜏≈𝛼+ 𝛽𝐶via ordinary least squares. As shown in Figure 3, the fitted
+lines closely track the empirical means: for Qwen-8B we obtain 𝛼≈0.0174 and 𝛽≈6.2 × 10−5, and for
+Qwen-4B we obtain 𝛼≈0.0152 and 𝛽≈3.6 × 10−5, with coefficients of determination 𝑅2 > 0.99 in both
+cases. This supports the linear mixed-iteration model used in Section 2.2.
+For solo decode, we set the per-stream token speed 𝛾to the empirical mean across runs. In our setup, this
+yields 𝛾≈45.45 tokens/s for Qwen-8B and 𝛾≈52.63 tokens/s for Qwen-4B.
+6.2.
+Convergence Analysis
+We evaluate the asymptotic performance of our proposed policies using a two-class instance (𝐼= 2) calibrated
+to the hardware specifications derived in Section 6.1. The system parameters are 𝐵= 16, 𝐶= 256, 𝛼= 0.0174,
+and 𝛽= 6.2 × 10−5. The solo decode speed is set to 𝛾≈45.45 tokens/s (corresponding to a per-token latency
+of 0.022s).
+We define two distinct workload classes to represent the heterogeneity discussed in Table EC.1:
+• Class 0 (Decode-Heavy): 𝑃0 = 300, 𝐷0 = 1000. Represents tasks like code generation.
+• Class 1 (Prefill-Heavy): 𝑃1 = 3000, 𝐷1 = 400. Represents tasks like paper summarization or context-
+heavy analysis.
+
+
+--- Page 25 ---
+25
+Arrival rates are symmetric with 𝜆= [0.5,0.5], and abandonment rates are 𝜃= [0.1,0.1]. We utilize the
+separate charging scheme with prices 𝑐𝑝= 0.1 and 𝑐𝑑= 0.2. We simulate the system across varying scales
+𝑛∈{5, 20, 50,200, 500}, running 5 random seeds per configuration to capture stochastic variability.
+Revenue and Queue Convergence. We first validate the asymptotic optimality of the standard
+gate-and-route policy. Figure 4 illustrates the per-GPU revenue and queue lengths as the system scale 𝑛
+increases.
+As predicted by the fluid limit, the average per-GPU revenue (Left) converges to the optimal value 𝑅★
+derived from the steady-state LP. The shaded error bands, representing the standard deviation across seeds,
+narrow significantly as 𝑛→∞, confirming the concentration of measure. Simultaneously, the normalized
+queue lengths for both Class 0 (Top Right) and Class 1 (Bottom Right) stabilize near their fluid targets.
+Notably, the prefill gate effectively regulates the admission process, ensuring that the stochastic queue lengths
+track the fluid-optimal backlog required to maintain utilization, while the decode buffer remains negligible.
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+180
+200
+220
+240
+260
+280
+300
+320
+Revenue Rate (per GPU)
+n=500
+n=200
+n=50
+n=20
+n=5
+OPT
+(a) Convergence of per-GPU revenue.
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Prefill Queue Length (per GPU)
+Class 0: Prefill Queue Length
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Decode Queue Length (per GPU)
+Class 0: Decode Queue Length
+n=500
+n=200
+n=50
+n=20
+n=5
+OPT
+(b) Convergence of average queue lengths for Class 0.
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+Prefill Queue Length (per GPU)
+Class 1: Prefill Queue Length
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+Decode Queue Length (per GPU)
+Class 1: Decode Queue Length
+n=500
+n=200
+n=50
+n=20
+n=5
+OPT
+(c) Convergence of average queue lengths for Class 1.
+Figure 4
+Asymptotic convergence of Revenue and Queue Lengths under the Gate-and-Route policy.
+Occupancy Convergence Analysis. While the aggregate revenue converges, a deeper inspection
+reveals a discrepancy in the convergence behavior of specific resource occupancies under the standard policy.
+Figure 5 plots the fluid-scaled prefill occupancy 𝑋(𝑛)
+𝑖
+/𝑛and decode occupancy 𝑌(𝑛)
+𝑖
+/𝑛.
+We observe that the prefill occupancy (Top) converges tightly to the LP solution 𝑥★
+𝑖. This is expected, as
+the prefill gate explicitly targets these values. However, the decode occupancy (Bottom) exhibits persistent
+variance and deviates from the specific class-wise breakdown 𝑦★
+𝑚,𝑖+ 𝑦★
+𝑠,𝑖predicted by the LP, even though
+the total reward is optimal. This occurs because the standard router prioritizes any available solo slot to
+maximize throughput (work-conservation) but is indifferent to which class occupies that slot. Consequently,
+
+
+--- Page 26 ---
+26
+the specific mix of Class 1 vs. Class 2 in decode slots fluctuates, satisfying the aggregate capacity constraints
+but failing to converge to the specific fluid vector 𝑦★.
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.0000
+0.0025
+0.0050
+0.0075
+0.0100
+0.0125
+0.0150
+0.0175
+Prefill Resource (per GPU)
+Class 0: Prefill Resource
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+Mixed Decode Resource (per GPU)
+Class 0: Mixed Decode Resource
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0
+2
+4
+6
+8
+10
+Solo Decode Resource (per GPU)
+Class 0: Solo Decode Resource
+n=500
+n=200
+n=50
+n=20
+n=5
+OPT
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.000
+0.025
+0.050
+0.075
+0.100
+0.125
+0.150
+0.175
+Prefill Resource (per GPU)
+Class 1: Prefill Resource
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+Mixed Decode Resource (per GPU)
+Class 1: Mixed Decode Resource
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+1
+2
+3
+4
+Solo Decode Resource (per GPU)
+Class 1: Solo Decode Resource
+n=500
+n=200
+n=50
+n=20
+n=5
+OPT
+Figure 5
+Occupancy convergence under the Gate-and-Route Policy. Top: Class 0 (Decode-Heavy). Bottom:
+Class 1 (Prefill-Heavy). Note the loose convergence for decode occupancy (𝑦).
+SLI-Aware Convergence. To address the decode occupancy drift and enforce strict adherence to the
+fluid plan (crucial for fairness SLIs), we employ the SLI-aware gate-and-route policy described in Section 5.1.
+This policy utilizes a stochastic router with probabilities 𝑝𝑠,𝑖derived from the LP solution to probabilistically
+route jobs to mixed or solo pools.
+Figure 6 demonstrates the impact of this policy. Unlike the standard case, both the prefill occupancy and
+the decode occupancy now converge strictly to the optimization solution for both classes. By enforcing the
+specific routing split 𝑦★
+𝑚,𝑖vs. 𝑦★
+𝑠,𝑖, the SLI-aware policy ensures that the stochastic system structurally mimics
+the fluid limit. This validates Theorem 4, confirming that we can achieve precise control over resource
+allocation distributions at scale, which is a prerequisite for satisfying multi-objective SLIs in the long run.
+6.3.
+Policy Performance: Baselines and Ablations
+To evaluate the efficacy of our proposed framework, we compare several alternative scheduling policies
+across a variety of instances. These instances encompass diverse infrastructure hyperparameters (𝛼from
+0.15 to 0.02, 𝛽from 10−5 to 10−3, and 𝛾from 10 to 50), distinct target user compositions (𝑃𝑖, 𝐷𝑖from 200
+to 3000), and different arrival rates 𝜆from 0.25 to 0.5, and all under GPU number 𝑛= 500. We report the
+normalized revenue rate (scaled from 0 to 1) along with standard deviations to demonstrate robustness.
+
+
+--- Page 27 ---
+27
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.0000
+0.0025
+0.0050
+0.0075
+0.0100
+0.0125
+0.0150
+0.0175
+Prefill Resource (per GPU)
+Class 0: Prefill Resource
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+Mixed Decode Resource (per GPU)
+Class 0: Mixed Decode Resource
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0
+2
+4
+6
+8
+10
+Solo Decode Resource (per GPU)
+Class 0: Solo Decode Resource
+n=500
+n=200
+n=50
+n=20
+n=5
+OPT
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.000
+0.025
+0.050
+0.075
+0.100
+0.125
+0.150
+0.175
+Prefill Resource (per GPU)
+Class 1: Prefill Resource
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+Mixed Decode Resource (per GPU)
+Class 1: Mixed Decode Resource
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+Solo Decode Resource (per GPU)
+Class 1: Solo Decode Resource
+n=500
+n=200
+n=50
+n=20
+n=5
+OPT
+Figure 6
+Occupancy convergence under the SLI-Aware Gate-and-Route Policy. Top: Class 0 (Decode-Heavy).
+Bottom: Class 1 (Prefill-Heavy). Both prefill (𝑥) and decode (𝑦) occupancies now converge tightly to the LP
+targets.
+Candidate Policies We evaluate the following five policies together with our proposed policy to isolate
+the contributions of our admission control (Gate), decode router (Route), and static planning:
+• Gate-and-Route (Greedy Router) with Static Planning (GG-SP): This is our proposed policy. It
+utilizes the queue-length based admission control (Gate) derived from our theoretical analysis. For
+routing, it uses a Greedy router in the gate-and-route architecture; specifically, the router prioritizes
+dispatching waiting decode tasks to available solo GPUs over initiating new prefill tasks.
+• FCFS-and-Immediate without Static Planning (FI-WSP): This represents the standard industry
+baseline in Sarathi-serve (Agrawal et al. 2024). It employs First-Come-First-Served (FCFS) admission
+without any queue-length based control. Crucially, it uses an “Immediate” execution model where
+prefill and decode phases are coupled: the decode phase commences immediately on the same GPU slot
+following the prefill completion, occupying the resource continuously until the request is finished.
+• Gate-and-Immediate without Static Planning (GI-WSP): This policy introduces our queue-length
+based Gate control to the coupled architecture. Like FI-WSP, it executes decode immediately after
+prefill on the same slot. Comparing GI-WSP against GG-SP highlights the specific performance gains
+achieved by decoupling the prefill and decode phases.
+• Gate-and-FCFS without Static Planning (GF-WSP): This policy utilizes the same decoupled
+architecture and queue-length based Gate as our proposed method. However, the routing logic is
+inverted to a naive FCFS approach: whenever a GPU slot becomes available, the system prioritizes
+admitting a new prefill task rather than processing a waiting decode task. Comparing this against GG-SP
+demonstrates the necessity of the decode-first (Greedy) prioritization in a decoupled system.
+
+
+--- Page 28 ---
+28
+• FCFS-and-Route (Greedy Router) with Static Planning (FG-SP): This policy mirrors our proposed
+gate-and-route architecture with the same Greedy router, but removes the admission control mechanism
+and accepts all arrivals via FCFS. Comparing FG-SP against GG-SP isolates the role of the Gate in
+preventing system overload and maintaining revenue stability.
+The comparative results, illustrated in Figure 7, reveal a critical hierarchy of design elements. We find that
+while the admission gate alone (GI-WSP) provides a meaningful improvement over the industry baseline
+(FI-WSP), other components like static planning can actually be counter-productive when applied in isolation
+(as seen in FG-SP), where rigid resource partitioning without traffic regulation may lead to localized
+imbalances. The full revenue potential is only unlocked in our integrated GG-SP policy: the gate controls the
+decode workloads, while the static planning enables the greedy router to extract maximal efficiency from the
+hardware pools. Additionally, the consistently low standard deviations observed for GG-SP across varied
+instances underscore the robustness of this integrated design.
+0
+2000
+4000
+6000
+8000
+10000
+Time (s)
+0.60
+0.65
+0.70
+0.75
+0.80
+0.85
+0.90
+0.95
+1.00
+Revenue Rate (Normalized to OPT)
+GG-SP(Ours)
+FI-WSP(Sarathi)
+GI-WSP
+GF-WSP
+FG-SP
+OPT
+Figure 7
+Comparison of normalized average revenue across different policies. The results aggregate
+performance over various infrastructure settings (𝛼, 𝛽, 𝛾) and user class combinations. Error bars indicate the
+standard deviation.
+6.4.
+The Cost of Service Quality and Hardware Resources
+To investigate the cost of service quality and fairness, we analyze the trade-off between total revenue and
+specific SLIs. We utilize the same system instance defined in the convergence analysis to ensure consistency,
+which is representative since it consists of long-prefill-short-decode and short-prefill-long-decode classes.
+We formulate this as a constrained optimization problem where we maximize revenue subject to a strict
+constraint on exactly one SLI metric at a time: Prefill Fairness, Decode Fairness, or Time Per Output Token
+(TPOT), while relaxing the others. This approach allows us to isolate the “price” of each specific constraint
+in terms of lost revenue.
+
+
+--- Page 29 ---
+29
+The Shadow Price of SLIs Figure 8 illustrates the Pareto frontiers for three operational constraints. We
+interpret the slope of these curves as the shadow price, which is the marginal revenue sacrificed to achieve a
+stricter SLI target. It reveals distinct economic sensitivities:
+0
+0.1
+0.2
+0.3
+0
+100
+200
+η1
+Revenue
+(a) Prefill Fairness (𝜂1).
+0
+0.5
+1
+0
+100
+200
+η2
+Revenue
+(b) Decode Fairness (𝜂2).
+0.02
+0.022
+0.024
+0
+100
+200
+η3
+Revenue
+(c) TPOT Limit (𝜂3).
+Figure 8
+Pareto frontiers illustrating the shadow price of Service Level Indicators (SLIs).
+• Asymmetric Costs of Fairness (Figs. 8a and 8b): We observe a stark contrast between the shadow
+prices of fairness at different stages of the inference pipeline. Prefill fairness (𝜂1) incurs a steep revenue
+penalty because the prefill stage acts as the primary bottleneck; imposing rigid class-mix constraints
+here prevents the scheduler from aligning admissions with the hardware’s optimal operating point,
+leading to a structural mismatch between job arrivals and downstream capacity. In contrast, the nearly
+flat frontier for decode fairness (𝜂2) suggests a negligible shadow price. This implies that once a request
+has entered the system, rebalancing its processing speed relative to other classes barely degrades total
+revenue.
+• The Price of Low TPOT (Fig. 8c): The shadow price of the TPOT constraint increases significantly as
+the target latency approaches 0.022s, a lower bound determined by the solo-decode rate 𝛾. Near this
+threshold, the feasible region for prefill throughput shrinks rapidly, leading to a substantial decrease in
+optimal revenue as the system prioritizes meeting the stringent latency requirement over throughput.
+GPU configurations and Revenue We next analyze the sensitivity of the system’s performance to the
+maximum batch size (𝐵) and the hyperparameters (𝛼, 𝛽, 𝛾). Figure 9 illustrates the trade-off between total
+Revenue (primary objective, left y-axis) and TPOT (latency cost, right y-axis).
+The results indicate distinct operational trends. First, revenue increases with batch size 𝐵but saturates
+around 𝐵= 16, suggesting diminishing returns on memory scaling beyond this point. Second, the system is
+highly sensitive to the computational penalty 𝛽; as 𝛽increases, revenue drops sharply. Finally, 𝛾acts as a
+strong incentive, positively correlating with higher revenue and lower latency.
+Figure 10a visualizes the revenue landscape across the joint configuration space of memory capacity
+(proxied by 𝐵) and computational speed (proxied by 𝛽). This mapping serves two critical strategic functions
+for infrastructure management.
+
+
+--- Page 30 ---
+30
+0
+5
+10
+15
+20
+25
+30
+35
+100
+200
+300
+Max Batch Size (B)
+Revenue
+Max Batch Size (B)
+0.022
+0.0225
+0.023
+0.0235
+0.024
+0.0245
+TPOT
+0
+0.02
+0.04
+0.06
+0.08
+0.1
+180
+200
+220
+Alpha (α)
+Revenue
+Alpha (α)
+0.02
+0.04
+0.06
+0.08
+TPOT
+0
+0.0002
+0.0004
+0.0006
+0.0008
+0.001
+100
+150
+200
+Beta (β)
+Revenue
+Beta (β)
+0.05
+0.1
+0.15
+0.2
+TPOT
+0
+10
+20
+30
+40
+50
+100
+150
+200
+Gamma (γ)
+Revenue
+Gamma (γ)
+0
+2
+4
+6
+8
+TPOT
+Figure 9
+Parameter sensitivity analysis showing the impact of maximum batch size (𝐵), 𝛼, 𝛽, and 𝛾on
+revenue and TPOT. Blue lines indicate revenue (higher is better); red lines indicate TPOT (lower is better).
+First, the heatmap provides a quantitative basis for hardware selection by allowing operators to overlay GPU
+market prices onto the revenue landscape to identify configurations with the highest return on investment
+(ROI). Second, its gradient directs hardware upgrades by revealing the steepest path to revenue growth. By
+identifying whether this path favors increasing 𝐵or decreasing 𝛽, decision-makers can pinpoint the primary
+bottleneck (memory or compute) and prioritize investments to maximize marginal gains.
+Optimal Token Pricing We also examine the optimal pricing structure by analyzing the relationship
+between the prefill price 𝑐𝑝and the decode price 𝑐𝑑. Specifically, if we investigate the common revenue
+maximization problem subject to a total price constraint 𝑐𝑝+ 𝑐𝑑= 𝑘, the heatmap (Figure 10b) results reveal
+a striking invariance: regardless of the magnitude of the budget 𝑘, the revenue-maximizing prices consistently
+yield a unique, constant ratio 𝑐𝑝/𝑐𝑑. This indicates that the optimal economic balance between prefill and
+decode is scale-invariant. Consequently, for pricing strategy, managers should focus on maintaining this
+intrinsic cost structure ratio, as the optimal split between prefill and decode prices remains stable even as the
+total price level varies.
+7.
+Conclusions
+Efficient LLM inference at scale hinges on resolving the resource contention between compute-bound prefill
+and memory-bound decode. In this work, we connect an empirically grounded iteration-time abstraction
+with stochastic control to study admission and scheduling in large GPU clusters under token-based revenue
+objectives and service constraints. A multiclass many-GPU fluid approximation yields a tractable steady-state
+
+
+--- Page 31 ---
+31
+10
+20
+30
+40
+Max Batch Size (B)
+0.0002
+0.0004
+0.0006
+0.0008
+0.0010
+Beta ( )
+B vs Beta
+50
+100
+150
+200
+250
+300
+Revenue ($)
+(a) Memory-speed tradeoff (𝐵vs. 𝛽).
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+Price cp
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+Price cd
+(cp vs cd)
+100
+200
+300
+400
+500
+Revenue ($)
+(b) Optimal token pricing (𝑐𝑝vs. 𝑐𝑑).
+Figure 10
+Sensitivity analysis of hardware configurations and pricing structures on per-GPU revenue.
+linear program that prescribes how to split capacity between mixed and solo modes and how to allocate prefill
+occupancy across classes.
+Building on this planning formulation, we develop a gate-and-route control architecture with a prefill
+admission gate that tracks the fluid occupancy targets and a decode router that keeps downstream capacity
+work-conserving. Our analysis establishes a set of structural properties that enable this decomposition,
+including the existence of an optimal fluid plan with no steady-state decode buffering (Proposition 1) and a
+corresponding asymptotic optimality guarantee for the proposed policy in the many-GPU limit.
+Our numerical evaluation is empirically calibrated and intended to illustrate the mechanisms highlighted
+by the theory: we calibrate the iteration-time model using real deployments on a modern inference stack, and
+then run calibrated event-driven simulations to study the resulting control behavior. In particular, simulations
+confirm two qualitative predictions from the asymptotic analysis: per-GPU revenue approaches the fluid
+optimum as the cluster scales, and persistent decode backlogs are avoided under the proposed control. We
+further compare against representative heuristic baselines and ablations in our calibrated setting, with the
+goal of clarifying mechanisms rather than providing a production benchmark.
+Our results also yield actionable implications for service providers. First, billing and scheduling objectives
+need not coincide: while separate charging for prefill and decode tokens is natural for accounting, optimizing
+the scheduler against a separate objective can encourage overly aggressive prefill admission and shift
+congestion downstream. A practical recommendation is therefore to bill by phase if desired, while scheduling
+against an end-to-end (bundled) completion objective to align incentives with user-perceived performance.
+Second, incorporating SLIs as constraints or penalties in the planning problem provides a systematic way to
+study the revenue implications of fairness and latency requirements; in our setting, enforcing fairness at the
+prefill stage is typically more revenue-costly than at the decode stage.
+
+
+--- Page 32 ---
+32
+Several avenues exist to extend the theoretical depth and practical scope of this work. First, one can relax
+the assumption of exponential service times by employing measure-valued processes. This formulation
+would accommodate general service distributions, enabling more granular, state-dependent control policies.
+Second, to move beyond mean-value analysis, developing diffusion approximations that characterize stochastic
+variability will provide rigorous guarantees for tail-latency SLIs. Finally, the model can be generalized to
+heterogeneous infrastructures, orchestrating inference across clusters composed of diverse GPU generations
+and distinct agent architectures.
+References
+Agrawal A, Kedia N, Panwar A, Mohan J, Kwatra N, Gulavani BS, Tumanov A, Ramjee R (2024) Taming throughput-
+latency tradeoff in LLM inference with Sarathi-Serve. 18th USENIX Symposium on Operating Systems Design
+and Implementation (OSDI 24).
+Ai R, Pan Y, Simchi-Levi D, Tambe M, Xu H (2025) Beyond majority voting: LLM aggregation by leveraging
+higher-order information.
+Aminabadi RY, Rajbhandari S, Awan AA, Li C, Li D, Zheng E, Ruwase O, Smith M, Zhang M, Rasley J, et al.
+(2022) DeepSpeed-Inference: Enabling efficient inference of transformer models at unprecedented scale. SC22:
+International Conference for High Performance Computing, Networking, Storage and Analysis, 1–15 (IEEE).
+Anthropic (2025) Claude API pricing. URL https://claude.com/pricing#api.
+Ao R, Luo G, Simchi-Levi D, Wang X (2025) Optimizing LLM inference: Fluid-guided online scheduling with memory
+constraints.
+Ata B (2006) Dynamic control of a multiclass queue with thin arrival streams. Operations Research 54(5):876–892.
+Atar R, Giat C, Shimkin N (2010) The c𝜇/𝜃rule for many-server queues with abandonment. Operations Research
+58(5):1427–1439.
+Bassamboo A, Randhawa RS (2010) On the accuracy of fluid models for capacity sizing in queueing systems with
+impatient customers. Operations Research 58(5):1398–1413.
+Bassamboo A, Randhawa RS (2016) Scheduling homogeneous impatient customers. Management Science 62(7):2129–
+2147.
+Chen Z, Ye Y, Zhou Z (2025) Adaptively robust LLM inference optimization under prediction uncertainty. arXiv preprint
+URL http://dx.doi.org/10.48550/arXiv.2508.14544.
+Conover M, Hayes M, Mathur A, Xie J, Wan J, Shah S, Ghodsi A, Wendell P, Zaharia M, Xin R (2023) Free dolly: Intro-
+ducing the world’s first truly open instruction-tuned LLM. URL https://www.databricks.com/blog/
+2023/04/12/dolly-first-open-commercially-viable-instruction-tuned-llm.
+Dai JG, Tezcan T (2011) State Space Collapse in Many-Server Diffusion Limits of Parallel Server Systems. Mathematics
+of Operations Research 36(2):271–320.
+
+
+--- Page 33 ---
+33
+Dai T, Swaminathan JM (2026) Artificial intelligence and operations: A foundational framework of emerging research
+and practice. Production and Operations Management .
+Dai Z, Yang Z, Yang Y, Carbonell JG, Le Q, Salakhutdinov R (2019) Transformer-XL: Attentive language models
+beyond a fixed-length context. Proceedings of the 57th Annual Meeting of the Association for Computational
+Linguistics, 2978–2988.
+DeepSeek (2025) Models & pricing — DeepSeek API docs. URL https://api-docs.deepseek.com/quick_
+start/pricing/.
+Dong J, Feldman P, Yom-Tov GB (2015) Service systems with slowdowns: Potential failures and proposed solutions.
+Operations Research 63(2):305–324.
+Ghosh S, Lam H (2019) Robust Analysis in Stochastic Simulation: Computation and Performance Guarantees. Operations
+Research 67(1):232–249.
+Google (2025) Billing — Gemini API — Google AI for developers. URL https://ai.google.dev/
+gemini-api/docs/billing/.
+Google Cloud (2025) Vertex AI generative AI pricing. URL https://cloud.google.com/vertex-ai/
+generative-ai/pricing.
+Harrison JM, Zeevi A (2004) Dynamic scheduling of a multiclass queue in the Halfin-Whitt heavy traffic regime.
+Operations Research 52(2):243–257.
+Hu H, Simchi-Levi D (2025) Pre-trained AI model assisted online decision-making under missing covariates: A
+theoretical perspective.
+Huang C, Tang Z, Hu S, Jiang R, Zheng X, Ge D, Wang B, Wang Z (2025) ORLM: A customizable framework in
+training large models for automated optimization modeling. Operations Research Articles in Advance.
+Ibrahim R (2018) Sharing delay information in service systems: A literature survey. Queueing Systems 89:49–79.
+Ibrahim R, Whitt W (2009) Real-Time delay estimation in overloaded multiserver queues with abandonments.
+Management Science 55(10):1729–1742.
+Jaillet P, Jiang J, Mellou K, Molinaro M, Podimata C, Zhou Z (2025) Online scheduling for LLM inference with KV
+cache constraints. arXiv preprint URL http://dx.doi.org/10.48550/arXiv.2502.07115.
+Kwon W, Li Z, Zhuang S, Sheng Y, Zheng L, Yu CH, Gonzalez J, Zhang H, Stoica I (2023) Efficient memory
+management for large language model serving with PagedAttention. Proceedings of the 29th Symposium on
+Operating Systems Principles, 611–626.
+Lam H (2016) Robust Sensitivity Analysis for Stochastic Systems. Mathematics of Operations Research 41(4):1248–1275.
+Li B, Jiang Y, Gadepally V, Tiwari D (2024) LLM inference serving: Survey of recent advances and opportunities. 2024
+IEEE High Performance Extreme Computing Conference (HPEC), 1–8.
+Li Y, Dai J, Peng T (2025) Throughput-optimal scheduling algorithms for LLM inference and AI agents. arXiv preprint
+URL http://dx.doi.org/10.48550/arXiv.2504.07347.
+
+
+--- Page 34 ---
+34
+Long Z, Shimkin N, Zhang H, Zhang J (2020) Dynamic scheduling of multiclass many-server queues with abandonment:
+The generalized c𝜇/h rule. Operations Research 68(4):1218–1230.
+Long Z, Zhang H, Zhang J, Zhang ZG (2024) The generalized c/𝜇rule for queues with heterogeneous server pools.
+Operations Research 72(6):2488–2506.
+Mitzenmacher M, Shahout R (2025) Queueing, predictions, and large language models: Challenges and open problems.
+Stochastic Systems Articles in Advance.
+OpenAI (2025) OpenAI API pricing. URL https://openai.com/api/pricing.
+Patel P, Choukse E, Zhang C, Shah A, Goiri I, Maleki S, Bianchini R (2024) SplitWise: Efficient generative LLM
+inference using phase splitting. Proceedings of the 51st International Symposium on Computer Architecture (ISCA
+2024), 3775–3801.
+Shazeer N (2019) Fast transformer decoding: One write-head is all you need. arXiv preprint URL http://dx.doi.
+org/10.48550/arXiv.1911.02150.
+Simchi-Levi D, Dai T, Menache I, Wu MX (2025) Democratizing optimization with generative AI. SSRN preprint URL
+http://dx.doi.org/10.2139/ssrn.5511218.
+Simchi-Levi D, Mellou K, Menache I, Pathuri J (2026) Large language models for supply chain decisions. AI in Supply
+Chains, volume 27 of Springer Series in Supply Chain Management (Springer).
+Sun B, Huang Z, Zhao H, Xiao W, Zhang X, Li Y, Lin W (2024) Llumnix: Dynamic scheduling for large language
+model serving. 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24), 173–191.
+Wang M, Ye Y, Zhou Z (2025) LLM serving optimization with variable prefill and decode lengths. arXiv preprint URL
+http://dx.doi.org/10.48550/arXiv.2508.06133.
+Whitt W (2006) Fluid models for multiserver queues with abandonments. Operations Research 54(1):37–54.
+Wu C, Bassamboo A, Perry O (2019) Service system with dependent service and patience times. Management Science
+65(3):1151–1172.
+Yu GI, Jeong J, Kim G, Kim S, Chun BG (2022) Orca: A distributed serving system for transformer-based generative
+models. 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22), 521–538
+(USENIX Association).
+Zhang J (2013) Fluid models of many-server queues with abandonment. Queueing Systems 73(2):147–193.
+Zhao W, Ren X, Hessel J, Cardie C, Choi Y, Deng Y (2024) WildChat: 1m ChatGPT interaction logs in the wild. The
+Twelfth International Conference on Learning Representations.
+Zhao WX, Zhou K, Li J, Tang T, Wang X, Hou Y, Min Y, Zhang B, Zhang J, Dong Z, Du Y, Yang C, Chen Y, Chen Z,
+Jiang J, Ren R, Li Y, Tang X, Liu Z, Liu P, Nie JY, Wen JR (2025) A survey of large language models.
+Zheng L, Chiang WL, Sheng Y, Li T, Zhuang S, Wu Z, Zhuang Y, Li Z, Lin Z, Xing E, et al. (2024) LMSYS-Chat-
+1M: A large-scale real-world LLM conversation dataset. The Twelfth International Conference on Learning
+Representations.
+
+
+--- Page 35 ---
+35
+Zhong Y, Liu S, Chen J, Hu J, Zhu Y, Liu X, Jin X, Zhang H (2024) DistServe: Disaggregating prefill and decoding for
+goodput-optimized large language model serving. 18th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 24), 193–210.
+Zhou Z, Ning X, Hong K, Fu T, Xu J, Li S, Lou Y, Wang L, Yuan Z, Li X, Yan S, Dai G, Zhang XP, Dong Y, Wang Y
+(2024) A survey on efficient inference for large language models.
+
+
+--- Page 36 ---
+ec1
+EC.1.
+Proof of Proposition 1
+We mainly adopt the strategy that given an optimal solution with 𝑞𝑑,𝑖> 0, we can always construct an
+optimal solution with 𝑞′
+𝑑,𝑖= 0 based on the solution given above. The proof follows from the following steps:
+First, we eliminate 𝑞𝑑in the original optimization problem to get a new optimization problem (P′)
+which better characterizes our target. Fix a class 𝑖with 𝜃𝑖> 0. From the second constraint in (40), we have:
+𝜇𝑝,𝑖𝑥𝑖−𝜃𝑖𝑞𝑑,𝑖= 𝜇𝑚,𝑖𝑦𝑚,𝑖+ 𝜇𝑠,𝑖𝑦𝑠,𝑖,
+Considering 𝑞𝑑,𝑖≥0, we obtain the following inequality
+𝜇𝑚,𝑖𝑦𝑚,𝑖+ 𝜇𝑠,𝑖𝑦𝑠,𝑖≤𝜇𝑝,𝑖𝑥𝑖,
+(EC.1)
+with
+𝑞𝑑,𝑖= 𝜇𝑝,𝑖𝑥𝑖−𝜇𝑚,𝑖𝑦𝑚,𝑖−𝜇𝑠,𝑖𝑦𝑠,𝑖
+𝜃𝑖
+≥0.
+(EC.2)
+Here 𝑞𝑑,𝑖is exactly the slack variable of (EC.1). Without loss of generality, we focus on 𝜃𝑖> 0.
+Define the problem (P′):
+max
+{𝑥𝑖,𝑦𝑚,𝑖,𝑦𝑠,𝑖,𝑞𝑝,𝑖}𝐼
+𝑖=1
+𝐼∑︁
+𝑖=1
+𝑤𝑖
+ 𝜇𝑚,𝑖𝑦𝑚,𝑖+ 𝜇𝑠,𝑖𝑦𝑠,𝑖
+
+s.t.
+𝐼∑︁
+𝑖=1
+𝑥𝑖≤1,
+𝐼∑︁
+𝑖=1
+𝑦𝑚,𝑖≤(𝐵−1)
+𝐼∑︁
+𝑖=1
+𝑥𝑖,
+𝐼∑︁
+𝑖=1
+𝑦𝑠,𝑖≤𝐵
+
+1 −
+𝐼∑︁
+𝑖=1
+𝑥𝑖
+
+,
+𝜆𝑖−𝜃𝑖𝑞𝑝,𝑖= 𝜇𝑝,𝑖𝑥𝑖,
+∀𝑖,
+𝜇𝑚,𝑖𝑦𝑚,𝑖+ 𝜇𝑠,𝑖𝑦𝑠,𝑖≤𝜇𝑝,𝑖𝑥𝑖,
+∀𝑖,
+𝑥𝑖, 𝑦𝑚,𝑖, 𝑦𝑠,𝑖, 𝑞𝑝,𝑖≥0,
+∀𝑖.
+(EC.3)
+For any feasible solution of (EC.3) we can recover a feasible solution of (40) by defining 𝑞𝑑,𝑖via (EC.2).
+Conversely, any feasible solution of (40) satisfies (EC.1) and thus yields a feasible solution of (EC.3) by
+dropping 𝑞𝑑,𝑖. Hence the two problems are equivalent and share the same optimal value.
+In particular, 𝑞𝑑,𝑖= 0 for a given class 𝑖is equivalent to the inequality (EC.1) being tight:
+𝑞𝑑,𝑖= 0
+⇐⇒
+𝜇𝑚,𝑖𝑦𝑚,𝑖+ 𝜇𝑠,𝑖𝑦𝑠,𝑖= 𝜇𝑝,𝑖𝑥𝑖.
+
+
+--- Page 37 ---
+ec2
+Second, we characterize the above optimization problem by using the KKT condition:
+Because (EC.3) is a linear program with a nonempty relative interior (Slater point exists: e.g., take
+𝑥𝑖= 𝑦𝑚,𝑖= 𝑦𝑠,𝑖= 0 and 𝑞𝑝,𝑖= 𝜆𝑖/𝜃𝑖), the Karush–Kuhn–Tucker (KKT) conditions are necessary and sufficient
+for optimality.
+The Lagrangian of (EC.3) is
+L =
+𝐼∑︁
+𝑖=1
+𝑤𝑖
+ 𝜇𝑚,𝑖𝑦𝑚,𝑖+ 𝜇𝑠,𝑖𝑦𝑠,𝑖
+ + 𝛼
+
+1 −
+𝐼∑︁
+𝑖=1
+𝑥𝑖
+
++ 𝛽
+
+(𝐵−1)
+𝐼∑︁
+𝑖=1
+𝑥𝑖−
+𝐼∑︁
+𝑖=1
+𝑦𝑚,𝑖
+
++ 𝛿
+
+𝐵−
+𝐼∑︁
+𝑖=1
+𝑦𝑠,𝑖−𝐵
+𝐼∑︁
+𝑖=1
+𝑥𝑖
+
++
+𝐼∑︁
+𝑖=1
+𝜙𝑖
+ 𝜆𝑖−𝜃𝑖𝑞𝑝,𝑖−𝜇𝑝,𝑖𝑥𝑖
+
++
+𝐼∑︁
+𝑖=1
+𝜂𝑖
+ 𝜇𝑝,𝑖𝑥𝑖−𝜇𝑚,𝑖𝑦𝑚,𝑖−𝜇𝑠,𝑖𝑦𝑠,𝑖
+ +
+𝐼∑︁
+𝑖=1
+ 𝜎𝑥,𝑖𝑥𝑖+ 𝜎𝑚,𝑖𝑦𝑚,𝑖+ 𝜎𝑠,𝑖𝑦𝑠,𝑖+ 𝜎𝑝,𝑖𝑞𝑝,𝑖
+.
+The KKT conditions at an optimal primal–dual pair  𝑥★
+𝑖, 𝑦★
+𝑚,𝑖, 𝑦★
+𝑠,𝑖, 𝑞★
+𝑝,𝑖;𝛼★, 𝛽★, 𝛿★, 𝜙★
+𝑖,𝜂★
+𝑖, 𝜎★
+𝑥,𝑖, 𝜎★
+𝑚,𝑖, 𝜎★
+𝑠,𝑖, 𝜎★
+𝑝,𝑖
+
+are:
+(i) Stationarity. For each 𝑖,
+𝜕L
+𝜕𝑦𝑚,𝑖
+= 𝑤𝑖𝜇𝑚,𝑖−𝛽−𝜂𝑖𝜇𝑚,𝑖+ 𝜎𝑚,𝑖= 0,
+(EC.4)
+𝜕L
+𝜕𝑦𝑠,𝑖
+= 𝑤𝑖𝜇𝑠,𝑖−𝛿−𝜂𝑖𝜇𝑠,𝑖+ 𝜎𝑠,𝑖= 0,
+(EC.5)
+𝜕L
+𝜕𝑥𝑖
+= −𝛼+ (𝐵−1)𝛽−𝐵𝛿−𝜙𝑖𝜇𝑝,𝑖+ 𝜂𝑖𝜇𝑝,𝑖+ 𝜎𝑥,𝑖= 0,
+(EC.6)
+𝜕L
+𝜕𝑞𝑝,𝑖
+= −𝜙𝑖𝜃𝑖+ 𝜎𝑝,𝑖= 0.
+(EC.7)
+(ii) Complementary slackness.
+𝛼
+
+1 −
+𝐼∑︁
+𝑗=1
+𝑥𝑗
+
+= 0,
+(C1)
+𝛽
+ 𝐼∑︁
+𝑗=1
+𝑦𝑚, 𝑗−(𝐵−1)
+𝐼∑︁
+𝑗=1
+𝑥𝑗
+
+= 0,
+(C2)
+𝛿
+ 𝐼∑︁
+𝑗=1
+𝑦𝑠, 𝑗+ 𝐵
+𝐼∑︁
+𝑗=1
+𝑥𝑗−𝐵
+
+= 0,
+(C3)
+𝜂𝑖
+ 𝜇𝑚,𝑖𝑦𝑚,𝑖+ 𝜇𝑠,𝑖𝑦𝑠,𝑖−𝜇𝑝,𝑖𝑥𝑖
+ = 0,
+∀𝑖,
+(C4)
+𝜎𝑥,𝑖𝑥𝑖= 0, 𝜎𝑚,𝑖𝑦𝑚,𝑖= 0, 𝜎𝑠,𝑖𝑦𝑠,𝑖= 0, 𝜎𝑝,𝑖𝑞𝑝,𝑖= 0,
+∀𝑖.
+(C5)
+(iii) Primal feasibility. All constraints in (EC.3) hold.
+(iv) Dual feasibility.
+𝛼, 𝛽, 𝛿, 𝜂𝑖, 𝜎𝑥,𝑖, 𝜎𝑚,𝑖, 𝜎𝑠,𝑖, 𝜎𝑝,𝑖≥0,
+∀𝑖,
+𝜙𝑖∈R, ∀𝑖.
+
+
+--- Page 38 ---
+ec3
+Third, starting from the characterization above, we can begin to construct a satisfying optimal
+solution.
+Let
+(𝑥★
+𝑖, 𝑦★
+𝑚,𝑖, 𝑦★
+𝑠,𝑖, 𝑞★
+𝑝,𝑖)
+be any optimal solution of (EC.3) (hence also of (40)) and let (𝛼★, 𝛽★, 𝛿★, 𝜙★
+𝑖,𝜂★
+𝑖, . . . ) be a corresponding
+dual optimal solution satisfying the KKT conditions above.
+Suppose that there exists an index 𝑖0 such that the following constraint is slack at the optimum, i.e.,
+𝜇𝑚,𝑖0𝑦★
+𝑚,𝑖0 + 𝜇𝑠,𝑖0𝑦★
+𝑠,𝑖0 < 𝜇𝑝,𝑖0𝑥★
+𝑖0.
+(EC.8)
+Then, by complementary slackness (C4), we must have
+𝜂★
+𝑖0 = 0.
+We now show that, under the assumption 𝛾𝜏≥(𝐵−1)/𝐵, we can reallocate prefill and decode occupancy
+across modes so that:
+• the global capacity constraints remain feasible,
+• the per-class decode completion rates 𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖remain unchanged for all 𝑖,
+• and the slack in (EC.8) is reduced, ultimately to 0,
+without changing the objective value. This yields a new optimal solution in which the 𝑖0-th decode constraint
+is tight. By repeating the same procedure for every class with slack inequality (EC.8), we obtain an optimal
+solution with
+𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖= 𝜇𝑝,𝑖𝑥★
+𝑖,
+∀𝑖,
+which is equivalent to 𝑞★
+𝑑,𝑖= 0 in the original formulation.
+For each 𝑖with 𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖< 𝜇𝑝,𝑖𝑥★
+𝑖(i.e., 𝑞★
+𝑑,𝑖> 0 in the original variables), define the gap
+Δ𝑖:=
+𝜇𝑝,𝑖𝑥★
+𝑖−𝜇𝑚,𝑖𝑦★
+𝑚,𝑖−𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+𝜇𝑝,𝑖
+≥0.
+Consider the modified active prefill and prefill queue
+˜𝑥𝑖:= 𝑥★
+𝑖−Δ𝑖=
+𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+𝜇𝑝,𝑖
+,
+˜𝑞𝑝,𝑖:= 𝑞★
+𝑝,𝑖+ 𝜇𝑝,𝑖Δ𝑖
+𝜃𝑖
+= 𝑞★
+𝑝,𝑖+
+𝜇𝑝,𝑖𝑥★
+𝑖−𝜇𝑚,𝑖𝑦★
+𝑚,𝑖−𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+𝜃𝑖
+.
+(For classes where (EC.1) already holds with equality, set Δ𝑖= 0 and ˜𝑥𝑖= 𝑥★
+𝑖, ˜𝑞𝑝,𝑖= 𝑞★
+𝑝,𝑖.)
+By construction,
+𝜇𝑝,𝑖˜𝑥𝑖= 𝜇𝑝,𝑖
+ 𝑥★
+𝑖−Δ𝑖
+ = 𝜇𝑝,𝑖𝑥★
+𝑖− 𝜇𝑝,𝑖𝑥★
+𝑖−𝜇𝑚,𝑖𝑦★
+𝑚,𝑖−𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+
+= 𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖.
+
+
+--- Page 39 ---
+ec4
+Hence the inequality(EC.8) becomes tight:
+𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖= 𝜇𝑝,𝑖˜𝑥𝑖.
+Moreover,
+𝜆𝑖−𝜃𝑖˜𝑞𝑝,𝑖−𝜇𝑝,𝑖˜𝑥𝑖= 𝜆𝑖−𝜃𝑖
+
+𝑞★
+𝑝,𝑖+
+𝜇𝑝,𝑖𝑥★
+𝑖−𝜇𝑚,𝑖𝑦★
+𝑚,𝑖−𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+𝜃𝑖
+
+−𝜇𝑝,𝑖
+ 𝑥★
+𝑖−Δ𝑖
+
+= (𝜆𝑖−𝜃𝑖𝑞★
+𝑝,𝑖−𝜇𝑝,𝑖𝑥★
+𝑖) + 𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖−𝜇𝑚,𝑖𝑦★
+𝑚,𝑖−𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+= 0,
+so the first constraint remains satisfied. Nonnegativity holds because 𝑥★
+𝑖≥Δ𝑖is equivalent to 𝜇𝑝,𝑖𝑥★
+𝑖≥
+𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖, which already holds.
+At this stage we have decreased Í
+𝑖𝑥𝑖to Í
+𝑖˜𝑥𝑖= Í
+𝑖𝑥★
+𝑖−Í
+𝑖Δ𝑖while keeping (𝑦𝑚,𝑖, 𝑦𝑠,𝑖) unchanged. Thus:
+• The constraint Í
+𝑖𝑥𝑖≤1 remains feasible;
+• The solo-decode capacity Í
+𝑖𝑦𝑠,𝑖≤𝐵 1 −Í
+𝑖𝑥𝑖
+ becomes less restrictive, since the right-hand side
+increases when Í
+𝑖𝑥𝑖decreases;
+• The mixed-decode capacity
+𝐼∑︁
+𝑖=1
+𝑦𝑚,𝑖≤(𝐵−1)
+𝐼∑︁
+𝑖=1
+𝑥𝑖
+may become more restrictive, because the right-hand side decreases as Í
+𝑖𝑥𝑖decreases.
+If the mixed-capacity constraint is still satisfied with the new ˜𝑥𝑖, we are done with this step. Otherwise, let
+Δ :=
+𝐼∑︁
+𝑖=1
+𝑦★
+𝑚,𝑖−(𝐵−1)
+𝐼∑︁
+𝑖=1
+˜𝑥𝑖> 0
+denote the gap of mixed-mode occupancy between the new capacity.
+We now show that, thanks to the assumption 𝛾𝜏≥(𝐵−1)/𝐵, we can reduce the total mixed occupancy by
+Δ while increasing solo occupancy accordingly, without violating capacity and without changing decode
+completion rates.
+For each 𝑖, define perturbations (𝛿𝑦𝑚,𝑖, 𝛿𝑦𝑠,𝑖) such that
+𝐼∑︁
+𝑖=1
+𝛿𝑦𝑚,𝑖= −Δ,
+𝛿𝑦𝑚,𝑖≤0, ∀𝑖.
+We choose 𝛿𝑦𝑠,𝑖to preserve per-class decode completion rates:
+𝜇𝑚,𝑖𝛿𝑦𝑚,𝑖+ 𝜇𝑠,𝑖𝛿𝑦𝑠,𝑖= 0,
+∀𝑖.
+(EC.9)
+Equation (EC.9) implies
+𝛿𝑦𝑠,𝑖= −𝜇𝑚,𝑖
+𝜇𝑠,𝑖
+𝛿𝑦𝑚,𝑖.
+
+
+--- Page 40 ---
+ec5
+From the speed abstraction, we have
+𝜇𝑚,𝑖=
+1
+𝐷𝑖𝜏,
+𝜇𝑠,𝑖= 𝛾
+𝐷𝑖
+,
+⇒
+𝜇𝑚,𝑖
+𝜇𝑠,𝑖
+= 1
+𝛾𝜏,
+which is independent of 𝑖. Hence
+𝐼∑︁
+𝑖=1
+𝛿𝑦𝑠,𝑖= −1
+𝛾𝜏
+𝐼∑︁
+𝑖=1
+𝛿𝑦𝑚,𝑖= Δ
+𝛾𝜏.
+(EC.10)
+Thus we have decreased total mixed occupancy by Δ and increased total solo occupancy by Δ/(𝛾𝜏).
+Mixed-decode capacity. By construction, the new mixed occupancy is
+𝐼∑︁
+𝑖=1
+ 𝑦★
+𝑚,𝑖+ 𝛿𝑦𝑚,𝑖
+ =
+𝐼∑︁
+𝑖=1
+𝑦★
+𝑚,𝑖−Δ = (𝐵−1)
+𝐼∑︁
+𝑖=1
+˜𝑥𝑖,
+so the mixed capacity is now exactly tight and hence feasible.
+Solo-decode capacity. Let 𝑋★:= Í𝐼
+𝑖=1 𝑥★
+𝑖and ˜𝑋:= Í𝐼
+𝑖=1 ˜𝑥𝑖. Then
+˜𝑋= 𝑋★−
+𝐼∑︁
+𝑖=1
+Δ𝑖.
+Originally, the solo capacity constraint was
+𝐼∑︁
+𝑖=1
+𝑦★
+𝑠,𝑖≤𝐵(1 −𝑋★).
+Conducting the steps above, with 𝑦𝑠,𝑖unchanged and 𝑥𝑖replaced by ˜𝑥𝑖, we had
+𝐼∑︁
+𝑖=1
+𝑦★
+𝑠,𝑖≤𝐵(1 −𝑋★) ≤𝐵(1 −˜𝑋),
+so solo capacity was slack. After applying (𝛿𝑦𝑚,𝑖, 𝛿𝑦𝑠,𝑖), the new solo occupancy becomes, using (EC.10),
+𝐼∑︁
+𝑖=1
+ 𝑦★
+𝑠,𝑖+ 𝛿𝑦𝑠,𝑖
+ =
+𝐼∑︁
+𝑖=1
+𝑦★
+𝑠,𝑖+ Δ
+𝛾𝜏.
+We want to ensure
+𝐼∑︁
+𝑖=1
+𝑦★
+𝑠,𝑖+ Δ
+𝛾𝜏≤𝐵(1 −˜𝑋).
+(EC.11)
+Observe that
+Δ =
+𝐼∑︁
+𝑖=1
+𝑦★
+𝑚,𝑖−(𝐵−1)
+𝐼∑︁
+𝑖=1
+˜𝑥𝑖
+=
+ 𝐼∑︁
+𝑖=1
+𝑦★
+𝑚,𝑖−(𝐵−1)
+𝐼∑︁
+𝑖=1
+𝑥★
+𝑖
+
++ (𝐵−1)
+𝐼∑︁
+𝑖=1
+(𝑥★
+𝑖−˜𝑥𝑖).
+
+
+--- Page 41 ---
+ec6
+By feasibility of the original solution, Í
+𝑖𝑦★
+𝑚,𝑖≤(𝐵−1) Í
+𝑖𝑥★
+𝑖, hence
+Δ ≤(𝐵−1)
+𝐼∑︁
+𝑖=1
+(𝑥★
+𝑖−˜𝑥𝑖) = (𝐵−1)
+𝐼∑︁
+𝑖=1
+Δ𝑖.
+Therefore,
+Δ
+𝛾𝜏≤𝐵−1
+𝛾𝜏
+𝐼∑︁
+𝑖=1
+Δ𝑖.
+Using the assumption 𝛾𝜏≥(𝐵−1)/𝐵, we obtain
+𝐵−1
+𝛾𝜏
+≤𝐵,
+⇒
+Δ
+𝛾𝜏≤𝐵
+𝐼∑︁
+𝑖=1
+Δ𝑖.
+Finally, note that
+𝐵(1 −˜𝑋) = 𝐵(1 −𝑋★) + 𝐵
+𝐼∑︁
+𝑖=1
+Δ𝑖.
+Combining these inequalities,
+𝐼∑︁
+𝑖=1
+𝑦★
+𝑠,𝑖+ Δ
+𝛾𝜏≤
+𝐼∑︁
+𝑖=1
+𝑦★
+𝑠,𝑖+ 𝐵
+𝐼∑︁
+𝑖=1
+Δ𝑖
+≤𝐵(1 −𝑋★) + 𝐵
+𝐼∑︁
+𝑖=1
+Δ𝑖
+= 𝐵(1 −˜𝑋),
+which is exactly (EC.11). Thus the solo-decode capacity constraint remains feasible after the reallocation.
+By (EC.9), for each 𝑖,
+𝜇𝑚,𝑖
+ 𝑦★
+𝑚,𝑖+ 𝛿𝑦𝑚,𝑖
+ + 𝜇𝑠,𝑖
+ 𝑦★
+𝑠,𝑖+ 𝛿𝑦𝑠,𝑖
+ = 𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖.
+Hence all class-level decode completion rates are unchanged, and the objective
+𝐼∑︁
+𝑖=1
+𝑤𝑖
+ 𝜇𝑚,𝑖𝑦𝑚,𝑖+ 𝜇𝑠,𝑖𝑦𝑠,𝑖
+
+remains the same. Consequently, we have constructed a new feasible solution with the same objective value,
+but with mixed occupancy reduced to exactly match the capacity available under the updated ˜𝑥𝑖.
+Moreover, for any class 𝑖with initial slack in (EC.1), we now have
+𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖= 𝜇𝑝,𝑖˜𝑥𝑖,
+i.e., its decode inequality is tight.
+Applying the above procedure to each class 𝑖whose decode inequality (EC.1) is slack at an optimal
+solution, we obtain another optimal solution of (EC.3) such that
+𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖= 𝜇𝑝,𝑖𝑥★
+𝑖,
+∀𝑖.
+
+
+--- Page 42 ---
+ec7
+Returning to the original formulation (40), this is equivalent (via (EC.2)) to
+𝑞★
+𝑑,𝑖= 0,
+∀𝑖.
+Thus the steady-state fluid LP admits an optimal solution in which the decode buffer is empty in the fluid
+limit, completing the proof.
+□
+EC.2.
+Proofs of Theorem 1
+Proof
+Fix 𝑇> 0. We denote the scaled processes as ¯𝑊𝑛:= 𝑊𝑛/𝑛. From the model above, we have:
+𝐴𝑛
+𝑖(𝑡) = 𝑁𝑎,𝑖(𝜆𝑖𝑛𝑡),
+𝐵𝑛
+𝑝,𝑖(𝑡) = 𝑁𝑏𝑝,𝑖
+∫𝑡
+0
+𝜃𝑖𝑄𝑛
+𝑝,𝑖(𝑠) 𝑑𝑠
+
+,
+𝐵𝑛
+𝑑,𝑖(𝑡) = 𝑁𝑏𝑑,𝑖
+∫𝑡
+0
+𝜃𝑖𝑄𝑛
+𝑑,𝑖(𝑠) 𝑑𝑠
+
+,
+𝐷𝑛
+𝑝,𝑖(𝑡) = 𝑁𝑑𝑝,𝑖
+∫𝑡
+0
+𝜇𝑝,𝑖𝑋𝑛
+𝑖(𝑠) 𝑑𝑠
+
+,
+𝐷𝑛
+𝑑,𝑚,𝑖(𝑡) = 𝑁𝑑𝑚,𝑖
+∫𝑡
+0
+𝜇𝑚,𝑖𝑌𝑛
+𝑚,𝑖(𝑠) 𝑑𝑠
+
+,
+𝐷𝑛
+𝑑,𝑠,𝑖(𝑡) = 𝑁𝑑𝑠,𝑖
+∫𝑡
+0
+𝜇𝑠,𝑖𝑌𝑛
+𝑠,𝑖(𝑠) 𝑑𝑠
+
+First we prove the tightness. The GPU capacity implies that 0 ≤𝑋𝑛≤𝑛, 0 ≤𝑌𝑛
+𝑚≤(𝐵−1)𝑋𝑛≤(𝐵−1)𝑛,
+0 ≤𝑌𝑛
+𝑠≤𝐵(𝑛−𝑋𝑛) ≤𝐵𝑛, so the time-changes for 𝐷𝑛
+𝑝,𝑖, 𝐷𝑛
+𝑑,𝑚,𝑖, 𝐷𝑛
+𝑑,𝑠,𝑖are bounded. Since 𝑄𝑛
+𝑝,𝑖(𝑠) ≤
+𝑄𝑛
+𝑝,𝑖(0) + 𝐴𝑛
+𝑖(𝑠) and 𝑄𝑛
+𝑑,𝑖(𝑠) ≤𝑄𝑛
+𝑑,𝑖(0) + 𝐷𝑛
+𝑝,𝑖(𝑠), we have:
+1
+𝑛
+∫𝑡
+0
+𝜃𝑝,𝑖𝑄𝑛
+𝑝,𝑖(𝑠) 𝑑𝑠≤𝜃𝑝,𝑖
+
+𝑡¯𝑄𝑛
+𝑝,𝑖(0) + 𝑡¯𝐴𝑛
+𝑖(𝑡)
+
+,
+1
+𝑛
+∫𝑡
+0
+𝜃𝑑,𝑖𝑄𝑛
+𝑑,𝑖(𝑠) 𝑑𝑠≤𝜃𝑑,𝑖
+
+𝑡¯𝑄𝑛
+𝑑,𝑖(0) + 𝑡¯𝐷𝑛
+𝑝,𝑖(𝑡)
+
+,
+hence these time-changes are stochastically bounded on [0,𝑇]. Controls are nondecreasing and satisfy
+𝑈𝑛
+𝑝,𝑖(𝑡) ≤𝑄𝑛
+𝑝,𝑖(0) + 𝐴𝑛
+𝑖(𝑡),
+𝑈𝑛
+𝑑,𝑚,𝑖(𝑡) +𝑈𝑛
+𝑑,𝑠,𝑖(𝑡) ≤𝑄𝑛
+𝑑,𝑖(0) + 𝐷𝑛
+𝑝,𝑖(𝑡),
+and structural transfers obey 𝑀𝑛
+𝑚→𝑠≤𝐵𝐷𝑛
+𝑝, 𝑀𝑛
+𝑠→𝑚≤𝐵𝑈𝑛
+𝑝. By the FSLLN for Poisson processes, the family
+{ ¯𝐴𝑛
+𝑖}𝑛is tight.
+Then by the random time-change theorem, together with the bounds above, we have the tightness of all
+other time-changed Poisson coordinates. Also, by Billingsley’s criterion for nondecreasing processes, the full
+vector ¯X𝑛is tight in D([0,𝑇], R𝑑) under the 𝐽1-topology.
+Second, we focus on the subsequence convergence and continuity. By tightness, we may pick a subsequence
+¯X𝑛⇒¯X. By Skorokhod representation theorem, we may assume a.s. convergence u.o.c. on [0,𝑇]. Since all
+jumps are 1
+𝑛, the limit ¯X is a.s. continuous.
+Finally, we prove that the stochastic processes satisfy the fluid model constraints. The FSLLN gives
+¯𝐴𝑛
+𝑖→𝑎𝑖(𝑡) = 𝜆𝑖𝑡u.o.c. For the time-changed Poisson processes, if 𝐿𝑛(𝑡) := 1
+𝑛
+∫𝑡
+0 ℓ𝑛(𝑠) 𝑑𝑠→𝐿(𝑡) u.o.c., then
+𝑁(𝐿𝑛(·)𝑛)/𝑛→𝐿(·) u.o.c. Hence
+¯𝐵𝑛
+𝑝,𝑖⇒𝑏𝑝,𝑖(𝑡) =
+∫𝑡
+0
+𝜃𝑝,𝑖𝑞𝑝,𝑖(𝑠) 𝑑𝑠,
+¯𝐵𝑛
+𝑑,𝑖⇒𝑏𝑑,𝑖(𝑡) =
+∫𝑡
+0
+𝜃𝑑,𝑖𝑞𝑑,𝑖(𝑠) 𝑑𝑠,
+
+
+--- Page 43 ---
+ec8
+¯𝐷𝑛
+𝑝,𝑖⇒𝑑𝑝,𝑖(𝑡) =
+∫𝑡
+0
+𝜇𝑝,𝑖𝑥𝑖(𝑠) 𝑑𝑠,
+¯𝐷𝑛
+𝑑,𝑚,𝑖⇒𝑑𝑑,𝑚,𝑖(𝑡) =
+∫𝑡
+0
+𝜇𝑚,𝑖𝑦𝑚,𝑖(𝑠) 𝑑𝑠,
+¯𝐷𝑛
+𝑑,𝑠,𝑖⇒𝑑𝑑,𝑠,𝑖(𝑡) =
+∫𝑡
+0
+𝜇𝑠,𝑖𝑦𝑠,𝑖(𝑠) 𝑑𝑠.
+Taking limits in the flow balances yields (24)–(28) with (29)–(32).
+The remaining inequalities are easy to check since the prelimit constraints satisfy:
+0 ≤¯𝑋𝑛≤1,
+0 ≤¯𝑌𝑛
+𝑚≤(𝐵−1) ¯𝑋𝑛,
+0 ≤¯𝑌𝑛
+𝑠≤𝐵(1 −¯𝑋𝑛),
+and the inequalities are preserved under the limit. Hence (33)–(35) hold.
+□
+EC.3.
+Proof of Optimality of Gate and Route Policy
+EC.3.1.
+Proof of prefill convergence in Theorem 2
+We focus on the LP solutions where 𝑞∗
+𝑝,𝑖> 0. The proof for 𝑞∗
+𝑝,𝑖= 0 is straightforward.
+LEMMA EC.1. There exists time 𝑡0, such that for 𝑡≥𝑡0, we have: 𝑥𝑖(𝑡) ≤𝑥∗
+𝑖for all i.
+Proof
+Suppose not, then for any 𝑡0, there exists 𝑡1, such that 𝑥𝑖(𝑡1) > 𝑥∗
+𝑖. Take ˜𝑡= sup{˜𝑡< 𝑡0 : 𝑥𝑖(˜𝑡) ≤𝑥∗
+𝑖}.
+Then it is clear that 𝑥𝑖(˜𝑡) = 𝑥∗
+𝑖and 𝑥𝑖(𝑡) > 𝑥∗
+𝑖for 𝑡∈(˜𝑡,𝑡1].
+But by our policy, if 𝑥𝑖(𝑡) > 𝑥∗
+𝑖, we must have 𝑥′
+𝑖(𝑡) < 0. This means that 𝑥𝑖(𝑡1) = 𝑥𝑖(˜𝑡) +
+∫𝑡1
+˜𝑡
+𝑑𝑥𝑖(𝑡)𝑑𝑡<
+𝑥𝑖(˜𝑡) = 𝑥∗
+𝑖, contradiction.
+□
+LEMMA EC.2. In the fluid system, there exists time 𝑡𝑖, such that 𝑞𝑝,𝑖(𝑡𝑖) > 0. And 𝑞𝑝,𝑖(𝑡) > 0 for all 𝑡≥𝑡𝑖
+and 𝑖∈𝐼.
+Proof
+Suppose not, then for some 𝑖, we have 𝑞𝑝,𝑖(𝑡) = 0 for all 𝑡. In which case, 𝑥𝑖(𝑡) ≤𝑥∗
+𝑖. By the balance
+equation, we have:
+𝜆𝑖= 𝜃𝑖𝑞𝑝,𝑖(𝑡) + 𝜇𝑝,𝑖𝑥𝑖(𝑡)
+= 𝜇𝑝,𝑖𝑥𝑖(𝑡)
+≤𝜇𝑝,𝑖𝑥∗
+𝑖
+However, by the structure of the LP solution, 𝜆𝑖= 𝜃𝑖𝑞∗
+𝑝,𝑖+ 𝜇𝑝,𝑖𝑥∗
+𝑖, contradiction.
+If there exists some index 𝑖and ˜𝑡𝑖such that 𝑞𝑝,𝑖(˜𝑡𝑖) = 0, we can take a small enough interval (˜𝑡−𝜖, ˜𝑡) such
+that 𝑞𝑝,𝑖(𝑡) is decreasing in the interval and 𝑞𝑝,𝑖(𝑡) < 𝑞∗
+𝑝,𝑖. Since in the interval 𝑞𝑝,𝑖(𝑡) > 0, 𝑥𝑖(𝑡) = 𝑥∗
+𝑖. Then
+by the balance equations, we have:
+¤𝑞𝑝,𝑖(𝑡) = 𝜃𝑖[𝑞∗
+𝑝,𝑖−𝑞𝑝,𝑖(𝑡)] > 0
+contradiction! Then 𝑞𝑝,𝑖(𝑡) > 0 for all 𝑡≥𝑡𝑖and 𝑖∈𝐼.
+□
+LEMMA EC.3. Under our policy, 𝑞𝑝,𝑖(𝑡) →𝑞∗
+𝑝,𝑖and 𝑥𝑖(𝑡) →𝑥∗
+𝑖as 𝑡→∞.
+
+
+--- Page 44 ---
+ec9
+Proof
+By the above lemma, we can assume that 𝑞𝑝,𝑖(𝑡) > 0. 𝑥𝑖(𝑡) = 𝑥∗
+𝑖as a result. Then the convergence
+of 𝑥𝑖(𝑡) follows. By the balance equation,
+¤𝑞𝑝,𝑖(𝑡) = 𝜆𝑖−𝜇𝑝,𝑖𝑥∗
+𝑖−𝜃𝑖𝑞𝑝,𝑖(𝑡)
+= 𝜃𝑖(𝑞∗
+𝑝,𝑖−𝑞𝑝,𝑖(𝑡))
+Solving the above ODE, the convergence of 𝑞𝑝,𝑖(𝑡) follows in standard.
+□
+EC.3.2.
+Proof of decode convergence in Theorem 2
+We now show that, under these conditions, the aggregate decode buffer 𝑞𝑑(𝑡) := Í𝐼
+𝑖=1 𝑞𝑑,𝑖(𝑡) converges to
+zero along any fluid trajectory of the gate-and-route policy.
+LEMMA EC.4. Consider the fluid model under the gate-and-route policy with the static GPU partition
+induced by the LP solution: a fraction 𝑥★:= Í𝐼
+𝑖=1 𝑥★
+𝑖of GPUs are mixed and a fraction 1 −𝑥★are solo. Let
+𝑦𝑚(𝑡) :=
+𝐼∑︁
+𝑖=1
+𝑦𝑚,𝑖(𝑡),
+𝑦𝑠(𝑡) :=
+𝐼∑︁
+𝑖=1
+𝑦𝑠,𝑖(𝑡).
+If at some regular time 𝑡we have 𝑞𝑑(𝑡) > 0, then decode capacity is fully utilized:
+𝑦𝑚(𝑡) = 𝑥★(𝐵−1),
+𝑦𝑠(𝑡) = (1 −𝑥★)𝐵.
+Proof
+By construction of the static planning step, exactly a fraction 𝑥★of the GPUs are permanently
+assigned to the mixed group, and the remaining fraction 1 −𝑥★to the solo group. Each mixed GPU holds at
+most (𝐵−1) decodes, while each solo GPU holds at most 𝐵decodes. After fluid scaling by 𝑛, the maximal
+aggregate decode occupancies are
+𝑦𝑚(𝑡) ≤𝑥★(𝐵−1),
+𝑦𝑠(𝑡) ≤(1 −𝑥★)𝐵.
+The gate-and-route decode router is work-conserving: as long as the global decode buffer is nonempty (i.e.,
+𝑞𝑑(𝑡) > 0), any free decode slot in either group is immediately filled with a waiting job. Hence no decode slot
+can be idle whenever 𝑞𝑑(𝑡) > 0. Therefore,
+𝑦𝑚(𝑡) = 𝑥★(𝐵−1),
+𝑦𝑠(𝑡) = (1 −𝑥★)𝐵,
+whenever 𝑞𝑑(𝑡) > 0.
+□
+We next introduce a Lyapunov function that measures the total remaining decode work in “mixed-mode
+time units.”
+DEFINITION EC.1 (WEIGHTED DECODE WORK). Define
+𝑊𝑑(𝑡) :=
+𝐼∑︁
+𝑖=1
+𝑞𝑑,𝑖(𝑡) + 𝑦𝑚,𝑖(𝑡) + 𝑦𝑠,𝑖(𝑡)
+𝜇𝑚,𝑖
+.
+
+
+--- Page 45 ---
+ec10
+Here 1/𝜇𝑚,𝑖is the mean decode service time of a type-𝑖job in mixed mode. Thus 𝑊𝑑(𝑡) is the total
+remaining decode work expressed in mixed-mode time units.
+We assume the mode speed ratio
+𝜇𝑠,𝑖= 𝛾𝜏𝜇𝑚,𝑖=: 𝜅𝜇𝑚,𝑖
+for all 𝑖∈{1, . . . , 𝐼},
+with 𝜅= 𝛾𝜏> 0 constant across classes.
+LEMMA EC.5. Along any fluid trajectory, for 𝑡≥0,
+¤𝑊𝑑(𝑡) =
+𝐼∑︁
+𝑖=1
+𝜇𝑝,𝑖
+𝜇𝑚,𝑖
+𝑥𝑖(𝑡) − 𝑦𝑚(𝑡) + 𝜅𝑦𝑠(𝑡) −
+𝐼∑︁
+𝑖=1
+𝜃𝑖
+𝜇𝑚,𝑖
+𝑞𝑑,𝑖(𝑡).
+(EC.12)
+Proof
+We use the fluid balance equations and the random time-change representation for arrivals,
+completions, and abandonments; all fluid coordinates are absolutely continuous, so their derivatives exist.
+Arrivals into decode. For class 𝑖, prefills complete at rate 𝜇𝑝,𝑖𝑥𝑖(𝑡). Each completion creates one decode
+job of that class, with mixed-mode work 1/𝜇𝑚,𝑖. Hence the instantaneous inflow into 𝑊𝑑from class 𝑖is
+𝜇𝑝,𝑖𝑥𝑖(𝑡) ·
+1
+𝜇𝑚,𝑖
+,
+and summing over 𝑖yields the first term on the right-hand side of (EC.12).
+Service in mixed mode. For class 𝑖, mixed decodes are in service at rate 𝜇𝑚,𝑖𝑦𝑚,𝑖(𝑡), each completion
+removing 1/𝜇𝑚,𝑖units of 𝑊𝑑. Thus the mixed-mode drain is
+𝐼∑︁
+𝑖=1
+𝜇𝑚,𝑖𝑦𝑚,𝑖(𝑡) ·
+1
+𝜇𝑚,𝑖
+=
+𝐼∑︁
+𝑖=1
+𝑦𝑚,𝑖(𝑡) = 𝑦𝑚(𝑡).
+Service in solo mode. Using 𝜇𝑠,𝑖= 𝜅𝜇𝑚,𝑖, solo-mode completions for class 𝑖occur at rate 𝜇𝑠,𝑖𝑦𝑠,𝑖(𝑡), each
+also removing 1/𝜇𝑚,𝑖units of work. Thus
+𝐼∑︁
+𝑖=1
+𝜇𝑠,𝑖𝑦𝑠,𝑖(𝑡) ·
+1
+𝜇𝑚,𝑖
+=
+𝐼∑︁
+𝑖=1
+𝜅𝜇𝑚,𝑖𝑦𝑠,𝑖(𝑡) ·
+1
+𝜇𝑚,𝑖
+= 𝜅
+𝐼∑︁
+𝑖=1
+𝑦𝑠,𝑖(𝑡) = 𝜅𝑦𝑠(𝑡),
+which gives the second term in (EC.12).
+Abandonments. Class-𝑖decode abandonments occur at rate 𝜃𝑖𝑞𝑑,𝑖(𝑡). Each abandonment removes 1/𝜇𝑚,𝑖
+units of 𝑊𝑑. Thus the total drain from abandonments is
+𝐼∑︁
+𝑖=1
+𝜃𝑖𝑞𝑑,𝑖(𝑡) ·
+1
+𝜇𝑚,𝑖
+,
+which yields the third term in (EC.12) with a minus sign.
+Combining these three contributions establishes (EC.12).
+□
+
+
+--- Page 46 ---
+ec11
+LEMMA EC.6. Assume that under the gate-and-route policy, the prefill occupancies satisfy 𝑥𝑖(𝑡) →𝑥★
+𝑖as
+𝑡→∞for each 𝑖, and let 𝑥★:= Í𝐼
+𝑖=1 𝑥★
+𝑖. Define the per-GPU decode capacity (in mixed-mode time units)
+𝐶★:= 𝜅(1 −𝑥★)𝐵+ 𝑥★(𝐵−1).
+Then there exists 𝑇0 < ∞such that for all 𝑡≥𝑇0,
+𝑞𝑑(𝑡) > 0 =⇒¤𝑊𝑑(𝑡) ≤−
+𝐼∑︁
+𝑖=1
+𝜃𝑖
+𝜇𝑚,𝑖
+𝑞𝑑,𝑖(𝑡).
+Proof
+Since 𝑥𝑖(𝑡) →𝑥★
+𝑖, we have
+𝐴(𝑡) :=
+𝐼∑︁
+𝑖=1
+𝜇𝑝,𝑖
+𝜇𝑚,𝑖
+𝑥𝑖(𝑡) −→𝐴★:=
+𝐼∑︁
+𝑖=1
+𝜇𝑝,𝑖
+𝜇𝑚,𝑖
+𝑥★
+𝑖.
+We claim that 𝐴★≤𝐶★. Indeed, by Proposition 1 we can choose an LP-optimal solution with 𝑞★
+𝑑,𝑖= 0 for all 𝑖.
+Summing the LP decode flow-balance constraints and using 𝜇𝑠,𝑖= 𝜅𝜇𝑚,𝑖gives
+𝐴★=
+𝐼∑︁
+𝑖=1
+𝑦★
+𝑚,𝑖+ 𝜅
+𝐼∑︁
+𝑖=1
+𝑦★
+𝑠,𝑖≤𝑥★(𝐵−1) + 𝜅(1 −𝑥★)𝐵= 𝐶★,
+where the inequality is exactly the LP mixed/solo decode capacity constraints.
+By Lemma EC.1, there exists 𝑡0 such that 𝑥𝑖(𝑡) ≤𝑥★
+𝑖for all 𝑖and all 𝑡≥𝑡0. Hence
+𝐴(𝑡) ≤𝐴★≤𝐶★,
+𝑡≥𝑡0.
+By Lemma EC.4, if 𝑞𝑑(𝑡) > 0 then decode capacity is fully utilized and 𝑦𝑚(𝑡) = 𝑥★(𝐵−1), 𝑦𝑠(𝑡) =
+(1 −𝑥★)𝐵. Substituting into (EC.12) gives, for such 𝑡,
+¤𝑊𝑑(𝑡) = 𝐴(𝑡) −
+h
+𝑥★(𝐵−1) + 𝜅(1 −𝑥★)𝐵
+i
+−
+𝐼∑︁
+𝑖=1
+𝜃𝑖
+𝜇𝑚,𝑖
+𝑞𝑑,𝑖(𝑡).
+Then by using the inequality 𝐴(𝑡) ≤𝐴★≤𝐶★, we have:
+¤𝑊𝑑(𝑡) ≤−
+𝐼∑︁
+𝑖=1
+𝜃𝑖
+𝜇𝑚,𝑖
+𝑞𝑑,𝑖(𝑡),
+as claimed.
+□
+We are now ready to show that the decode buffer vanishes in the fluid limit.
+PROPOSITION EC.1. Assume 𝜃𝑖> 0 for all 𝑖, and that under the gate-and-route policy the prefill
+occupancies satisfy 𝑥𝑖(𝑡) →𝑥★
+𝑖as 𝑡→∞, with the associated capacity constant 𝐶★:= 𝜅(1−𝑥★)𝐵+𝑥★(𝐵−1).
+Then along any fluid trajectory,
+lim
+𝑡→∞𝑞𝑑(𝑡) = 0.
+
+
+--- Page 47 ---
+ec12
+Proof
+Define
+𝜃:= min
+1≤𝑖≤𝐼
+𝜃𝑖
+𝜇𝑚,𝑖
+> 0,
+using the assumption 𝜃𝑖> 0 for all 𝑖. Then
+𝐼∑︁
+𝑖=1
+𝜃𝑖
+𝜇𝑚,𝑖
+𝑞𝑑,𝑖(𝑡) ≥𝜃
+𝐼∑︁
+𝑖=1
+𝑞𝑑,𝑖(𝑡) = 𝜃𝑞𝑑(𝑡).
+Then by Lemma EC.6, we have:
+¤𝑊𝑑(𝑡) ≤−𝜃𝑞𝑑(𝑡).
+(EC.13)
+which means that 𝑊𝑑(𝑡) is nonincreasing whenever 𝑞𝑑(𝑡) ≥0.
+We now argue by contradiction. Suppose 𝑞𝑑(𝑡) does not converge to zero. Then there exists 𝛿> 0 and a
+sequence 𝑡𝑘→∞such that 𝑞𝑑(𝑡𝑘) ≥𝛿for all 𝑘. Because of the Lipschitz property of the fluid processes,
+there exists 𝜂> 0 and subintervals [𝑡′
+𝑘,𝑡′′
+𝑘] with
+𝑡′
+𝑘≤𝑡𝑘≤𝑡′′
+𝑘,
+𝑡′′
+𝑘−𝑡′
+𝑘≥𝜂,
+Then for all 𝑡∈[𝑡′
+𝑘,𝑡′′
+𝑘], (EC.13) gives ¤𝑊𝑑(𝑡) ≤−𝜃𝛿/2 =: −𝑐< 0. Take the integral of the inequality, we
+have:
+𝑊𝑑(𝑡′′
+𝑘) −𝑊𝑑(𝑡′
+𝑘) ≤−𝑐(𝑡′′
+𝑘−𝑡′
+𝑘) ≤−𝑐𝜂< 0,
+which means that in each interval determined by the sequence 𝑡𝑘, the decrease of 𝑊𝑑(𝑡) is at least 𝑐𝜂,
+which contradicts the fact that 𝑊𝑑(𝑡) ≥0.
+Therefore, our assumption is false, and we must have
+lim
+𝑡→∞𝑞𝑑(𝑡) = 0.
+□
+Proof of Theorem 2
+Combining Proposition EC.1 with the previously established convergence of the
+prefill occupancies 𝑥𝑖(𝑡) →𝑥★
+𝑖and the fixed decode capacities in Lemma EC.4, we conclude that the fluid
+occupancies converge to the LP-optimal point (𝑥★
+𝑖, 𝑦★
+𝑚,𝑖, 𝑦★
+𝑠,𝑖)𝑖∈[𝐼], and the corresponding per-GPU reward
+attains the LP optimum. This is the key ingredient in the proof of Theorem 2 (asymptotic optimality of the
+gate-and-route policy).
+□
+
+
+--- Page 48 ---
+ec13
+EC.4.
+Proof of the Optimality of the Prioritize-and-Route Policy
+EC.4.1.
+Proof of Theorem 3
+Proof
+Let ˜𝜋𝑛,★be the prioritize-and-route policy defined in Section 4.2, parameterized by an optimal
+solution of the steady-state fluid LP (42).
+Under separate charging, the steady-state objective (42) by which the reward only depends on aggregate
+occupancies (Í
+𝑖𝑥𝑖,Í
+𝑖𝑦𝑚,𝑖,Í
+𝑖𝑦𝑠,𝑖). What is left is to prove that the prioritize-and-route policy reaches the
+maximal workload of the system.
+The prioritize-and-route policy is work-conserving at the prefill side, so the prefill occupancy is always full.
+The priority index 𝜙𝑖= 𝐷𝑖/𝑃𝑖is proportional to the decode-work generation rate per unit prefill occupancy,
+since
+𝜇𝑝,𝑖
+𝜇𝑚,𝑖
+= 𝐶/(𝜏𝑃𝑖)
+1/(𝜏𝐷𝑖) = 𝐶𝐷𝑖
+𝑃𝑖
+= 𝐶𝜙𝑖.
+Therefore, among all feasible ways to allocate a given amount of prefill occupancy across classes, the static
+priority rule maximizes the instantaneous inflow of downstream decode workload. This ensures that the
+aggregate decode occupancies are maximized whenever sufficient workload is available; if workload is
+insufficient, no policy can keep more decode capacity busy.
+Consequently, the limiting fluid reward under the prioritize-and-route policy achieves the optimal value
+˜𝑅★of the steady-state LP (42), which yields the asymptotic optimality of the policy, i.e.
+liminf
+𝑇→∞liminf
+𝑛→∞
+˜𝑅𝑛(𝑇; ˜𝜋𝑛,★) = ˜𝑅★.
+which is exactly Theorem 3.
+□
+EC.5.
+Proofs of the Optimality of the SLI-Aware Policy
+In this section, we prove the optimality of the SLI-aware policy. Since the SLI-aware policy deals with the
+prefill stage the same as the Gate-and-Route policy, we will only prove the optimality of the SLI-aware policy
+for the decode stage. The optimality of the prefill stage follows from the optimality of the Gate-and-Route
+policy.
+EC.5.1.
+Convergence of the decode occupancies under the SLI-aware policy
+In this subsection, we focus on the convergence of the decode occupancies under the SLI-aware policy.
+PROPOSITION EC.2. Fix an optimal solution (𝑥★
+𝑖, 𝑦★
+𝑚,𝑖, 𝑦★
+𝑠,𝑖, 𝑞★
+𝑝,𝑖, 𝑞★
+𝑑,𝑖)𝑖∈I of the SLI-aware steady-state
+program (49) with 𝑞★
+𝑑,𝑖= 0 for all 𝑖. Let 𝑥★:= Í𝐼
+𝑖=1 𝑥★
+𝑖and consider the corresponding static planning of the
+system. Denote 𝑞𝑑,𝑚,𝑖(𝑡) and 𝑞𝑑,𝑠,𝑖(𝑡) for the mixed and solo decode buffers under the virtual buffer split of
+Section 5.1 respectively. Then along any fluid trajectory of the SLI-aware policy,
+lim
+𝑡→∞𝑦𝑚,𝑖(𝑡) = 𝑦★
+𝑚,𝑖,
+lim
+𝑡→∞𝑦𝑠,𝑖(𝑡) = 𝑦★
+𝑠,𝑖,
+lim
+𝑡→∞𝑞𝑑,𝑠,𝑖(𝑡) = 0,
+lim
+𝑡→∞𝑞𝑑,𝑚,𝑖(𝑡) = 0,
+∀𝑖∈I.
+
+
+--- Page 49 ---
+ec14
+Proof
+Denote the total mixed and solo decode capacities as
+𝐶𝑚:= 𝑥★(𝐵−1),
+𝐶𝑠:= (1 −𝑥★)𝐵.
+First we show that the decode buffer converges to zero as 𝑡→∞. Define the weighted decode work
+respectively:
+𝑊𝑚(𝑡) :=
+𝐼∑︁
+𝑖=1
+𝑞𝑑,𝑚,𝑖(𝑡) + 𝑦𝑚,𝑖(𝑡)
+𝜇𝑚,𝑖
+,
+𝑊𝑠(𝑡) :=
+𝐼∑︁
+𝑖=1
+𝑞𝑑,𝑠,𝑖(𝑡) + 𝑦𝑠,𝑖(𝑡)
+𝜇𝑠,𝑖
+.
+Take the derivative of the formulas above, we have:
+¤𝑊𝑚(𝑡) =
+𝐼∑︁
+𝑖=1
+(1 −𝑝𝑠,𝑖) 𝜇𝑝,𝑖
+𝜇𝑚,𝑖
+𝑥𝑖(𝑡) −𝑦𝑚(𝑡) −
+𝐼∑︁
+𝑖=1
+𝜃𝑖
+𝜇𝑚,𝑖
+𝑞𝑑,𝑚,𝑖(𝑡),
+(EC.14)
+¤𝑊𝑠(𝑡) =
+𝐼∑︁
+𝑖=1
+𝑝𝑠,𝑖𝜇𝑝,𝑖
+𝜇𝑠,𝑖
+𝑥𝑖(𝑡) −𝑦𝑠(𝑡) −
+𝐼∑︁
+𝑖=1
+𝜃𝑖
+𝜇𝑠,𝑖
+𝑞𝑑,𝑠,𝑖(𝑡).
+(EC.15)
+Here 𝑦𝑚(𝑡) := Í
+𝑖𝑦𝑚,𝑖(𝑡) and 𝑦𝑠(𝑡) := Í
+𝑖𝑦𝑠,𝑖(𝑡).
+Whenever 𝑞𝑑,𝑚(𝑡) > 0, the mixed group is work-conserving, so all mixed decode slots are busy and
+𝑦𝑚(𝑡) = 𝐶𝑚; similarly, 𝑞𝑑,𝑠(𝑡) > 0 implies 𝑦𝑠(𝑡) = 𝐶𝑠. Since 𝑥𝑖(𝑡) →𝑥★
+𝑖and the LP feasibility constraints
+include Í
+𝑖𝑦★
+𝑚,𝑖≤𝐶𝑚and Í
+𝑖𝑦★
+𝑠,𝑖≤𝐶𝑠, the constants
+𝐴★
+𝑚:=
+𝐼∑︁
+𝑖=1
+(1 −𝑝𝑠,𝑖) 𝜇𝑝,𝑖
+𝜇𝑚,𝑖
+𝑥★
+𝑖,
+𝐴★
+𝑠:=
+𝐼∑︁
+𝑖=1
+𝑝𝑠,𝑖𝜇𝑝,𝑖
+𝜇𝑠,𝑖
+𝑥★
+𝑖
+satisfy 𝐴★
+𝑚≤𝐶𝑚and 𝐴★
+𝑠≤𝐶𝑠, since they are both the admission limit of the policy which should be less than
+the total decode capacity. Therefore,
+𝑞𝑑,𝑚(𝑡) > 0 =⇒¤𝑊𝑚(𝑡) ≤−𝜃𝑚𝑞𝑑,𝑚(𝑡),
+𝑞𝑑,𝑠(𝑡) > 0 =⇒¤𝑊𝑠(𝑡) ≤−𝜃𝑠𝑞𝑑,𝑠(𝑡),
+where 𝜃𝑚:= min𝑖𝜃𝑖/𝜇𝑚,𝑖> 0 and 𝜃𝑠:= min𝑖𝜃𝑖/𝜇𝑠,𝑖> 0. The same contradiction argument as in Proposi-
+tion EC.1 implies
+lim
+𝑡→∞𝑞𝑑,𝑚(𝑡) = 0,
+lim
+𝑡→∞𝑞𝑑,𝑠(𝑡) = 0.
+Now we are ready to show the convergence of the decode occupancies respectively. By our policy, we can
+compute the instant admission rates of the mixed and solo decode pools respectively:
+¤𝑢𝑑,𝑚,𝑖(𝑡) = (1 −𝑝𝑠,𝑖) (𝜇𝑝,𝑖𝑥𝑖(𝑡) −𝜃𝑖𝑞𝑑,𝑠,𝑖(𝑡)),
+¤𝑢𝑑,𝑠,𝑖(𝑡) = 𝑝𝑠,𝑖(𝜇𝑝,𝑖𝑥𝑖(𝑡) −𝜃𝑖𝑞𝑑,𝑚,𝑖(𝑡))
+Take the derivative of the decode occupancies of the balance equations, we have:
+¤𝑦𝑚,𝑖(𝑡) = (1 −𝑝𝑠,𝑖) 𝜇𝑝,𝑖𝑥𝑖(𝑡) −𝜇𝑚,𝑖𝑦𝑚,𝑖(𝑡),
+¤𝑦𝑠,𝑖(𝑡) = 𝑝𝑠,𝑖𝜇𝑝,𝑖𝑥𝑖(𝑡) −𝜇𝑠,𝑖𝑦𝑠,𝑖(𝑡),
+Since 𝑥𝑖(𝑡) →𝑥★
+𝑖and 𝑞𝑑,𝑚,𝑖(𝑡) →0 and 𝑞𝑑,𝑠,𝑖(𝑡) →0 and the LP feasibility condition:
+𝜇𝑝,𝑖𝑥★
+𝑖= 𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+
+
+--- Page 50 ---
+ec15
+then for any 𝜖> 0, there exists 𝑇𝜖such that for all 𝑡≥𝑇𝜖,
+| ¤𝜇𝑑,𝑠,𝑖(𝑡) −𝜇𝑠,𝑖𝑦★
+𝑠,𝑖| ≤𝜖
+| ¤𝜇𝑑,𝑚,𝑖(𝑡) −𝜇𝑚,𝑖𝑦★
+𝑚,𝑖| ≤𝜖
+Then we have:
+𝜇𝑚,𝑖𝑦∗
+𝑚,𝑖−𝜖≤¤𝑦𝑠,𝑖(𝑡) + 𝜇𝑚,𝑖𝑦𝑚,𝑖(𝑡) ≤𝜇𝑚,𝑖𝑦∗
+𝑚,𝑖+ 𝜖
+𝜇𝑠,𝑖𝑦∗
+𝑠,𝑖−𝜖≤¤𝑦𝑠,𝑖(𝑡) + 𝜇𝑠,𝑖𝑦𝑠,𝑖(𝑡) ≤𝜇𝑠,𝑖𝑦∗
+𝑠,𝑖+ 𝜖
+Solving the above inequalities and let 𝜖→0 and 𝑡→∞, we have:
+lim
+𝑡→∞𝑦𝑚,𝑖(𝑡) = 𝑦★
+𝑚,𝑖,
+lim
+𝑡→∞𝑦𝑠,𝑖(𝑡) = 𝑦★
+𝑠,𝑖,
+∀𝑖∈I.
+which means that the decode occupancies converge to the LP targets.
+□
+EC.6.
+General SLI-aware Policy
+In this section, we analyze the general SLI-aware setting under mild regularity on the optimization problem
+(bounded penalties, etc.), in which case the SLI-aware LP may admit an optimal solution with 𝑞★
+𝑑,𝑖> 0 for
+some 𝑖.
+General SLI-aware Policy Fix an optimal solution of the SLI-aware LP (𝑥★
+𝑖, 𝑦★
+𝑚,𝑖, 𝑦★
+𝑠,𝑖, 𝑞★
+𝑝,𝑖, 𝑞★
+𝑑,𝑖)𝑖∈I,
+allowing 𝑞★
+𝑑,𝑖> 0. As in Section 5.1, we partition GPUs into 𝐺(𝑛)
+mix and 𝐺(𝑛)
+solo according to the static planning.
+We split the decode buffer into mixed buffer and solo buffer and track the queue lengths 𝑄𝑛
+𝑑,𝑚,𝑖(𝑡) and
+𝑄𝑛
+𝑑,𝑠,𝑖(𝑡) accordingly. Upon each class-𝑖prefill completion, we route the resulting decode job to the solo
+buffer with probability 𝑝𝑠,𝑖and to the mixed buffer with probability 1 −𝑝𝑠,𝑖.
+We set the pool-selection probabilities
+𝑝𝑠,𝑖:=
+
+
+𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+,
+if 𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖> 0,
+1,
+otherwise.
+When 𝑞★
+𝑑,𝑖> 0, the LP flow-balance implies
+𝜇𝑚,𝑖𝑦★
+𝑚,𝑖+ 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖= 𝜇𝑝,𝑖𝑥★
+𝑖−𝜃𝑖𝑞★
+𝑑,𝑖,
+so the definition of 𝑝𝑠,𝑖above can be rewritten as
+𝑝𝑠,𝑖=
+𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+𝜇𝑝,𝑖𝑥★
+𝑖−𝜃𝑖𝑞★
+𝑑,𝑖
+,
+i.e., 𝑝𝑠,𝑖is the solo share of the net decode completion rate. Accordingly, we have the consistent pool-level
+queue split
+𝑞★
+𝑑,𝑠,𝑖:= 𝑝𝑠,𝑖𝑞★
+𝑑,𝑖,
+𝑞★
+𝑑,𝑚,𝑖:= (1 −𝑝𝑠,𝑖) 𝑞★
+𝑑,𝑖.
+
+
+--- Page 51 ---
+ec16
+We additionally define pool class selection weights (with the convention 0/0 := 0)
+𝜛𝑚,𝑖:=
+𝜇𝑚,𝑖𝑦★
+𝑚,𝑖
+Í
+𝑗∈I 𝜇𝑚, 𝑗𝑦★
+𝑚, 𝑗
+,
+𝜛𝑠,𝑖:=
+𝜇𝑠,𝑖𝑦★
+𝑠,𝑖
+Í
+𝑗∈I 𝜇𝑠, 𝑗𝑦★
+𝑠, 𝑗
+.
+Different from the baseline SLI-aware policy, in the general SLI-aware policy, we introduce a pool class
+selection rule within each pool.
+(i) Solo-pool class selection. Whenever a solo decode slot becomes available and Í
+𝑖𝑄𝑛
+𝑑,𝑠,𝑖(𝑡−) > 0, the
+decode scheduler selects a class according to the weights {𝜛𝑠,𝑖}𝑖∈I restricted to currently nonempty solo
+decode buffer:
+P
+
+select class 𝑖
+ {𝑄𝑛
+𝑑,𝑠, 𝑗(𝑡−)} 𝑗
+
+=
+𝜛𝑠,𝑖1{𝑄𝑛
+𝑑,𝑠,𝑖(𝑡−) > 0}
+Í
+𝑗∈I 𝜛𝑠, 𝑗1{𝑄𝑛
+𝑑,𝑠, 𝑗(𝑡−) > 0} .
+It then routes the head-of-line job of that class to the freed solo slot. If the solo decode buffer is empty, the
+slot idles.
+(ii) Mixed-pool class selection. Whenever a mixed decode slot becomes available and Í
+𝑖𝑄𝑛
+𝑑,𝑚,𝑖(𝑡−) > 0,
+the scheduler selects a class according to {𝜛𝑚,𝑖} restricted to nonempty mixed decode buffer (defined
+analogously) and routes the corresponding head-of-line job to the freed mixed slot.
+This policy is work-conserving within each pool and preserves FCFS within each class buffer. It differs
+from the baseline SLI-aware router only in the cross-class selection rule within the mixed/solo decode pools.
+Then we focus on the fluid dynamics induced by the general SLI-aware policy. We focus on the case where
+the SLI-aware LP solution satisfies 𝑞★
+𝑑,𝑖> 0 for all 𝑖and both decode capacity constraints bind. The proof for
+boundary cases (some 𝑞★
+𝑑,𝑖= 0, etc.) is analogous.
+First, we introduce some conventions for the general SLI-aware policy. Let 𝑞𝑑,𝑚,𝑖(𝑡) and 𝑞𝑑,𝑠,𝑖(𝑡) denote
+the mixed/solo decode queue contents, and 𝑢𝑑,𝑚,𝑖(𝑡) and 𝑢𝑑,𝑠,𝑖(𝑡) denote the cumulative admissions into
+mixed/solo decode service. Abandonments occur from each pool buffer at rate 𝜃𝑖, i.e.,
+¤𝑏𝑑,𝑚,𝑖(𝑡) = 𝜃𝑖𝑞𝑑,𝑚,𝑖(𝑡),
+¤𝑏𝑑,𝑠,𝑖(𝑡) = 𝜃𝑖𝑞𝑑,𝑠,𝑖(𝑡),
+and the total queue length is 𝑞𝑑,𝑖(𝑡) = 𝑞𝑑,𝑚,𝑖(𝑡) + 𝑞𝑑,𝑠,𝑖(𝑡).
+LEMMA EC.7. Fix a regular time 𝑡at which all fluid coordinates are differentiable. Define the aggregate
+decode admission and completion rates
+¤𝑢𝑑,𝑚(𝑡) :=
+∑︁
+𝑖∈I
+¤𝑢𝑑,𝑚,𝑖(𝑡),
+¤𝑢𝑑,𝑠(𝑡) :=
+∑︁
+𝑖∈I
+¤𝑢𝑑,𝑠,𝑖(𝑡),
+¤𝑑𝑑,𝑚(𝑡) :=
+∑︁
+𝑖∈I
+𝜇𝑚,𝑖𝑦𝑚,𝑖(𝑡),
+¤𝑑𝑑,𝑠(𝑡) :=
+∑︁
+𝑖∈I
+𝜇𝑠,𝑖𝑦𝑠,𝑖(𝑡).
+Define the pool-level decode backlogs
+𝑞𝑑,𝑚(𝑡) :=
+∑︁
+𝑖∈I
+𝑞𝑑,𝑚,𝑖(𝑡),
+𝑞𝑑,𝑠(𝑡) :=
+∑︁
+𝑖∈I
+𝑞𝑑,𝑠,𝑖(𝑡).
+
+
+--- Page 52 ---
+ec17
+If the corresponding pool buffer is positive at time 𝑡, then that pool is work-conserving:
+𝑞𝑑,𝑚(𝑡) > 0 =⇒¤𝑢𝑑,𝑚(𝑡) = ¤𝑑𝑑,𝑚(𝑡),
+𝑞𝑑,𝑠(𝑡) > 0 =⇒¤𝑢𝑑,𝑠(𝑡) = ¤𝑑𝑑,𝑠(𝑡).
+Moreover, under the within-pool class selection rule,
+𝑞𝑑,𝑚(𝑡) > 0 =⇒¤𝑢𝑑,𝑚,𝑖(𝑡) = ¤𝑢𝑑,𝑚(𝑡)
+𝜛𝑚,𝑖1{𝑞𝑑,𝑚,𝑖(𝑡) > 0}
+Í
+𝑗∈I 𝜛𝑚, 𝑗1{𝑞𝑑,𝑚, 𝑗(𝑡) > 0},
+𝑞𝑑,𝑠(𝑡) > 0 =⇒¤𝑢𝑑,𝑠,𝑖(𝑡) = ¤𝑢𝑑,𝑠(𝑡)
+𝜛𝑠,𝑖1{𝑞𝑑,𝑠,𝑖(𝑡) > 0}
+Í
+𝑗∈I 𝜛𝑠, 𝑗1{𝑞𝑑,𝑠, 𝑗(𝑡) > 0} .
+Proof
+If 𝑞𝑑,•(𝑡) > 0 for • ∈{𝑚, 𝑠}, then the corresponding pool buffer is nonempty and the policy is
+work-conserving on that pool: If a decode slot is free, then a job will be routed to the slot immediately. Hence
+¤𝑢𝑑,•(𝑡) = ¤𝑑𝑑,•(𝑡). The instant admission formulas follow directly from the definition of pool selection rule: at
+the fluid scale, each pool’s admissions inherit the fixed weights 𝜛•,𝑖restricted to nonempty class buffers. □
+LEMMA EC.8. Fix 𝜇∈R𝐼
+++ and 𝑣∈R𝐼
+++ with Í𝐼
+𝑖=1 𝑣𝑖= 1. Let 𝐷:= diag(𝜇1, . . . , 𝜇𝐼) and 𝐴:= 𝑣𝜇⊤−𝐷.
+Then:
+(i) 0 is a simple eigenvalue of 𝐴and all other eigenvalues have strictly negative real parts.
+(ii) For the ODE ¤𝑦(𝑡) = 𝐴𝑦(𝑡), 1⊤𝑦(𝑡) is conserved and
+𝑦(𝑡) −→𝑦∞:=  1⊤𝑦(0)
+𝐷−1𝑣
+1⊤𝐷−1𝑣
+as 𝑡→∞.
+Proof
+(i):By the matrix determinant lemma,
+det(𝜆𝐼−𝐴) = det(𝜆𝐼+ 𝐷−𝑣𝜇⊤) = det(𝜆𝐼+ 𝐷)
+
+1 −𝜇⊤(𝜆𝐼+ 𝐷)−1𝑣
+
+.
+Hence 𝜆is an eigenvalue of 𝐴if and only if
+1 = 𝜇⊤(𝜆𝐼+ 𝐷)−1𝑣=
+𝐼∑︁
+𝑖=1
+𝑣𝑖
+𝜇𝑖
+𝜆+ 𝜇𝑖
+.
+At 𝜆= 0, the right-hand side equals Í
+𝑖𝑣𝑖= 1, so 𝜆= 0 is an eigenvalue. Its simplicity follows because the
+derivative of the right-hand side at 𝜆= 0 equals −Í
+𝑖𝑣𝑖/𝜇𝑖≠0. Next, let 𝜆satisfy Re(𝜆) ≥0 and 𝜆≠0. Then
+for each 𝑖,
+
+𝜇𝑖
+𝜆+ 𝜇𝑖
+ <
+𝜇𝑖
+Re(𝜆) + 𝜇𝑖
+≤1,
+with strict inequality because 𝜆≠0. Therefore
+
+𝐼∑︁
+𝑖=1
+𝑣𝑖
+𝜇𝑖
+𝜆+ 𝜇𝑖
+ ≤
+𝐼∑︁
+𝑖=1
+𝑣𝑖
+
+𝜇𝑖
+𝜆+ 𝜇𝑖
+ <
+𝐼∑︁
+𝑖=1
+𝑣𝑖= 1,
+so the eigenvalue equation cannot hold. This shows that 0 is the only eigenvalue with nonnegative real part.
+
+
+--- Page 53 ---
+ec18
+(ii): Since 𝐴= 𝑣𝜇⊤−𝐷and Í
+𝑖𝑣𝑖= 1, we have
+1⊤𝐴= 1⊤(𝑣𝜇⊤) −1⊤𝐷= (1⊤𝑣)𝜇⊤−𝜇⊤= 0⊤.
+Therefore, along any absolutely continuous solution of ¤𝑦(𝑡) = 𝐴𝑦(𝑡),
+𝑑
+𝑑𝑡1⊤𝑦(𝑡) = 1⊤¤𝑦(𝑡) = 1⊤𝐴𝑦(𝑡) = 0
+so the total mass 𝑀:= 1⊤𝑦(𝑡) is conserved: 𝑀= 1⊤𝑦(0) for all 𝑡. The equilibrium set is the kernel of 𝐴. If
+𝐴𝑦= 0, then
+0 = 𝐴𝑦= 𝑣(𝜇⊤𝑦) −𝐷𝑦
+⇐⇒
+𝐷𝑦= (𝜇⊤𝑦) 𝑣.
+Let 𝑠:= 𝜇⊤𝑦; since 𝐷is invertible, this implies
+𝑦= 𝑠𝐷−1𝑣.
+Hence Ker(𝐴) = span{𝑟} where 𝑟:= 𝐷−1𝑣∈R𝐼
+++. Imposing the conserved mass 𝑀= 1⊤𝑦determines 𝑠
+uniquely:
+𝑀= 1⊤𝑦= 𝑠1⊤𝐷−1𝑣
+=⇒
+𝑠=
+𝑀
+1⊤𝐷−1𝑣.
+Therefore the hyperplane {1⊤𝑦= 𝑀} contains a unique equilibrium, namely
+𝑦∞= 𝑀
+𝐷−1𝑣
+1⊤𝐷−1𝑣=  1⊤𝑦(0)
+𝐷−1𝑣
+1⊤𝐷−1𝑣.
+By part (i), all eigenvalues of 𝐴other than 0 have strictly negative real parts, and 0 is a simple eigenvalue.
+Let 𝑟:= 𝐷−1𝑣be the (right) eigenvector associated with eigenvalue 0, and note that 1⊤is a (left) eigenvector
+since 1⊤𝐴= 0⊤. The corresponding spectral projector is
+𝑃:= 𝑟1⊤
+1⊤𝑟= 𝐷−1𝑣1⊤
+1⊤𝐷−1𝑣.
+Standard linear-systems theory then implies 𝑒𝐴𝑡→𝑃as 𝑡→∞. Consequently,
+𝑦(𝑡) = 𝑒𝐴𝑡𝑦(0) −→𝑃𝑦(0) =  1⊤𝑦(0)
+𝐷−1𝑣
+1⊤𝐷−1𝑣= 𝑦∞,
+□
+PROPOSITION EC.3. Assume 𝜃𝑖> 0 for all 𝑖∈I. Under the refined SLI-aware policy above, every fluid
+solution satisfies
+lim
+𝑡→∞𝑥𝑖(𝑡) = 𝑥★
+𝑖,
+lim
+𝑡→∞𝑦𝑚,𝑖(𝑡) = 𝑦★
+𝑚,𝑖,
+lim
+𝑡→∞𝑦𝑠,𝑖(𝑡) = 𝑦★
+𝑠,𝑖,
+lim
+𝑡→∞𝑞𝑑,𝑖(𝑡) = 𝑞★
+𝑑,𝑖,
+for all 𝑖∈I.
+
+
+--- Page 54 ---
+ec19
+Proof
+The prefill part mainly follows from the proof of Theorem 2. Therefore the prefill argument in the
+proof of Theorem 2 applies verbatim, and there exists 𝑇𝑝< ∞such that for all 𝑡≥𝑇𝑝and all 𝑖∈I,
+𝑞𝑝,𝑖(𝑡) > 0,
+𝑥𝑖(𝑡) = 𝑥★
+𝑖.
+(EC.16)
+We analyze the decode dynamics on [𝑇𝑝, ∞) and shift the time origin so that (EC.16) holds for all 𝑡≥0.
+Then the resulting constant pool arrival rates are
+𝛼𝑠,𝑖:= 𝑝𝑠,𝑖𝜇𝑝,𝑖𝑥★
+𝑖,
+𝛼𝑚,𝑖:= (1 −𝑝𝑠,𝑖)𝜇𝑝,𝑖𝑥★
+𝑖,
+𝑖∈I,
+and the pool capacities
+𝑦★
+𝑠:=
+∑︁
+𝑖∈I
+𝑦★
+𝑠,𝑖,
+𝑦★
+𝑚:=
+∑︁
+𝑖∈I
+𝑦★
+𝑚,𝑖,
+which coincide with the binding decode capacity constraints at the LP optimum.
+The differential version of the balance equations give:
+¤𝑞𝑑,𝑠,𝑖(𝑡) = 𝛼𝑠,𝑖−¤𝑢𝑑,𝑠,𝑖(𝑡) −𝜃𝑖𝑞𝑑,𝑠,𝑖(𝑡),
+¤𝑞𝑑,𝑚,𝑖(𝑡) = 𝛼𝑚,𝑖−¤𝑢𝑑,𝑚,𝑖(𝑡) −𝜃𝑖𝑞𝑑,𝑚,𝑖(𝑡),
+together with the corresponding in-service dynamics ¤𝑦𝑠,𝑖(𝑡) = ¤𝑢𝑑,𝑠,𝑖(𝑡) −𝜇𝑠,𝑖𝑦𝑠,𝑖(𝑡) and ¤𝑦𝑚,𝑖(𝑡) = ¤𝑢𝑑,𝑚,𝑖(𝑡) −
+𝜇𝑚,𝑖𝑦𝑚,𝑖(𝑡) under the static planning.
+We first show that there exists 𝑇0 < ∞such that for all 𝑡≥𝑇0,
+𝑞𝑑,𝑠(𝑡) > 0, 𝑞𝑑,𝑚(𝑡) > 0,
+𝑦𝑠(𝑡) = 𝑦★
+𝑠, 𝑦𝑚(𝑡) = 𝑦★
+𝑚,
+(EC.17)
+where 𝑞𝑑,𝑠(𝑡) := Í
+𝑖𝑞𝑑,𝑠,𝑖(𝑡) and 𝑞𝑑,𝑚(𝑡) := Í
+𝑖𝑞𝑑,𝑚,𝑖(𝑡), and 𝑦𝑠(𝑡) := Í
+𝑖𝑦𝑠,𝑖(𝑡) and 𝑦𝑚(𝑡) := Í
+𝑖𝑦𝑚,𝑖(𝑡).
+Fix the solo pool (the mixed pool is identical). Using the LP balances and the definitions of 𝑞★
+𝑑,𝑠,𝑖:= 𝑝𝑠,𝑖𝑞★
+𝑑,𝑖,
+we have for each 𝑖,
+𝛼𝑠,𝑖= 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖+ 𝜃𝑖𝑞★
+𝑑,𝑠,𝑖
+⇒
+𝛼𝑠,𝑖
+𝜇𝑠,𝑖
+≥𝑦★
+𝑠,𝑖,
+with strict inequality for any 𝑖with 𝑝𝑠,𝑖> 0 (equivalently 𝑦★
+𝑠,𝑖> 0). Summing gives
+∑︁
+𝑖∈I
+𝛼𝑠,𝑖
+𝜇𝑠,𝑖
+>
+∑︁
+𝑖∈I
+𝑦★
+𝑠,𝑖= 𝑦★
+𝑠.
+(EC.18)
+Suppose, toward a contradiction, that 𝑞𝑑,𝑠(𝑡) = 0 for 𝑡≥𝑇′ for some 𝑇′ < ∞. Then 𝑞𝑑,𝑠,𝑖(𝑡) = 0 for 𝑡≥𝑇′
+and all 𝑖. The solo-buffer balance implies, for 𝑡≥𝑇′,
+0 = ¤𝑞𝑑,𝑠,𝑖(𝑡) = 𝛼𝑠,𝑖−¤𝑢𝑑,𝑠,𝑖(𝑡) −𝜃𝑖𝑞𝑑,𝑠,𝑖(𝑡) = 𝛼𝑠,𝑖−¤𝑢𝑑,𝑠,𝑖(𝑡),
+so ¤𝑢𝑑,𝑠,𝑖(𝑡) = 𝛼𝑠,𝑖for 𝑡≥𝑇′. Therefore for 𝑡≥𝑇′,
+¤𝑦𝑠,𝑖(𝑡) = ¤𝑢𝑑,𝑠,𝑖(𝑡) −𝜇𝑠,𝑖𝑦𝑠,𝑖(𝑡) = 𝛼𝑠,𝑖−𝜇𝑠,𝑖𝑦𝑠,𝑖(𝑡).
+
+
+--- Page 55 ---
+ec20
+Solving this linear ODE yields 𝑦𝑠,𝑖(𝑡) →𝛼𝑠,𝑖/𝜇𝑠,𝑖as 𝑡→∞. Taking sums and using (EC.18) implies
+𝑦𝑠(𝑡) = Í
+𝑖𝑦𝑠,𝑖(𝑡) →Í
+𝑖𝛼𝑠,𝑖/𝜇𝑠,𝑖> 𝑦★
+𝑠, contradicting the capacity constraint 𝑦𝑠(𝑡) ≤𝑦★
+𝑠for all 𝑡. Therefore
+the solo-pool buffer cannot be eventually empty. Moreover, by (EC.18), there exists 𝑇𝑠< ∞such that
+𝑞𝑑,𝑠(𝑡) > 0,
+∀𝑡≥𝑇𝑠.
+Applying the same reasoning to the mixed pool yields 𝑇𝑚< ∞such that 𝑞𝑑,𝑚(𝑡) > 0 for all 𝑡≥𝑇𝑚. Let
+𝑇0 := max{𝑇𝑠,𝑇𝑚}. Then for all 𝑡≥𝑇0, both pool buffers are positive. By the work-conserving property of the
+policy within each pool, 𝑦𝑠(𝑡) = 𝑦★
+𝑠and 𝑦𝑚(𝑡) = 𝑦★
+𝑚for all 𝑡≥𝑇0, proving (EC.17).
+Second, we focus on the convergence of the decode occupancies. We consider 𝑡≥𝑇0 for which (EC.17)
+holds. Since 𝑞𝑑,𝑚(𝑡) > 0, Lemma EC.7 gives ¤𝑢𝑑,𝑚(𝑡) = ¤𝑑𝑑,𝑚(𝑡). Moreover, since 𝑞𝑑,𝑚(𝑡) > 0 for all 𝑡≥𝑇0
+by (EC.17), the selection rule is active for all such 𝑡. For any class 𝑖with 𝛼𝑚,𝑖> 0, if 𝑞𝑑,𝑚,𝑖(𝑡) = 0 when
+𝑡≥𝑇0, then no class-𝑖job can be pulled from the mixed buffer at time 𝑡, so ¤𝑢𝑑,𝑚,𝑖(𝑡) = 0 and the mixed-queue
+balance gives
+¤𝑞𝑑,𝑚,𝑖(𝑡) = 𝛼𝑚,𝑖−¤𝑢𝑑,𝑚,𝑖(𝑡) −𝜃𝑖𝑞𝑑,𝑚,𝑖(𝑡) = 𝛼𝑚,𝑖> 0.
+Therefore 𝑞𝑑,𝑚,𝑖(𝑡) > 0 for 𝑡≥𝑇0 whenever 𝛼𝑚,𝑖> 0. Hence the class-level admission rate simplifies to the
+unconditional proportion 𝜛𝑚,𝑖for almost every 𝑡≥𝑇0.
+¤𝑢𝑑,𝑚,𝑖(𝑡) = 𝜛𝑚,𝑖¤𝑢𝑑,𝑚(𝑡) = 𝜛𝑚,𝑖
+∑︁
+𝑗∈I
+𝜇𝑚, 𝑗𝑦𝑚, 𝑗(𝑡).
+Under the static planning, the mixed in-service masses satisfy
+¤𝑦𝑚,𝑖(𝑡) = ¤𝑢𝑑,𝑚,𝑖(𝑡) −𝜇𝑚,𝑖𝑦𝑚,𝑖(𝑡) = 𝜛𝑚,𝑖
+∑︁
+𝑗∈I
+𝜇𝑚, 𝑗𝑦𝑚, 𝑗(𝑡) −𝜇𝑚,𝑖𝑦𝑚,𝑖(𝑡).
+This is a linear system ¤𝑦𝑚(𝑡) = 𝐴𝑚𝑦𝑚(𝑡), where
+𝐴𝑚:= 𝜛𝑚𝜇⊤
+𝑚−diag(𝜇𝑚,1, . . . , 𝜇𝑚,𝐼),
+𝜛𝑚:= (𝜛𝑚,𝑖)𝑖∈I, 𝜇𝑚:= (𝜇𝑚,𝑖)𝑖∈I.
+Applying Lemma EC.8 to 𝐴𝑚yields 𝑦𝑚,𝑖(𝑡) →𝑦★
+𝑚,𝑖as 𝑡→∞. The same argument applies to the solo pool
+which yields 𝑦𝑠,𝑖(𝑡) →𝑦★
+𝑠,𝑖.
+Finally, we prove the convergence of the decode queues. For each class 𝑖, the pool-specific decode queues
+satisfy, for 𝑡≥𝑇0,
+¤𝑞𝑑,𝑠,𝑖(𝑡) = 𝛼𝑠,𝑖−¤𝑢𝑑,𝑠,𝑖(𝑡) −𝜃𝑖𝑞𝑑,𝑠,𝑖(𝑡),
+¤𝑞𝑑,𝑚,𝑖(𝑡) = 𝛼𝑚,𝑖−¤𝑢𝑑,𝑚,𝑖(𝑡) −𝜃𝑖𝑞𝑑,𝑚,𝑖(𝑡).
+Since both pools are work-conserving for all 𝑡≥𝑇0. Therefore the admission rates satisfy
+¤𝑢𝑑,𝑠,𝑖(𝑡) = 𝜛𝑠,𝑖
+∑︁
+𝑗∈I
+𝜇𝑠, 𝑗𝑦𝑠, 𝑗(𝑡),
+¤𝑢𝑑,𝑚,𝑖(𝑡) = 𝜛𝑚,𝑖
+∑︁
+𝑗∈I
+𝜇𝑚, 𝑗𝑦𝑚, 𝑗(𝑡),
+
+
+--- Page 56 ---
+ec21
+for 𝑡≥𝑇0. Substituting gives, for 𝑡≥𝑇0,
+¤𝑞𝑑,𝑠,𝑖(𝑡) = 𝛼𝑠,𝑖−𝜛𝑠,𝑖
+∑︁
+𝑗∈I
+𝜇𝑠, 𝑗𝑦𝑠, 𝑗(𝑡)−𝜃𝑖𝑞𝑑,𝑠,𝑖(𝑡),
+¤𝑞𝑑,𝑚,𝑖(𝑡) = 𝛼𝑚,𝑖−𝜛𝑚,𝑖
+∑︁
+𝑗∈I
+𝜇𝑚, 𝑗𝑦𝑚, 𝑗(𝑡)−𝜃𝑖𝑞𝑑,𝑚,𝑖(𝑡).
+Since 𝑦𝑠,𝑖(𝑡) →𝑦★
+𝑠,𝑖and 𝑦𝑚,𝑖(𝑡) →𝑦★
+𝑚,𝑖, the pool-level LP balances satisfy
+𝑝𝑠,𝑖𝜇𝑝,𝑖𝑥★
+𝑖−𝜇𝑠,𝑖𝑦★
+𝑠,𝑖= 𝜃𝑖𝑞★
+𝑑,𝑠,𝑖,
+(1 −𝑝𝑠,𝑖)𝜇𝑝,𝑖𝑥★
+𝑖−𝜇𝑚,𝑖𝑦★
+𝑚,𝑖= 𝜃𝑖𝑞★
+𝑑,𝑚,𝑖.
+Using the definition of 𝜛•,𝑖, we also have 𝜛𝑠,𝑖
+Í
+𝑗∈I 𝜇𝑠, 𝑗𝑦★
+𝑠, 𝑗= 𝜇𝑠,𝑖𝑦★
+𝑠,𝑖and 𝜛𝑚,𝑖
+Í
+𝑗∈I 𝜇𝑚, 𝑗𝑦★
+𝑚, 𝑗= 𝜇𝑚,𝑖𝑦★
+𝑚,𝑖.
+Solving the standard linear ODE, we have for any 𝑡≥𝑇0,
+𝑞𝑑,𝑠,𝑖(𝑡) = 𝑒−𝜃𝑖(𝑡−𝑇0) 𝑞𝑑,𝑠,𝑖(𝑇0) +
+∫𝑡
+𝑇0
+𝑒−𝜃𝑖(𝑡−𝑢) 
+𝛼𝑠,𝑖−𝜛𝑠,𝑖
+∑︁
+𝑗∈I
+𝜇𝑠, 𝑗𝑦𝑠, 𝑗(𝑢)
+
+𝑑𝑢.
+Since 𝑦𝑠,𝑖(𝑢) →𝑦★
+𝑠,𝑖for each 𝑖, the integrand converges to 𝛼𝑠,𝑖−𝜛𝑠,𝑖
+Í
+𝑗∈I 𝜇𝑠, 𝑗𝑦★
+𝑠, 𝑗= 𝛼𝑠,𝑖−𝜇𝑠,𝑖𝑦★
+𝑠,𝑖= 𝜃𝑖𝑞★
+𝑑,𝑠,𝑖.
+Standard arguments for linear convolution with an exponentially decaying kernel (or directly applying
+dominated convergence) then yield 𝑞𝑑,𝑠,𝑖(𝑡) →𝑞★
+𝑑,𝑠,𝑖as 𝑡→∞. The same argument applied to the mixed
+pool queue gives 𝑞𝑑,𝑚,𝑖(𝑡) →𝑞★
+𝑑,𝑚,𝑖. Summing gives 𝑞𝑑,𝑖(𝑡) = 𝑞𝑑,𝑚,𝑖(𝑡) + 𝑞𝑑,𝑠,𝑖(𝑡) →𝑞★
+𝑑,𝑖.
+□
+EC.7.
+Additional Experiments and Empirical Validation
+This section provides additional empirical validations that complement the main text. We first provide a
+comprehensive analysis of workload heterogeneity through task-level statistics and visualization in the (𝑃, 𝐷)
+space. We then validate the exponential distribution assumption for output lengths by fitting empirical data
+and calculating divergence metrics. Finally, we detail the computing infrastructure used for our measurements
+and simulations.
+Workload heterogeneity and task characteristics. Table EC.1 reports the average prompt (input) and
+output lengths for eight task categories from the Databricks Dolly-15k instruction-tuning dataset (Conover
+et al. 2023). The data reveals substantial variation across categories. For example, summarization and
+information extraction tasks average over 1,000 input tokens with moderate output. In contrast, creative
+writing and open QA require fewer than 100 input tokens yet generate longer outputs on average.
+To further illustrate this heterogeneity, Figure EC.1 plots the input and output length pairs for two
+representative categories: Information Extraction and Creative Writing. These two classes exhibit nearly
+opposite characteristics. Information Extraction tasks cluster in the high-input and low-output region. Creative
+Writing tasks concentrate in the low-input and high-output zone. This contrast confirms that a uniform
+scheduling policy cannot efficiently balance resources across diverse workloads, which motivates the
+multiclass framework developed in this paper.
+
+
+--- Page 57 ---
+ec22
+Task Category
+Avg. 𝑃(tokens)
+Avg. 𝐷(tokens)
+Samples
+Brainstorming
+61
+331
+1,764
+Classification
+123
+142
+2,136
+Closed QA
+992
+182
+1,738
+Creative writing
+89
+915
+699
+General QA
+69
+572
+2,187
+Information extraction
+1,139
+273
+1,462
+Open QA
+45
+293
+3,739
+Summarization
+1,177
+436
+1,150
+Table EC.1
+Workload heterogeneity: average prompt (𝑃) and output (𝐷) lengths across task categories from
+the Databricks Dolly-15k instruction-tuning dataset (Conover et al. 2023).
+Figure EC.1
+Scatter plot of input versus output lengths for Information Extraction (blue) and Creative Writing
+(red) in the Databricks Dolly-15k dataset. The two categories occupy nearly opposite regions of the (𝑃, 𝐷) space.
+Validation of the exponential distribution assumption. Our model assumes exponentially distributed
+output lengths for each task class. This assumption directly determines the decode service rate in our stochastic
+network. To check whether this approximation is reasonable, we fit exponential distributions to the actual
+output length data from the Databricks Dolly-15k dataset using Maximum Likelihood Estimation.
+
+
+--- Page 58 ---
+ec23
+Figure EC.2 compares the empirical CDFs with the fitted exponential CDFs for all eight task categories.
+The exponential fit is good for most categories. Brainstorming, Classification, Closed QA, Information
+Extraction, Open QA, and Summarization all track closely. General QA shows reasonable agreement despite
+some mid-range deviation. Creative Writing deviates more noticeably in the upper tail. This is likely because
+its output distribution is heavier-tailed than a pure exponential, which is consistent with its high mean and
+variance.
+Figure EC.2
+Empirical output length CDFs (solid blue) versus fitted exponential CDFs (dashed red) for the
+eight task categories in the Databricks Dolly-15k dataset.
+
+
+--- Page 59 ---
+ec24
+To complement the visual comparison, Table EC.2 reports the Kullback-Leibler (KL) divergence between
+the empirical output-length distribution and its fitted exponential approximation for each category. Smaller
+values indicate closer agreement. Overall, the exponential assumption captures the main characteristics of the
+distributions well enough to justify its use for analytical tractability.
+Table EC.2
+KL divergence between empirical output lengths and fitted exponential distributions across task
+categories (smaller is better).
+Category
+KL divergence
+Open QA
+0.0584
+Brainstorming
+0.0652
+Closed QA
+0.1245
+Summarization
+0.1255
+General QA
+0.1309
+Classification
+0.1491
+Creative Writing
+0.1595
+Information Extraction
+0.2631
+Computing infrastructure. Table EC.3 summarizes the hardware and software environment used for the
+empirical measurements and numerical experiments in the paper.
+Table EC.3
+Computing infrastructure specifications.
+Component
+Specification
+Hardware
+CPU
+AMD EPYC 7H12 64-core processor
+Cores / threads
+2 sockets × 64 cores × 2 threads (256 hardware threads)
+Clock frequency
+1.5–2.6 GHz
+Cache
+L1d/L1i: 4 MiB (128×), L2: 64 MiB (128×), L3: 512 MiB (32×)
+GPU
+4× NVIDIA A100-SXM4-40GB
+GPU memory
+40 GB per GPU (160 GB total)
+System memory
+1.0 TiB RAM
+Swap
+8.0 GiB
+Software
+Operating system Ubuntu 22.04.5 LTS (Jammy Jellyfish)
+Python
+Version 3.9.23
+CUDA
+Version 12.6
+NVIDIA driver
+Version 560.28.03

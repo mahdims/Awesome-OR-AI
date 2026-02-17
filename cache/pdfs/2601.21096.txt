@@ -1,0 +1,1923 @@
+--- Page 1 ---
+Magellan: Autonomous Discovery of Novel Compiler
+Optimization Heuristics with AlphaEvolve
+Hongzheng Chen1,3 Alexander Novikov2 Ngân (NV) V˜u2 Hanna Alam1 Zhiru Zhang3
+Aiden Grossman1 Mircea Trofin1 Amir Yazdanbakhsh2
+1 Google 2 Google DeepMind 3 Cornell University
+Abstract
+Modern compilers rely on hand-crafted heuristics to guide
+optimization passes. These human-designed rules often strug-
+gle to adapt to the complexity of modern software and hard-
+ware and lead to high maintenance burden. To address this
+challenge, we present Magellan, an agentic framework that
+evolves the compiler pass itself by synthesizing executable
+C++ decision logic. Magellan couples an LLM coding agent
+with evolutionary search and autotuning in a closed loop of
+generation, evaluation on user-provided macro-benchmarks,
+and refinement, producing compact heuristics that integrate
+directly into existing compilers. Across several production
+optimization tasks, Magellan discovers policies that match
+or surpass expert baselines. In LLVM function inlining, Mag-
+ellan synthesizes new heuristics that outperform decades of
+manual engineering for both binary-size reduction and end-
+to-end performance. In register allocation, it learns a concise
+priority rule for live-range processing that matches intricate
+human-designed policies on a large-scale workload. We also
+report preliminary results on XLA problems, demonstrating
+portability beyond LLVM with reduced engineering effort.
+1
+Introduction
+Compilers are among the most mature and systematically en-
+gineered software systems, and many of their optimization
+problems are NP-hard [1], making exact solutions impractical
+at production scale. As a result, modern compilers rely heav-
+ily on hand-crafted heuristics [2–6], which encode expert
+intuition about complex cost-benefit tradeoffs. While these
+heuristics have enabled decades of progress, they are inher-
+ently difficult to design, tune, and maintain. This challenge
+is only worsening as hardware and software ecosystems be-
+come more heterogeneous, eroding the assumptions behind
+long-standing rules and demanding continual human effort
+to keep compiler performance competitive.
+Recent progress in large language models (LLMs) has re-
+newed interest in automating heuristic design. LLMs have
+been paired with evolutionary and feedback-driven search to
+discover algorithms and heuristics for well-defined optimiza-
+tion tasks [7–11]. Within compilers, most LLM-based efforts
+fall into two directions: either (1) replacing code generation
+by directly synthesizing target code [12, 13], or (2) searching
+for optimization sequences that drive an existing compiler to
+better results [14–17]. In contrast, our goal is different. We do
+not aim to generate per-program pass sequences, nor to by-
+pass the compiler as a code generator. Instead, we target the
+compiler’s optimization decision logic itself by evolving
+the compiler pass code, producing compact, deployable
+heuristics that can be integrated upstream and reused across
+applications.
+We argue that this pass-level evolution offers a practical
+middle ground between manual engineering and neural net-
+work (NN) policy integration. Prior NN-based policy discov-
+ery methods described in [18, 19] have shown that learned
+policies can match or outperform expert heuristics, but they
+typically require integrating neural models into the com-
+piler infrastructure [20–22]. Reproducing such integration
+for new passes, new objectives, or emerging accelerators can
+be expensive and time-consuming. In contrast, our approach
+treats heuristic design as a program-synthesis problem, di-
+rectly searching over executable C++ implementations that
+the compiler can compile and evaluate on realistic macro-
+benchmarks. As a result, the discovered heuristics retain
+deployment and maintenance properties that are identical,
+or very close, to those of human-authored compiler code.
+In this paper, we introduce Magellan, an autonomous
+framework for discovering compiler optimization heuristics
+by combining an LLM-powered coding agent with evolution-
+ary search and autotuning. Magellan is designed for real-
+world, large-scale, production compiler optimization: users
+can directly use end-to-end application performance met-
+rics as the reward signal, and Magellan iteratively proposes,
+evaluates, and refines a pass implementation that integrates
+directly into the compiler. We find that even for fundamental,
+heavily studied optimizations such as function inlining [23],
+Magellan can synthesize new heuristics that surpass decades
+of manually engineered effort, demonstrating that mature
+compiler passes still contain untapped optimization poten-
+tial when explored with scalable automated search.
+We demonstrate the generality and practical impact of
+Magellan through in-depth case studies on heuristic-driven
+LLVM passes, specifically function inlining and register al-
+location, and extend our evaluation to additional tasks in
+XLA. Overall, Magellan greatly simplifies automated heuris-
+tic discovery in compilers by reducing it to a direct search
+over human-readable, deployable compiler code, delivering
+both productivity gains and measurable improvements over
+expert baselines. Our main contributions are:
+1
+arXiv:2601.21096v1  [cs.AI]  28 Jan 2026
+
+
+--- Page 2 ---
+Figure 1. Overview of Magellan. We use LLVM as the demonstration, but Magellan can be readily applied to other compilers.
+• We introduce Magellan, an end-to-end compiler optimiza-
+tion agent powered by AlphaEvolve [10] that evolves com-
+piler passes by synthesizing and evaluating executable
+C++ heuristics with a simple integration pass into existing
+compilers.
+• We introduce a hierarchical search strategy in Magellan
+that improves evolution efficiency by combining an LLM
+to propose heuristic templates with an autotuner to refine
+hyperparameters during search.
+• We present case studies on realistic compiler optimization
+tasks in LLVM and XLA, showing code-size reduction and
+runtime speedups over expert-crafted baselines.
+2
+Magellan Design
+The process illustrated in Fig. 1 presents the four-stage work-
+flow of Magellan, which integrates AlphaEvolve with the
+LLVM compiler to automate the discovery and refinement
+of optimization heuristics. LLVM can be substituted with
+other infrastructures such as XLA to target different com-
+piler passes and backends. The key idea of Magellan is a
+hierarchical search strategy that separates high-level policy
+design from low-level parameter tuning: the LLM proposes
+a heuristic template with symbolic hyperparameters, and
+an external autotuner later fills in those values. The system
+operates as a closed-loop process comprising (1) policy pro-
+posal, (2) local evaluation, (3) hyperparameter tuning,
+and (4) feedback generation, forming an iterative cycle
+that gradually improves compiler decision policies.
+2.1
+Policy Proposal
+In the first stage, Magellan uses AlphaEvolve equipped with
+an LLM to modify a source file that contains the policy we
+want to improve. The policy-relevant regions are marked
+with EVOLVE-BLOCK comments, a mechanism provided by
+AlphaEvolve to delimit editable code. Each candidate defines
+a decision policy for a compiler optimization pass and con-
+forms to LLVM’s standard API interfaces. To structure the
+search space, we prompt the LLM to emit a policy template
+in which tunable constants are parameterized as explicit
+compiler flags, allowing the model to focus on high-level
+decision logic rather than committing to specific numerical
+thresholds. The synthesized template is then automatically
+inserted into the LLVM codebase for evaluation.
+2.2
+Local Evaluation
+After a candidate heuristic with default hyperparameters
+is generated, the compiler is recompiled with the modified
+source file described in the first stage, and the resulting com-
+piler is evaluated on representative macro-benchmarks to
+obtain an end-to-end reward signal. In our current imple-
+mentation, we rebuild the compiler and execute the resulting
+toolchain on the benchmark suite, reporting metrics such
+as binary size (e.g., via llvm-size) or runtime performance
+(e.g., via perf stat). This setup grounds evaluation in real-
+istic workloads rather than synthetic objectives, and it also
+enables us to quantify the sampling complexity required for
+progress under different configurations. Importantly, Magel-
+lan is not restricted to full end-to-end execution: when such
+evaluation is too costly, the same loop can instead rely on
+proxy signals (e.g., static cost models or faster approxima-
+tions) as the reward, trading fidelity for scalability.
+2.3
+Hyperparameter Tuning
+The resulting performance score is then passed to a box-
+black autotuner [24], which proposes new hyperparameter
+configurations based on previous evaluation results. Dur-
+ing this stage, the program template remains fixed, while
+the hyperparameters are iteratively adjusted to seek better
+2
+
+
+--- Page 3 ---
+Magellan : Autonomous Discovery of Novel Compiler Optimization Heuristics with AlphaEvolve
+performance. After a fixed number of tuning rounds, the
+best-performing configuration is returned to AlphaEvolve
+as feedback for further policy refinement.
+2.4
+Feedback Incorporation
+In the final stage, the evaluation results, including the best
+score, tuning logs, and profiling traces, are returned to Al-
+phaEvolve. AlphaEvolve then performs an evolutionary search
+over policy templates, using these signals together with the
+empirical reward to select promising candidates and gen-
+erate new variants for the next iteration. The system then
+evaluates the new candidate and repeats the loop, iteratively
+refining the policy template through successive rounds of
+selection and variation.
+3
+Case Studies
+We demonstrate the practicality of Magellan by applying
+it to several key compiler optimization problems. Unless
+otherwise specified, all experiments use Gemini-2.5-Pro [25]
+as the base model. By default, no autotuning is applied. When
+it is, we use Vizier [24] as the autotuner. Our experiments
+are conducted on Google’s internal clang/LLVM toolchain,
+which closely tracks the LLVM main repository tip-of-tree
+rather than upstream release snapshots; commits from the
+2025 summer timeframe are representative of the version
+used in our study.
+3.1
+Function Inlining for Size
+Function inlining is a classic compiler optimization that re-
+places function calls with the body of the corresponding
+callee [6]. This transformation eliminates call overhead and
+exposes additional optimization opportunities such as con-
+stant propagation, dead code elimination, and register allo-
+cation across call boundaries. However, inlining may also
+increase code size and may degrade instruction cache be-
+havior, making the decision of when and what to inline
+non-trivial. In fact, globally optimal inlining is known to be
+NP-hard [23], so modern compilers rely on heuristic cost
+models to balance performance benefits against code growth
+and resource constraints.
+Specifically, we choose function inlining for binary size
+reduction as Magellan’s pilot problem because it provides a
+clear and deterministic reward signal, and because we can
+contrast applying Magellan as an exact replacement of a
+neural network policy [18]. This optimization is important
+and is used for edge deployments at Google, such as Fuchsia
+OS, Chrome on Android, as well as cloud infrastructure. We
+consider two settings, with examples shown in Fig. 2:
+(a) Partial Heuristics: Feature-based policies defined by ex-
+tending MLModelRunner::evaluateUntyped, the inter-
+face used to embed neural networks [18]. In this case,
+1
+(a) Partial heuristic definition.
+2
+// llvm/lib/Analysis/AlphaEvolveRunner.cpp
+3
+// EVOLVE-BLOCK-START
+4
+void *AERunner::evaluateUntyped() {
+5
+std::unique_ptr<InlineAdvice>
+6
+int64_t CallerUsers =
+7
+*getTensor<int64_t>(FeatureIndex::caller_users);
+8
+int64_t CalleeUsers =
+9
+*getTensor<int64_t>(FeatureIndex::callee_users);
+10
+// ...
+11
+}
+12
+// EVOLVE-BLOCK-END
+13
+14
+(b) Full heuristic definition.
+15
+// llvm/lib/Analysis/AlphaEvolveRunner.cpp
+16
+// EVOLVE-BLOCK-START
+17
+AEInlineAdvisor::getAdviceImpl(CallBase &CB) {
+18
+bool IsInliningRecommended = false;
+19
+Function *Callee = CB.getCalledFunction();
+20
+Function *Caller = CB.getCaller();
+21
+// ...
+22
+}
+23
+// EVOLVE-BLOCK-END
+Figure 2. Evolvable blocks for function inlining.
+Magellan needs to compose 38 predefined features1 (e.g.,
+call site and caller/callee usage) to form a new policy.
+(b) Full Heuristics: API-level decision logic implemented
+via MLInlineAdvisor::getAdviceImpl. Magellan only
+receives a CallBase object and must infer which LLVM
+APIs to invoke to construct the full policy. Note that start-
+ing from CallBase, LLVM’s IR interfaces allow traversing
+the surrounding context, including the enclosing basic
+block and function, any loops containing the call site, and
+ultimately the entire compilation unit.
+In both settings, the heuristic returns a binary decision indi-
+cating whether the call site should be inlined. The legality of
+an inlining decision is checked before invoking the heuris-
+tic using the existing MLInlineAdvisor infrastructure. This
+ensures that, for any policy that integrates successfully into
+the compiler, the compiler’s output is always correct.
+We evaluate Magellan using an internal search applica-
+tion and start from a naive policy that always returns false.
+The baseline is the upstream LLVM inlining heuristic2. In the
+first setting, Magellan composes heuristics using the features
+extracted in the MLInlineAdvisor [18], intended as inputs
+for a neural network. In contrast to the previously used neu-
+ral network-based training techniques [18], we compute the
+reward from the final, linked binary, as opposed to compiling
+random samples of compilation units and using the .text
+section size in the resulting object file. This feature-based
+setting exhibits fast early improvements: within a few dozen
+iterations, the search consistently outperforms the baseline
+and converges to a stable plateau, achieving a 4.27% size
+1https://github.com/llvm/llvm-project/blob/
+c878baf1d9a259cf0788ffa1cc5c9d065adcb4c5/llvm/include/llvm/Analysis/
+InlineModelFeatureMaps.h
+2https://github.com/llvm/llvm-project/blob/main/llvm/lib/Analysis/
+InlineCost.cpp
+3
+
+
+--- Page 4 ---
+0
+100
+200
+300
+400
+500
+# Program Samples
+0.0%
+1.0%
+2.0%
+3.0%
+4.0%
+5.0%
+Binary Size Reduction
+Partial heuristic
+Full heuristic
+Full heuristic (autotune)
+Figure 3. Evolutionary curve of binary size reduction on in-
+ternal search benchmark. Each program sample corresponds
+to a specific policy template combined with a set of hyper-
+parameters proposed by the autotuner. The initial points
+differ between the two methods because predefined features
+influence the inlining decisions prior to search.
+reduction relative to LLVM’s upstream heuristic after 1.5
+days of sequential exploration.
+In the second setting, Magellan generates the entire inlin-
+ing heuristic directly using LLVM APIs. As shown in Fig. 3,
+the API-level search starts from a weaker initial point be-
+cause no predefined features are available to guide decisions,
+leading to a larger trial-and-error phase in the early stage.
+However, it continues to improve well beyond the plateau
+of the feature-based policy, demonstrating the advantage of
+a more expressive search space. By the end of the 1.5-day
+search window, the API-based approach yields a 5.23% im-
+provement over the human-developed heuristic, surpassing
+both the baseline and the feature-based setting. Notably, the
+evolutionary curves of the two methods differ not only in
+final performance but also in learning dynamics: the feature-
+based search converges faster but saturates earlier, while the
+API-based search explores more aggressively and achieves
+higher eventual gains. We provide a detailed analysis of the
+synthesized policy in Section 3.1.3.
+3.1.1
+Effectiveness of Separation of Concerns. To eval-
+uate the benefit of separating high-level policy design from
+low-level parameter tuning, we augment the full-heuristic
+setting with an external autotuner that searches only over
+hyperparameters while holding the policy template fixed.
+In each outer iteration, the autotuner proposes a batch of
+10 candidate hyperparameter configurations, and Magellan
+selects the best-performing one for the next iteration. As
+shown in Fig. 3, this decoupled strategy substantially accel-
+erates convergence and yields higher final gains compared
+to having an LLM jointly search over both policy logic and
+hyperparameters. While the untuned full-heuristic setting
+already outperforms the feature-based setting, adding au-
+totuning further boosts binary size reduction by exploring
+a richer numeric design space with minimal LLM involve-
+ment. Within just 10 outer iterations (100 program samples),
+May 1, 2025
+June 1, 2025
+July 1, 2025
+Aug 1, 2025
+0%
+1%
+2%
+3%
+4%
+5%
+6%
+7%
+Binary Size Reduction
+5.95%
+5.82%
+5.75%
+5.91%
+5.69%
+5.56%
+5.50%
+5.67%
+Magellan
+NN Model
+Figure 4. Temporal generalization for function inlining.
+Magellan achieves more than a 5% size reduction in roughly
+5 hours. This improvement is driven by higher sampling
+efficiency by construction: once a policy template compiles,
+the autotuner can explore many hyperparameter settings
+without regenerating the policy, and in particular without re-
+peatedly recompiling the compiler. Consequently, the invalid
+rate drops from over 65% when the LLM directly proposes
+full heuristics to only 13% with autotuning, yielding a 5×
+reduction in wasted samples. Taken together, these results
+highlight the effectiveness and practicality of separating
+high-level policy design from low-level parameter tuning.
+3.1.2
+Temporal and Domain Generalization. To under-
+stand how well the generated policy generalizes, we evaluate
+the same policy across both different timestamps and differ-
+ent applications.
+As Google uses a monolithic source repository [26], a pol-
+icy is trained at a specific timestamp while the underlying
+application and codebase evolve over time. We take the best
+policy produced by Magellan in Fig. 3 and assess its temporal
+generalization by measuring performance across four snap-
+shots of the application benchmark collected over consecu-
+tive months. We compare the evolved heuristic against the
+currently-used neural network3, which was trained around
+2 years ago with a combination of evolutionary strategy [27]
+applied to a large internal code base, followed by further
+tuning with offline imitation learning [28] applied to a rel-
+evant internal binary. Despite continuous drift in compiler
+internals and workload characteristics, Magellan consistently
+delivers superior or comparable results, achieving code size
+reductions between 5.75% and 5.95% and slightly outperform-
+ing the neural network. These results suggest that Magel-
+lan’s C++ policies generalize robustly across time without
+requiring continual retraining or fine-tuning.
+Fig. 5 extends the analysis to domain generalization, eval-
+uating Magellan across more than ten production binaries
+compiled with the production optimization flags. Each binary
+represents a distinct application domain, including search
+infrastructure and embedded workloads. Here, Magellan
+achieved an average size reduction of 8.79%, closely matching
+3https://github.com/google/ml-compiler-opt/releases/tag/inlining-Oz-
+v1.2. It is used by LLVM using the existing, in-tree MLGO facilities, which
+will not be detailed here.
+4
+
+
+--- Page 5 ---
+Magellan : Autonomous Discovery of Novel Compiler Optimization Heuristics with AlphaEvolve
+Binary 1
+Binary 2
+Binary 3
+Binary 4
+Binary 5
+Binary 6
+Binary 7
+Binary 8
+Binary 9
+Binary 10
+Binary 11
+Binary 12
+Binary 13
+0.0%
+2.5%
+5.0%
+7.5%
+10.0%
+12.5%
+Binary Size Reduction
+7.6%
+10.6%
+11.7%
+4.8%
+7.1%
+10.2%
+5.8%
+10.6%
+9.5%
+8.7%
+8.3%
+7.2%
+8.6%
+7.6%
+10.3%
+12.4%
+5.9%
+7.2%
+9.9%
+7.3%
+10.3%
+9.3%
+8.6%
+8.2%
+8.8%
+8.6%
+Magellan
+NN Model
+Figure 5. Domain generalization for function inlining.
+the neural model’s 8.52%, and outperformed it on a major-
+ity of individual binaries. The observed consistency across
+heterogeneous codebases indicates that the heuristics discov-
+ered by Magellan capture broadly applicable structural pat-
+terns rather than overfitting to specific benchmarks. More-
+over, this generalization arises without model retraining or
+feature re-engineering. Collectively, these results validate
+that Magellan produces heuristics that are both temporally
+robust and domain generalizable, meeting a criterion for
+practical deployment in evolving compiler toolchains.
+3.1.3
+Code Maintainability. A detailed analysis of the
+heuristics synthesized by Magellan shows that the gener-
+ated code is far more compact while achieving superior opti-
+mization quality compared to LLVM’s manually engineered
+baseline. The evolved inlining policy contains 143 lines of ex-
+ecutable logic as in Appendix A, roughly 15× shorter than the
+2,115-line manual implementation after removing comments
+and blanks, yet integrates cleanly into LLVM and consis-
+tently delivers larger code-size reductions. This conciseness
+stems from eliminating redundant branching conditions and
+special-case logic, retaining only the key decisions needed to
+balance inlining benefits against code growth. We emphasize,
+however, that compactness should not be conflated with gen-
+eral maintainability: it remains unclear whether a broader,
+multi-objective policy (e.g., jointly optimizing size and per-
+formance with scope comparable to the default heuristic)
+would remain similarly concise.
+In addition, Magellan achieves better code size reduction
+by identifying that strategic inlining can shrink binaries
+rather than simply avoiding code growth. Its key insight is
+to aggressively inline single-use functions so that both the
+call site and the entire function body disappear, and to pri-
+oritize readonly functions that enable substantial dead code
+elimination after inlining. The generated policy also uses
+a weighted complexity model that penalizes control-flow
+instructions more heavily, and adds bonuses for constant ar-
+guments and exact type matches that indicate simplification
+opportunities. In contrast to LLVM’s conservative strategy
+of inlining less for size, this policy recognizes that inlining
+0
+20
+40
+60
+80
+100
+# Iterations
+35%
+30%
+25%
+20%
+15%
+10%
+5%
+0%
+Performance Improvement
+0.61%
+Gemini 2.5
+Gemini 3 (Continuation)
+Gemini 3
+Figure 6. Evolutionary curve of performance improvement
+on the clang benchmark.
+the right functions, particularly single-use and side-effect-
+free ones, often leads to smaller final binaries by unlocking
+downstream optimizations.
+3.2
+Function Inlining for Performance
+We further evaluate Magellan on the more challenging task
+of improving end-to-end performance via function inlin-
+ing, using LLVM’s upstream heuristic as the baseline. As
+with binary-size reduction, the reward signal is sparse, but
+performance feedback is both noisy and substantially more
+expensive to obtain because, beyond recompilation, it re-
+quires executing representative macro-benchmarks; micro-
+benchmarks are often poor proxies for large production
+workloads with flat profiles and diverse hot paths [29]. To
+partially control this cost, we use clang itself as the macro-
+benchmark, which we judge to be representative while re-
+maining practical to evaluate. The benchmarked binary was
+built using the same Profile Guided Optimization (PGO) pro-
+file, obtained using IR instrumentation, between baseline and
+experiment, and using distributed ThinLTO [30] and the -O3
+optimization level. We start from a naive policy that returns
+false for all inlining decisions, and in all experiments the
+autotuner proposes 40 hyperparameter configurations per it-
+eration. Using Gemini-2.5-Pro as the base model, Magellan re-
+covers from the poor starting point and discovers non-trivial
+improvements, but the search eventually plateaus around a
+-2.4% regression after 60 iterations and does not surpass the
+baseline. We also evaluate Gemini-3-Pro [31] starting from
+the same naive false policy, but it similarly fails to push
+beyond 0% after 100 iterations (about one week of sequen-
+tial evaluation), suggesting that starting from scratch, even
+with a stronger LLM, is insufficient to cross the performance
+ceiling under this search setting.
+To determine whether the plateau reflects a hard perfor-
+mance boundary or a search limitation, we conduct a further
+experiment: we take the best-performing heuristic produced
+by Gemini-2.5-Pro and use it as the initialization seed for
+Gemini-3-Pro, while keeping the same autotuning config-
+uration of 40 hyperparameter proposals per iteration. This
+5
+
+
+--- Page 6 ---
+continuation strategy constrains the search space around a
+well-structured heuristic and provides inductive hints that
+enable Gemini-3-Pro to escape the 0% plateau. As shown in
+Fig. 6, the continued Gemini-3-Pro run achieves consistent
+positive speedups beyond 0%, ultimately surpassing the hand-
+tuned baseline by 0.61%. The evolved policy outperforms
+LLVM’s upstream inliner by using a lightweight cost model
+with well-tuned heuristics: it skips zero-cost instructions, ap-
+plies large bonuses for constant arguments, loop nesting, and
+vector code, and scales thresholds aggressively for hot call
+sites, inlining the cases that matter most without expensive
+analysis overhead (Appendix B). To our knowledge, while
+neural-network policies deployed in LLVM have previously
+exhibited similar ceiling-breaking behavior [32], such results
+have so far been demonstrated only on micro-benchmarks
+rather than large workloads, and without leveraging (and
+baselining from) the state of the art in performance opti-
+mization, such as PGO and (Thin)LTO [30]. These findings
+show that large-model combined with localized hyperpa-
+rameter tuning can unlock new regions of the performance
+landscape, highlighting a promising direction for automated
+performance optimization under sparse and noisy objectives.
+3.3
+Preliminary Results on Other Problems
+Beyond function inlining, we also evaluate Magellan on addi-
+tional optimization tasks in LLVM and XLA. The additional
+task for LLVM is register allocation. In this setting, Magellan
+targets the priority-queue policy used for live-range process-
+ing in RegAllocGreedy4. On a large-scale production search
+workload, Magellan converges to an unexpectedly simple so-
+lution: a constant-value policy, which implies that the order
+of live-range insertion alone is sufficient to achieve strong
+performance in this configuration. Despite its simplicity, the
+evolved policy matches the performance of intricate human-
+crafted heuristics, improving from -0.55% to -0.15% within
+relatively few iterations and indicating rapid convergence
+toward a near-optimal behavior.
+To demonstrate Magellan’s applicability beyond LLVM,
+we further evaluate it within the XLA compiler stack, focus-
+ing on graph rewriting and auto-sharding. The graph rewrit-
+ing task builds on Enzyme-JAX [33, 34], which uses equality
+saturation [35] to apply rewrite rules exhaustively and rep-
+resent many equivalent computation graphs in an e-graph.
+After saturation, the key challenge is extraction: selecting
+a single optimized graph under a cost model. The e-graph
+groups equivalent expressions into e-classes, each containing
+multiple e-nodes whose children reference other e-classes.
+A valid extraction chooses one e-node per reachable e-class
+starting from designated roots, ensures that selecting an e-
+node also selects exactly one representative from each of its
+child e-classes, and avoids cycles. This problem is NP-hard
+4https://github.com/llvm/llvm-project/blob/main/llvm/lib/CodeGen/
+RegAllocGreedy.cpp
+and is typically addressed with ILP or heuristics [36, 37]. In
+our setting, each e-node is assigned a cost, and the objec-
+tive is to minimize the total cost of the extracted program.
+Magellan synthesizes new extraction heuristics that guide
+these selection decisions, achieving a 7% improvement over
+manually designed policies and demonstrating its ability to
+navigate the combinatorial tradeoffs inherent to eqsat-based
+graph optimization.
+The second task targets auto-sharding [38–40] in XLA
+for distributed TPU execution, following the ASPLOS’25
+IOPDDL contest setting [41]. The contest formulates the
+problem as a constrained combinatorial optimization task
+over a computational graph: each node must be assigned a
+sharding strategy from a discrete candidate set, and the objec-
+tive is to minimize the total cost across both computation and
+inter-device communication and resharding, while ensuring
+that time-varying memory usage does not exceed a global
+budget. The inputs to this task are graph instances derived
+from real models (such as diffusion and Gemma), where
+nodes expose multiple valid strategies and edges capture
+communication effects between strategy choices. We follow
+the contest protocol by using the same public benchmark in-
+stances for training and the private instances for evaluation
+(5 public and 20 private in the contest split), and we adopt
+the same objective and scoring function as the competition.
+For initialization, we feed the official problem specification5
+to Gemini-2.5-Pro to obtain the initial solution and then ap-
+ply Magellan to evolve the heuristic strategy that selects
+sharding decisions to reduce the global cost while respecting
+memory constraints. After one week of evolution, Magellan
+achieves performance comparable to top contest submissions
+without manually engineered cost models. Although inte-
+gration into the full XLA pipeline is still in progress by the
+contest organizers, these results demonstrate that Magel-
+lan can be applied to large-scale ML compiler optimization
+problems and is portable beyond LLVM.
+4
+Related Work
+Large language models (LLMs) have recently been paired
+with evolutionary and feedback-driven search to tackle tradi-
+tional optimization problems with well-defined metrics. Fun-
+Search [7] demonstrated that combining an LLM with evo-
+lutionary program search can discover improved solutions
+to traditional combinatorial optimization problems such as
+cap set and bin packing through iterative program refine-
+ment. Subsequent work incorporates LLMs into evolutionary
+frameworks that use reflection, crossover, and mutation to
+refine candidate heuristics [8, 9]. AlphaEvolve [10] extends
+this paradigm by evolving entire codebases rather than iso-
+lated functions, and demonstrates algorithmic improvements
+across a range of scientific and engineering applications.
+5https://github.com/asplos-contest/2025/blob/main/IOPDDL.md
+6
+
+
+--- Page 7 ---
+Magellan : Autonomous Discovery of Novel Compiler Optimization Heuristics with AlphaEvolve
+ShinkaEvolve [11] further advances the approach with tech-
+niques that improve sample efficiency and exploration be-
+havior.
+The success of these LLM-guided evolutionary frame-
+works has stimulated interest in system and compiler opti-
+mization problems, which often involve combinatorial search
+spaces. To drive progress in this direction, HeuriGym [42]
+was proposed as one of the first comprehensive suites of sys-
+tem and compiler tasks tailored for LLM evaluation. Broader
+perspectives on LLM-driven scientific workflows are ex-
+plored in AI-Driven Research Systems (ADRS) [43], which
+highlight the potential for LLMs to automate complex re-
+search pipelines across system domains. Task-specific solvers
+like SATLUTION [44] apply LLMs to SAT solving.
+In LLM-enabled compiler and program generation, prior
+work largely follows two directions. The first uses the LLM
+as a code generator in place of the compiler, directly emitting
+target code or accelerator kernels from high-level descrip-
+tions [12, 13, 45]. While promising, this line of work is typi-
+cally limited to relatively small kernels, and it bypasses the
+mature correctness and compatibility guarantees provided
+by existing compiler infrastructures. In contrast, we aim to
+reuse the compiler pipeline to preserve these properties and
+to target large, production applications. The second direction
+is more complementary to our goal: instead of generating
+code, LLMs propose optimization sequences or transforma-
+tion plans that steer an existing compiler toward better out-
+comes [14]. These approaches often pair LLM proposals with
+structured search such as MCTS [15] and task-specific fine-
+tuning [16, 17] to improve decisions in phase ordering and
+heuristic selection. However, they generally require generat-
+ing sequences per input application, whereas our approach
+incurs a one-time cost by directly evolving deployable com-
+piler passes that can be reused across programs.
+Complementary to generative approaches, there is a rich
+literature on machine learning-based heuristic synthesis
+within compiler infrastructures. Reinforcement learning en-
+vironments such as CompilerGym [19] enable agents to inter-
+act with real compilers to learn optimization sequences from
+feedback, avoiding per-program generation at inference time.
+In LLVM specifically, ML-Guided Optimization (MLGO) fa-
+cilities [18] allow using trained neural policies to replace
+hand-crafted heuristics for decisions such as inlining or reg-
+ister allocation [46], demonstrating that learned heuristics
+can surpass baseline compiler performance without explicit
+program synthesis.
+Our work with Magellan aligns with these ML-driven
+compiler efforts but emphasizes maintainable and easily de-
+ployable heuristic synthesis by separating high-level policy
+generation from low-level numeric tuning. Magellan synthe-
+sizes compact, deployable compiler passes that generalize
+across applications, combining LLM expressiveness with
+autotuner efficiency to balance search cost and practical de-
+ployment in real-world compiler stacks.
+5
+Discussion and Future Work
+The effectiveness of Magellan stems from its combination of
+LLM-driven creativity and systematic evolutionary search
+over both policy templates and hyperparameters. The LLM
+proposes a C++ heuristic template that uses LLVM’s APIs and
+exposes its parameters as compiler flags, while the evolution-
+ary search explores sparse reward landscapes in a principled
+manner. The incorporation of an autotuner that tunes the
+exposed parameters further improves sampling efficiency.
+Beyond raw performance gains, a key outcome is a substan-
+tial productivity improvement: Magellan can quickly generate
+heuristics that match, and often surpass, those developed
+manually over decades, using the same macro-benchmarks
+that human developers rely on to obtain an end-to-end re-
+ward signal. It produces concise, human-readable heuristic
+code that can be shipped and maintained just like human-
+authored compiler code, substantially lowering the barrier to
+deploying data-driven compiler optimizations in production.
+Despite these strengths, several challenges and open ques-
+tions remain. The current search loop is constrained by the
+cost of compiling and evaluating each candidate, especially
+for performance objectives that require evaluating represen-
+tative macro-benchmarks. It is unclear which properties, if
+any, make LLM-driven pass evolution competitive (insofar as
+policy discovery goes) relative to neural-policy approaches,
+which face similar evaluation cost challenges. Understanding
+when this alternative is preferable, and how its effectiveness
+scales with search budget, model choice, and objective noise,
+is an important direction for future study.
+Looking forward, we see several promising directions.
+First, scaling up evaluations with longer search iterations
+will help characterize convergence behavior and clarify the
+limits of the current approach. Second, Magellan can comple-
+ment neural approaches by automating feature discovery, for
+example in conjunction with learned embedding methods
+such as IR2Vec [47]. Third, Magellan should be applied to
+green-field problems in different compiler infrastructures
+and domain-specific systems; recent compilers for GPUs
+and NPUs, such as those targeting kernel mapping, operator
+scheduling, and task assignment, rely on heuristics that are
+ripe for automated discovery [48–51]. An important question
+this can answer is whether Magellan can discover heuristics
+in the absence of pre-existing literature and examples. Fi-
+nally, we aim for Magellan to evolve into a general platform
+capable of rapidly adapting compiler heuristics to new archi-
+tectures, optimization tasks, and performance constraints,
+enabling co-design workflows where humans and AI collabo-
+rate fluidly to push the boundaries of automated performance
+engineering.
+7
+
+
+--- Page 8 ---
+Acknowledgment
+We thank Jacques Pienaar, William Moses, Jeremy Kun, Michael
+D. Moffitt, Sami Alabed, and Kazu Hirata for providing opti-
+mization problems for LLVM and XLA. We are also grateful
+to David Li, Tipp Moseley, and Parthasarathy Ranganathan
+for their feedback on our framework, and to Sagi Perel for
+his support with Vizier. We also thank the AlphaEvolve team
+and the extended team at Google DeepMind who enabled
+and supported this research direction.
+References
+[1] Alfred V. Aho, Monica S. Lam, Ravi Sethi, and Jeffrey D. Ullman.
+Compilers: Principles, Techniques, and Tools (2nd Edition). Addison-
+Wesley Longman Publishing Co., Inc., USA, 2006.
+[2] Fisher. Trace scheduling: A technique for global microcode com-
+paction. IEEE Transactions on Computers, C-30(7):478–490, 1981.
+[3] G. J. Chaitin. Register allocation &amp; spilling via graph coloring. In
+Proceedings of the 1982 SIGPLAN Symposium on Compiler Construction,
+SIGPLAN ’82, page 98–105, New York, NY, USA, 1982. Association for
+Computing Machinery.
+[4] M. Lam. Software pipelining: an effective scheduling technique for
+vliw machines. In Proceedings of the ACM SIGPLAN 1988 Conference
+on Programming Language Design and Implementation, PLDI ’88, page
+318–328, New York, NY, USA, 1988. Association for Computing Ma-
+chinery.
+[5] David G. Bradlee, Susan J. Eggers, and Robert R. Henry. Integrating
+register allocation and instruction scheduling for riscs. SIGPLAN Not.,
+26(4):122–131, April 1991.
+[6] P. P. Chang and W.-W. Hwu. Inline function expansion for compiling
+c programs. In Proceedings of the ACM SIGPLAN 1989 Conference on
+Programming Language Design and Implementation, PLDI ’89, page
+246–257, New York, NY, USA, 1989. Association for Computing Ma-
+chinery.
+[7] Bernardino Romera-Paredes, Mohammadamin Barekatain, Alexander
+Novikov, Matej Balog, M Pawan Kumar, Emilien Dupont, Francisco JR
+Ruiz, Jordan S Ellenberg, Pengming Wang, Omar Fawzi, et al. Mathe-
+matical discoveries from program search with large language models.
+Nature, 625(7995):468–475, 2024.
+[8] Haoran Ye, Jiarui Wang, Zhiguang Cao, Federico Berto, Chuanbo Hua,
+Haeyeon Kim, Jinkyoo Park, and Guojie Song. Reevo: Large language
+models as hyper-heuristics with reflective evolution. In Advances in
+Neural Information Processing Systems (NeurIPS), 2024.
+[9] Fei Liu, Xialiang Tong, Mingxuan Yuan, Xi Lin, Fu Luo, Zhenkun
+Wang, Zhichao Lu, and Qingfu Zhang. Evolution of heuristics: towards
+efficient automatic algorithm design using large language model. In
+Proceedings of the 41st International Conference on Machine Learning
+(ICML), 2024.
+[10] Alexander Novikov, Ngân V˜u, Marvin Eisenberger, Emilien Dupont,
+Po-Sen Huang, Adam Zsolt Wagner, Sergey Shirobokov, Borislav Ko-
+zlovskii, Francisco JR Ruiz, Abbas Mehrabian, et al. Alphaevolve: A
+coding agent for scientific and algorithmic discovery. arXiv preprint
+arXiv:2506.13131, 2025.
+[11] Robert Tjarko Lange, Yuki Imajuku, and Edoardo Cetin. Shinkaevolve:
+Towards open-ended and sample-efficient program evolution. arXiv
+preprint arXiv:2509.19349, 2025.
+[12] Robert Tjarko Lange, Qi Sun, Aaditya Prasad, Maxence Faldor, Yujin
+Tang, and David Ha. Towards robust agentic cuda kernel benchmark-
+ing, verification, and optimization. arXiv preprint arXiv:2509.14279,
+2025.
+[13] Gang Liao, Hongsen Qin, Ying Wang, Alicia Golden, Michael Kuch-
+nik, Yavuz Yetim, Jia Jiunn Ang, Chunli Fu, Yihan He, Samuel Hsia,
+et al. Kernelevolve: Scaling agentic kernel coding for heterogeneous
+ai accelerators at meta. arXiv preprint arXiv:2512.23236, 2025.
+[14] Charles Hong, Sahil Bhatia, Alvin Cheung, and Sophia Shao. Au-
+tocomp: Llm-driven code optimization for tensor accelerators. In
+Machine Learning for Computer Architecture and Systems 2025, 2025.
+[15] Sujun Tang, Christopher Priebe, Rohan Mahapatra, Lianhui Qin, and
+Hadi Esmaeilzadeh. Compiler optimization via llm reasoning for
+efficient model serving. arXiv preprint arXiv:2506.01374, 2025.
+[16] Chris Cummins, Volker Seeker, Dejan Grubisic, Mostafa Elhoushi,
+Youwei Liang, Baptiste Roziere, Jonas Gehring, Fabian Gloeckle, Kim
+Hazelwood, Gabriel Synnaeve, et al. Large language models for com-
+piler optimization. arXiv preprint arXiv:2309.07062, 2023.
+[17] Chris Cummins, Volker Seeker, Dejan Grubisic, Baptiste Roziere, Jonas
+Gehring, Gabriel Synnaeve, and Hugh Leather. Meta large language
+model compiler: Foundation models of compiler optimization. arXiv
+preprint arXiv:2407.02524, 2024.
+[18] Mircea Trofin, Yundi Qian, Eugene Brevdo, Zinan Lin, Krzysztof Choro-
+manski, and David Li. MLGO: a machine learning guided compiler
+optimizations framework. arXiv preprint arXiv:2101.04808, 2021.
+[19] Chris Cummins, Bram Wasti, Jiadong Guo, Brandon Cui, Jason Ansel,
+Sahir Gomez, Somya Jain, Jia Liu, Olivier Teytaud, Benoit Steiner, et al.
+Compilergym: Robust, performant compiler optimization environ-
+ments for ai research. In 2022 IEEE/ACM International Symposium on
+Code Generation and Optimization (CGO), pages 92–105. IEEE, 2022.
+[20] S. VenkataKeerthy, Siddharth Jain, Umesh Kalvakuntla, Pranav Sai
+Gorantla, Rajiv Shailesh Chitale, Eugene Brevdo, Albert Cohen, Mircea
+Trofin, and Ramakrishna Upadrasta. The next 700 ml-enabled compiler
+optimizations. In Proceedings of the 33rd ACM SIGPLAN International
+Conference on Compiler Construction, CC 2024, page 238–249, New
+York, NY, USA, 2024. Association for Computing Machinery.
+[21] Qijing Huang, Ameer Haj-Ali, William Moses, John Xiang, Ion Sto-
+ica, Krste Asanovic, and John Wawrzynek. Autophase: Compiler
+phase-ordering for hls with deep reinforcement learning. In 2019 IEEE
+27th Annual International Symposium on Field-Programmable Custom
+Computing Machines (FCCM), pages 308–308. IEEE, 2019.
+[22] Hongzheng Chen and Minghua Shen. A deep-reinforcement-learning-
+based scheduler for fpga hls. In 2019 IEEE/ACM International Confer-
+ence on Computer-Aided Design (ICCAD), pages 1–8. IEEE, 2019.
+[23] Theodoros Theodoridis, Tobias Grosser, and Zhendong Su. Under-
+standing and exploiting optimal function inlining. In Proceedings of
+the 27th ACM International Conference on Architectural Support for
+Programming Languages and Operating Systems, ASPLOS ’22, page
+977–989, New York, NY, USA, 2022. Association for Computing Ma-
+chinery.
+[24] Daniel Golovin, Benjamin Solnik, Subhodeep Moitra, Greg Kochanski,
+John Karro, and David Sculley. Google vizier: A service for black-box
+optimization. In Proceedings of the 23rd ACM SIGKDD international
+conference on knowledge discovery and data mining, pages 1487–1495,
+2017.
+[25] Gheorghe Comanici, Eric Bieber, Mike Schaekermann, Ice Pasupat,
+Noveen Sachdeva, Inderjit Dhillon, Marcel Blistein, Ori Ram, Dan
+Zhang, Evan Rosen, et al. Gemini 2.5: Pushing the frontier with
+advanced reasoning, multimodality, long context, and next generation
+agentic capabilities. arXiv preprint arXiv:2507.06261, 2025.
+[26] Rachel Potvin and Josh Levenberg. Why google stores billions of lines
+of code in a single repository. Communications of the ACM, 59:78–87,
+2016.
+[27] Krzysztof Choromanski, Mark Rowland, Vikas Sindhwani, Richard E
+Turner, and Adrian Weller. Structured evolution with compact architec-
+tures for scalable policy optimization. arXiv preprint arXiv:1804.02395,
+2018.
+[28] Teodor V. Marinov, Alekh Agarwal, and Mircea Trofin. Offline imita-
+tion learning from multiple baselines with applications to compiler
+optimization, 2024.
+8
+
+
+--- Page 9 ---
+Magellan : Autonomous Discovery of Novel Compiler Optimization Heuristics with AlphaEvolve
+[29] Svilen Kanev, Juan Pablo Darago, Kim Hazelwood, Parthasarathy Ran-
+ganathan, Tipp Moseley, Gu-Yeon Wei, and David Brooks. Profiling a
+warehouse-scale computer. In Proceedings of the 42nd annual interna-
+tional symposium on computer architecture, pages 158–169, 2015.
+[30] Teresa Johnson, Mehdi Amini, and Xinliang David Li. Thinlto: Scalable
+and incremental lto. In Proceedings of the 2017 International Symposium
+on Code Generation and Optimization, pages 111–121, 2017.
+[31] Google. Gemini 3, 2025. https://deepmind.google/models/gemini/.
+[32] Amir H Ashouri, Mostafa Elhoushi, Yuzhe Hua, Xiang Wang, Muham-
+mad Asif Manzoor, Bryan Chan, and Yaoqing Gao.
+Mlgoperf:
+An ml guided inliner to optimize performance.
+arXiv preprint
+arXiv:2207.08389, 2022.
+[33] Arya Vohra, Leo Seojun Lee, Jakub Bachurski, Oleksandr Zinenko,
+Phitchaya Mangpo Phothilimthana, Albert Cohen, and William S.
+Moses. Mind the abstraction gap: Bringing equality saturation to
+real-world ml compilers. Proc. ACM Program. Lang., 9(OOPSLA2),
+October 2025.
+[34] William Moses and Valentin Churavy. Instead of rewriting foreign
+code for machine learning, automatically synthesize fast gradients.
+Advances in neural information processing systems, 33:12472–12485,
+2020.
+[35] Max Willsey, Chandrakana Nandi, Yisu Remy Wang, Oliver Flatt,
+Zachary Tatlock, and Pavel Panchekha. egg: Fast and extensible
+equality saturation. Proc. ACM Program. Lang., 5(POPL), January 2021.
+[36] Jiaqi Yin, Zhan Song, Chen Chen, Yaohui Cai, Zhiru Zhang, and Cunxi
+Yu. e-boost: Boosted e-graph extraction with adaptive heuristics and
+exact solving. In 2025 IEEE/ACM International Conference On Computer
+Aided Design (ICCAD), pages 1–9, 2025.
+[37] Yaohui Cai, Kaixin Yang, Chenhui Deng, Cunxi Yu, and Zhiru Zhang.
+Smoothe: Differentiable e-graph extraction. In Proceedings of the 30th
+ACM International Conference on Architectural Support for Program-
+ming Languages and Operating Systems, Volume 1, ASPLOS ’25, page
+1020–1034, New York, NY, USA, 2025. Association for Computing
+Machinery.
+[38] Hongzheng Chen, Cody Hao Yu, Shuai Zheng, Zhen Zhang, Zhiru
+Zhang, and Yida Wang. Slapo: A schedule language for progressive
+optimization of large deep learning model training. In Proceedings
+of the 29th ACM International Conference on Architectural Support
+for Programming Languages and Operating Systems, Volume 2, pages
+1095–1111, 2024.
+[39] Sami Alabed, Daniel Belov, Bart Chrzaszcz, Juliana Franco, Dominik
+Grewe, Dougal Maclaurin, James Molloy, Tom Natan, Tamara Norman,
+Xiaoyue Pan, Adam Paszke, Norman A. Rink, Michael Schaarschmidt,
+Timur Sitdikov, Agnieszka Swietlik, Dimitrios Vytiniotis, and Joel
+Wee. Partir: Composing spmd partitioning strategies for machine
+learning. In Proceedings of the 30th ACM International Conference
+on Architectural Support for Programming Languages and Operating
+Systems, Volume 1, ASPLOS ’25, page 794–810, New York, NY, USA,
+2025. Association for Computing Machinery.
+[40] Lianmin Zheng, Zhuohan Li, Hao Zhang, Yonghao Zhuang, Zhifeng
+Chen, Yanping Huang, Yida Wang, Yuanzhong Xu, Danyang Zhuo,
+Eric P Xing, et al. Alpa: Automating inter-and intra-operator par-
+allelism for distributed deep learning. In 16th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI 22), pages
+559–578, 2022.
+[41] Michael D. Moffitt and Pratik Fegade. The asplos 2025 / eurosys 2025
+contest on intra-operator parallelism for distributed deep learning. In
+Proceedings of the 30th ACM International Conference on Architectural
+Support for Programming Languages and Operating Systems, volume 3
+of ASPLOS 2025, pages 5–17, 2025.
+[42] Hongzheng Chen, Yingheng Wang, Yaohui Cai, Hins Hu, Jiajie Li,
+Shirley Huang, Chenhui Deng, Rongjian Liang, Shufeng Kong, Haox-
+ing Ren, et al. Heurigym: An agentic benchmark for llm-crafted heuris-
+tics in combinatorial optimization. arXiv preprint arXiv:2506.07972,
+2025.
+[43] Audrey Cheng, Shu Liu, Melissa Pan, Zhifei Li, Bowen Wang, Alex
+Krentsel, Tian Xia, Mert Cemri, Jongseok Park, Shuo Yang, et al. Bar-
+barians at the gate: How ai is upending systems research. arXiv
+preprint arXiv:2510.06189, 2025.
+[44] Cunxi Yu, Rongjian Liang, Chia-Tung Ho, and Haoxing Ren. Au-
+tonomous code evolution meets np-completeness. arXiv preprint
+arXiv:2509.07367, 2025.
+[45] Alec M Hammond, Aram Markosyan, Aman Dontula, Simon Mahns,
+Zacharias Fisches, Dmitrii Pedchenko, Keyur Muzumdar, Natacha Sup-
+per, Mark Saroufim, Joe Isaacson, et al. Agentic operator generation
+for ml asics. arXiv preprint arXiv:2512.10977, 2025.
+[46] Yundi Qian and Mircea Trofin. Mlgo: A machine learning framework
+for compiler optimization. Google Research Blog, July 2022.
+[47] S VenkataKeerthy, Rohit Aggarwal, Shalini Jain, Maunendra Sankar
+Desarkar, Ramakrishna Upadrasta, and YN Srikant. Ir2vec: Llvm ir
+based scalable program embeddings. ACM Transactions on Architecture
+and Code Optimization (TACO), 17(4):1–27, 2020.
+[48] Shihan Fang, Hongzheng Chen, Niansong Zhang, Jiajie Li, Han Meng,
+Adrian Liu, and Zhiru Zhang. Dato: A task-based programming model
+for dataflow accelerators. arXiv preprint arXiv:2509.06794, 2025.
+[49] Hongzheng Chen, Bin Fan, Alexander Collins, Bastian Hagedorn,
+Evghenii Gaburov, Masahiro Masuda, Matthew Brookhart, Chris Sulli-
+van, Jason Knight, Zhiru Zhang, et al. Tawa: Automatic warp special-
+ization for modern gpus with asynchronous references. arXiv preprint
+arXiv:2510.14719, 2025.
+[50] Rupanshu Soi, Rohan Yadav, Fredrik Kjolstad, Alex Aiken,
+Maryam Mehri Dehnavi, Michael Garland, and Michael Bauer.
+Optimal software pipelining and warp specialization for tensor core
+gpus. arXiv preprint arXiv:2512.18134, 2025.
+[51] Hongzheng Chen, Niansong Zhang, Shaojie Xiang, Zhichen Zeng,
+Mengjia Dai, and Zhiru Zhang. Allo: A programming model for com-
+posable accelerator design. Proceedings of the ACM on Programming
+Languages, 8(PLDI):593–620, 2024.
+9
+
+
+--- Page 10 ---
+A
+Magellan-Generated Inlining Policy for Binary Size
+The following code snippet shows the Magellan-generated inlining policy for binary size reduction.
+1
+// AEInlineAdvisor.cpp
+2
+#include "llvm/Analysis/AEInlineAdvisor.h"
+3
+#include "llvm/Analysis/InlineAdvisor.h"
+4
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
+5
+#include "llvm/IR/PassManager.h"
+6
+7
+// EVOLVE-BLOCK-START
+8
+// You can include additional LLVM headers here.
+9
+10
+using namespace llvm;
+11
+12
+// Define constants for inlining thresholds for better readability and maintainability.
+13
+// These values are heuristics and can be tuned based on profiling data.
+14
+// A very small function, often beneficial to inline to remove call overhead.
+15
+constexpr unsigned TINY_FUNCTION_THRESHOLD = 10;
+16
+// Base instruction count threshold for regular functions.
+17
+constexpr unsigned SMALL_FUNCTION_THRESHOLD = 25;
+18
+// Additional instruction count budget for functions with a single call site,
+19
+// as inlining them avoids code duplication and enables more optimizations.
+20
+constexpr unsigned SINGLE_USE_INLINE_BONUS = 80; // Significantly increases threshold
+21
+// Threshold for functions considered to have "many" basic blocks for penalty.
+22
+constexpr unsigned MANY_BASIC_BLOCKS_THRESHOLD = 5;
+23
+// Penalty applied for functions with many basic blocks.
+24
+constexpr unsigned BASIC_BLOCK_PENALTY = 5;
+25
+26
+std::unique_ptr<InlineAdvice> AEInlineAdvisor::getAdviceImpl(CallBase &CB) {
+27
+// Implementation of inlining strategy. Do not change the function interface.
+28
+// Default to not inlining.
+29
+constexpr unsigned CONSERVATIVE_INLINE_PENALTY = 20;
+30
+constexpr unsigned HOT_FUNCTION_BONUS = 50;
+31
+bool IsInliningRecommended = false;
+32
+Function *Callee = CB.getCalledFunction();
+33
+34
+// Define weights for different instruction types to calculate a "complexity score"
+35
+// rather than a raw instruction count.
+36
+constexpr unsigned WEIGHT_HIGH_COMPLEXITY_INST = 3;
+37
+constexpr unsigned WEIGHT_MEDIUM_COMPLEXITY_INST = 2;
+38
+constexpr unsigned WEIGHT_LOW_COMPLEXITY_INST = 1;
+39
+40
+// If the callee is null (indirect call) or a declaration (no body to inline),
+41
+// we cannot inline.
+42
+if (!Callee
+Callee->isDeclaration()) {
+43
+// If the callee is null (indirect call) or a declaration (no body to inline),
+44
+// we cannot inline. Return advice to not inline.
+45
+IsInliningRecommended = false;
+46
+return std::make_unique<InlineAdvice>(
+47
+this, CB,
+48
+FAM.getResult<OptimizationRemarkEmitterAnalysis>(*CB.getCaller()),
+49
+IsInliningRecommended);
+50
+}
+51
+52
+// Check for explicit inlining attributes first, as they override heuristics.
+53
+if (Callee->hasFnAttribute(Attribute::NoInline)) {
+54
+// Explicitly prevent inlining. IsInliningRecommended remains false.
+55
+// Fall through to the final return.
+56
+} else if (Callee->hasFnAttribute(Attribute::AlwaysInline)) {
+57
+IsInliningRecommended = true;
+58
+} else {
+59
+// Crazy Idea: Calculate a weighted instruction count based on instruction complexity.
+60
+// This gives a more nuanced "size" estimation for inlining decisions.
+61
+unsigned WeightedCalleeInstructionCount = 0;
+62
+for (const BasicBlock &BB : *Callee) {
+63
+for (const Instruction &I : BB) {
+64
+switch (I.getOpcode()) {
+65
+case Instruction::Call:
+66
+case Instruction::Invoke:
+67
+case Instruction::CallBr:
+68
+case Instruction::Ret:
+69
+case Instruction::Br:
+70
+case Instruction::Switch:
+71
+case Instruction::IndirectBr:
+72
+WeightedCalleeInstructionCount += WEIGHT_HIGH_COMPLEXITY_INST;
+73
+break;
+74
+case Instruction::Load:
+75
+case Instruction::Store:
+76
+case Instruction::Alloca:
+77
+case Instruction::GetElementPtr:
+78
+case Instruction::AtomicCmpXchg:
+79
+case Instruction::AtomicRMW:
+10
+
+
+--- Page 11 ---
+Magellan : Autonomous Discovery of Novel Compiler Optimization Heuristics with AlphaEvolve
+80
+case Instruction::Fence:
+81
+case Instruction::FNeg:
+82
+case Instruction::FAdd:
+83
+case Instruction::FSub:
+84
+case Instruction::FMul:
+85
+case Instruction::FDiv:
+86
+case Instruction::FRem:
+87
+case Instruction::FCmp:
+88
+case Instruction::SDiv:
+89
+case Instruction::UDiv:
+90
+case Instruction::SRem:
+91
+case Instruction::URem:
+92
+case Instruction::InsertElement:
+93
+case Instruction::ExtractElement:
+94
+case Instruction::ShuffleVector:
+95
+case Instruction::ExtractValue:
+96
+case Instruction::InsertValue:
+97
+WeightedCalleeInstructionCount += WEIGHT_MEDIUM_COMPLEXITY_INST;
+98
+break;
+99
+default:
+100
+WeightedCalleeInstructionCount += WEIGHT_LOW_COMPLEXITY_INST;
+101
+break;
+102
+}
+103
+}
+104
+}
+105
+106
+// Very tiny functions are almost always beneficial to inline due to
+107
+// eliminating call overhead, regardless of other factors. This acts as
+108
+// an absolute minimum threshold that can override other penalties,
+109
+// ensuring even size-optimized tiny functions are considered if they are small enough.
+110
+// Use the raw instruction count for this absolute threshold as it's simpler and
+111
+// less sensitive to specific instruction mixes for extremely small functions.
+112
+if (Callee->getInstructionCount() < TINY_FUNCTION_THRESHOLD) {
+113
+IsInliningRecommended = true;
+114
+} else {
+115
+// Crazy Idea: Aggressive inlining for pure/readonly functions or functions
+116
+// with a single use that are still relatively small. These often lead to
+117
+// significant simplifications and dead code elimination post-inlining,
+118
+// as they reduce overall code size or enable more optimizations.
+119
+constexpr unsigned AGGRESSIVE_SPECIAL_CASE_THRESHOLD = 150;
+120
+// Slightly more conservative for read-only functions than pure functions,
+121
+// as they might still have complex interactions.
+122
+constexpr unsigned AGGRESSIVE_READONLY_THRESHOLD = 75;
+123
+124
+if ((Callee->hasOneUse() && Callee->getInstructionCount() < AGGRESSIVE_SPECIAL_CASE_THRESHOLD)
+125
+(Callee->getMemoryEffects().doesNotAccessMemory() && WeightedCalleeInstructionCount < AGGRESSIVE_SPECIAL_CASE_THRESHOLD)
+126
+(Callee->getMemoryEffects().onlyReadsMemory() && WeightedCalleeInstructionCount < AGGRESSIVE_READONLY_THRESHOLD)) {
+127
+IsInliningRecommended = true;
+128
+} else {
+129
+// Heuristic-based inlining for other cases:
+130
+unsigned CurrentThreshold = SMALL_FUNCTION_THRESHOLD;
+131
+132
+// Adjust the base threshold based on general function optimization attributes.
+133
+// Use an if-else if structure to prioritize these flags and prevent
+134
+// conflicting adjustments (e.g., being both OptimizeForSize and Hot).
+135
+if (Callee->hasFnAttribute(Attribute::OptimizeForSize)
+136
+Callee->hasFnAttribute(Attribute::MinSize)) {
+137
+// For size-optimized functions, start with a more conservative threshold.
+138
+CurrentThreshold = std::max(0U, CurrentThreshold - CONSERVATIVE_INLINE_PENALTY);
+139
+} else if (Callee->hasFnAttribute(Attribute::Hot)) {
+140
+// For hot functions, allow more aggressive inlining.
+141
+CurrentThreshold += HOT_FUNCTION_BONUS;
+142
+}
+143
+144
+// Functions with a single call site are strong candidates as inlining
+145
+// them avoids code duplication and enables more optimizations.
+146
+// This bonus applies if the single-use function wasn't already covered
+147
+// by the more aggressive special-case inlining above.
+148
+if (Callee->hasOneUse()) {
+149
+CurrentThreshold += SINGLE_USE_INLINE_BONUS;
+150
+}
+151
+152
+// Add a penalty for functions with many basic blocks, indicating complex control flow.
+153
+// This is to avoid inflating the caller's basic block count too much if the callee
+154
+// has many small blocks.
+155
+if (Callee->size() > MANY_BASIC_BLOCKS_THRESHOLD) {
+156
+CurrentThreshold = std::max(0U, CurrentThreshold - BASIC_BLOCK_PENALTY);
+157
+}
+158
+159
+// Crazy Idea Enhancement: Add bonus for arguments that are constants or undef.
+160
+// This indicates potential for significant simplification post-inlining.
+161
+constexpr unsigned CONSTANT_ARG_BONUS_PER_ARG = 10;
+162
+constexpr unsigned UNDEF_ARG_BONUS_PER_ARG = 5;
+11
+
+
+--- Page 12 ---
+163
+// Crazy Idea Enhancement: Add bonus/penalty based on argument type matching.
+164
+constexpr unsigned EXACT_TYPE_MATCH_BONUS_PER_ARG = 7;
+165
+constexpr unsigned POINTER_CASTABLE_TYPE_MATCH_BONUS_PER_ARG = 3;
+166
+constexpr unsigned NON_TRIVIAL_CAST_PENALTY_PER_ARG = 5;
+167
+168
+// Get the DataLayout for type comparisons involving pointers.
+169
+const DataLayout &DL = Callee->getParent()->getDataLayout();
+170
+171
+for (unsigned I = 0, E = CB.arg_size(); I != E; ++I) {
+172
+Value *Arg = CB.getArgOperand(I);
+173
+Type *ArgTy = Arg->getType();
+174
+175
+// Check for constant/undef arguments first.
+176
+if (isa<Constant>(Arg)) {
+177
+CurrentThreshold += CONSTANT_ARG_BONUS_PER_ARG;
+178
+} else if (isa<UndefValue>(Arg)) {
+179
+CurrentThreshold += UNDEF_ARG_BONUS_PER_ARG;
+180
+}
+181
+182
+// Check argument type matching against callee's formal parameter type.
+183
+if (I < Callee->getFunctionType()->getNumParams()) {
+184
+Type *ParamTy = Callee->getFunctionType()->getParamType(I);
+185
+186
+if (ArgTy == ParamTy) {
+187
+CurrentThreshold += EXACT_TYPE_MATCH_BONUS_PER_ARG;
+188
+} else if ((ArgTy->isPointerTy() && ParamTy->isIntegerTy())
+189
+(ArgTy->isIntegerTy() && ParamTy->isPointerTy())) {
+190
+// Check for no-op pointer/integer casts.
+191
+if (CastInst::isBitOrNoopPointerCastable(ArgTy, ParamTy, DL)) {
+192
+CurrentThreshold += POINTER_CASTABLE_TYPE_MATCH_BONUS_PER_ARG;
+193
+} else {
+194
+CurrentThreshold = std::max(0U, CurrentThreshold - NON_TRIVIAL_CAST_PENALTY_PER_ARG);
+195
+}
+196
+} else if (!ArgTy->isVoidTy() && ArgTy != ParamTy) {
+197
+// For other type mismatches (e.g., different integer widths, float to int),
+198
+// apply a penalty if a cast is required that changes bit patterns.
+199
+// We need to infer the cast opcode to check if it's a no-op bitcast or a conversion.
+200
+Instruction::CastOps Opcode = Instruction::BitCast; // Default to BitCast
+201
+if (ArgTy->isIntegerTy() && ParamTy->isIntegerTy()) {
+202
+Opcode = CastInst::getCastOpcode(Arg, /*SrcIsSigned=*/true, ParamTy, /*DstIsSigned=*/true);
+203
+} else if (ArgTy->isFloatingPointTy() && ParamTy->isFloatingPointTy()) {
+204
+Opcode = CastInst::getCastOpcode(Arg, /*SrcIsSigned=*/false, ParamTy, /*DstIsSigned=*/false);
+205
+}
+206
+207
+if (!CastInst::isNoopCast(Opcode, ArgTy, ParamTy, DL)) {
+208
+CurrentThreshold = std::max(0U, CurrentThreshold - NON_TRIVIAL_CAST_PENALTY_PER_ARG);
+209
+}
+210
+}
+211
+}
+212
+}
+213
+214
+IsInliningRecommended = WeightedCalleeInstructionCount < CurrentThreshold;
+215
+}
+216
+}
+217
+}
+218
+219
+// Single return point for all cases.
+220
+return std::make_unique<InlineAdvice>(
+221
+this, CB,
+222
+FAM.getResult<OptimizationRemarkEmitterAnalysis>(*CB.getCaller()),
+223
+IsInliningRecommended);
+224
+}
+225
+226
+// EVOLVE-BLOCK-END
+B
+Magellan-Generated Inlining Policy for Performance
+The following code snippet shows the Magellan-generated inlining policy for performance improvement.
+1
+#include "llvm/Analysis/AEInlineAdvisor.h"
+2
+#include "llvm/Analysis/LoopInfo.h"
+3
+#include "llvm/Analysis/BlockFrequencyInfo.h"
+4
+#include "llvm/Analysis/InlineAdvisor.h"
+5
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
+6
+#include "llvm/Analysis/TargetLibraryInfo.h"
+7
+#include "llvm/IR/PassManager.h"
+8
+9
+using namespace llvm;
+10
+11
+// This is the best parameter configuration obtained by the autotuner:
+12
+// [name: "ae-inline-base-threshold"
+12
+
+
+--- Page 13 ---
+Magellan : Autonomous Discovery of Novel Compiler Optimization Heuristics with AlphaEvolve
+13
+// int_value: 200
+14
+// , name: "ae-inline-call-penalty"
+15
+// int_value: 13
+16
+// , name: "ae-inline-const-arg-bonus"
+17
+// int_value: 68
+18
+// , name: "ae-inline-hotness-mul"
+19
+// int_value: 10
+20
+// , name: "ae-inline-hotness-shift"
+21
+// int_value: 3
+22
+// , name: "ae-inline-large-caller-reduction"
+23
+// int_value: 21
+24
+// , name: "ae-inline-large-caller-threshold"
+25
+// int_value: 9207
+26
+// , name: "ae-inline-loop-bonus"
+27
+// int_value: 12
+28
+// , name: "ae-inline-recursion-penalty"
+29
+// int_value: 22
+30
+// , name: "ae-inline-vector-bonus"
+31
+// int_value: 97
+32
+// ]
+33
+34
+// EVOLVE-BLOCK-START
+35
+// You can include additional LLVM headers, constants, and flags here.
+36
+#include "llvm/IR/Instructions.h"
+37
+#include "llvm/IR/InstIterator.h"
+38
+39
+// [hyperparam]: ae-inline-base-threshold, int, 10, 200
+40
+static cl::opt<int> BaseThreshold(
+41
+"ae-inline-base-threshold",
+42
+cl::desc("Base instruction count threshold for inlining"),
+43
+cl::init(60), cl::Hidden);
+44
+45
+// [hyperparam]: ae-inline-call-penalty, int, 5, 50
+46
+static cl::opt<int> CallPenalty(
+47
+"ae-inline-call-penalty",
+48
+cl::desc("Penalty for call instructions in callee"),
+49
+cl::init(15), cl::Hidden);
+50
+51
+// [hyperparam]: ae-inline-const-arg-bonus, int, 0, 100
+52
+static cl::opt<int> ConstantArgBonus(
+53
+"ae-inline-const-arg-bonus",
+54
+cl::desc("Bonus for each constant argument"),
+55
+cl::init(40), cl::Hidden);
+56
+57
+// [hyperparam]: ae-inline-loop-bonus, int, 0, 100
+58
+static cl::opt<int> LoopBonus(
+59
+"ae-inline-loop-bonus",
+60
+cl::desc("Bonus for call sites inside loops"),
+61
+cl::init(40), cl::Hidden);
+62
+63
+// [hyperparam]: ae-inline-vector-bonus, int, 0, 100
+64
+static cl::opt<int> VectorBonus(
+65
+"ae-inline-vector-bonus",
+66
+cl::desc("Bonus if callee contains vector instructions"),
+67
+cl::init(30), cl::Hidden);
+68
+69
+// [hyperparam]: ae-inline-hotness-mul, int, 1, 10
+70
+static cl::opt<int> HotnessMultiplier(
+71
+"ae-inline-hotness-mul",
+72
+cl::desc("Multiplier for hot call sites"),
+73
+cl::init(3), cl::Hidden);
+74
+75
+// [hyperparam]: ae-inline-hotness-shift, int, 0, 15
+76
+static cl::opt<int> HotnessShift(
+77
+"ae-inline-hotness-shift",
+78
+cl::desc("Shift amount to determine hotness"),
+79
+cl::init(8), cl::Hidden);
+80
+81
+// [hyperparam]: ae-inline-recursion-penalty, int, 0, 100
+82
+static cl::opt<int> RecursionPenalty(
+83
+"ae-inline-recursion-penalty",
+84
+cl::desc("Penalty for recursive calls"),
+85
+cl::init(50), cl::Hidden);
+86
+87
+// [hyperparam]: ae-inline-large-caller-threshold, int, 1000, 10000
+88
+static cl::opt<int> LargeCallerThreshold(
+89
+"ae-inline-large-caller-threshold",
+90
+cl::desc("Caller size threshold for penalties"),
+91
+cl::init(4000), cl::Hidden);
+92
+93
+// [hyperparam]: ae-inline-large-caller-reduction, int, 0, 90
+94
+static cl::opt<int> LargeCallerReduction(
+95
+"ae-inline-large-caller-reduction",
+13
+
+
+--- Page 14 ---
+96
+cl::desc("Percentage reduction of threshold for large callers"),
+97
+cl::init(20), cl::Hidden);
+98
+99
+// Implementation of inlining strategy for performance. Do not change the
+100
+// function interface. Default implementation is to not inline.
+101
+// Please make sure to use BlockFrequencyInfo and TargetLibraryInfo
+102
+// as we are optimizing for performance.
+103
+std::unique_ptr<InlineAdvice> AEInlineAdvisor::getAEAdviceImpl(CallBase &CB) {
+104
+Function *Caller = CB.getCaller();
+105
+Function *Callee = CB.getCalledFunction();
+106
+107
+if (!Callee
+Callee->isDeclaration()) {
+108
+return std::make_unique<InlineAdvice>(
+109
+this, CB, FAM.getResult<OptimizationRemarkEmitterAnalysis>(*Caller),
+110
+false);
+111
+}
+112
+113
+if (Callee->hasFnAttribute(Attribute::AlwaysInline)) {
+114
+return std::make_unique<InlineAdvice>(
+115
+this, CB, FAM.getResult<OptimizationRemarkEmitterAnalysis>(*Caller),
+116
+true);
+117
+}
+118
+119
+const TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(*Callee);
+120
+LibFunc LibFn;
+121
+if (TLI.getLibFunc(*Callee, LibFn) && TLI.hasOptimizedCodeGen(LibFn)) {
+122
+return std::make_unique<InlineAdvice>(
+123
+this, CB, FAM.getResult<OptimizationRemarkEmitterAnalysis>(*Caller),
+124
+true);
+125
+}
+126
+127
+int Cost = 0;
+128
+bool HasVector = false;
+129
+130
+for (const auto &I : instructions(Callee)) {
+131
+if (isa<AllocaInst>(I)
+isa<PHINode>(I)
+isa<BitCastInst>(I)
+132
+isa<PtrToIntInst>(I)
+isa<IntToPtrInst>(I)) {
+133
+continue;
+134
+}
+135
+136
+if (const auto *CI = dyn_cast<CallBase>(&I)) {
+137
+Cost += CallPenalty;
+138
+if (CI->isIndirectCall()) {
+139
+Cost += CallPenalty;
+140
+}
+141
+} else {
+142
+Cost += 1;
+143
+}
+144
+145
+if (!HasVector && I.getType()->isVectorTy()) {
+146
+HasVector = true;
+147
+}
+148
+}
+149
+150
+int Threshold = BaseThreshold;
+151
+152
+for (const auto &Arg : CB.args()) {
+153
+if (isa<Constant>(Arg)) {
+154
+Threshold += ConstantArgBonus;
+155
+}
+156
+}
+157
+158
+LoopInfo &LI = FAM.getResult<LoopAnalysis>(*Caller);
+159
+int Depth = LI.getLoopDepth(CB.getParent());
+160
+if (Depth > 0) {
+161
+Threshold += LoopBonus * std::min(Depth, 3);
+162
+}
+163
+164
+if (HasVector) {
+165
+Threshold += VectorBonus;
+166
+}
+167
+168
+BlockFrequencyInfo &BFI = FAM.getResult<BlockFrequencyAnalysis>(*Caller);
+169
+uint64_t EntryFreq = BFI.getEntryFreq().getFrequency();
+170
+if (EntryFreq > 0) {
+171
+uint64_t CallSiteFreq = BFI.getBlockFreq(CB.getParent()).getFrequency();
+172
+if (CallSiteFreq > (EntryFreq >> HotnessShift)) {
+173
+Threshold *= HotnessMultiplier;
+174
+}
+175
+}
+176
+177
+if (Caller == Callee) {
+178
+Threshold -= RecursionPenalty;
+14
+
+
+--- Page 15 ---
+Magellan : Autonomous Discovery of Novel Compiler Optimization Heuristics with AlphaEvolve
+179
+}
+180
+181
+int CallerSize = 0;
+182
+for (const auto &BB : *Caller) {
+183
+CallerSize += BB.size();
+184
+if (CallerSize > LargeCallerThreshold) break;
+185
+}
+186
+187
+if (CallerSize > LargeCallerThreshold) {
+188
+Threshold = Threshold * (100 - LargeCallerReduction) / 100;
+189
+}
+190
+191
+bool IsInliningRecommended = Cost < Threshold;
+192
+193
+return std::make_unique<InlineAdvice>(
+194
+this, CB, FAM.getResult<OptimizationRemarkEmitterAnalysis>(*Caller),
+195
+IsInliningRecommended);
+196
+}
+197
+198
+// EVOLVE-BLOCK-END
+199
+200
+std::unique_ptr<InlineAdvice> AEInlineAdvisor::getAdviceImpl(CallBase &CB) {
+201
+// legality check
+202
+auto &Caller = *CB.getCaller();
+203
+auto &Callee = *CB.getCalledFunction();
+204
+auto &ORE = FAM.getResult<OptimizationRemarkEmitterAnalysis>(Caller);
+205
+206
+auto MandatoryKind = InlineAdvisor::getMandatoryKind(CB, FAM, ORE);
+207
+// If this is a "never inline" case, there won't be any changes to internal
+208
+// state we need to track, so we can just return the base InlineAdvice, which
+209
+// will do nothing interesting.
+210
+// Same thing if this is a recursive case.
+211
+if (MandatoryKind == InlineAdvisor::MandatoryInliningKind::Never
+212
+&Caller == &Callee)
+213
+return getMandatoryAdvice(CB, false);
+214
+215
+auto IsViable = isInlineViable(Callee);
+216
+if (!IsViable.isSuccess())
+217
+return std::make_unique<InlineAdvice>(this, CB, ORE, false);
+218
+219
+bool Mandatory =
+220
+MandatoryKind == InlineAdvisor::MandatoryInliningKind::Always;
+221
+222
+if (Mandatory)
+223
+return std::make_unique<InlineAdvice>(this, CB, ORE, true);
+224
+225
+return getAEAdviceImpl(CB);
+226
+}
+15
