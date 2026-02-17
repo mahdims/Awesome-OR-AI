@@ -38,8 +38,14 @@ def send_email(to: Union[str, List[str]], subject: str, html_content: str) -> bo
     gmail_user = os.getenv("GMAIL_USER")
     app_password = os.getenv("GMAIL_APP_PASSWORD")
 
-    if not gmail_user or not app_password:
-        print("[WARN] GMAIL_USER or GMAIL_APP_PASSWORD not set. Cannot send email.")
+    missing = []
+    if not gmail_user:
+        missing.append("GMAIL_USER")
+    if not app_password:
+        missing.append("GMAIL_APP_PASSWORD")
+    if missing:
+        print(f"[WARN] Missing env var(s): {', '.join(missing)}. Cannot send email.")
+        print("       Set these as GitHub secrets (or export locally) and re-run.")
         return False
 
     recipients = [to] if isinstance(to, str) else to

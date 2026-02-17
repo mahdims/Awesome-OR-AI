@@ -110,7 +110,7 @@ def run_daily(categories: list, db: Database, days: int = 7,
     deliver(
         html_content=html,
         subject=f"Bi-Daily Research Intelligence Briefing — {issue_code} · {date.today().isoformat()}",
-        preview_dir=EMAILS_DIR if preview else None,
+        preview_dir=EMAILS_DIR,
         send=send and not preview,
     )
 
@@ -167,7 +167,7 @@ def run_weekly(categories: list, db: Database, days: int = 7,
         deliver(
             html_content=html,
             subject=f"Weekly Research Intelligence: {category} — {date.today().isoformat()}",
-            preview_dir=EMAILS_DIR if preview else None,
+            preview_dir=EMAILS_DIR,
             filename=f"weekly_{category.lower().replace(' ', '_')[:30]}_{date.today().isoformat()}.html",
             send=send and not preview,
         )
@@ -204,7 +204,7 @@ def run_monthly(categories: list, db: Database, days: int = 30,
     deliver(
         html_content=html,
         subject=f"Monthly Research Digest — {date.today().isoformat()}",
-        preview_dir=EMAILS_DIR if preview else None,
+        preview_dir=EMAILS_DIR,
         send=send and not preview,
     )
 
