@@ -1,0 +1,3513 @@
+--- Page 1 ---
+Predicting Future Utility: Global Combinatorial Optimization
+for Task-Agnostic KV Cache Eviction
+Ziyao Tang * 1 2 3 Pengkun Jiao * 1 Xinhang Chen 2 Wei Liu 2 Shiyong Li 2 Jingjing Chen 1
+Abstract
+Given the quadratic complexity of attention, KV
+cache eviction is vital to accelerate model infer-
+ence. Current KV cache eviction methods typi-
+cally rely on instantaneous heuristic metrics, im-
+plicitly assuming that score magnitudes are con-
+sistent proxies for importance across all heads.
+However, this overlooks the heterogeneity in
+predictive fidelity across attention heads. While
+certain heads prioritize the instantaneous contri-
+bution of tokens, others are dedicated to captur-
+ing long-horizon utility. In this paper, we pro-
+pose that optimal budget allocation should be
+governed by the marginal utility in preserving
+long-term semantic information. Based on this in-
+sight, we propose LU-KV, a novel framework that
+optimizes head-level budget allocation through
+a convex-hull relaxation and a marginal-utility-
+based greedy solver to achieve near-optimal pre-
+cision. Furthermore, we implement a data-driven
+offline profiling protocol to facilitate the practi-
+cal deployment of LU-KV. Extensive evaluations
+on LongBench and RULER benchmarks demon-
+strate that LU-KV achieves an 80% reduction in
+KV cache size with minimal performance degra-
+dation, while simultaneously reducing inference
+latency and GPU memory footprint.
+1. Introduction
+The advent of Large Language Models (LLMs) has revolu-
+tionized long-context processing; however, the Key-Value
+(KV) cache presents a formidable bottleneck. As sequence
+lengths reach million-token scales, the linear growth of
+cache memory limits inference throughput and complicates
+scalable deployment.
+To address this, KV cache evic-
+tion (Zhang et al., 2023; Feng et al., 2024; Kim et al., 2025)
+has become a standard necessity, traditionally operating via
+1Fudan University 2Baidu 3Work done during an intern-
+ship at Baidu.
+Correspondence to:
+Jingjing Chen <chen-
+jingjing@fudan.edu.cn>.
+Preprint. February 10, 2026.
+a two-stage paradigm: intra-head scoring to identify crit-
+ical tokens and cross-head budget allocation to distribute
+available storage across the model’s architecture.
+While significant progress has been made in designing so-
+phisticated scoring metrics (Zhang et al., 2023; Li et al.,
+2024), budget allocation strategies remain a critical yet un-
+derdeveloped frontier. Existing methods largely rely on
+instantaneous heuristic scoring, assuming that current
+attention magnitudes serve as reliable proxies for future
+importance. However, we identify a fundamental flaw in
+this magnitude-based paradigm: it ignores the inherent het-
+erogeneity in predictive fidelity across different attention
+heads. Specifically, high-magnitude scores in certain heads
+often align poorly with Oracle Importance—the true long-
+term contribution to the KV cache—capturing transient
+noise rather than enduring semantic anchors. Blindly bi-
+asing budgets toward regions with high-magnitude heuristic
+scores, without accounting for their long-term utility, in-
+evitably leads to suboptimal cache retention.
+We posit that optimal budget allocation should be governed
+not by absolute scores, but by the marginal utility of a met-
+ric in preserving future information. In this view, memory
+allocation is treated as a strategic investment: if a metric
+exhibits poor alignment with the Oracle Importance in a
+specific head, increasing its budget yields rapidly dimin-
+ishing returns. Conversely, in heads where the metric is
+precise, a unit investment in budget effectively preserves
+the model’s long-horizon generative quality. Therefore, the
+crux of an efficient allocation strategy lies in quantifying
+and optimizing the long-term cost-benefit ratio of each head
+under a specific metric.
+Based on this insight, we propose Long-horizon Utility KV
+(LU-KV), a novel framework for head-wise KV cache bud-
+get allocation. We introduce a data-driven offline calibration
+mechanism to profile the marginal contribution curves of
+individual attention heads. Based on this, we formulate the
+global budget distribution as a combinatorial optimization
+problem aimed at maximizing expected long-horizon utility
+retention across all heads. To solve this efficiently, we em-
+ploy a convex-hull relaxation and a greedy solver, ensuring
+near-optimal budget allocation with minimal computational
+overhead.
+1
+arXiv:2602.08585v1  [cs.LG]  9 Feb 2026
+
+
+--- Page 2 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+Extensive experiments on the LongBench and RULER
+benchmarks demonstrate the effectiveness of LU-KV. Our
+method achieves an 80% reduction in KV cache size with
+minimal performance degradation, while simultaneously
+reducing inference latency and GPU memory footprint.
+Our contributions are summarized as follows:
+• We define the Optimality Gap between heuristic metrics
+and long-horizon utility importance, demonstrating that
+heuristic score magnitudes are insufficient for cross-head
+budget allocation.
+• We formulate budget allocation as a global utility max-
+imization problem and introduce an efficient solver us-
+ing convex-hull relaxation and marginal-utility-based
+greedy allocation.
+• We propose an offline profiling protocol that leverages
+the structural stability of LLMs, enabling zero-overhead
+online execution via a pre-computed lookup table.
+• We conduct extensive evaluations across diverse long-
+context benchmarks to validate the effectiveness and ro-
+bustness of our proposed methods.
+2. Related Work
+Existing research on KV cache eviction can be broadly
+categorized into two synergistic streams: intra-head eviction
+policies, which identify informative tokens within individual
+heads, and cross-head budget allocation, which manages
+resource distribution across the entire model.
+Intra-head Eviction Policies
+Intra-head strategies fo-
+cus on designing high-fidelity proxy metrics to distin-
+guish critical tokens from noise. Early heuristics, such as
+StreamingLLM (Xiao et al., 2024), identified the “attention
+sink” phenomenon, showing that retaining initial tokens
+is crucial for maintaining model stability. Subsequently,
+methods like H2O (Zhang et al., 2023) and SnapKV (Li
+et al., 2024) utilized accumulated attention scores or obser-
+vation windows to dynamically cluster and retain salient
+tokens. Beyond raw attention weights, recent literature has
+explored geometric and perturbation-based indicators to
+mitigate inherent biases. For instance, KeyDiff (Park et al.,
+2025) leverages the geometric features of Key vectors, while
+CriticalKV (Feng et al., 2025) explicitly measures poten-
+tial output perturbations by considering Value magnitudes
+and projection weights. Despite their progress, these works
+primarily aim to optimize token selection within a fixed bud-
+get, often overlooking how that budget should be partitioned
+across heads.
+Cross-Head Budget Allocation
+Recognizing the hetero-
+geneity of information density across layers, recent stud-
+ies have shifted toward non-uniform allocation strategies.
+Static and rule-based methods often rely on structural pri-
+ors; for example, PyramidKV (Cai et al., 2024) employs a
+fixed pyramidal shape based on the “information funneling”
+hypothesis, while HeadKV (Fu et al., 2025) and CAKE (Qin
+et al., 2025) incorporate task-specific priors or spatial dis-
+persion to formulate cascading rules. In contrast, dynamic
+allocation strategies like Ada-KV (Feng et al., 2024) at-
+tempt to distribute resources based on real-time statistics,
+such as attention entropy. However, these approaches in-
+herently assume that proxy scores are well-calibrated and
+comparable across different heads—an assumption that of-
+ten fails in practice due to varying score scales and metric
+inaccuracies.
+Relation to our work.
+Unlike previous methods that rely
+on instantaneous heuristic scoring and consequently over-
+look the long-horizon importance of tokens, we propose an
+allocation framework governed by Long-Horizon Utility.
+Rather than directly comparing uncalibrated proxy scores,
+our approach profiles the offline budget-utility relationship
+to explicitly quantify the marginal gain of retaining tokens
+within each specific head. This grants our framework metric-
+universality: for any chosen proxy (e.g., SnapKV), we can
+derive the optimal budget configuration to maximize long-
+horizon information retention.
+3. Preliminaries
+We consider decoder-only LLMs with L layers and H at-
+tention heads per layer. Inference proceeds in two phases:
+parallel prefill and autoregressive decoding.
+3.1. Attention Mechanism and KV Cache
+At decoding step k, for a fixed layer ℓand head h, the model
+generates a query qℓ,h,k ∈Rdh to attend to historical keys
+kℓ,h,j and values vℓ,h,j (j ≤k). The attention weights A
+and the head output are computed as:
+Aℓ,h,k,j = Softmax
+ 
+q⊤
+ℓ,h,kkℓ,h,j
+√dh
+!
+,
+(1)
+oℓ,k =
+H
+X
+h=1
+
+
+T
+X
+j=1
+Aℓ,h,k,jvℓ,h,j
+
+W(ℓ,h)
+O
+.
+(2)
+where W(ℓ,h)
+O
+∈Rdh×dmodel is the head-specific output pro-
+jection. To avoid redundant computation, previously com-
+puted (k, v) pairs are stored in a KV Cache. As the se-
+quence length grows, the linear increase in cache size poses
+a significant memory bottleneck.
+3.2. KV Cache Eviction
+To maintain a manageable memory footprint, KV Cache
+Eviction strategies (Feng et al., 2024; Park et al., 2025)
+2
+
+
+--- Page 3 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+impose a fixed budget B per head. These methods typically
+use attention scores as an importance proxy, retaining a
+subset of indices Iℓ,h ⊂{1, . . . , T} such that |Iℓ,h| ≤B.
+The attention output is then approximated by re-normalizing
+weights over the retained set:
+˜oℓ,h,k =
+X
+j∈Iℓ,h
+˜Aℓ,h,k,jvℓ,h,j.
+(3)
+Current policies often prioritize “heavy hitters” with the
+highest cumulative attention scores, assuming their domi-
+nance in preserving model performance.
+Symbol
+Description
+(ℓ, h)
+The h-th attention head in the ℓ-th layer.
+T
+The total number of input tokens during the prefill phase.
+π
+The metric used to evaluate token importance.
+π∗
+The oracle metric of token importance.
+σ
+Target compression ratio (percentage of tokens evicted).
+Btotal
+Global memory budget (total number of KV pairs to retain).
+b(ℓ, h)
+Memory budget allocated to a specific attention head (ℓ, h).
+Mπ
+ℓ,h
+Token indices at head (ℓ, h), sorted by π (descending).
+Mπ
+ℓ,h(k)
+Pruned subset containing the top-k elements of Mπ
+ℓ,h.
+4. Methodology
+4.1. Long-horizon KV Cache Eviction
+KV Cache eviction inherently entails a risk of information
+loss. Traditional eviction methods (e.g., H2O, SnapKV) rely
+on instantaneous attention weights, such as those calculated
+during the prefill stage. We term these methods Heuristic
+Metric. However, these methods overlook the potential for
+shifts in attention patterns during future decoding steps. To
+address this, we propose Long-horizon Utility KV (LU-
+KV), a framework that evaluates KV utility over extended
+sequences. We formulate the cache eviction problem as a
+Global Combinatorial Optimization of long-horizon utility,
+which we solve to determine the optimal head-wise budget
+allocation.
+Oracle Importance.
+To strictly quantify the importance
+of a token, we need a definitive standard of token utility
+based on actual contribution for model inference. Inspired
+by the output perturbation bound analysis in AdaKV (Feng
+et al., 2024) and the criticality definition in CriticalKV (Feng
+et al., 2025), we posit that true token importance should
+reflect its actual contribution to the final model output.
+Accordingly, we define the Oracle Importance Iℓ,h,j of a
+cached position j in head (ℓ, h) as its maximum potential
+contribution over a future decoding window:
+Iℓ,h,j ≜
+max
+k∈{1,...,Kmax}
+
+Aℓ,h,k,j ·
+vℓ,h,jW(ℓ,h)
+O
+
+
+. (4)
+This metric captures the true utility of a token in a long-
+horizon view: whether it constitutes a major component of
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Compression Ratio
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Recall of Oracle Importance
+Random
+Oracle
+SnapKV
+Keydiff
+Figure 1. Recall of oracle importance for oracle metric and several
+heuristic metrics across varying compression ratios (σ), where 1
+implies full compression and 0 implies no compression.
+the output vector at any future step k. Based on this, we
+theoretically construct an Oracle Metric (π∗) that yields
+the set Mπ∗
+ℓ,h, which perfectly aligns with the descending
+ranking of the ground-truth oracle importance Iℓ,h,:.
+Limitation of Heuristic Metric.
+Considering a head KV
+cache budget bℓ,h. In practice, however, Mπ
+ℓ,h(bℓ,h) de-
+termined by a heuristic metric π often deviates from the
+optimal set Mπ∗
+ℓ,h(bℓ,h), due to the short-horizon of π.
+To analyze this discrepancy, we decompose the relationship
+between Mπ∗
+ℓ,h and Mπ
+ℓ,h into 3 classes:
+• Hits: Mℓ,h,hit = Mπ∗
+ℓ,h(bℓ,h)∩Mπ
+ℓ,h(bℓ,h) (Correctly
+retained high oracle importance tokens)
+• Misses: Mℓ,h,miss = M∗
+ℓ,h(bℓ,h) \ Mπ
+ℓ,h(bℓ,h) (High
+Oracle importance, wrongly evicted)
+• False Positives: Mℓ,h,fp = Mπ
+ℓ,h(bℓ,h) \ Mπ∗
+ℓ,h(bℓ,h)
+(Low oracle importance, wrongly retained)
+Consequently, kept cache set Mπ
+ℓ,h(bℓ,h) determined by π
+can also be expressed as:
+Mπ
+ℓ,h(bℓ,h) = (Mπ∗
+ℓ,h(bℓ,h) \ Mℓ,h,miss) ∪Mℓ,h,fp. (5)
+Let eviction loss Lℓ,h(·) denote the Oracle Importance mass
+lost by head (ℓ, h) due to the removal of kv cache.
+Lℓ,h(Mℓ,h) ≜
+X
+j /∈Mℓ,h
+Iℓ,h,j.
+(6)
+Substituting the set formulation from Eq. (5) into the loss
+definition in Eq. (6), we can rigorously decompose the evic-
+tion loss of policy π into two distinct components:
+Lℓ,h(Mπ
+ℓ,h(bℓ,h)) = Lℓ,h(Mπ∗
+ℓ,h(bℓ,h)) +
+X
+j∈Mℓ,h,miss
+Iℓ,h,j −
+X
+j∈Mℓ,h,fp
+Iℓ,h,j
+= Lℓ,h(Mπ∗
+ℓ,h(bℓ,h))
+|
+{z
+}
+Loss of Oracle Metric
++ ∆ℓ,h(π, π∗, b(ℓ, h))
+|
+{z
+}
+Optimality Gap
+.
+(7)
+3
+
+
+--- Page 4 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+where Lℓ,h(M∗
+ℓ,h) is the eviction loss of Oracle Metric,
+which is fixed due to compression ratio; ∆ℓ,h(π, I) is de-
+fined as the Optimality Gap between the oracle metric and
+the used metric π in long-horizon view, which relevant to π.
+Figure 1 validates the decomposition in Eq. (7) by visual-
+izing the total loss as the vertical distance to Recall = 1.0.
+Specifically, the loss of a heuristic metric Lℓ,h(Mπ
+ℓ,h(bℓ,h))
+is the sum of the inherent Oracle loss (red curve to 1.0)
+and the Optimality Gap (vertical gap between heuristic
+metric curve and oracle curve). This observation suggests
+two optimization paths: (1) refining budget allocation cross
+head to lower the total Oracle loss, and (2) improving the
+selection metric to bridge the optimality gap.
+4.2. Global Optimization of Head-Level KV Cache
+Budget Allocation
+The formulation above characterizes the loss within a single
+attention head; however, modern LLMs operate through a
+complex multi-head, multi-layer architecture. Existing
+head-level approaches, e.g, AdaKV (Feng et al., 2024), at-
+tempt to address this by employing a global greedy strategy
+that pools candidate tokens from all heads and retains the
+top-K elements based on surrogate scores. Nevertheless,
+this strategy remains suboptimal due to the existence of the
+Optimality Gap ∆ℓ,h(π, π∗, b(ℓ, h)) defined in Eq. 7.
+Global Optimization Objective.
+We now consider the
+problem of allocating a global cache budget Btotal across
+all attention heads to minimize the aggregate eviction loss
+across the entire model.
+Let bℓ,h denote the cache budget allocated to head (ℓ, h),
+subject to the global constraint P
+ℓ,h bℓ,h = Btotal. For a
+given metric π, we define Mπ
+ℓ,h(bℓ,h) as the set of top-bℓ,h
+token positions selected by π within that head.
+The global optimization objective aims to minimize the
+aggregate eviction loss across all layers and heads by opti-
+mizing the budget distribution {bℓ,h}:
+min
+{bℓ,h}
+L
+X
+ℓ=1
+H
+X
+h=1
+Lℓ,h
+ Mπ
+ℓ,h(bℓ,h)
+
+,
+s.t.
+L
+X
+ℓ=1
+H
+X
+h=1
+bℓ,h = Btotal.
+(8)
+Since Mπ
+ℓ,h(bℓ,h) lacks strict monotonicity with respect to
+the oracle importance, and given that the parameter space for
+{bℓ,h} constitutes a high-dimensional combinatorial domain,
+rendering the global optimization problem NP-hard. The
+proof of the non-convex of Lℓ,h
+
+Mπ
+ℓ,h(bℓ,h)
+
+is provided
+in Appendix A.1.
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Local Compression Ratio
+σ
+Our Method
+Optimal DP
+(a)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Local Compression Ratio
+σ
+hotpotqa
+multifiled-en
+passage_retrieval_en
+qmsum
+repobench-p
+trec
+Our Method
+(b)
+Figure 2. (a) Comparison between our greedy solver based on
+convex-hull relaxation (solving Eq. 10) and DP solution (solving
+Eq. 8). (b) Shows the consistent trend of optimal local compression
+ratio across different downstream tasks under the same global
+compression ratio σ.
+Efficient Optimization via Convex Hull Relaxation.
+To facilitate an efficient solution to the objective in
+Equation 8, we propose a convex relaxation approach
+that transforms the discrete loss Lℓ,h into a tractable
+surrogate.
+By applying Isotonic Regression via the
+Pool Adjacent Violators Algorithm (PAVA) to the raw
+loss sequence
+n
+Lℓ,h
+
+Mπ
+ℓ,h(i)
+
+|1 ≤i ≤T
+o
+, we derive
+a convex, non-increasing surrogate sequence, denoted as
+n
+˘Lℓ,h
+
+Mπ
+ℓ,h(i)
+
+|1 ≤i ≤T
+o
+. We define the Effective
+Marginal Gain of allocating i-th token in Mπ
+ℓ,h:
+gπ
+ℓ,h(i) = ˘Lℓ,h
+ Mπ
+ℓ,h(i −1)
+
+−˘Lℓ,h
+ Mπ
+ℓ,h(i)
+
+≥0. (9)
+The marginal gain gπ
+ℓ,h(i) is monotonically non-increasing
+while i increases. This property allows a global greedy strat-
+egy to achieve the global optimum for the relaxed objective:
+min
+{bℓ,h}
+L
+X
+ℓ=1
+H
+X
+h=1
+˘Lℓ,h
+ Mπ
+ℓ,h(bℓ,h)
+
+,
+s.t.
+L
+X
+ℓ=1
+H
+X
+h=1
+bℓ,h = Btotal.
+(10)
+Specifically, we iteratively allocate the i-th token from the
+attention head (ℓ, h) that yields the maximum effective
+marginal gain gπ
+ℓ,h(i), continuing until the global budget
+Btotal is exhausted. As illustrated in Figure 2a, our approach
+4
+
+
+--- Page 5 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+achieves an exact match with the results of the optimal Dy-
+namic Programming (DP) solver. Details of the convex
+relaxation and allocation process are in Appendix A.2.
+4.3. Practical Implementation: Offline Profiling
+The optimization problem formulated in Eq. 10 requires
+future decoding results to compute the oracle importance I,
+which is inherently inaccessible during real-time inference.
+However, we identify a key structural property of LLMs:
+individual attention heads exhibit a consistent trend in their
+optimal local-to-global compression ratios across diverse
+tasks. As illustrated in Figure 2b, these compression pro-
+files remain remarkably stable across various scenarios, e.g,
+question answering and long-context retrieval. This em-
+pirical consistency allows us to characterize the optimal
+global-local budget allocation in an offline manner.
+Offline Optimal Budget Estimation.
+To construct this
+offline allocation, we employ a data-driven probing protocol
+consisting of three phases:
+• Context Generation: We construct a long-context input
+Csyn (≈4,000 tokens) with a coherent narrative structure
+to simulate realistic KV cache states.
+• Oracle Computation: We generate a diverse set of
+queries Q = {q1, . . . , qM} targeting different informa-
+tion segments. For each qi, the ground-truth oracle impor-
+tance is computed via full-attention decoding.
+• Profile Aggregation: We solve Eq. 10 for each query
+across a dense grid of global compression ratios ρ ∈
+[0, 1] to obtain the query-specific optimal local ratios
+r∗(π)
+ℓ,h (qi; ρ).
+We aggregate these solutions into a final static profile Φ(π)
+by averaging the optimal local ratios across the calibration
+set:
+Φ(π)(ρ)ℓ,h ≜1
+M
+M
+X
+i=1
+r∗(π)
+ℓ,h (qi; ρ).
+(11)
+The resulting Φ(π) serves as a lookup table mapping any
+target global sparsity ρ to a precise configuration for every
+head, effectively capturing the expected utility of each head
+across the general data distribution.
+Online Execution.
+During inference, our method intro-
+duces negligible computational overhead through three
+steps:
+1. Lookup:
+Given a target global compression ratio
+σtarget, the system retrieves the pre-computed local ra-
+tios {rℓ,h} ←Φ(π)(σtarget).
+2. Budgeting: These ratios are translated into integer bud-
+gets: bℓ,h = ⌊(1 −rℓ,h) · T⌋.
+3. Eviction: Each head independently applies the heuristic
+metric π to retain the top-bℓ,h tokens.
+This strategy successfully bridges the gap between theoret-
+ical oracle performance and practical runtime constraints
+without requiring online optimization.
+5. Experiments
+5.1. Experimental Setup
+Benchmarks.
+We assess general long-context generation
+capabilities using LongBench (Bai et al., 2024), which
+consists of 16 diverse datasets covering various long-form
+tasks. Additionally, we utilize RULER (Hsieh et al., 2024)
+to evaluate retrieval robustness across expanding context
+windows, ranging from 4k to 128k tokens. Further details
+regarding the benchmarks are provided in Appendix C.
+Base Models and Baseline Methods.
+We evaluate our
+method using LLMs of varying scales and context win-
+dow capacities: Llama-3.1-8B-Instruct (Dubey et al., 2024),
+Mistral-7B-Instruct-v0.3 (Jiang et al., 2023), and Qwen2.5-
+32B-Instruct (Team, 2024).
+We consider two KV cache importance metrics: the Metric
+SnapKV (Li et al., 2024), denoted as π1, which relies on
+accumulated attention scores; and the Metric KeyDiff (Park
+et al., 2025), denoted as π2, which utilizes the geometric fea-
+tures of key vectors. Under these two metrics, we compare
+our approach against three allocation strategies:
+• Uniform: A static allocation that distributes the KV bud-
+get evenly across all layers.
+• PyramidKV (Cai et al., 2024): A static allocation based
+on the Information Funneling hypothesis, which progres-
+sively prunes the budget in deeper layers.
+• AdaKV (Feng et al., 2024): A dynamic allocation em-
+ploying Global Top-k selection, based on the assumption
+that heads with higher importance scores warrant larger
+budgets.
+Detailed baseline specifications are deferred to Appendix D.
+Experimental Settings.
+Our evaluations are conducted
+using the KVPress framework (NVIDIA, 2024), adopting a
+question-agnostic compression protocol. In this setting, the
+context is compressed and the KV cache is evicted solely
+based on the input document, strictly before the arrival
+of any query. This paradigm closely mirrors real-world
+production environments where the prompt or context is
+pre-filled and cached for future unknown user interactions.
+Furthermore, by precluding access to query-specific atten-
+tion, this setup imposes a significantly more rigorous test on
+the method’s ability to retain salient information compared
+to query-aware approaches.
+5
+
+
+--- Page 6 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+Table 1. Main Results on LongBench. Comparison of KV cache eviction strategies using the SnapKV Metric (π1) and the KeyDiff
+Metric (π2) at an 80% compression ratio.
+Model
+Method
+QA
+Summ.
+Few-Shot
+Synth.
+Code
+Avg.
+Single
+Multi
+Mistral-7B-v0.3
+Full-KV
+38.36
+37.83
+28.86
+70.86
+51.25
+63.26
+47.30
+Uniform-π1
+24.70
+31.78
+24.15
+63.95
+47.50
+60.98
+40.67
+Pyramid-π1
+25.36
+31.95
+23.98
+63.35
+48.75
+61.80
+40.94
+Ada-π1
+26.21
+31.88
+24.42
+66.52
+49.50
+62.05
+41.89
+LU-KV-π1 (Ours)
+37.16
+36.59
+27.97
+69.81
+51.35
+57.69
+45.79
+Uniform-π2
+28.53
+30.86
+24.71
+59.00
+33.08
+46.89
+36.83
+Pyramid-π2
+29.44
+30.53
+24.50
+59.33
+34.06
+42.95
+36.59
+Ada-π2
+31.94
+33.78
+25.23
+59.60
+40.79
+57.71
+40.54
+LU-KV-π2 (Ours)
+39.80
+38.09
+28.22
+68.32
+52.02
+56.04
+46.21
+Qwen2.5-32B
+Full-KV
+42.91
+54.15
+27.33
+68.91
+55.75
+42.35
+48.51
+Uniform-π1
+25.02
+44.50
+23.33
+64.45
+48.75
+44.99
+41.21
+Pyramid-π1
+19.44
+40.23
+21.84
+60.24
+50.46
+46.34
+38.68
+Ada-π1
+25.75
+43.60
+23.34
+65.70
+50.13
+44.97
+41.58
+LU-KV-π1 (Ours)
+39.84
+53.55
+26.19
+67.32
+54.75
+48.46
+47.95
+Uniform-π2
+26.85
+44.30
+22.32
+65.82
+38.36
+29.32
+38.33
+Pyramid-π2
+22.00
+35.87
+20.64
+60.05
+24.71
+26.85
+32.42
+Ada-π2
+32.16
+46.44
+23.68
+66.33
+48.92
+36.71
+42.32
+LU-KV-π2 (Ours)
+41.58
+54.23
+26.61
+67.86
+53.75
+46.91
+48.26
+Table 2. Main Results on RULER-16K. Comparison of KV cache eviction strategies using the SnapKV Metric (π1) and the KeyDiff
+Metric (π2) at an 80% compression ratio.
+Model Method
+RULER Tasks (16K)
+single1
+single2
+single3
+multikey1
+multikey2
+multikey3
+multivalue
+multiquery
+vt
+cwe
+fwe
+qa-1
+qa-2
+Avg
+Mistral-7B-v0.3
+Full-KV
+94.20
+96.40
+99.60
+97.40
+95.60
+76.80
+89.50
+88.65
+96.28
+82.22 87.93 71.60 50.00 86.63
+Uniform-π1
+40.40
+16.20
+2.40
+14.20
+6.20
+1.00
+9.65
+11.00
+66.92
+66.96 85.53 29.80 33.60 29.53
+Pyramid-π1
+50.00
+57.00
+2.40
+28.00
+4.80
+0.20
+16.15
+21.55
+62.32
+31.94 82.20 32.00 33.00 32.43
+Ada-π1
+58.00
+38.80
+2.40
+20.20
+12.40
+5.60
+12.85
+16.80
+92.08
+71.36 86.13 33.60 37.00 37.48
+LU-KV-π1 (Ours)
+70.80
+78.80
+18.20
+83.60
+79.20
+67.40
+67.80
+76.25
+95.88
+78.32 84.47 62.00 47.00 69.98
+Uniform-π2
+94.60
+72.80
+100.00
+78.80
+7.40
+0.80
+94.80
+86.10
+94.16
+65.56 90.87 32.40 35.80 65.70
+Pyramid-π2
+93.20
+96.20
+99.60
+88.20
+6.60
+0.60
+92.00
+89.75
+94.36
+36.92 88.73 31.40 34.80 65.57
+Ada-π2
+92.60
+91.20
+97.40
+87.80
+6.80
+1.20
+88.00
+86.45
+91.28
+75.44 86.47 36.40 36.60 67.51
+LU-KV-π2 (Ours)
+85.60
+76.60
+100.00
+87.00
+90.80
+35.20
+96.45
+92.85
+92.16
+80.78 86.80 64.60 46.80 79.66
+Qwen2.5-32B
+Full-KV
+100.00 100.00 100.00
+100.00
+99.80
+100.00
+99.85
+99.95
+100.00 97.70 96.20 79.40 62.40 95.02
+Uniform-π1
+97.40
+55.60
+3.80
+25.80
+4.80
+2.00
+14.40
+19.60
+99.28
+87.14 94.00 28.00 39.00 43.91
+Pyramid-π1
+83.80
+36.00
+2.40
+19.20
+2.00
+0.00
+13.15
+14.95
+93.68
+56.84 95.73 26.40 34.60 36.83
+Ada-π1
+98.80
+52.60
+4.40
+21.80
+7.00
+4.20
+14.75
+18.25
+99.32
+88.48 94.53 29.40 39.00 44.04
+LU-KV-π1 (Ours)
+99.80
+99.20
+32.00
+84.20
+71.80
+78.40
+84.60
+85.80
+99.72
+95.66 93.13 65.00 56.80 80.47
+Uniform-π2
+100.00 100.00 100.00
+100.00
+8.00
+1.00
+99.40
+99.95
+98.92
+90.36 99.33 36.40 41.40 74.98
+Pyramid-π2
+100.00 100.00
+99.80
+99.60
+1.00
+0.20
+99.55
+99.95
+84.52
+69.26 98.93 30.20 35.80 70.68
+Ada-π2
+100.00 100.00 100.00
+99.80
+44.20
+23.00
+99.00
+99.90
+99.88
+95.34 99.07 44.00 46.40 80.81
+LU-KV-π2 (Ours) 100.00 100.00 100.00
+100.00
+86.60
+46.80
+99.25
+99.95
+100.00 96.02 96.20 71.60 59.00 88.88
+5.2. Main Results on KV Cache Eviction
+Results on LongBench.
+Table 1 summarizes the perfor-
+mance under an 80% compression ratio. Consistent with
+our global optimization objective in Eq. 8, our method ef-
+fectively minimizes the aggregate eviction loss, translating
+into significant accuracy gains. On Mistral-7B-v0.3
+with π2 (KeyDiff), our method improves the average ac-
+curacy from 40.54 (AdaKV) to 46.21, recovering 84% of
+the performance gap between the compressed model and
+the Full-KV upper bound. Crucially, these gains are robust
+across diverse domains—from summarization to synthetic
+tasks—demonstrating that our learned compression profiles
+6
+
+
+--- Page 7 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+0
+5
+10
+15
+20
+25
+30
+Layer Index (ℓ)
+0
+2
+4
+6
+Layer Eviction Loss
+×10−5
+Uniform-SnapKV
+PyramidKV-SnapKV
+AdaKV-SnapKV
+Ours-SnapKV
+Figure 3. Comparison of aggregated layer-wise eviction loss. Ours
+consistently achieves the lowest and most stable loss across all
+layers, whereas baselines like AdaKV and PyramidKV exhibit
+severe loss spikes.
+0
+7
+Head (h)
+Uniform-SnapKV (Total Loss: 5.35e-04)
+0
+7
+Head (h)
+PyramidKV-SnapKV (Total Loss: 6.41e-04)
+0
+7
+Head (h)
+AdaKV-SnapKV (Total Loss: 4.98e-04)
+0
+4
+8
+12
+16
+20
+24
+28
+Layer Index (ℓ)
+0
+7
+Head (h)
+Ours-SnapKV (Total Loss: 3.87e-04)
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+×10−5
+Loss Value
+Figure 4. Heatmap visualization of per-head loss distribution Lℓ,h.
+Baselines suffer from intense ”loss bursts” (dark red blocks) in
+specific heads due to optimality gap, while our method effectively
+suppresses these spikes across the entire model.
+2k
+4k
+8k
+16k
+32k
+64k
+120k
+Sequence Length
+0
+5
+10
+15
+20
+25
+30
+35
+40
+45
+Peak Memory Usage (GB)
+No compression
+SnapKV 50%
+SnapKV 80%
+Our SnapKV 50%
+Our SnapKV 80%
+(a) Peak memory usage
+2k
+4k
+8k
+16k
+32k
+64k
+120k
+Sequence Length
+0
+5
+10
+15
+20
+25
+30
+Time To First Token (s)
+No compression
+SnapKV 50%
+SnapKV 80%
+Our SnapKV 50%
+Our SnapKV 80%
+(b) Time To First Token (TTFT) latency
+Figure 5. Efficiency comparison on Llama-3.1-8b. Our method maintains comparable latency to baselines while significantly reducing
+memory usage in long-context scenarios.
+successfully capture the intrinsic Oracle Importance distri-
+bution across varying data densities.
+Results on RULER.
+The RULER benchmark serves as a
+stress test for retrieval robustness in extreme contexts. Fo-
+cusing on Mistral-7B-v0.3 using the SnapKV metric
+(π1) in Table 2, conventional strategies struggle significantly:
+Uniform allocation collapses to 29.53% average accuracy,
+and AdaKV provides only marginal relief at 37.48%. In con-
+trast, our approach achieves a remarkable 69.98% average
+accuracy under the same 80% compression ratio. Notably,
+on the challenging multikey-3 task, our method boosts
+performance from 1.00% (Uniform) to 67.40%, demonstrat-
+ing substantial robustness in preserving sparse yet critical
+information.
+5.3. LU-KV is Optimal Global Allocation.
+To validate our core hypothesis, we visualize the eviction
+loss distribution under an 80% compression ratio. As il-
+lustrated in Figure 3 and Figure 4, the failure modes of
+different strategies reveal their fundamental limitations in
+both optimization granularity and deployment constraints.
+Limitations of PyramidKV. PyramidKV primarily at-
+tempts to optimize in the layer-wise dimension based on
+fixed priors. While it adjusts the budget distribution across
+layers, Figure 3 (pink line) shows that this rigid heuristic in-
+duces a sharp escalation in loss within deeper layers (layers
+27–32), failing to adapt to the high semantic density of these
+regions. Consequently, the aggressive pruning in deep lay-
+ers—based on an ill-suited pyramidal hypothesis—causes
+irreversible context loss that outweighs the minor gains in
+shallow layers, ultimately yielding a higher aggregated Ora-
+cle Loss than the Uniform baseline.
+Limitations of AdaKV. AdaKV focuses on the head-wise
+dimension, allocating budgets dynamically based on proxy
+score magnitudes. However, it faces a critical engineering
+trade-off: performing a true global cross-layer sort requires
+buffering all KV states during prefill, which causes unac-
+7
+
+
+--- Page 8 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+Table 3. Ablation Study on LongBench. We evaluate the impact of the optimality gap by comparing strategies w/o Optimality Gap (△)
+against w/ Optimality Gap. Evaluated on Mistral-7B-v0.3 and Qwen2.5-32B at an 80% compression ratio.
+Model Method
+Single-Doc QA
+Multi-Doc QA
+Summarization
+Few-shot
+Synthetic
+Code
+Avg
+NrtvQA
+Qasper
+MF-en
+Hotpot
+2WikiQA
+Musique
+GovRep
+QMSum
+MultiNews
+TREC
+TriviaQA
+SAMSum
+PCount
+PR-en
+Lcc
+RB-P
+Mistral-7B
+Full-KV
+27.04 38.30 49.75 49.11 36.68 27.69 34.64 25.55 26.40 76.50 88.96 47.11
+5.50
+97.00 65.60 60.92 47.30
+LU-KV-π1 (w/o △) 23.03 27.14 42.68 49.69 31.27 21.20 30.34 23.15 23.64 66.00 89.36 47.13
+5.00
+96.50 66.72 60.33 43.95
+LU-KV-π1 (w/ △)
+25.25 34.91 51.32 48.87 38.10 22.80 33.57 25.02 25.31 71.00 91.32 47.12
+5.19
+97.50 53.76 61.62 45.79
+LU-KV-π2 (w/o △) 24.82 29.97 47.07 44.72 34.68 23.10 30.62 24.15 24.53 47.50 89.06 46.80
+4.68
+92.50 46.63 60.89 41.98
+LU-KV-π2 (w/ △)
+25.80 39.78 53.82 48.26 41.33 24.69 33.49 25.52 25.65 69.00 88.81 47.14
+6.53
+97.50 51.18 60.89 46.21
+Qwen2.5-32B
+Full-KV
+30.68 45.93 52.13 63.00 60.75 38.71 32.43 24.51 25.06 72.00 88.71 46.01 11.50 100.00 50.72 33.98 48.51
+LU-KV-π1 (w/o △) 27.50 26.07 36.90 59.58 53.91 37.27 29.37 20.76 22.32 65.50 88.57 45.45
+9.50
+99.25 60.36 37.77 45.00
+LU-KV-π1 (w/ △)
+29.41 39.16 50.95 62.82 58.00 39.84 31.34 23.12 24.10 71.00 88.89 42.07
+9.50 100.00 60.21 36.71 47.95
+LU-KV-π2 (w/o △) 26.65 26.11 42.18 57.12 52.08 30.64 28.25 22.33 21.16 73.50 88.69 43.64
+8.50
+91.54 42.14 36.31 43.18
+LU-KV-π2 (w/ △)
+31.30 42.88 50.55 61.61 59.67 41.41 31.56 24.01 24.25 74.00 88.31 41.28
+7.50 100.00 55.45 38.37 48.26
+ceptable peak memory spikes. Consequently, AdaKV is
+often practically constrained to layer-wise uniform (or lo-
+cally dynamic) budgets while competing only within layers.
+This explains why its layer-wise loss curve (Figure 3, blue
+dashed line) closely mirrors the Uniform baseline, failing
+to rebalance resources across layers. Furthermore, within
+layers, Figure 4 reveals that distinct “loss bursts” (dark red
+blocks) persist. This confirms the ranking discordance: sim-
+ply prioritizing heads with high proxy scores fails to capture
+true Oracle importance, leading to suboptimal intra-layer
+allocation.
+Superiority of Allocation with Optimality Gap. Our
+method integrates the advantages of both dimensions while
+circumventing their drawbacks. As an offline static strat-
+egy, our method retrieves the optimal configuration from a
+pre-computed profile. This allows us to execute true global
+optimization (Cross-Layer & Cross-Head) without incurring
+the runtime memory overhead that limits online dynamic
+methods. Results show distinct improvements in two as-
+pects: (1) Cross-Layer: Figure 3 (orange solid line) shows
+that our method effectively homogenizes the eviction loss
+across all layers, preventing the surge in deeper layers ob-
+served in PyramidKV. (2) Cross-Head: Figure 4 confirms
+that the localized “loss bursts” characteristic of AdaKV
+are successfully eliminated. By optimizing the Effective
+Marginal Gain (gπ
+ℓ,h) globally, we achieve superior resource
+utilization, significantly reducing the total Oracle Eviction
+Loss compared to AdaKV (3.87 × 10−4 vs. 4.98 × 10−4).
+5.4. Ablation Study
+To deconstruct our performance gains, we evaluate two
+allocation logics in Table 3. The first, Without Optimality
+Gap Allocation, distributes the budget solely on total Oracle
+importance, assuming perfect metric ranking while ignoring
+the Optimality Gap. The second, our With Optimality
+Gap Allocation, incorporates the correction term to rectify
+metric-oracle discrepancies.
+Results show that disregarding the optimality gap causes a
+substantial performance degradation, with an average score
+decrease of 3.53 points. This validates our derivation: op-
+timal allocation should not be dictated by where the proxy
+metric perceives importance (Method Confidence), but
+where it accurately preserves critical information (Method
+Correctness).
+5.5. Efficiency
+Figure 5 shows that on Llama-3.1-8B, our method achieves
+peak memory reduction and TTFT latency comparable to the
+SnapKV baseline. This confirms that our proposed method
+introduces negligible computational overhead, effectively
+maintaining strict resource limits while significantly miti-
+gating the performance degradation caused by compression.
+6. Conclusion
+In this paper, we theoretically analyze the limitations of
+existing heuristic KV eviction methods through the lens of
+long-horizon inference, revealing their inability to capture
+the long-term cumulative contribution of tokens.
+To bridge this gap, we introduce a novel paradigm: KV
+cache retention should be determined not only by instanta-
+neous importance but also by future utility. We formulate
+the head-level budget allocation as a global combinatorial
+optimization problem and propose an efficient convex-hull
+relaxation and a greedy solver algorithm to solve it. Exten-
+sive evaluation across highly demanding benchmarks, such
+as LongBench and RULER, demonstrates the efficacy of
+our proposed approach.
+8
+
+
+--- Page 9 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+References
+Bai, Y., Lv, X., Zhang, J., Lyu, H., Tang, J., Huang, Z.,
+Du, Z., Liu, X., Zeng, A., Hou, L., et al. Longbench: A
+bilingual, multitask benchmark for long context under-
+standing. In Proceedings of the 62nd annual meeting of
+the association for computational linguistics (volume 1:
+Long papers), pp. 3119–3137, 2024.
+Cai, Z., Zhang, Y., Gao, B., Liu, Y., Liu, T., Lu, K., Xiong,
+W., Dong, Y., Chang, B., Hu, J., and Xiao, W. Pyramidkv:
+Dynamic KV cache compression based on pyramidal
+information funneling. CoRR, abs/2406.02069, 2024.
+doi: 10.48550/ARXIV.2406.02069. URL https:
+//doi.org/10.48550/arXiv.2406.02069.
+Chen, M. Evaluating large language models trained on code.
+arXiv preprint arXiv:2107.03374, 2021.
+Dasigi, P., Lo, K., Beltagy, I., Cohan, A., Smith, N. A., and
+Gardner, M. A dataset of information-seeking questions
+and answers anchored in research papers. In Toutanova,
+K., Rumshisky, A., Zettlemoyer, L., Hakkani-Tur, D.,
+Beltagy, I., Bethard, S., Cotterell, R., Chakraborty, T.,
+and Zhou, Y. (eds.), Proceedings of the 2021 Conference
+of the North American Chapter of the Association for
+Computational Linguistics: Human Language Technolo-
+gies, pp. 4599–4610, Online, June 2021. Association for
+Computational Linguistics. doi: 10.18653/v1/2021.naacl
+-main.365. URL https://aclanthology.org/2
+021.naacl-main.365/.
+Devoto, A., Jeblick, M., and J´egou, S. Expected attention:
+Kv cache compression by estimating attention from future
+queries distribution, 2025. URL https://arxiv.or
+g/abs/2510.00636.
+Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle,
+A., Letman, A., Mathur, A., Schelten, A., Yang, A., Fan,
+A., et al. The llama 3 herd of models. arXiv preprint
+arXiv:2407.21783, 2024.
+Fabbri, A., Li, I., She, T., Li, S., and Radev, D. Multi-news:
+A large-scale multi-document summarization dataset
+and abstractive hierarchical model. In Korhonen, A.,
+Traum, D., and M`arquez, L. (eds.), Proceedings of the
+57th Annual Meeting of the Association for Computa-
+tional Linguistics, pp. 1074–1084, Florence, Italy, July
+2019. Association for Computational Linguistics. doi:
+10.18653/v1/P19-1102. URL https://aclantho
+logy.org/P19-1102/.
+Feng, Y., Lv, J., Cao, Y., Xie, X., and Zhou, S. K. Ada-kv:
+Optimizing KV cache eviction by adaptive budget alloca-
+tion for efficient LLM inference. CoRR, abs/2407.11550,
+2024. doi: 10.48550/ARXIV.2407.11550. URL https:
+//doi.org/10.48550/arXiv.2407.11550.
+Feng, Y., Lv, J., Cao, Y., Xie, X., and Zhou, S. K. Iden-
+tify critical KV cache in LLM inference from an output
+perturbation perspective. CoRR, abs/2502.03805, 2025.
+doi: 10.48550/ARXIV.2502.03805. URL https:
+//doi.org/10.48550/arXiv.2502.03805.
+Fu, Y., Cai, Z., Asi, A., Xiong, W., Dong, Y., and Xiao,
+W. Not all heads matter: A head-level KV cache com-
+pression method with integrated retrieval and reason-
+ing.
+In The Thirteenth International Conference on
+Learning Representations, ICLR 2025, Singapore, April
+24-28, 2025. OpenReview.net, 2025.
+URL https:
+//openreview.net/forum?id=FJFVmeXusW.
+Gliwa, B., Mochol, I., Biesek, M., and Wawer, A. SAM-
+Sum corpus: A human-annotated dialogue dataset for
+abstractive summarization. In Wang, L., Cheung, J. C. K.,
+Carenini, G., and Liu, F. (eds.), Proceedings of the 2nd
+Workshop on New Frontiers in Summarization, pp. 70–
+79, Hong Kong, China, November 2019. Association for
+Computational Linguistics. doi: 10.18653/v1/D19-5409.
+URL https://aclanthology.org/D19-540
+9/.
+Ho, X., Duong Nguyen, A.-K., Sugawara, S., and Aizawa,
+A. Constructing a multi-hop QA dataset for comprehen-
+sive evaluation of reasoning steps. In Scott, D., Bel,
+N., and Zong, C. (eds.), Proceedings of the 28th In-
+ternational Conference on Computational Linguistics,
+pp. 6609–6625, Barcelona, Spain (Online), December
+2020. International Committee on Computational Lin-
+guistics. doi: 10.18653/v1/2020.coling-main.580. URL
+https://aclanthology.org/2020.coling
+-main.580/.
+Hsieh, C.-P., Sun, S., Kriman, S., Acharya, S., Rekesh, D.,
+Jia, F., Zhang, Y., and Ginsburg, B. Ruler: What’s the
+real context size of your long-context language models?
+arXiv preprint arXiv:2404.06654, 2024.
+Huang, L., Cao, S., Parulian, N., Ji, H., and Wang,
+L. Efficient attentions for long document summariza-
+tion.
+In Toutanova, K., Rumshisky, A., Zettlemoyer,
+L., Hakkani-Tur, D., Beltagy, I., Bethard, S., Cotterell,
+R., Chakraborty, T., and Zhou, Y. (eds.), Proceedings of
+the 2021 Conference of the North American Chapter of
+the Association for Computational Linguistics: Human
+Language Technologies, pp. 1419–1436, Online, June
+2021. Association for Computational Linguistics. doi:
+10.18653/v1/2021.naacl-main.112. URL https://ac
+lanthology.org/2021.naacl-main.112/.
+Jiang, A. Q., Sablayrolles, A., Mensch, A., Bamford, C.,
+Chaplot, D. S., Casas, D. d. l., Bressand, F., Lengyel, G.,
+Lample, G., Saulnier, L., et al. Mistral 7b. arXiv preprint
+arXiv:2310.06825, 2023.
+9
+
+
+--- Page 10 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+Joshi, M., Choi, E., Weld, D., and Zettlemoyer, L. TriviaQA:
+A large scale distantly supervised challenge dataset for
+reading comprehension. In Barzilay, R. and Kan, M.-Y.
+(eds.), Proceedings of the 55th Annual Meeting of the
+Association for Computational Linguistics (Volume 1:
+Long Papers), pp. 1601–1611, Vancouver, Canada, July
+2017. Association for Computational Linguistics. doi:
+10.18653/v1/P17-1147. URL https://aclantho
+logy.org/P17-1147/.
+Kim, J., Kim, J., Kwon, S., Lee, J. W., Yun, S., and Song,
+H. O. Kvzip: Query-agnostic KV cache compression with
+context reconstruction. CoRR, abs/2505.23416, 2025.
+doi: 10.48550/ARXIV.2505.23416. URL https:
+//doi.org/10.48550/arXiv.2505.23416.
+Koˇcisk`y, T., Schwarz, J., Blunsom, P., Dyer, C., Hermann,
+K. M., Melis, G., and Grefenstette, E. The narrativeqa
+reading comprehension challenge. Transactions of the
+Association for Computational Linguistics, 6:317–328,
+2018.
+Li, X. and Roth, D. Learning question classifiers. In COL-
+ING 2002: The 19th International Conference on Com-
+putational Linguistics, 2002. URL https://aclant
+hology.org/C02-1150/.
+Li, Y., Huang, Y., Yang, B., Venkitesh, B., Locatelli,
+A., Ye, H., Cai, T., Lewis, P., and Chen, D. Snapkv:
+LLM knows what you are looking for before gener-
+ation.
+In Globersons, A., Mackey, L., Belgrave, D.,
+Fan, A., Paquet, U., Tomczak, J. M., and Zhang, C.
+(eds.), Advances in Neural Information Processing Sys-
+tems 38: Annual Conference on Neural Information
+Processing Systems 2024, NeurIPS 2024, Vancouver,
+BC, Canada, December 10 - 15, 2024, 2024.
+URL
+http://papers.nips.cc/paper_files/p
+aper/2024/hash/28ab418242603e0f7323e
+54185d19bde-Abstract-Conference.html.
+Liu, T., Xu, C., and McAuley, J. Repobench: Benchmarking
+repository-level code auto-completion systems. arXiv
+preprint arXiv:2306.03091, 2023.
+NVIDIA. Kvpress, 2024. URL https://github.com
+/NVIDIA/kvpress.
+Park, J., Jones, D., Morse, M. J., Goel, R., Lee, M., and
+Lott, C. Keydiff: Key similarity-based KV cache eviction
+for long-context LLM inference in resource-constrained
+environments. CoRR, abs/2504.15364, 2025. doi: 10.4
+8550/ARXIV.2504.15364. URL https://doi.org/
+10.48550/arXiv.2504.15364.
+Qin, Z., Cao, Y., Lin, M., Hu, W., Fan, S., Cheng, K., Lin,
+W., and Li, J. CAKE: cascading and adaptive KV cache
+eviction with layer preferences. In The Thirteenth Inter-
+national Conference on Learning Representations, ICLR
+2025, Singapore, April 24-28, 2025. OpenReview.net,
+2025. URL https://openreview.net/forum
+?id=EQgEMAD4kv.
+Rajpurkar, P., Jia, R., and Liang, P.
+Know what you
+don’t know: Unanswerable questions for SQuAD. In
+Gurevych, I. and Miyao, Y. (eds.), Proceedings of the
+56th Annual Meeting of the Association for Computa-
+tional Linguistics (Volume 2: Short Papers), pp. 784–789,
+Melbourne, Australia, July 2018. Association for Compu-
+tational Linguistics. doi: 10.18653/v1/P18-2124. URL
+https://aclanthology.org/P18-2124/.
+Team, Q. Qwen2.5: A party of foundation models, Septem-
+ber 2024. URL https://qwenlm.github.io/b
+log/qwen2.5/.
+Trivedi, H., Balasubramanian, N., Khot, T., and Sabharwal,
+A. Musique: Multihop questions via single-hop ques-
+tion composition. Transactions of the Association for
+Computational Linguistics, 10:539–554, 2022.
+Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Effi-
+cient streaming language models with attention sinks. In
+The Twelfth International Conference on Learning Repre-
+sentations, ICLR 2024, Vienna, Austria, May 7-11, 2024.
+OpenReview.net, 2024. URL https://openreview
+.net/forum?id=NG7sS51zVF.
+Yang, Z., Qi, P., Zhang, S., Bengio, Y., Cohen, W., Salakhut-
+dinov, R., and Manning, C. D. HotpotQA: A dataset
+for diverse, explainable multi-hop question answering.
+In Riloff, E., Chiang, D., Hockenmaier, J., and Tsu-
+jii, J. (eds.), Proceedings of the 2018 Conference on
+Empirical Methods in Natural Language Processing,
+pp. 2369–2380, Brussels, Belgium, October-November
+2018. Association for Computational Linguistics. doi:
+10.18653/v1/D18-1259. URL https://aclantho
+logy.org/D18-1259/.
+Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai, R.,
+Song, Z., Tian, Y., R´e, C., Barrett, C. W., Wang, Z., and
+Chen, B. H2O: heavy-hitter oracle for efficient generative
+inference of large language models. In Oh, A., Naumann,
+T., Globerson, A., Saenko, K., Hardt, M., and Levine,
+S. (eds.), Advances in Neural Information Processing
+Systems 36: Annual Conference on Neural Information
+Processing Systems 2023, NeurIPS 2023, New Orleans,
+LA, USA, December 10 - 16, 2023, 2023. URL http:
+//papers.nips.cc/paper_files/paper/2
+023/hash/6ceefa7b15572587b78ecfcebb2
+827f8-Abstract-Conference.html.
+Zhong, M., Yin, D., Yu, T., Zaidi, A., Mutuma, M., Jha, R.,
+Hassan, A., Celikyilmaz, A., Liu, Y., Qiu, X., et al. Qm-
+10
+
+
+--- Page 11 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+sum: A new benchmark for query-based multi-domain
+meeting summarization. In Proceedings of the 2021 Con-
+ference of the North American Chapter of the Association
+for Computational Linguistics: Human Language Tech-
+nologies, pp. 5905–5921, 2021.
+11
+
+
+--- Page 12 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+A. Theoretical Proofs
+A.1. Non-convexity of Eviction Loss in Eq. 8
+Fix an attention head (ℓ, h) and consider the discrete loss sequence
+n
+Lℓ,h
+
+Mπ
+ℓ,h(i)
+oT
+i=0, where Mπ
+ℓ,h(i) denotes the top-i
+positions selected by π in this head. Since Mπ
+ℓ,h(i −1) ⊂Mπ
+ℓ,h(i) and
+Mπ
+ℓ,h(i) \ Mπ
+ℓ,h(i −1)
+ = 1 for all i ≥1, by
+Eq. (6) we have
+Lℓ,h
+ Mπ
+ℓ,h(i)
+
+=
+X
+j /∈Mπ
+ℓ,h(i)
+Iℓ,h,j
+=
+X
+j /∈Mπ
+ℓ,h(i−1)
+Iℓ,h,j −
+X
+j∈Mπ
+ℓ,h(i)\Mπ
+ℓ,h(i−1)
+Iℓ,h,j
+= Lℓ,h
+ Mπ
+ℓ,h(i −1)
+
+−
+X
+j∈Mπ
+ℓ,h(i)\Mπ
+ℓ,h(i−1)
+Iℓ,h,j.
+(12)
+Therefore, the discrete first difference is non-positive:
+Lℓ,h
+ Mπ
+ℓ,h(i)
+
+−Lℓ,h
+ Mπ
+ℓ,h(i −1)
+
+= −
+X
+j∈Mπ
+ℓ,h(i)\Mπ
+ℓ,h(i−1)
+Iℓ,h,j ≤0.
+(13)
+The discrete second difference satisfies
+Lℓ,h
+ Mπ
+ℓ,h(i + 1)
+
+−2Lℓ,h
+ Mπ
+ℓ,h(i)
+
++ Lℓ,h
+ Mπ
+ℓ,h(i −1)
+
+=
+
+Lℓ,h
+ Mπ
+ℓ,h(i + 1)
+
+−Lℓ,h
+ Mπ
+ℓ,h(i)
+
+−
+
+Lℓ,h
+ Mπ
+ℓ,h(i)
+
+−Lℓ,h
+ Mπ
+ℓ,h(i −1)
+
+=
+X
+j∈Mπ
+ℓ,h(i)\Mπ
+ℓ,h(i−1)
+Iℓ,h,j −
+X
+j∈Mπ
+ℓ,h(i+1)\Mπ
+ℓ,h(i)
+Iℓ,h,j.
+(14)
+Hence, Lℓ,h
+
+Mπ
+ℓ,h(i)
+
+is (discretely) convex in i if and only if the increment added at step i has no smaller oracle
+importance than the increment added at step i + 1, i.e., the oracle importances are non-increasing along the ordering induced
+by π. For a heuristic metric π, this monotonicity generally fails (there exist inversions w.r.t. Iℓ,h,:), which implies that there
+exists some i such that the right-hand side of Eq. (14) is negative. Consequently, Lℓ,h
+
+Mπ
+ℓ,h(bℓ,h)
+
+is non-convex as a
+function of bℓ,h in general, and Eq. (8) is a non-convex combinatorial optimization problem.
+A.2. Convex Relaxation Optimization of Equition 8
+Eq. (8) is a discrete multi-head budget allocation problem.
+As shown in Appendix A.1, for a heuristic metric π,
+Lℓ,h
+
+Mπ
+ℓ,h(bℓ,h)
+
+is generally non-convex in bℓ,h. We adopt the convex-hull relaxation described in Section 4.2 to
+obtain a tractable surrogate objective.
+Convex surrogate loss by PAVA.
+For each head (ℓ, h), consider the raw discrete loss sequence
+n
+Lℓ,h
+
+Mπ
+ℓ,h(i)
+oT
+i=0.
+Applying isotonic regression via PAVA yields a convex, non-increasing surrogate sequence
+n
+˘Lℓ,h
+
+Mπ
+ℓ,h(i)
+oT
+i=0, as
+defined in Section 4.2. We further define the effective marginal gain (Eq. (9)) as
+gπ
+ℓ,h(i) = ˘Lℓ,h
+ Mπ
+ℓ,h(i −1)
+
+−˘Lℓ,h
+ Mπ
+ℓ,h(i)
+
+≥0,
+(15)
+which is monotonically non-increasing in i.
+Equivalent maximization form.
+By telescoping Eq. (15), for any integer budget bℓ,h ∈{0, 1, . . . , T} we have
+˘Lℓ,h
+ Mπ
+ℓ,h(bℓ,h)
+
+= ˘Lℓ,h
+ Mπ
+ℓ,h(0)
+
+−
+bℓ,h
+X
+i=1
+gπ
+ℓ,h(i).
+(16)
+12
+
+
+--- Page 13 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+Substituting Eq. (16) into Eq. (10), the relaxed minimization is equivalent to the following maximization:
+max
+{bℓ,h}
+L
+X
+ℓ=1
+H
+X
+h=1
+bℓ,h
+X
+i=1
+gπ
+ℓ,h(i)
+s.t.
+L
+X
+ℓ=1
+H
+X
+h=1
+bℓ,h = Btotal.
+(17)
+Optimality of greedy allocation.
+Since gπ
+ℓ,h(i) is non-increasing in i for every head, Eq. (17) is a separable diminishing-
+returns allocation problem. An optimal solution is obtained by iteratively allocating one unit of budget to the head (ℓ, h)
+that maximizes the next available gain gπ
+ℓ,h(bℓ,h + 1), until the budget constraint is met. Equivalently, the greedy procedure
+selects the Btotal largest feasible marginal gains across all heads under the prefix constraint induced by {gπ
+ℓ,h(i)}i, which
+yields the global optimum of Eq. (10).
+B. Additional Experimental Results
+B.1. Visualizing the Eviction Loss across Different Metrics
+To evaluate the universality of the optimality gap, we visualize the eviction loss for the Mistral-7B-v0.3 model on the
+HotpotQA task (LongBench) under an 80% global compression ratio. Figure 6 illustrates the results across three heuristic
+metrics: SnapKV, KeyDiff, and EA.
+B.2. Comprehensive Head-wise Optimal Allocation Profiles
+In this section, we provide the full visualization of the optimal budget allocation profiles for the Mistral-7B-v0.3 model
+using the KeyDiff metric. These figures display the mapping from the target global compression ratio to the allocated local
+compression ratio for each of the 32 layers and 8 heads.
+The elements in the visualizations are defined as follows:
+• The horizontal axis (x-axis) represents the Global Compression Ratio (σ ∈[0, 1]).
+• The vertical axis (y-axis) represents the Optimal Local Compression Ratio (rℓ,h) for the specific head.
+• The black solid line (labeled as ‘mytest convex’) indicates the allocation curve derived from our proposed convex-hull
+optimization algorithm, calculated using our synthetic calibration data.
+• The orange dashed line (labeled as ‘mytest mckp’) represents the theoretical optimal solution computed via the
+Multi-Choice Knapsack Problem (MCKP) dynamic programming algorithm on the synthetic calibration data.
+• The background colored lines represent the corresponding utility profiles for various downstream datasets in the
+benchmark.
+13
+
+
+--- Page 14 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+0
+5
+10
+15
+20
+25
+30
+Layer Index (ℓ)
+0
+2
+4
+6
+Layer Eviction Loss
+×10−5
+Uniform-SnapKV
+PyramidKV-SnapKV
+AdaKV-SnapKV
+Ours-SnapKV
+(a) SnapKV: Layer-wise Aggregation
+0
+7
+Head (h)
+Uniform-SnapKV (Total Loss: 5.35e-04)
+0
+7
+Head (h)
+PyramidKV-SnapKV (Total Loss: 6.41e-04)
+0
+7
+Head (h)
+AdaKV-SnapKV (Total Loss: 4.98e-04)
+0
+4
+8
+12
+16
+20
+24
+28
+Layer Index (ℓ)
+0
+7
+Head (h)
+Ours-SnapKV (Total Loss: 3.87e-04)
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+×10−5
+Loss Value
+(b) SnapKV: Per-head Heatmap
+0
+5
+10
+15
+20
+25
+30
+Layer Index (ℓ)
+0
+2
+4
+6
+Layer Eviction Loss
+×10−5
+Uniform-KeyDiff
+PyramidKV-KeyDiff
+AdaKV-KeyDiff
+Ours-KeyDiff
+(c) KeyDiff: Layer-wise Aggregation
+0
+7
+Head (h)
+Uniform-KeyDiff (Total Loss: 5.77e-04)
+0
+7
+Head (h)
+PyramidKV-KeyDiff (Total Loss: 6.74e-04)
+0
+7
+Head (h)
+AdaKV-KeyDiff (Total Loss: 5.38e-04)
+0
+4
+8
+12
+16
+20
+24
+28
+Layer Index (ℓ)
+0
+7
+Head (h)
+Ours-KeyDiff (Total Loss: 4.10e-04)
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+×10−5
+Loss Value
+(d) KeyDiff: Per-head Heatmap
+0
+5
+10
+15
+20
+25
+30
+Layer Index (ℓ)
+2
+4
+6
+Layer Eviction Loss
+×10−5
+Uniform-EA
+PyramidKV-EA
+AdaKV-EA
+Ours-EA
+(e) EA: Layer-wise Aggregation
+0
+7
+Head (h)
+Uniform-EA (Total Loss: 7.26e-04)
+0
+7
+Head (h)
+PyramidKV-EA (Total Loss: 8.01e-04)
+0
+7
+Head (h)
+AdaKV-EA (Total Loss: 6.30e-04)
+0
+4
+8
+12
+16
+20
+24
+28
+Layer Index (ℓ)
+0
+7
+Head (h)
+Ours-EA (Total Loss: 5.20e-04)
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+2.00
+×10−5
+Loss Value
+(f) EA: Per-head Heatmap
+Figure 6. Performance of Mistral-7B-v0.3 on HotpotQA (LongBench) across different metrics. The figure compares the aggregated
+layer-wise eviction loss (left column) and per-head loss distribution heatmaps (right column) for SnapKV (top row), KeyDiff (middle
+row), and EA (bottom row) at an 80% global compression ratio.
+14
+
+
+--- Page 15 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+0
+.5
+1
+L0
+H0
+H1
+H2
+H3
+H4
+H5
+H6
+H7
+0
+.5
+1
+L1
+0
+.5
+1
+L2
+0
+.5
+1
+L3
+0
+.5
+1
+L4
+0
+.5
+1
+L5
+0
+.5
+1
+L6
+0
+.5
+1
+L7
+0
+.5
+1
+L8
+0
+.5
+1
+L9
+0
+.5
+1
+0
+.5
+1
+L10
+0
+.5
+1 0
+.5
+1 0
+.5
+1 0
+.5
+1 0
+.5
+1 0
+.5
+1 0
+.5
+1
+hotpotqa
+multifiled-en
+passage_retrieval_en
+qmsum
+repobench-p
+trec
+mytest convex
+mytest mckp
+Figure 7. Head-wise Optimal Allocation Profiles (Part I: Layers 0 to 10). Visualization of the optimal local budget distribution for the
+Mistral-7B-v0.3 model on the different tasks (LongBench) using the KeyDiff metric.
+15
+
+
+--- Page 16 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+0
+.5
+1
+L11
+H0
+H1
+H2
+H3
+H4
+H5
+H6
+H7
+0
+.5
+1
+L12
+0
+.5
+1
+L13
+0
+.5
+1
+L14
+0
+.5
+1
+L15
+0
+.5
+1
+L16
+0
+.5
+1
+L17
+0
+.5
+1
+L18
+0
+.5
+1
+L19
+0
+.5
+1
+L20
+0
+.5
+1
+0
+.5
+1
+L21
+0
+.5
+1 0
+.5
+1 0
+.5
+1 0
+.5
+1 0
+.5
+1 0
+.5
+1 0
+.5
+1
+hotpotqa
+multifiled-en
+passage_retrieval_en
+qmsum
+repobench-p
+trec
+mytest convex
+mytest mckp
+Figure 8. Head-wise Optimal Allocation Profiles (Part II: Layers 11 to 21). Visualization of the optimal local budget distribution for
+the Mistral-7B-v0.3 model on the different tasks (LongBench) using the KeyDiff metric.
+16
+
+
+--- Page 17 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+0
+.5
+1
+L22
+H0
+H1
+H2
+H3
+H4
+H5
+H6
+H7
+0
+.5
+1
+L23
+0
+.5
+1
+L24
+0
+.5
+1
+L25
+0
+.5
+1
+L26
+0
+.5
+1
+L27
+0
+.5
+1
+L28
+0
+.5
+1
+L29
+0
+.5
+1
+L30
+0
+.5
+1
+0
+.5
+1
+L31
+0
+.5
+1 0
+.5
+1 0
+.5
+1 0
+.5
+1 0
+.5
+1 0
+.5
+1 0
+.5
+1
+hotpotqa
+multifiled-en
+passage_retrieval_en
+qmsum
+repobench-p
+trec
+mytest convex
+mytest mckp
+Figure 9. Head-wise Optimal Allocation Profiles (Part III: Layers 22 to 31). Visualization of the optimal local budget distribution for
+the Mistral-7B-v0.3 model on the different tasks (LongBench) using the KeyDiff metric.
+17
+
+
+--- Page 18 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+Table 4. Detailed scores of 16 datasets on LongBench at an 50% compression ratio.
+Model Method
+Single-Doc QA
+Multi-Doc QA
+Summarization
+Few-shot
+Synthetic
+Code
+Avg
+NrtvQA
+Qasper
+MF-en
+Hotpot
+2WikiQA
+Musique
+GovRep
+QMSum
+MultiNews
+TREC
+TriviaQA
+SAMSum
+PCount
+PR-en
+Lcc
+RB-P
+Mistral-7B-v0.3
+Full-KV
+27.04 38.30 49.75 49.11 36.68 27.69 34.64 25.55 26.40 76.50 88.96 47.11
+5.50
+97.00 65.60 60.92 47.30
+Metric SnapKV (π1)
+Uniform-π1
+24.51 32.14 42.98 48.71 34.72 24.64 32.07 23.68 25.10 68.50 88.91 47.18
+5.50
+96.50 65.36 60.51 45.06
+Pyramid-π1
+24.40 30.30 44.34 48.54 34.10 24.18 31.74 24.06 24.43 67.50 89.21 46.83
+3.50
+97.50 65.63 60.34 44.79
+Ada-π1
+24.47 31.50 43.61 50.00 35.93 25.43 31.51 24.27 25.11 72.00 88.94 47.29
+6.50
+96.50 65.35 60.87 45.58
+LU-KV-π1 (Ours) 25.81 38.93 50.53 49.20 36.82 27.05 34.96 25.64 26.42 76.00 89.45 47.33
+5.54
+98.00 66.14 61.62 47.46
+Metric KeyDiff (π2)
+Uniform-π2
+24.03 35.36 49.01 47.61 36.29 25.34 31.97 24.38 25.46 56.00 88.56 46.57
+4.20
+95.00 56.82 60.52 44.20
+Pyramid-π2
+27.26 34.78 46.46 45.38 35.94 25.21 31.73 24.84 25.35 68.00 89.21 47.31
+6.50
+96.00 47.92 60.37 44.52
+Ada-π2
+26.05 37.68 51.31 47.04 37.79 26.43 33.02 25.05 25.80 63.00 88.39 46.82
+2.87
+95.25 65.27 60.39 45.76
+LU-KV-π2 (Ours) 27.66 38.91 50.92 51.30 39.67 24.42 34.57 25.48 26.60 75.00 89.46 47.61
+3.05
+95.75 63.24 61.14 47.17
+Llama-3.1-8B
+Full-KV
+29.39 45.17 55.74 58.31 48.12 32.57 34.53 25.30 26.91 72.50 91.78 44.32
+8.47
+99.50 63.43 52.59 49.29
+Metric SnapKV (π1)
+Uniform-π1
+26.46 39.37 48.32 56.53 44.99 30.41 31.75 23.65 25.30 62.50 92.31 44.01
+7.00
+99.50 66.01 53.89 47.00
+Pyramid-π1
+28.13 33.86 48.94 55.26 46.16 31.36 30.80 24.58 24.23 60.00 92.53 44.03
+6.59
+99.50 65.98 54.44 46.65
+Ada-π1
+29.32 40.23 51.32 56.01 44.67 32.38 31.82 24.23 25.40 68.50 91.90 44.19
+7.89
+99.50 64.92 54.31 47.91
+LU-KV-π1 (Ours) 30.57 44.45 55.59 56.91 47.32 32.33 34.64 25.40 26.64 71.50 91.65 44.14
+7.95 100.00 65.25 55.77 49.38
+Metric KeyDiff (π2)
+Uniform-π2
+30.58 41.13 52.39 55.78 43.72 29.92 32.73 24.68 25.07 65.00 92.03 45.07
+7.83
+99.50 55.89 54.58 47.24
+Pyramid-π2
+30.66 41.15 52.06 56.13 44.73 30.01 31.85 25.11 24.98 59.00 91.78 45.18
+6.08
+99.50 37.66 55.42 45.71
+Ada-π2
+31.24 43.64 51.53 52.68 48.46 31.66 34.06 24.38 26.06 70.00 91.11 44.80
+7.08
+99.50 63.68 56.85 48.55
+LU-KV-π2 (Ours) 29.78 44.14 54.23 54.67 44.59 27.43 34.71 25.35 26.63 74.00 91.89 44.52
+5.79
+99.50 63.75 54.52 48.47
+Qwen2.5-32B
+Full-KV
+30.68 45.93 52.13 63.00 60.75 38.71 32.43 24.51 25.06 72.00 88.71 46.01 11.50 100.00 50.72 33.98 48.51
+Metric SnapKV (π1)
+Uniform-π1
+28.40 36.02 44.58 62.89 57.71 37.40 30.95 22.17 23.92 67.50 89.02 45.16 13.00 99.50 55.52 34.83 46.79
+Pyramid-π1
+25.81 22.00 36.10 57.36 49.10 33.74 28.95 21.71 21.41 58.00 89.03 45.55 10.00 100.00 60.03 35.60 43.40
+Ada-π1
+27.16 34.67 43.39 63.10 57.34 36.58 30.84 22.02 23.95 70.50 88.82 45.67 11.50 99.75 54.38 33.63 46.46
+LU-KV-π1 (Ours) 30.73 44.26 51.59 63.21 60.75 39.74 31.96 24.02 24.72 71.50 88.38 45.40 12.00 100.00 59.30 37.70 49.08
+Metric KeyDiff (π2)
+Uniform-π2
+28.66 37.44 47.88 62.21 58.97 39.09 30.86 23.53 23.37 75.00 85.93 46.15 13.25 98.00 41.03 34.73 46.63
+Pyramid-π2
+27.84 30.57 40.25 55.92 50.81 32.99 28.69 22.47 21.50 65.50 86.66 45.14
+9.67
+75.08 25.86 35.40 40.90
+Ada-π2
+29.90 42.44 51.13 60.14 59.78 39.67 31.90 23.21 23.96 72.00 87.23 44.84 13.50 100.00 43.33 33.71 47.30
+LU-KV-π2 (Ours) 31.63 45.78 51.38 63.37 63.00 43.18 32.46 24.69 25.04 74.00 89.26 44.47 10.50 100.00 53.40 34.51 49.17
+B.3. Detailed Scores Of LongBench
+In this section, we provide a comprehensive breakdown of performance across all 16 datasets in LongBench. Table 4
+presents the results under a 50% global compression ratio for SnapKV (π1) and KeyDiff (π2) metrics. To further verify
+the universality of our approach under more aggressive compression, we also evaluate the performance at an 80% global
+compression ratio in Table 5, extending our analysis to include the EA (π3) metric. Across these diverse settings, different
+importance metrics, and various model scales, the results consistently demonstrate that our proposed method remains
+effective.
+18
+
+
+--- Page 19 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+Table 5. Detailed scores of 16 datasets on LongBench at an 80% compression ratio.
+Model Method
+Single-Doc QA
+Multi-Doc QA
+Summarization
+Few-shot
+Synthetic
+Code
+Avg
+NrtvQA
+Qasper
+MF-en
+Hotpot
+2WikiQA
+Musique
+GovRep
+QMSum
+MultiNews
+TREC
+TriviaQA
+SAMSum
+PCount
+PR-en
+Lcc
+RB-P
+Mistral-7B-v0.3
+Full-KV
+27.04 38.30 49.75 49.11 36.68 27.69 34.64 25.55 26.40 76.50 88.96 47.11
+5.50
+97.00 65.60 60.92 47.30
+Metric SnapKV (π1)
+Uniform-π1
+21.37 19.10 33.64 44.22 29.19 21.93 28.20 22.06 22.20 55.00 90.07 46.79
+5.00
+90.00 63.37 58.59 40.67
+Pyramid-π1
+21.77 19.38 34.92 43.67 32.21 19.97 27.77 22.36 21.80 55.00 89.21 45.85
+5.50
+92.00 63.53 60.07 40.94
+Ada-π1
+20.29 22.31 36.03 44.43 29.09 22.12 27.98 22.88 22.41 62.50 90.07 46.99
+5.00
+94.00 64.47 59.62 41.89
+LU-KV-π1 (Ours) 25.25 34.91 51.32 48.87 38.10 22.80 33.57 25.02 25.31 71.00 91.32 47.12
+5.19
+97.50 53.76 61.62 45.79
+Metric KeyDiff (π2)
+Uniform-π2
+22.37 24.66 38.57 41.68 32.86 18.04 28.53 22.48 23.12 42.00 88.39 46.61
+3.66
+62.50 34.37 59.40 36.83
+Pyramid-π2
+22.61 26.74 38.96 39.81 34.85 16.92 28.23 22.71 22.55 42.00 89.56 46.42
+5.11
+63.00 26.95 58.94 36.59
+Ada-π2
+24.70 29.65 41.47 44.47 34.48 22.39 28.78 23.26 23.65 42.50 89.89 46.40
+4.57
+77.00 55.96 59.45 40.54
+LU-KV-π2 (Ours) 25.80 39.78 53.82 48.26 41.33 24.69 33.49 25.52 25.65 69.00 88.81 47.14
+6.53
+97.50 51.18 60.89 46.21
+Metric EA (π3)
+Uniform-π3
+12.87 30.45 40.25 28.62 23.59 11.32 21.72 22.81 24.54
+2.00
+13.28 17.38
+4.67
+3.55
+17.44 48.62 20.19
+Pyramid-π3
+14.50 30.96 36.90 32.05 27.57 15.42 27.10 23.75 24.87 22.50 18.99 25.83
+2.72
+30.50 20.34 37.34 24.46
+Ada-π3
+11.08 18.20 41.28 26.25 26.43 10.27 23.24 22.27 24.43
+2.50
+23.75 13.86
+3.32
+9.83
+29.84 50.74 21.08
+LU-KV-π3 (Ours) 22.65 36.86 50.81 47.45 36.18 26.65 34.27 25.26 26.78 20.00 40.74 21.90
+2.23
+97.00 22.37 54.52 35.35
+Llama-3.1-8B
+Full-KV
+29.39 45.17 55.74 58.31 48.12 32.57 34.53 25.30 26.91 72.50 91.78 44.32
+8.47
+99.50 63.43 52.59 49.29
+Metric SnapKV (π1)
+Uniform-π1
+28.36 28.10 34.36 51.76 33.42 26.02 27.27 21.95 22.41 46.50 91.78 44.15
+5.59
+97.50 66.52 54.26 42.50
+Pyramid-π1
+25.10 23.46 34.42 49.99 37.61 27.21 26.92 23.10 21.40 48.00 91.95 44.42
+6.17
+98.00 64.83 55.15 42.36
+Ada-π1
+28.27 28.43 37.38 53.24 36.21 27.66 27.46 23.09 23.06 56.50 91.76 44.68
+6.01
+98.00 66.88 55.05 43.98
+LU-KV-π1 (Ours) 29.99 40.10 56.09 56.39 46.94 28.51 32.04 24.32 25.52 65.50 89.28 43.76
+6.43
+99.50 59.64 59.27 47.70
+Metric KeyDiff (π2)
+Uniform-π2
+29.06 27.88 39.53 48.54 30.91 25.13 28.43 23.57 21.45 46.50 91.53 44.29
+9.19
+99.50 41.32 55.02 41.37
+Pyramid-π2
+30.59 30.06 39.03 49.80 35.39 26.51 27.99 23.32 21.32 41.00 91.83 44.30
+4.95
+97.50 29.25 56.26 40.57
+Ada-π2
+28.95 34.97 44.70 50.05 38.63 28.80 30.29 23.85 22.98 60.00 90.65 44.90
+6.99
+98.00 60.66 56.96 45.09
+LU-KV-π2 (Ours) 29.57 42.54 53.43 51.84 43.02 25.90 33.60 24.79 25.29 67.50 90.30 44.19
+6.57
+99.50 58.90 57.61 47.16
+Metric EA (π3)
+Uniform-π3
+30.50 37.17 41.61 48.91 38.89 25.11 29.55 23.23 24.99 47.50 89.85 42.64
+9.21
+91.00 55.59 53.87 43.10
+Pyramid-π3
+29.40 35.67 40.71 48.76 37.02 24.09 28.79 23.51 24.79 42.00 90.26 43.11
+9.36
+88.50 51.80 58.27 42.25
+Ada-π3
+29.93 34.50 40.53 45.49 33.99 27.80 26.62 23.42 23.62 51.00 91.43 40.88
+6.56
+95.00 63.51 58.24 43.28
+LU-KV-π3 (Ours) 32.13 46.81 56.09 53.88 45.64 30.23 34.12 25.07 25.77 71.50 90.12 42.34
+6.59
+99.50 63.38 56.45 48.73
+Qwen2.5-32B
+Full-KV
+30.68 45.93 52.13 63.00 60.75 38.71 32.43 24.51 25.06 72.00 88.71 46.01 11.50 100.00 50.72 33.98 48.51
+Metric SnapKV (π1)
+Uniform-π1
+24.75 20.48 29.83 55.54 45.23 32.74 28.49 19.97 21.53 59.00 88.89 45.47
+9.00
+88.50 55.16 34.82 41.21
+Pyramid-π1
+18.46 15.29 24.56 49.62 39.99 31.07 26.31 19.75 19.46 47.50 88.69 44.52
+9.25
+91.67 59.47 33.20 38.68
+Ada-π1
+25.99 21.37 29.88 54.47 45.43 30.89 28.34 19.92 21.76 62.50 88.88 45.71
+9.50
+90.75 55.38 34.55 41.58
+LU-KV-π1 (Ours) 29.41 39.16 50.95 62.82 58.00 39.84 31.34 23.12 24.10 71.00 88.89 42.07
+9.50 100.00 60.21 36.71 47.95
+Metric KeyDiff (π2)
+Uniform-π2
+24.92 19.10 36.53 53.43 46.28 33.18 26.63 20.81 19.53 67.50 85.67 44.29
+9.13
+67.58 22.60 36.03 38.33
+Pyramid-π2
+21.03 13.96 30.96 43.09 39.51 25.00 24.38 20.16 17.38 52.00 83.96 44.19
+7.00
+42.42 16.10 37.59 32.42
+Ada-π2
+26.29 26.76 43.43 55.98 48.01 35.34 28.38 21.74 20.92 66.00 88.58 44.40 11.00 86.83 42.38 31.03 42.32
+LU-KV-π2 (Ours) 31.30 42.88 50.55 61.61 59.67 41.41 31.56 24.01 24.25 74.00 88.31 41.28
+7.50 100.00 55.45 38.37 48.26
+Metric EA (π3)
+Uniform-π3
+24.65 32.09 36.49 54.09 47.96 32.75 31.21 22.32 23.41 70.00 74.20 43.98 14.61 86.22 28.61 33.14 40.98
+Pyramid-π3
+23.00 27.65 33.70 43.95 40.11 19.23 28.89 21.47 22.73 44.50 76.41 42.64 10.41 63.99 32.60 31.01 35.14
+Ada-π3
+30.01 29.86 45.95 60.11 54.61 40.05 31.21 22.70 24.17 72.00 82.23 43.26
+8.79
+88.02 46.08 35.53 44.66
+LU-KV-π3 (Ours) 30.25 43.34 50.88 64.80 58.72 41.60 33.01 24.74 24.79 77.00 85.85 40.32 10.12 98.25 57.87 36.06 48.60
+19
+
+
+--- Page 20 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+B.4. Detailed Scores Of RULER
+In this section, we provide a detailed performance breakdown on the RULER benchmark, evaluating the model across both
+RULER-16K (Table 6) and RULER-4K (Table 7). These evaluations are conducted at a strict 80% global compression ratio
+and include the EA (π3) metric to test the robustness of our method in extreme retrieval scenarios.
+The results show that traditional baselines, such as Uniform and PyramidKV, experience significant performance degra-
+dation in complex tasks like multikey and variable-tracking (vt). While AdaKV provides some improvement in specific
+configurations, it remains sensitive to the underlying heuristic metric. This is particularly evident with the EA metric; for
+example, on Mistral-7B-v0.3 (RULER-16K), AdaKV achieves only 26.28% average accuracy.
+In contrast, our proposed method (LU-KV) consistently achieves superior results across all tasks and metrics. By effectively
+optimizing the budget allocation, our method significantly boosts retrieval accuracy. Notably, in the aforementioned
+Mistral-EA setting, our method improves the average accuracy to 68.60%. Similar performance gains are observed for
+Llama-3.1-8B and Qwen2.5-32B, confirming the effectiveness of our approach across different model scales and importance
+metrics.
+20
+
+
+--- Page 21 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+Table 6. Detailed scores of 13 datasets on RULER-16K at an 80% compression ratio.
+Model Method
+RULER Tasks (16K)
+single1
+single2
+single3
+multikey1
+multikey2
+multikey3
+multivalue
+multiquery
+vt
+cwe
+fwe
+qa-1
+qa-2
+Avg
+Mistral-7B-v0.3
+Full-KV
+94.20
+96.40
+99.60
+97.40
+95.60
+76.80
+89.50
+88.65
+96.28
+82.22 87.93 71.60 50.00 86.63
+Metric SnapKV (π1)
+Uniform-π1
+40.40
+16.20
+2.40
+14.20
+6.20
+1.00
+9.65
+11.00
+66.92
+66.96 85.53 29.80 33.60 29.53
+Pyramid-π1
+50.00
+57.00
+2.40
+28.00
+4.80
+0.20
+16.15
+21.55
+62.32
+31.94 82.20 32.00 33.00 32.43
+Ada-π1
+58.00
+38.80
+2.40
+20.20
+12.40
+5.60
+12.85
+16.80
+92.08
+71.36 86.13 33.60 37.00 37.48
+LU-KV-π1 (Ours)
+70.80
+78.80
+18.20
+83.60
+79.20
+67.40
+67.80
+76.25
+95.88
+78.32 84.47 62.00 47.00 69.98
+Metric KeyDiff (π2)
+Uniform-π2
+94.60
+72.80
+100.00
+78.80
+7.40
+0.80
+94.80
+86.10
+94.16
+65.56 90.87 32.40 35.80 65.70
+Pyramid-π2
+93.20
+96.20
+99.60
+88.20
+6.60
+0.60
+92.00
+89.75
+94.36
+36.92 88.73 31.40 34.80 65.57
+Ada-π2
+92.60
+91.20
+97.40
+87.80
+6.80
+1.20
+88.00
+86.45
+91.28
+75.44 86.47 36.40 36.60 67.51
+LU-KV-π2 (Ours)
+85.60
+76.60
+100.00
+87.00
+90.80
+35.20
+96.45
+92.85
+92.16
+80.78 86.80 64.60 46.80 79.66
+Metric EA (π3)
+Uniform-π3
+19.80
+46.60
+0.00
+11.80
+0.00
+0.00
+30.20
+19.85
+37.20
+0.38
+62.40 23.00 18.80 20.77
+Pyramid-π3
+46.00
+51.40
+0.00
+20.20
+0.00
+0.00
+28.25
+17.40
+34.04
+29.28 48.93 32.60 29.20 25.95
+Ada-π3
+72.00
+26.20
+1.80
+13.20
+11.00
+2.40
+26.70
+15.70
+42.12
+0.34
+87.13 23.80 19.20 26.28
+LU-KV-π3 (Ours)
+84.20
+21.80
+58.60
+68.80
+96.00
+55.60
+78.45
+60.10
+93.52
+78.96 84.73 62.40 48.60 68.60
+Llama-3.1-8B
+Full-KV
+100.00 100.00 100.00
+99.60
+100.00
+99.20
+98.70
+99.10
+99.80
+88.80 89.93 81.20 57.00 93.33
+Metric SnapKV (π1)
+Uniform-π1
+98.00
+83.60
+2.60
+52.20
+11.20
+4.40
+34.90
+40.50
+89.40
+14.22 79.00 28.80 30.80 43.82
+Pyramid-π1
+90.60
+97.80
+2.40
+85.40
+20.60
+0.80
+72.70
+76.85
+84.64
+11.10 80.33 29.40 33.00 52.74
+Ada-π1
+99.20
+90.20
+3.00
+69.20
+20.60
+19.20
+47.30
+55.20
+95.92
+42.54 86.47 32.40 33.20 53.42
+LU-KV-π1 (Ours) 100.00
+99.80
+54.00
+99.40
+85.20
+93.60
+98.60
+98.80
+97.44
+61.40 84.67 65.40 49.80 83.70
+Metric KeyDiff (π2)
+Uniform-π2
+100.00 100.00 100.00
+99.60
+16.40
+0.00
+99.25
+99.55
+98.28
+59.70 86.93 38.40 43.00 72.39
+Pyramid-π2
+100.00 100.00 100.00
+99.60
+11.00
+0.00
+98.90
+99.60
+99.44
+23.14 85.93 39.80 40.60 69.08
+Ada-π2
+100.00 100.00 100.00
+99.60
+26.00
+0.80
+98.55
+99.25
+98.60
+78.34 90.93 45.60 42.00 75.36
+LU-KV-π2 (Ours) 100.00 100.00 100.00
+99.20
+99.20
+56.00
+99.20
+99.20
+97.36
+80.80 87.53 76.20 52.60 88.25
+Metric EA (π3)
+Uniform-π3
+98.60
+96.20
+2.40
+85.80
+5.20
+0.00
+79.45
+89.75
+81.00
+17.44 61.33 51.60 40.20 54.54
+Pyramid-π3
+98.80
+88.80
+1.20
+84.80
+10.00
+0.00
+76.65
+80.65
+86.80
+5.88
+36.20 52.00 41.00 50.98
+Ada-π3
+99.80
+99.40
+3.80
+90.60
+38.80
+2.60
+75.55
+91.60
+95.28
+9.56
+81.40 43.20 40.80 59.41
+LU-KV-π3 (Ours) 100.00 100.00
+99.60
+99.40
+99.80
+98.60
+97.55
+98.80
+98.04
+80.18 88.13 78.40 54.00 91.73
+Qwen2.5-32B
+Full-KV
+100.00 100.00 100.00
+100.00
+99.80
+100.00
+99.85
+99.95
+100.00 97.70 96.20 79.40 62.40 95.02
+Metric SnapKV (π1)
+Uniform-π1
+97.40
+55.60
+3.80
+25.80
+4.80
+2.00
+14.40
+19.60
+99.28
+87.14 94.00 28.00 39.00 43.91
+Pyramid-π1
+83.80
+36.00
+2.40
+19.20
+2.00
+0.00
+13.15
+14.95
+93.68
+56.84 95.73 26.40 34.60 36.83
+Ada-π1
+98.80
+52.60
+4.40
+21.80
+7.00
+4.20
+14.75
+18.25
+99.32
+88.48 94.53 29.40 39.00 44.04
+LU-KV-π1 (Ours)
+99.80
+99.20
+32.00
+84.20
+71.80
+78.40
+84.60
+85.80
+99.72
+95.66 93.13 65.00 56.80 80.47
+Metric KeyDiff (π2)
+Uniform-π2
+100.00 100.00 100.00
+100.00
+8.00
+1.00
+99.40
+99.95
+98.92
+90.36 99.33 36.40 41.40 74.98
+Pyramid-π2
+100.00 100.00
+99.80
+99.60
+1.00
+0.20
+99.55
+99.95
+84.52
+69.26 98.93 30.20 35.80 70.68
+Ada-π2
+100.00 100.00 100.00
+99.80
+44.20
+23.00
+99.00
+99.90
+99.88
+95.34 99.07 44.00 46.40 80.81
+LU-KV-π2 (Ours) 100.00 100.00 100.00
+100.00
+86.60
+46.80
+99.25
+99.95
+100.00 96.02 96.20 71.60 59.00 88.88
+Metric EA (π3)
+Uniform-π3
+93.40
+97.60
+6.00
+97.40
+0.40
+0.00
+94.75
+98.75
+99.44
+73.10 80.00 49.20 48.20 64.48
+Pyramid-π3
+81.80
+69.00
+0.20
+55.20
+0.00
+0.00
+56.30
+61.20
+96.12
+10.94 39.93 39.20 41.80 42.44
+Ada-π3
+100.00 100.00
+22.00
+99.20
+96.40
+39.40
+98.40
+99.55
+99.88
+92.04 93.93 60.20 50.80 80.91
+LU-KV-π3 (Ours)
+99.60
+99.80
+91.00
+100.00
+99.40
+29.40
+99.35
+99.95
+100.00 95.98 93.00 79.40 60.60 88.27
+21
+
+
+--- Page 22 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+Table 7. Detailed scores of 13 datasets on RULER-4K at an 80% compression ratio.
+Model Method
+RULER Tasks (4K)
+single1
+single2
+single3
+multikey1
+multikey2
+multikey3
+multivalue
+multiquery
+vt
+cwe
+fwe
+qa-1
+qa-2
+Avg
+Mistral-7B-v0.3
+Full-KV
+93.20
+95.80
+100.00
+99.40
+100.00
+97.40
+89.05
+97.50
+99.56
+98.46 95.60 76.80 54.60 92.11
+Metric SnapKV (π1)
+Uniform-π1
+37.00
+13.00
+2.40
+18.40
+5.80
+0.60
+11.80
+17.10
+25.16
+84.66 82.40 40.60 35.60 28.81
+Pyramid-π1
+35.20
+16.40
+2.40
+19.00
+4.00
+0.00
+11.40
+17.10
+28.80
+42.84 75.40 35.20 33.80 24.73
+Ada-π1
+50.40
+13.00
+2.40
+18.20
+12.80
+5.80
+12.70
+17.25
+49.84
+89.54 87.00 44.60 40.20 34.13
+LU-KV-π1 (Ours)
+79.00
+83.60
+12.60
+71.20
+89.80
+93.40
+54.50
+66.80
+93.64
+94.80 93.07 68.40 49.60 73.11
+Metric KeyDiff (π2)
+Uniform-π2
+90.60
+97.00
+100.00
+83.20
+8.00
+0.00
+88.10
+89.40
+98.92
+60.48 81.33 39.60 28.80 66.57
+Pyramid-π2
+94.40
+97.20
+100.00
+84.80
+6.00
+0.00
+83.80
+89.30
+98.84
+14.72 77.53 37.60 23.80 62.15
+Ada-π2
+91.80
+95.00
+99.40
+83.80
+5.80
+0.00
+82.00
+86.80
+99.36
+74.22 75.93 45.80 32.00 67.07
+LU-KV-π2 (Ours)
+87.40
+96.00
+99.40
+98.40
+98.80
+50.20
+96.35
+97.40
+99.36
+92.28 92.93 72.60 49.20 86.95
+Metric EA (π3)
+Uniform-π3
+66.40
+57.40
+0.40
+44.00
+0.60
+0.00
+56.30
+33.95
+57.92
+71.06 79.87 49.00 41.40 42.95
+Pyramid-π3
+72.00
+51.60
+0.00
+38.00
+0.60
+0.00
+39.75
+28.15
+80.44
+57.70 64.07 46.20 38.80 39.79
+Ada-π3
+86.00
+39.20
+3.00
+37.60
+34.00
+41.00
+59.20
+34.40
+97.84
+90.94 92.47 51.60 40.80 54.47
+LU-KV-π3 (Ours)
+83.80
+83.20
+98.60
+97.20
+99.80
+97.00
+82.05
+90.15
+99.52
+96.50 95.60 75.60 55.60 88.82
+Llama-3.1-8B
+Full-KV
+100.00 100.00 100.00
+99.80
+100.00
+99.80
+99.90
+99.90
+99.88
+99.68 94.93 88.00 62.60 95.73
+Metric SnapKV (π1)
+Uniform-π1
+82.00
+70.80
+2.40
+39.80
+13.20
+2.60
+38.35
+35.65
+61.16
+62.06 81.47 42.80 32.80 43.47
+Pyramid-π1
+74.80
+98.20
+2.40
+77.00
+23.00
+0.00
+69.70
+69.80
+48.48
+37.42 71.07 39.00 29.60 49.27
+Ada-π1
+86.60
+69.80
+2.40
+44.40
+17.60
+13.80
+37.75
+38.80
+81.20
+89.82 87.33 48.20 36.80 50.35
+LU-KV-π1 (Ours)
+99.40
+99.60
+14.20
+99.80
+87.20
+95.60
+98.30
+99.80
+97.52
+96.08 93.53 77.60 55.40 85.69
+Metric KeyDiff (π2)
+Uniform-π2
+100.00 100.00 100.00
+99.80
+14.60
+0.00
+98.65
+99.85
+98.08
+39.42 82.53 38.60 27.00 69.12
+Pyramid-π2
+100.00
+99.80
+100.00
+100.00
+7.80
+0.00
+99.25
+99.80
+99.64
+20.70 78.13 41.20 27.60 67.22
+Ada-π2
+100.00
+99.80
+100.00
+99.60
+35.00
+0.20
+99.40
+99.65
+99.08
+68.36 82.20 54.20 36.00 74.88
+LU-KV-π2 (Ours) 100.00 100.00 100.00
+99.80
+99.60
+56.80
+99.80
+99.90
+99.24
+92.50 93.80 83.20 57.20 90.91
+Metric EA (π3)
+Uniform-π3
+98.60
+91.40
+1.60
+92.00
+13.20
+0.00
+90.20
+93.35
+81.92
+43.32 73.00 55.60 45.40 59.97
+Pyramid-π3
+99.40
+81.60
+1.00
+89.80
+22.60
+0.00
+86.75
+92.00
+97.12
+26.64 58.27 57.00 44.60 58.21
+Ada-π3
+99.80
+95.00
+5.00
+89.20
+55.40
+4.60
+78.65
+88.65
+92.92
+88.94 90.40 42.60 44.80 67.38
+LU-KV-π3 (Ours) 100.00
+99.80
+100.00
+100.00
+99.80
+99.40
+99.90
+99.90
+98.60
+97.46 95.07 83.60 59.60 94.86
+Qwen2.5-32B
+Full-KV
+100.00 100.00 100.00
+99.80
+100.00
+100.00
+99.95
+100.00
+100.00 99.86 98.60 89.40 67.60 96.55
+Metric SnapKV (π1)
+Uniform-π1
+95.40
+39.00
+3.60
+27.20
+4.80
+0.40
+25.50
+22.75
+92.64
+96.18 86.27 56.20 41.80 45.52
+Pyramid-π1
+80.20
+13.00
+2.40
+13.40
+1.60
+0.00
+13.00
+12.70
+57.60
+63.30 66.67 34.00 31.00 29.91
+Ada-π1
+93.60
+24.00
+2.40
+19.60
+7.00
+4.00
+17.55
+17.40
+94.80
+98.50 89.00 59.00 42.60 43.80
+LU-KV-π1 (Ours)
+93.00
+92.20
+16.40
+81.40
+80.60
+84.20
+91.00
+87.90
+99.08
+99.68 95.40 85.00 63.80 82.28
+Metric KeyDiff (π2)
+Uniform-π2
+100.00 100.00 100.00
+99.60
+4.60
+0.40
+99.95
+100.00
+76.00
+78.94 88.47 49.20 34.20 71.64
+Pyramid-π2
+100.00 100.00
+99.80
+99.40
+1.00
+0.00
+99.95
+99.75
+26.56
+8.10
+75.00 35.40 24.40 59.18
+Ada-π2
+100.00 100.00 100.00
+99.80
+37.60
+7.60
+99.95
+100.00
+99.68
+94.72 87.53 59.40 40.60 78.99
+LU-KV-π2 (Ours) 100.00 100.00 100.00
+99.80
+96.20
+39.80
+99.95
+100.00
+100.00 99.20 95.53 87.80 64.20 90.96
+Metric EA (π3)
+Uniform-π3
+86.80
+92.80
+3.00
+91.80
+0.80
+0.00
+91.70
+91.85
+99.60
+90.28 82.13 62.20 52.20 65.01
+Pyramid-π3
+71.20
+49.00
+0.00
+33.00
+0.00
+0.00
+30.90
+35.20
+92.68
+27.58 38.93 49.80 41.20 36.11
+Ada-π3
+100.00
+99.80
+26.60
+98.20
+95.40
+69.80
+99.65
+99.55
+99.88
+99.68 94.00 73.00 59.60 85.78
+LU-KV-π3 (Ours)
+99.80
+100.00
+97.20
+99.60
+100.00
+51.00
+99.90
+100.00
+100.00 99.86 96.60 86.00 64.60 91.89
+22
+
+
+--- Page 23 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+C. Details about Benchmarks
+To evaluate the long-context capabilities of the models comprehensively, we employ two distinct benchmarks: RULER and
+LongBench. These benchmarks provide complementary insights, with RULER offering controllable synthetic stress tests
+and LongBench providing realistic multi-task evaluations.
+C.1. RULER
+RULER (Hsieh et al., 2024) is a synthetic benchmark designed to evaluate long-context language models beyond the
+standard retrieval-based “needle-in-a-haystack” (NIAH) tests. Unlike simple retrieval tasks, RULER introduces flexible
+configurations to customize sequence length and task complexity. It categorizes tasks into four distinct domains to test
+behaviors beyond searching from context:
+• Retrieval: Extending the vanilla NIAH, this category includes Single NIAH (S-NIAH), Multi-keys NIAH (MK-NIAH),
+Multi-values NIAH (MV-NIAH), and Multi-queries NIAH (MQ-NIAH). These tasks test the model’s robustness against
+distractors and its ability to retrieve diverse types and quantities of needles.
+• Multi-hop Tracing: To evaluate coreference chain resolution, RULER utilizes a Variable Tracking (VT) task, requiring
+the model to trace variable assignment chains across the long context.
+• Aggregation: This category tests the ability to aggregate relevant information spanning long-range context. Tasks
+include Common Words Extraction (CWE) and Frequent Words Extraction (FWE), where the model identifies words
+based on their frequency distribution.
+• Question Answering (QA): This domain uses augmented versions of SQuAD (Rajpurkar et al., 2018) and Hot-
+potQA (Yang et al., 2018) with inserted distractors to simulate long-context question answering scenarios.
+C.2. LongBench
+Complementing the synthetic nature of RULER, we utilize LongBench (Bai et al., 2024), a multi-task benchmark designed
+to assess long-context understanding in realistic scenarios. In this work, we focus specifically on the 16 English datasets
+from LongBench, which cover six major task categories. The English subset comprises:
+• Single-Document QA: Evaluated using NarrativeQA (Koˇcisk`y et al., 2018), Qasper (Dasigi et al., 2021), and
+MultiFieldQA-en, requiring models to comprehend long individual documents.
+• Multi-Document QA: Involves complex reasoning across multiple documents, utilizing HotpotQA (Yang et al., 2018),
+2WikiMultihopQA (Ho et al., 2020), and MuSiQue (Trivedi et al., 2022).
+• Summarization: Tests the ability to synthesize long inputs using GovReport (Huang et al., 2021), QMSum (Zhong
+et al., 2021), and MultiNews (Fabbri et al., 2019).
+• Few-Shot Learning: Assesses in-context learning abilities with long-context examples from TREC (Li & Roth, 2002),
+TriviaQA (Joshi et al., 2017), and SAMSum (Gliwa et al., 2019).
+• Synthetic Tasks: Includes PassageCount and PassageRetrieval-en to isolate specific long-range dependency capabili-
+ties.
+• Code Completion: Evaluates programming context understanding using LCC (Chen, 2021) and RepoBench-P (Liu
+et al., 2023).
+23
+
+
+--- Page 24 ---
+Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+D. Details about Baselines
+We adopted the original hyperparameters for the baseline methods as reported in their respective papers, details in Table 8.
+Table 8. Hyperparameter configurations for baseline methods, following their original reports.
+Method
+Hyperparameters
+SnapKV (Li et al., 2024)
+Kernel size = 7, Window size = 32
+AdaKV (Feng et al., 2024)
+αsafeguard = 0.20, Window size = 32
+PyramidKV (Cai et al., 2024)
+β = 20, Window size = 8
+Expected Attention (Devoto et al., 2025)
+nfuture positions = 512, nsink = 4, ϵ = 0.02
+E. LU-KV Implementation Details
+For offline calibration, we employed an AI-generated novel (≈4,000 words) paired with 30 generated questions. We
+utilized the L2-norm of the projected Value vectors (|vWO|2) for scoring, applying intra-layer normalization to the results.
+We configured the attention sink size to 4. The recent token window was set to 1 for KeyDiff and maintained at 32 for
+SnapKV. Additionally, we imposed a maximum compression threshold of 99% for any attention head, ensuring a minimum
+retention rate of 1%.
+24
