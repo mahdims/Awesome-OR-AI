@@ -104,17 +104,7 @@ def _priority_paper_row(item: dict, rank: int) -> str:
     pub_date = paper.get('published_date', '')[:10]
     affiliations = paper.get('affiliations', '')
 
-    full_brief = _markdown_to_html(paper.get('brief', ''))
-    if len(full_brief) > 250:
-        brief_html = (
-            f"{full_brief[:250]}..."
-            f'<details style="margin-top:6px;">'
-            f'<summary style="color:{COLORS["accent_primary"]}; cursor:pointer; font-weight:600; font-size:12px; list-style:none; display:block;">&#9654; Read more</summary>'
-            f'<div style="padding-top:8px; border-top:1px solid {COLORS["border"]}; margin-top:6px;">{full_brief}</div>'
-            f'</details>'
-        )
-    else:
-        brief_html = full_brief
+    brief_html = _markdown_to_html(paper.get('brief', ''))
 
     # MPI scores as muted chips
     mpi_chips = f'''<span style="background:{COLORS['accent_bg']}; color:{COLORS['text_muted']}; padding:2px 8px; border-radius:999px; font-weight:600; font-size:10px; margin-right:4px;">M={m}</span>
@@ -205,64 +195,16 @@ def _front_card_with_affiliations(front: dict, aff_info: Optional[dict]) -> str:
             f'<p style="margin:8px 0 0;">{_markdown_to_html(p)}</p>'
             for p in paragraphs[1:]
         )
-        if rest_paras:
-            summary_html = (
-                f'<div style="margin-top:10px; font-size:13px; line-height:1.6; color:{COLORS["text"]}; '
-                f'padding:12px; background:{COLORS["accent_bg"]}; border-radius:12px; '
-                f'border-left:3px solid {COLORS["accent_secondary"]};">'
-                f'<p style="margin:0;">{first_para}</p>'
-                f'<details style="margin-top:6px;">'
-                f'<summary style="color:{COLORS["accent_primary"]}; cursor:pointer; font-weight:600; font-size:11px; list-style:none; display:block;">&#9654; Read full analysis</summary>'
-                f'<div style="padding-top:8px; border-top:1px solid {COLORS["border"]}; margin-top:6px;">{rest_paras}</div>'
-                f'</details>'
-                f'</div>'
-            )
-        else:
-            summary_html = (
-                f'<div style="margin-top:10px; font-size:13px; line-height:1.6; color:{COLORS["text"]}; '
-                f'padding:12px; background:{COLORS["accent_bg"]}; border-radius:12px; '
-                f'border-left:3px solid {COLORS["accent_secondary"]};">'
-                f'<p style="margin:0;">{first_para}</p></div>'
-            )
+        summary_html = (
+            f'<div style="margin-top:10px; font-size:13px; line-height:1.6; color:{COLORS["text"]}; '
+            f'padding:12px; background:{COLORS["accent_bg"]}; border-radius:12px; '
+            f'border-left:3px solid {COLORS["accent_secondary"]};">'
+            f'<p style="margin:0;">{first_para}</p>'
+            + (f'{rest_paras}' if rest_paras else '')
+            + f'</div>'
+        )
 
     papers_count = f'<span style="background:{COLORS["accent_bg"]}; color:{COLORS["text"]}; padding:4px 12px; border-radius:999px; font-size:10px; font-weight:600; display:inline-block;">{size} papers</span>'
-
-    # Collapsed paper list
-    papers_detail = front.get('papers_detail', [])
-    papers_html = ''
-    if papers_detail:
-        rows = []
-        for p in papers_detail:
-            pid = p.get('arxiv_id', '')
-            title = p.get('title', pid)
-            pub = (p.get('published_date') or '')[:7]
-            rel = p.get('relevance') or {}
-            m_score = rel.get('methodological', '')
-            must = (p.get('significance') or {}).get('must_read', False)
-            must_badge = (
-                f' <span style="background:{COLORS["score_high"]}; color:white; '
-                f'padding:1px 6px; border-radius:999px; font-size:9px; font-weight:700;">★</span>'
-                if must else ''
-            )
-            score_str = (
-                f' <span style="color:{COLORS["text_muted"]}; font-size:10px;">M:{m_score}</span>'
-                if m_score != '' else ''
-            )
-            rows.append(
-                f'<li style="padding:5px 0; border-bottom:1px solid {COLORS["border"]}; list-style:none;">'
-                f'<a href="https://arxiv.org/abs/{pid}" style="color:{COLORS["accent_primary"]}; '
-                f'text-decoration:none; font-size:12px; font-weight:500;">{title}</a>'
-                f'{must_badge}{score_str}'
-                f' <span style="color:{COLORS["text_muted"]}; font-size:10px;">· {pub}</span>'
-                f'</li>'
-            )
-        papers_html = (
-            f'<details style="margin-top:10px;">'
-            f'<summary style="font-size:11px; color:{COLORS["accent_primary"]}; font-weight:600; cursor:pointer; list-style:none; display:block;">&#9654; {len(papers_detail)} papers in this front</summary>'
-            f'<ul style="margin:4px 0 0; padding:0; border-top:1px solid {COLORS["border"]};">'
-            + ''.join(rows)
-            + '</ul></details>'
-        )
 
     return f"""<tr><td style="padding:16px 24px; border-bottom:1px solid {COLORS['border']}; background:{COLORS['card_bg']};">
   <div>
@@ -274,7 +216,6 @@ def _front_card_with_affiliations(front: dict, aff_info: Optional[dict]) -> str:
   {methods_html}
   {aff_html}
   {summary_html}
-  {papers_html}
 </td></tr>"""
 
 
@@ -396,7 +337,7 @@ def render_enhanced_weekly_email(data: dict) -> str:
     ))
 
     if priority_papers:
-        for item in priority_papers:
+        for item in priority_papers[:7]:
             body_parts.append(_priority_paper_row(item, item['rank']))
     else:
         body_parts.append(f'<tr><td style="padding:12px 24px; color:{COLORS["text_muted"]};">No priority papers this week.</td></tr>')

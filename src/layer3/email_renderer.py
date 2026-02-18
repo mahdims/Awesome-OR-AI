@@ -204,17 +204,7 @@ def _paper_row(paper: dict, rank: int = 0) -> str:
     pub_date = paper.get('published_date', '')[:10]
     affiliations = paper.get('affiliations', '')
 
-    full_brief = _markdown_to_html(paper.get('brief', ''))
-    if len(full_brief) > 300:
-        brief_html = (
-            f"{full_brief[:300]}..."
-            f'<details style="margin-top:6px;">'
-            f'<summary style="color:{COLORS["accent_primary"]}; cursor:pointer; font-weight:600; font-size:12px; list-style:none; display:block;">&#9654; Read more</summary>'
-            f'<div style="padding-top:8px; border-top:1px solid {COLORS["border"]}; margin-top:6px;">{full_brief}</div>'
-            f'</details>'
-        )
-    else:
-        brief_html = full_brief
+    brief_html = _markdown_to_html(paper.get('brief', ''))
 
     # Modern rank badge
     rank_label = f'<span style="display:inline-block; background:{COLORS["accent_primary"]}; color:white; padding:2px 10px; border-radius:12px; font-size:11px; font-weight:700; margin-right:8px;">#{rank}</span>' if rank else ''
@@ -377,7 +367,7 @@ def _render_front_card(front: dict, front_methods: dict,
 
     summary_html = ''
     if summary:
-        summary_html = f'<div style="margin-top:8px; font-size:13px; color:{COLORS["text"]}; line-height:1.4; background:#F8F9FA; padding:10px; border-radius:4px;">{summary[:500]}{"..." if len(summary) > 500 else ""}</div>'
+        summary_html = f'<div style="margin-top:8px; font-size:13px; color:{COLORS["text"]}; line-height:1.4; background:#F8F9FA; padding:10px; border-radius:4px;">{summary}</div>'
 
     return f"""<tr><td style="padding:16px 24px; border-bottom:1px solid {COLORS['border']};">
   <div style="margin-bottom:6px;">
@@ -388,14 +378,6 @@ def _render_front_card(front: dict, front_methods: dict,
   {dom_html}
   {methods_html}
   {summary_html}
-  <div style="margin-top:8px;">
-    <details>
-      <summary style="font-size:12px; color:{COLORS['link']}; font-weight:bold; cursor:pointer; list-style:none; display:block;">&#9654; Papers in this front</summary>
-      <div style="padding-left:8px; margin-top:4px;">
-        {papers_html}
-      </div>
-    </details>
-  </div>
 </td></tr>"""
 
 
@@ -513,7 +495,7 @@ def render_weekly_email(categories_data: List[dict],
         if not papers:
             body_parts.append(f'<tr><td style="padding:8px 24px; color:{COLORS["text_muted"]}; font-size:13px;">No new papers this week.</td></tr>')
         else:
-            for rank, paper in enumerate(papers[:10], 1):
+            for rank, paper in enumerate(papers[:7], 1):
                 body_parts.append(_paper_row(paper, rank))
 
         # ── Part B: Research Landscape ──
