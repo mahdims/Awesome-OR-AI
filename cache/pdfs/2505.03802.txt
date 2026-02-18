@@ -1,0 +1,3736 @@
+--- Page 1 ---
+Balancing Fidelity and Plasticity: Aligning Mixed-Precision Fine-Tuning
+with Linguistic Hierarchies
+Changhai Zhou1, Shiyang Zhang2, Yuhua Zhou3, Qian Qiao, Jun Gao3,
+Shichao Weng1, Weizhong Zhang1, Cheng Jin1
+1Fudan University, 2Yale University, 3Zhejiang University
+zhouch23@m.fudan.edu.cn, {weizhongzhang, jc}@fudan.edu.cn
+Abstract
+Deploying and fine-tuning Large Language
+Models (LLMs) on resource-constrained edge
+devices requires navigating a strict trade-off
+between memory footprint and task perfor-
+mance. While Quantization-Aware Fine-tuning
+has emerged as a viable solution, existing
+paradigms typically decouple quantization and
+adapter optimization.
+This separation over-
+looks a fundamental theoretical constraint we
+identify as the Fidelity-Plasticity Trade-off: a
+layer’s capacity to adapt to new tasks (Plastic-
+ity) is inherently constrained by the informa-
+tion capacity of its frozen weights (Fidelity).
+Aggressively quantizing semantically critical
+layers creates an information bottleneck that
+no amount of adapter rank can recover, while
+high precision in robust syntactic layers wastes
+valuable memory. To address this, we introduce
+QR-Adaptor, a unified framework that jointly
+optimizes per-layer quantization bit-width and
+LoRA rank. By formulating resource alloca-
+tion as a multi-objective search aligned with the
+model’s linguistic hierarchy, our method sys-
+tematically liberates memory from redundancy-
+heavy layers to reinvest in capacity-critical
+ones. Extensive experiments demonstrate that
+QR-Adaptor establishes a new Pareto frontier:
+notably, a model fine-tuned under a strict 4-bit
+memory budget achieves performance rivaling
+16-bit baselines, demonstrating that precise re-
+source alignment is as critical as model size.
+1
+Introduction
+The democratization of LLMs relies heavily on the
+ability to fine-tune and deploy them on consumer-
+grade hardware (Touvron et al., 2023; Wan et al.,
+2023).
+To circumvent the prohibitive memory
+costs associated with full-parameter tuning, the
+research community has converged on two pri-
+mary paradigms for efficient adaptation: weight
+quantization, which reduces the precision of the
+frozen base model (Dettmers et al., 2022b; Frantar
+et al., 2023), and Parameter-Efficient Fine-Tuning
+(PEFT), which updates a sparse set of auxiliary pa-
+rameters such as Low-Rank Adapters (LoRA) (Hu
+et al., 2022). The integration of these techniques,
+exemplified by QLoRA (Dettmers et al., 2023a),
+has set a new standard for adapting massive models
+under limited memory budgets.
+However, current approaches largely treat quan-
+tization and adaptation as independent optimiza-
+tion problems.
+Recent automated quantization
+frameworks (Lee et al., 2025b), successfully as-
+sign mixed bit-widths based on layer sensitivity.
+Yet, these methods are primarily designed for post-
+training quantization, aiming to maximize recon-
+struction fidelity for frozen inference models rather
+than optimizing the model’s trainability. On the
+other hand, adaptive PEFT methods (Zhang et al.,
+2023; Zhou et al., 2025) focus solely on rank allo-
+cation, typically assuming a fixed or uniform base
+model precision. This compartmentalized perspec-
+tive ignores a fundamental coupling effect: the
+learning potential of a fine-tuning adapter is inher-
+ently constrained by the fidelity of the underlying
+quantized weights. A high-rank adapter attached to
+a layer collapsed by aggressive quantization may
+yield diminishing returns, wasting valuable mem-
+ory budget that could be better utilized elsewhere.
+We argue that this limitation stems from ne-
+glecting the Fidelity-Plasticity Trade-off. In our
+theoretical view, the performance of a layer is de-
+termined by the synergy between its static capac-
+ity (Fidelity, determined by quantization bit-width)
+and its dynamic adaptability (Plasticity, determined
+by adapter rank). Transformer models exhibit sig-
+nificant layer-wise heterogeneity: lower layers pri-
+marily encode robust surface-level syntax, while
+deeper layers handle complex semantic reasoning
+(Jawahar et al., 2019; Tenney et al., 2019). Uni-
+form quantization blindly suppresses the Fidelity of
+semantic-intensive layers, creating an irreversible
+information bottleneck. In such scenarios, increas-
+ing the adapter rank (Plasticity) yields diminishing
+arXiv:2505.03802v4  [cs.LG]  5 Jan 2026
+
+
+--- Page 2 ---
+returns because the underlying signal is too noisy
+to be effectively modulated. Conversely, assigning
+high precision to robust syntactic layers results in a
+suboptimal allocation of the memory budget. Con-
+sequently, the "optimal" configuration is not global
+uniformity, but a strategic re-allocation that mirrors
+the model’s intrinsic linguistic structure. We posit
+that efficiency is driven not merely by parameter
+reduction, but by harmonizing the distinct require-
+ments of Fidelity and Plasticity across different
+layers. To operationalize this insight, we propose
+shifting the paradigm from manual heuristics to
+automated joint optimization.
+To this end, we introduce QR-Adaptor, a uni-
+fied framework that jointly optimizes per-layer bit-
+width and LoRA rank. Unlike prior works that
+rely on differentiable proxies which may misalign
+with discrete quantization objectives, we formulate
+the problem as a multi-objective discrete search
+directly guided by downstream task performance.
+We develop a systematic three-stage pipeline: start-
+ing with task-informed initialization based on in-
+formation theoretic sensitivity, proceeding with
+global exploration via a Pareto-ranking genetic al-
+gorithm, and concluding with local refinement us-
+ing Bayesian Optimization. This approach allows
+the model to automatically "steal" bits from redun-
+dant layers and reinvest them into capacity-critical
+ones.
+Our main contributions are summarized as fol-
+lows:
+• We characterize the Fidelity-Plasticity Trade-
+off in quantized fine-tuning. We provide em-
+pirical evidence that decoupled optimization
+leads to suboptimal resource allocation, as the
+adaptation potential of high-rank adapters is
+constrained when the underlying weight fi-
+delity falls below a critical threshold.
+• We propose QR-Adaptor, a gradient-free
+framework that automates the joint search for
+bit-width and rank. By treating resource allo-
+cation as a multi-objective optimization prob-
+lem, our method aligns numerical precision
+with the model’s inherent linguistic hierarchy.
+• We demonstrate that QR-Adaptor establishes
+a new Pareto frontier in the accuracy-memory
+trade-off. Notably, our results show that a
+strategically allocated 4-bit memory budget
+can rival the performance of 16-bit LoRA
+baselines.
+2
+Related Work
+2.1
+LLM Quantization
+Quantization facilitates efficient deployment by
+mapping weights to lower precision. Early uniform
+methods like LLM.int8 (Dettmers et al., 2022a)
+enabled 8-bit inference. PTQ pushed limits to 4-
+bit: GPTQ (Frantar et al., 2023) utilizes Hessian
+information, while AWQ (Lin et al., 2023) protects
+activation outliers. Recent advancements focus
+on handling extreme outliers to unlock lower bit-
+widths. SpQR (Dettmers et al., 2023b) and Atom
+(Zhao et al., 2024) demonstrate that a small frac-
+tion of "outlier" weights requires higher precision
+to preserve model fidelity, while the vast majority
+can be aggressively compressed. QuaRot (Ashk-
+boos et al., 2024) further mitigates quantization
+error via rotation matrices.
+Recognizing the layer-wise heterogeneity of
+LLMs, mixed-precision strategies have gained trac-
+tion. MixLLM (Wang et al., 2025) and SliM-LLM
+(Huang et al.) assign bit-widths based on saliency.
+More recently, AMQ (Lee et al., 2025b) introduced
+an automated pipeline to search for optimal mixed-
+precision configurations. However, these methods
+are primarily designed for inference efficiency, aim-
+ing to maximize reconstruction fidelity for frozen
+models. They treat the model as static, overlook-
+ing the plasticity required during fine-tuning. As a
+result, a configuration optimized purely for infer-
+ence reconstruction often creates bottlenecks for
+downstream adaptation.
+2.2
+Parameter-Efficient Fine-Tuning (PEFT)
+PEFT adapts LLMs to downstream tasks with min-
+imal overhead. LoRA (Hu et al., 2022) approxi-
+mates updates via low-rank matrices. To improve
+flexibility, dynamic rank allocation methods have
+emerged. DyLoRA (Valipour et al., 2023) trains
+LoRA modules across a range of ranks to enable
+dynamic search-free adaptation. AdaLoRA (Zhang
+et al., 2023) and RankAdaptor (Zhou et al., 2025)
+dynamically allocate rank budgets based on sin-
+gular value importance. The DoRA (Liu et al.,
+2024) further decomposes weights into magnitude
+and direction to resemble full fine-tuning capac-
+ity. Despite their effectiveness, these methods typ-
+ically assume a fixed base model precision (e.g.,
+uniform 4-bit). They optimize the auxiliary pa-
+rameters (adapters) in isolation, ignoring the fact
+that a layer’s learning potential is fundamentally
+constrained by the quantization noise of its frozen
+
+
+--- Page 3 ---
+weights. This "rank-only" optimization leads to
+suboptimal resource utilization, as high ranks may
+be allocated to layers where the underlying infor-
+mation has already been irreversibly damaged.
+2.3
+Quantization-Aware Fine-Tuning
+The integration of quantization and PEFT aims to
+enable training on consumer hardware. QLoRA
+(Dettmers et al., 2023a) established the standard
+by combining 4-bit NormalFloat quantization with
+LoRA. Recent works have sought to refine this syn-
+ergy. QA-LoRA (Xu et al., 2023) introduces group-
+wise quantization-aware operators to reduce the
+discrepancy between quantized weights and low-
+rank adapters, enhancing stability. To mitigate the
+quantization error introduced at the start of training,
+LoftQ (Li et al., 2023) proposes a novel initializa-
+tion strategy using Singular Value Decomposition
+on the weight residuals. QLoRA employs a rigid,
+uniform configuration. While QA-LoRA improves
+the update mechanics and LoftQ improves initial-
+ization, they generally operate under a fixed archi-
+tectural constraint. In contrast, QR-Adaptor fo-
+cuses on the joint configuration search of bit-width
+and rank. We argue that initialization strategies and
+operator improvements are complementary to our
+architectural search; however, our unique contri-
+bution lies in solving the resource allocation prob-
+lem to maximize the upper bound of model perfor-
+mance under extreme constraints.
+Scope of Efficiency.
+We focus on the configu-
+ration search for quantized fine-tuning of a fixed
+architecture. Other compression techniques, such
+as structural pruning (Ma et al., 2023; Sun et al.,
+2024; Frantar and Alistarh, 2023) or knowledge
+distillation (Hinton et al., 2015; Hsieh et al., 2023;
+Jiao et al., 2020), are orthogonal to our work. QR-
+Adaptor can, in principle, be applied to a pruned
+model to further enhance its adaptability, but such
+combinations are beyond the scope of this paper.
+3
+Methodology
+3.1
+Theoretical Framework & Motivation
+To move beyond heuristic resource allocation, we
+first establish a theoretical model governing the in-
+teraction between quantization and adaptation. Let
+M denote the LLM. We model the total informa-
+tion capacity C(l)
+total of the l-th layer as the sum of
+its Static Capacity (frozen pre-trained weights) and
+Dynamic Capacity (trainable adapters).
+A: Uniform
+(2-bit)
+B: Uniform
+(4-bit)
+C: Anti-Intuit.
+(Shallow 4b/Deep 2b)
+D: Ours Intuit.
+(Shallow 2b/Deep 4b)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+MMLU Accuracy (Higher is Better)
+0.258
+0.581
+0.298
+0.461
+Validation of
+Fidelity-Plasticity
+MMLU Accuracy
+WikiText-2 PPL
+0
+20
+40
+60
+80
+100
+Perplexity (Lower is Better)
+Inf (Collapse)
+Impact of Layer-wise Bit-Rank Allocation (Qwen3-1.7B)
+Figure 1:
+Empirical validation of the Fidelity-
+Plasticity Trade-off. We compare four configurations
+on Qwen3-1.7B. Crucially, despite having the same
+memory budget, Config D (High Fidelity in Deep Lay-
+ers) significantly outperforms Config C (High Fidelity
+in Shallow Layers). This confirms our hypothesis that
+deep semantic layers are physically gated by quantiza-
+tion noise, requiring strategic bit allocationa.
+Fidelity-Plasticity Coupling.
+We define two key
+properties for each layer:
+1. Fidelity (Φl): The ability of the quantized
+weights W (l)
+q
+to retain pre-trained knowledge.
+This is strictly a function of the bit-width bl.
+Lower bits introduce a quantization noise term
+Eq(bl), reducing the mutual information with
+the original weights W (l)
+fp :
+Φl(bl) ∝I(W (l)
+fp ; W (l)
+q ) ≈f(bl)
+(1)
+2. Plasticity (Πl): The capacity of the adapter
+to mitigate quantization noise and learn new
+tasks. This is governed by the rank rl of the
+low-rank matrices Al, Bl:
+Πl(rl) ∝Rank(AlBl) = rl
+(2)
+Synergistic Optimization Hypothesis.
+For a
+layer to adapt effectively without collapsing, its
+Plasticity must be sufficient to compensate for both
+the fidelity loss and the specific adaptation demand
+of the layer’s linguistic function (Tl). We posit a
+conceptual lower-bound for effective adaptation:
+rl ≥α · Eq(bl) + β · Tl
+(3)
+where α, β are theoretical coefficients representing
+the relative impact of noise and task complexity.
+This model qualitatively explains the failure of de-
+coupled methods: by fixing bl globally, they ignore
+that deep semantic layers often possess a high task
+demand Tl. If Eq is also high (due to aggressive
+quantization), the required rl to satisfy Eq. 3 may
+exceed practical limits, leading to an information
+bottleneck.
+
+
+--- Page 4 ---
+Figure 2: Overview of the QR-Adaptor Framework. The pipeline consists of three synergistic stages: (I) Fidelity
+Sensitivity Profiling initializes the population based on information entropy to respect layer-wise task demand;
+(II) Discrete Landscape Exploration utilizes a constrained evolutionary strategy to approximate the global Pareto
+frontier without gradient mismatch; (III) Bayesian Frontier Refinement employs Gaussian Process regression to
+pinpoint the optimal bit-rank configuration within the non-smooth solution space.
+Empirical Validation.
+To validate this hypoth-
+esis, we conducted a controlled pilot study on
+Qwen3-1.7B (28 layers) fine-tuned on the Alpaca
+dataset for 1 epoch. We partitioned the model into
+Shallow (Layers 0–13, Syntax-heavy) and Deep
+(Layers 14–27, Semantic-heavy) blocks. We evalu-
+ated four configurations to test the trade-off:
+• Config A (Uniform Low): 2-bit + Rank 8.
+• Config B (Uniform High): All 4-bit + Rank
+8 (Standard Baseline).
+• Config C (Anti-Intuition): Shallow 4-bit +
+Rank 8 / Deep 2-bit + Rank 16.
+• Config D (Ours Intuition): Shallow 2-bit +
+Rank 16 / Deep 4-bit + Rank 8.
+The results, visualized in Figure 1, provide com-
+pelling evidence for our theory. Config A collapses
+completely (PPL: Inf, MMLU: 0.2577), confirming
+that uniform 2-bit is insufficient. Crucially, compar-
+ing the mixed-precision variants reveals the distinct
+roles of layers. Config C, which quantizes deep lay-
+ers to 2-bit, suffers severe degradation (PPL: 53.53,
+MMLU: 0.2980), barely outperforming the random
+baseline. This failure indicates that in semantic-
+heavy layers (high Tl), Plasticity (Rank 16) cannot
+compensate for the loss of Fidelity.
+In contrast, Config D achieves respectable per-
+formance (PPL: 33.52, MMLU: 0.4613) with the
+same average memory footprint as Config C. By
+preserving Fidelity in deep layers and trading it
+off in robust shallow layers, Config D successfully
+navigates the constraint landscape. While Config
+D logically trails the 4-bit baseline (Config B) due
+to lower total capacity, it demonstrates superior
+resource efficiency, preventing the catastrophic fail-
+ure seen in Config C and validating that allocation
+strategy is as critical as model size.
+3.2
+Problem Formulation
+Guided by the Synergistic Optimization Hypothe-
+sis, we formulate fine-tuning as a constrained multi-
+objective discrete optimization problem. Our goal
+is to find a global configuration that satisfies the
+layer-wise constraints implied by Eq. 3 while mini-
+mizing memory usage.
+Consider a pre-trained LLM with L layers. For
+each layer l, we assign a tuple (ql, rl) from the
+discrete search spaces of bit-widths Q and ranks
+R. The forward pass is defined as:
+y = Quantize(Wl, ql)x
+|
+{z
+}
+Fidelity Term (Φl)
++
+γ
+rl
+AlBlx
+|
+{z
+}
+Plasticity Term (Πl)
+(4)
+Unlike previous works that fix the Fidelity term
+globally, we optimize both terms jointly. We define
+
+
+--- Page 5 ---
+the search space as S = (Q×R)L. The objective is
+to identify a configuration C∗∈S that maximizes
+validation performance P subject to a hard memory
+budget Mbudget:
+max
+C
+P(C; Dval, θ∗
+C)
+s.t.
+L
+X
+l=1
+Mem(ql, rl) ≤Mbudget
+(5)
+where θ∗
+C denotes the parameters after fine-tuning.
+This combinatorial problem is non-differentiable
+and computationally expensive. To solve it, we pro-
+pose the QR-Adaptor framework (Figure 2), which
+systematically navigates this space to find solutions
+that harmonize Φl and Πl across all layers.
+3.3
+Phase I: Fidelity Sensitivity Profiling
+The optimization landscape defined by Eq. 5 is
+vast and non-convex. A random cold start ignores
+the heterogeneous nature of Tl (task demand), lead-
+ing to inefficient convergence. To align the initial
+population with the model’s intrinsic structure, we
+propose Fidelity Sensitivity Profiling.
+We employ Information Entropy as a proxy for
+the layer-wise task demand Tl. Layers with high en-
+tropy indicate complex feature distributions that are
+highly sensitive to the fidelity loss Eq. We quantify
+this sensitivity Sl by measuring the KL-divergence
+between the full-precision output and its minimum-
+bit counterpart on a calibration set Dcal:
+Sl =
+1
+|Dcal|
+P
+x∈Dcal DKL
+ P(y|x; Wfp) ∥P(y|x; ˆW (l)
+min)
+
+(6)
+A high Sl implies a strict constraint in Eq. 3. Con-
+sequently, we bias the initialization: the probability
+of assigning higher (ql, rl) to layer l is proportional
+to its normalized sensitivity score ˆSl. This embeds
+domain knowledge, pruning regions where the fi-
+delity bottleneck is inevitable.
+3.4
+Phase II: Discrete Landscape Exploration
+Given the initialized population, we employ a dis-
+crete evolutionary strategy to navigate the Fidelity-
+Plasticity landscape. We adapt the NSGA-II frame-
+work (Deb et al., 2002) specifically for the coupled
+nature of our problem. Unlike differentiable ar-
+chitecture search methods which rely on relaxed
+continuous proxies, evolutionary search directly
+evaluates discrete configurations, avoiding the gra-
+dient mismatch problem inherent in quantization.
+Synergistic Operators.
+Standard crossover op-
+erations may disrupt the delicate balance between
+bit-width and rank. We design operators to preserve
+structural integrity:
+• Layer-wise Crossover: We treat the tuple
+(ql, rl) as an atomic gene. Offspring inherit
+the complete configuration of a layer from
+one parent, ensuring that the local fidelity-
+plasticity alignment established in previous
+generations is preserved.
+• Proximity Mutation: To avoid destructive
+jumps in the loss landscape, we restrict muta-
+tions to immediate discrete neighbors (e.g.,
+4-bit ↔2-bit). This allows the search to
+locally adjust the inequality terms in Eq. 3
+without causing catastrophic collapse.
+Efficient Proxy Evaluation.
+Evaluating the true
+plasticity of a configuration requires full fine-
+tuning, which is computationally prohibitive. We
+utilize Proxy Tuning as a cost-effective estimator.
+We update the adapter parameters for only a few
+steps on Dcal. This brief adaptation phase is suffi-
+cient to reveal whether a configuration violates the
+fidelity bottleneck—if a layer’s capacity is insuf-
+ficient, the loss will fail to decrease even in early
+stages. This proxy metric efficiently ranks individ-
+uals to approximate the Pareto frontier Cfront.
+3.5
+Phase III: Bayesian Frontier Refinement
+While Phase II efficiently identifies the global
+Pareto front, genetic algorithms can lack precision
+in local convergence. To pinpoint the exact op-
+timum for a specific deployment constraint, we
+employ Bayesian Optimization (BO).
+We focus the search on the promising regions
+identified by Cfront. We model the objective func-
+tion f(C) using a Gaussian Process (GP) with a
+Matérn-5/2 Kernel. This kernel is chosen specif-
+ically for its ability to model rough, non-smooth
+landscapes characteristic of discrete quantization,
+where performance can drop sharply between adja-
+cent configurations (as seen in our pilot study).
+We iteratively select the next candidate config-
+uration Cnext to evaluate by maximizing the Ex-
+pected Improvement (EI) over the current best solu-
+tion ybest:
+EI(C) = E [max(0, f(C) −ybest)]
+(7)
+By maximizing EI, the framework automatically
+balances exploitation (refining high-performing
+
+
+--- Page 6 ---
+Table 1: Main Results on General NLU Benchmarks (Larger Models). Bold indicates the best result.
+Model
+Method
+Avg.
+Avg.
+Wiki2
+C4
+ARC-c
+ARC-e
+Hella
+PIQA
+Wino
+BoolQ
+OQA
+Avg.
+Bit
+Rank
+↓
+↓
+↑
+↑
+↑
+↑
+↑
+↑
+↑
+Acc. ↑
+Qwen Family
+Qwen3-4B
+LoRA (FP16)
+16.0
+16.0
+12.65
+14.52
+48.2
+78.5
+72.8
+76.2
+66.5
+79.2
+34.6
+65.1
+QLoRA (4-bit)
+4.0
+16.0
+13.05
+14.98
+45.8
+76.2
+70.5
+74.5
+64.2
+77.0
+32.4
+62.9
+AdaLoRA
+16.0
+12.8
+12.85
+14.82
+47.1
+77.4
+71.8
+75.4
+65.3
+78.2
+33.5
+64.1
+AMQ + LoRA
+4.50
+16.0
+12.92
+14.95
+47.8
+77.8
+72.0
+75.0
+64.8
+77.5
+33.0
+64.0
+QR-Adaptor-4
+3.6
+10.4
+12.82
+14.72
+47.0
+77.5
+71.5
+75.2
+65.5
+78.0
+34.0
+64.1
+QR-Adaptor-6
+5.3
+11.9
+12.45
+14.35
+48.8
+79.0
+73.2
+76.8
+67.0
+79.5
+35.0
+65.6
+Qwen3-8B
+LoRA (FP16)
+16.0
+16.0
+10.49
+12.15
+58.5
+82.2
+78.5
+78.8
+72.5
+82.5
+38.2
+70.2
+QLoRA (4-bit)
+4.0
+16.0
+10.85
+12.55
+55.8
+80.0
+76.2
+76.5
+70.2
+80.0
+35.8
+67.8
+AdaLoRA
+16.0
+12.8
+10.62
+12.35
+57.2
+81.2
+77.5
+77.8
+71.5
+81.5
+37.0
+69.0
+AMQ + LoRA
+4.33
+16.0
+10.68
+12.42
+57.8
+81.5
+77.8
+77.0
+71.0
+80.5
+36.2
+68.8
+QR-Adaptor-4
+3.5
+10.5
+10.65
+12.32
+57.2
+81.0
+77.5
+77.5
+71.5
+81.2
+37.0
+69.0
+QR-Adaptor-6
+5.2
+12.0
+10.35
+12.05
+59.2
+82.5
+79.0
+79.2
+73.0
+82.8
+38.6
+70.6
+LLaMA Family
+LLaMA-3-8B
+LoRA (FP16)
+16.0
+16.0
+7.42
+8.65
+56.2
+83.5
+77.2
+80.5
+74.0
+84.0
+40.5
+70.8
+QLoRA (4-bit)
+4.0
+16.0
+7.65
+8.92
+53.5
+81.2
+74.5
+78.2
+71.5
+81.5
+38.0
+68.3
+AdaLoRA
+16.0
+12.8
+7.55
+8.80
+55.0
+82.5
+76.0
+79.5
+72.8
+83.0
+39.2
+69.7
+AMQ + LoRA
+4.25
+16.0
+7.62
+8.88
+55.5
+82.8
+76.5
+78.5
+72.5
+81.8
+38.6
+69.4
+QR-Adaptor-4
+3.5
+10.6
+7.52
+8.75
+55.0
+82.2
+75.8
+79.2
+72.8
+82.5
+39.0
+69.5
+QR-Adaptor-6
+5.2
+12.1
+7.38
+8.55
+56.8
+83.8
+77.5
+80.8
+74.5
+84.2
+40.8
+71.2
+configurations) and exploration (testing uncertain
+regions). This stage acts as a final "polishing"
+step, ensuring that the selected bit-rank allocation
+is mathematically optimized to harmonize the trade-
+off between memory and task performance.
+4
+Evaluation
+4.1
+Experimental Setup
+Models & Datasets.
+Our primary evaluation fo-
+cuses on standard-scale open-source architectures,
+specifically LLaMA-3-8B (Grattafiori et al., 2024)
+and Qwen-3-4B/8B (Yang et al., 2025). We ex-
+tend our analysis to compact models (LLaMA-3.2-
+1B/3B, Qwen-3-1.7B), other generations (LLaMA-
+2, Qwen-2.5, LLaMA-3.1). For instruction tun-
+ing, we utilize the Alpaca-52k dataset (Taori et al.,
+2023), while also assessing performance on the
+larger-scale HC3.
+We report Zero-shot perfor-
+mance on standard commonsense reasoning bench-
+marks: ARC-E/C (Clark et al., 2018), PIQA (Bisk
+et al., 2020), Hella (Zellers et al., 2019), Wino-
+Grande (Sakaguchi et al., 2021), and MMLU
+(Hendrycks et al., 2021) (5-shot). We also report
+Perplexity (PPL) on WikiText-2 (Merity et al.,
+2016) and C4 (Raffel et al., 2023). For mathe-
+matical reasoning, we fine-tune and evaluate on
+GSM8K (Cobbe et al., 2021) (8-shot). Detailed
+results for the additional models, datasets, and ex-
+tended epochs are provided in Appendix B.
+Baselines.
+We compare QR-Adaptor against
+three primary baseline categories representing dif-
+ferent optimization strategies: (1) Upper Bound:
+Standard LoRA on FP16 base models; (2) Uni-
+form Quantization: QLoRA with 4-bit base mod-
+els; and (3) Adaptive Methods: AdaLoRA (rank-
+only search, target avg r = 16) and AMQ+LoRA
+(bit-only search via AMQ, fixed r = 16). Due
+to space constraints, comprehensive comparisons
+against lower-bit uniform variants (QLoRA 2/3-
+bit) and recent quantization-aware or compensation
+methods, LoftQ (Li et al., 2023), LQ-LoRA (Guo
+et al., 2024), ApiQ (Liao et al., 2024), and RILQ
+(Lee et al., 2025a) are provided in Appendix B.
+Implementation Details.
+We utilize the fol-
+lowing configurations:
+PyTorch version 2.1.2,
+BitsandBytes library version 0.43.1, Transform-
+ers library version 4.41.0, PEFT library version
+0.11.1, Optuna library version 3.6.1, CUDA ver-
+sion 12.4, GPU: NVIDIA L20. Operating System:
+Ubuntu.We define the population size as 5 and gen-
+erate 1 new offspring in each iteration. The second
+and third phases were iterated 5 times. Appendix C
+provides details of the implementation process and
+hyperparameter analysis.
+4.2
+Main Results
+We present a comprehensive evaluation of QR-
+Adaptor on general NLU tasks and complex rea-
+soning benchmarks. Our results demonstrate that
+
+
+--- Page 7 ---
+Table 2: Mathematical Reasoning (GSM8K, 8-shot).
+QR-Adaptor achieves comparable or superior perfor-
+mance to mixed-precision methods (AMQ) while using
+significantly fewer bits (3.4 vs 4.3).
+Method
+Avg.
+LLaMA Family
+Qwen Family
+Bit
+3-8B
+3.2-3B
+3-8B
+3-4B
+LoRA (FP16)
+16.0
+78.5
+68.5
+84.2
+78.2
+QLoRA (4-bit)
+4.0
+75.2
+64.2
+81.5
+74.5
+QLoRA (3-bit)
+3.0
+55.4
+42.8
+60.5
+51.2
+AdaLoRA
+4.0
+76.1
+65.5
+82.1
+75.8
+AMQ + LoRA
+4.3
+77.2
+66.8
+83.0
+76.8
+QR-Adaptor
+3.4
+77.8
+67.4
+83.6
+77.5
+joint bit-rank optimization consistently establishes
+a new Pareto frontier across varying model scales,
+from 1B to 8B parameters.
+General NLU Capabilities.
+Table 1 reports zero-
+shot performance and perplexity across the Qwen-
+3 and LLaMA-3 families. We observe distinct
+advantages in two operating regimes.
+First, in
+the efficiency-focused regime, QR-Adaptor-4 (av-
+eraging ∼3.5 bits) consistently outperforms the
+standard 4-bit QLoRA baseline despite using ap-
+proximately 12% less parameter memory.
+For
+instance, on Qwen3-8B, it improves average ac-
+curacy from 67.8% to 68.4%, and on LLaMA-3-
+8B, it gains +0.8% accuracy over QLoRA (69.1%
+vs. 68.3%). Second, in the performance-focused
+regime, QR-Adaptor-6 (averaging ∼5.2 bits) ef-
+fectively bridges the gap to full precision. Notably,
+it surpasses the FP16 LoRA upper bound on both
+8B models, achieving 70.6% on Qwen3-8B (vs.
+70.2%) and 71.2% on LLaMA-3-8B (vs. 70.8%).
+This suggests that a strategic combination of higher
+precision in sensitive layers and flexible rank adap-
+tation models linguistic features more effectively
+than uniform weights constrained by fixed adapters.
+Furthermore, compared to decoupled strategies like
+AdaLoRA and AMQ+LoRA, our joint optimization
+yields consistently lower perplexity on WikiText-2,
+validating the necessity of co-optimizing fidelity
+and plasticity to prevent information bottlenecks.
+Mathematical Reasoning (GSM8K).
+Table 2
+evaluates multi-step reasoning, a capability highly
+sensitive to quantization noise. Uniform quantiza-
+tion proves detrimental here; notably, 3-bit QLoRA
+on LLaMA-3 drops nearly 20 points compared to
+FP16 (55.4% vs 78.5%). In contrast, QR-Adaptor
+(3.4 bits) identifies and preserves the fidelity of crit-
+ical arithmetic layers, recovering the majority of
+Table 3: Efficiency Profile on LLaMA-3-8B. Search
+cost is normalized to standard training epochs. QR-
+Adaptor achieves the lowest memory footprint (12.8
+GB) with negligible search overhead compared to AMQ.
+Note that AMQ’s search phase consumes significant
+computational resources (≈4 epochs).
+Method
+Search Cost
+(Equiv. Epochs)
+Peak Mem.
+(GB)
+Speed
+(vs. LoRA)
+Avg.
+Bits
+LoRA (FP16)
+0.0
+28.5
+1.00×
+16.0
+QLoRA (4-bit)
+0.0
+14.2
+0.85×
+4.0
+AdaLoRA
+0.0
+14.5
+0.65×
+4.0
+AMQ + LoRA
+≈4.0
+14.2
+0.85×
+4.3
+QR-Adaptor
+0.5
+12.8
+0.82×
+3.4
+this performance drop to reach 77.8%. This demon-
+strates robust resilience where uniform compres-
+sion fails, confirming that our search successfully
+protects the specific attention heads responsible for
+logical reasoning.
+4.3
+Efficiency Analysis
+A primary critique of Neural Architecture Search
+(NAS) approaches is the potential computational
+overhead. Table 3 profiles the computational effi-
+ciency on an NVIDIA A100. Addressing the search
+overhead, the complete QR-Adaptor pipeline re-
+quires equivalent to merely ∼0.5 standard fine-
+tuning epochs. Given that the discovered configu-
+ration is static and reusable across subsequent runs,
+this one-time cost is negligible when amortized
+over the model’s deployment lifecycle.
+In terms of resource utilization, QR-Adaptor es-
+tablishes a superior efficiency profile. By strate-
+gically allocating lower precision (e.g., 2-bit) to
+redundancy-heavy layers, we reduce peak VRAM
+to 12.8 GB, comfortably fitting within consumer-
+grade hardware limits and surpassing the 14.2
+GB footprint of 4-bit QLoRA. It is a known phe-
+nomenon in quantization-aware fine-tuning that
+lower bit-widths can decrease training speed due
+to the overhead of on-the-fly dequantization (con-
+verting quantized weights to BF16 for computa-
+tion). Furthermore, unlike AdaLoRA, which incurs
+a ∼35% throughput penalty due to dynamic SVD
+computations (0.65× speed), our fixed architec-
+tural configuration maintains competitive training
+speeds (0.82×), ensuring a significantly shorter
+total turn-around time for multi-epoch training.
+4.4
+In-depth Analysis
+Beyond aggregate metrics, we analyze the internal
+behavior of QR-Adaptor to validate our theoretical
+claims regarding the Fidelity-Plasticity Trade-off.
+
+
+--- Page 8 ---
+Bit
+4
+8
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+8
+8
+8
+8
+8
+4
+8
+4
+8
+4
+8
+8
+8
+8
+8
+8
+8
+8
+Shallow
+Transition
+Deep
+0
+4
+8
+12
+16
+20
+24
+28
+Layer Index
+Rank
+2
+16
+2
+2
+4
+2
+2
+2
+2
+2
+4
+4
+4
+4
+4
+8
+16
+8
+8
+8
+16
+4
+8
+4
+8
+8
+16
+8
+16 16 16 16
+2
+4
+8
+2
+6
+12
+16
+Figure 3: Layer-wise Bit-Rank Allocation. The dis-
+covered configuration exhibits a clear gradient: high
+fidelity (bits) and plasticity (rank) are automatically con-
+centrated in deep semantic layers, while shallow layers
+are aggressively compressed.
+Validating the Linguistic Hierarchy.
+Figure 3
+visualizes the optimal configuration (Cbest) discov-
+ered for LLaMA-3-8B. A distinct hierarchical gra-
+dient emerges autonomously: the search allocates
+lower precision and ranks to shallow layers (0-10),
+reflecting the inherent robustness of syntactic fea-
+ture extraction. Conversely, deep layers (20-32)
+are consistently assigned high fidelity and plastic-
+ity. This distribution strongly aligns with inter-
+pretability studies (Jawahar et al., 2019), confirm-
+ing that QR-Adaptor successfully identifies that
+complex semantic reasoning requires minimizing
+the Fidelity Bottleneck, while efficiently compress-
+ing redundancy in lower layers.
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+Iteration
+8
+9
+10
+11
+12
+Validation Perplexity
+Phase II
+(Evolutionary Search)
+Phase III
+(Bayesian Opt.)
+ PPL
+=3.05
+Figure 4: Search Convergence. Validation PPL de-
+creases steadily, proving the effectiveness of the evolu-
+tionary exploration and Bayesian refinement.
+Search Convergence & Effectiveness.
+Figure
+4 tracks the validation perplexity evolution. We
+observe a steep optimization trajectory during the
+Evolutionary Search (Phase II), validating the effi-
+ciency of our synergistic operators in navigating the
+discrete landscape. The subsequent Bayesian Op-
+timization (Phase III) achieves asymptotic conver-
+gence, fine-tuning the solution to the exact Pareto
+limit. Notably, the final allocated bit-width exhibits
+a strong Pearson correlation (r > 0.8) with the
+Fidelity Sensitivity Score (Sl) derived in Phase I,
+substantiating the predictive power of our entropy-
+based profiling as a task-agnostic prior.
+QR-Adaptor
+(Full)
+w/o Rank Search
+(Fixed r=16)
+w/o Bit Search
+(Fixed 4-bit)
+w/o Phase I
+(Random Init)
+58
+59
+60
+61
+62
+63
+64
+Average Accuracy (%)
+62.8
+61.5
+60.9
+59.2
+Avg. Accuracy
+Relative Memory
+0.950
+0.975
+1.000
+1.025
+1.050
+1.075
+1.100
+1.125
+1.150
+Relative Memory (Lower is Better)
+1.00x
+1.12x
+1.08x
+1.02x
+Impact of Each Component (Ablation Study)
+Figure 5: Impact of Joint Optimization. Joint opti-
+mization yields the better trade-off.
+4.5
+Ablation Study
+To verify our core hypothesis that Fidelity (bit-
+width) and Plasticity (adapter rank) are physically
+coupled, we analyzed the impact of optimizing
+these dimensions independently versus jointly on
+LLaMA-3-8B. As shown in Figure 6, the results
+demonstrate the necessity of joint optimization. De-
+coupled strategies fail to navigate the trade-off: fix-
+ing the rank limits the plasticity required for deep
+semantic layers, while fixing the bit-width fails to
+exploit the memory redundancy in shallow syntac-
+tic layers. Furthermore, we analyze the impact of
+initialization. Without the task-informed prior pro-
+vided by Phase I, the vast and non-convex search
+space leads to inefficient exploration and subopti-
+mal convergence. Detailed component-wise abla-
+tion results are provided in Appendix D.
+5
+Conclusion
+In this paper, we identify and formalize the Fidelity-
+Plasticity Trade-off in quantized fine-tuning, re-
+vealing that the adaptation potential of Large Lan-
+guage Models is intrinsically gated by the informa-
+tion capacity of their frozen weights. To navigate
+this constraint, we introduce QR-Adaptor, a unified
+framework that automates the joint optimization of
+quantization bit-width and adapter rank. By treat-
+ing resource allocation as a multi-objective search
+aligned with the model’s linguistic hierarchy, QR-
+Adaptor liberates memory from redundancy-heavy
+syntactic layers to reinvest in capacity-critical se-
+mantic layers. Extensive experiments on LLaMA-3
+and Qwen families demonstrate that our method
+establishes a new Pareto frontier. Our findings sug-
+gest that the efficacy of LLM adaptation on edge
+devices depends not merely on the total parameter
+count, but on the strategic harmonization of static
+fidelity and dynamic plasticity.
+
+
+--- Page 9 ---
+Limitation and Future Work.
+Although our
+three-stage pipeline is efficient (approx. 0.5 train-
+ing epochs), it introduces a non-zero computa-
+tional overhead compared to heuristic-based meth-
+ods like QLoRA. While this cost is negligible
+when amortized over the model’s deployment life-
+cycle—since the discovered configuration is static
+and reusable—it may present a bottleneck in sce-
+narios requiring rapid, one-shot adaptation for con-
+tinuously changing tasks. Future work will explore
+predictor-based neural architecture search (NAS)
+to further accelerate the profiling phase.
+References
+Saleh Ashkboos, Amirkeivan Mohtashami, Maximil-
+ian L Croci, Bo Li, Pashmina Cameron, Martin Jaggi,
+Dan Alistarh, Torsten Hoefler, and James Hensman.
+2024. Quarot: Outlier-free 4-bit inference in rotated
+llms. Advances in Neural Information Processing
+Systems, 37:100213–100240.
+Yonatan Bisk, Rowan Zellers, Jianfeng Gao, Yejin Choi,
+and 1 others. 2020. Piqa: Reasoning about physical
+commonsense in natural language. In Proceedings
+of the AAAI conference on artificial intelligence, vol-
+ume 34, pages 7432–7439.
+Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot,
+Ashish Sabharwal, Carissa Schoenick, and Oyvind
+Tafjord. 2018. Think you have solved question an-
+swering? try arc, the ai2 reasoning challenge. arXiv
+preprint arXiv:1803.05457.
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian,
+Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias
+Plappert, Jerry Tworek, Jacob Hilton, Reiichiro
+Nakano, Christopher Hesse, and John Schulman.
+2021. Training verifiers to solve math word prob-
+lems. Preprint, arXiv:2110.14168.
+Kalyanmoy Deb, Amrit Pratap, Sameer Agarwal, and
+TAMT Meyarivan. 2002. A fast and elitist multiob-
+jective genetic algorithm: Nsga-ii. IEEE transactions
+on evolutionary computation, 6(2):182–197.
+Tim Dettmers, Mike Lewis, Younes Belkada, and
+Luke Zettlemoyer. 2022a. Llm. int8 (): 8-bit ma-
+trix multiplication for transformers at scale. CoRR,
+abs/2208.07339.
+Tim Dettmers, Mike Lewis, Younes Belkada, and
+Luke Zettlemoyer. 2022b. Llm.int8(): 8-bit matrix
+multiplication for transformers at scale. Preprint,
+arXiv:2208.07339.
+Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and
+Luke Zettlemoyer. 2023a. Qlora: Efficient finetuning
+of quantized llms. arXiv preprint arXiv:2305.14314.
+Tim Dettmers, Ruslan Svirschevski, Vage Egiazarian,
+Denis Kuznedelev, Elias Frantar, Saleh Ashkboos,
+Alexander Borzunov, Torsten Hoefler, and Dan Al-
+istarh. 2023b. Spqr: A sparse-quantized representa-
+tion for near-lossless llm weight compression. arXiv
+preprint arXiv:2306.03078.
+Elias Frantar and Dan Alistarh. 2023. Sparsegpt: Mas-
+sive language models can be accurately pruned in
+one-shot. Preprint, arXiv:2301.00774.
+Elias Frantar, Sahar Ashkboos, Torsten Hoefler, and Dan
+Alistarh. 2023. Gptq: Accurate post-training quan-
+tization for generative pre-trained transformers. In
+The Eleventh International Conference on Learning
+Representations (ICLR).
+Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri,
+and et al. Abhinav Pandey. 2024. The llama 3 herd
+of models. Preprint, arXiv:2407.21783.
+Han Guo, Philip Greengard, Eric Xing, and Yoon Kim.
+2024. LQ-loRA: Low-rank plus quantized matrix de-
+composition for efficient language model finetuning.
+In The Twelfth International Conference on Learning
+Representations.
+Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou,
+Mantas Mazeika, Dawn Song, and Jacob Steinhardt.
+2021. Measuring massive multitask language under-
+standing. In International Conference on Learning
+Representations.
+Geoffrey Hinton, Oriol Vinyals, and Jeff Dean. 2015.
+Distilling the knowledge in a neural network.
+Preprint, arXiv:1503.02531.
+Cheng-Yu Hsieh, Chun-Liang Li, Chih-Kuan Yeh,
+Hootan Nakhost, Yasuhisa Fujii, Alexander Ratner,
+Ranjay Krishna, Chen-Yu Lee, and Tomas Pfister.
+2023. Distilling step-by-step! outperforming larger
+language models with less training data and smaller
+model sizes. Preprint, arXiv:2305.02301.
+Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan
+Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and
+Weizhu Chen. 2022. Lora: Low-rank adaptation of
+large language models. In Proceedings of ICLR.
+Wei Huang, Haotong Qin, Yangdong Liu, Yawei Li,
+Qinshuo Liu, Xianglong Liu, Luca Benini, Michele
+Magno, Shiming Zhang, and XIAOJUAN QI. Slim-
+llm: Salience-driven mixed-precision quantization
+for large language models. In Forty-second Interna-
+tional Conference on Machine Learning.
+Ganesh Jawahar, Benoît Sagot, and Djamé Seddah.
+2019. What does BERT learn about the structure of
+language? In Proceedings of the 57th Annual Meet-
+ing of the Association for Computational Linguistics,
+pages 3651–3657, Florence, Italy. Association for
+Computational Linguistics.
+Xiaoqi Jiao, Yichun Yin, Lifeng Shang, Xin Jiang, Xiao
+Chen, Linlin Li, Fang Wang, and Qun Liu. 2020.
+Tinybert: Distilling bert for natural language under-
+standing. Preprint, arXiv:1909.10351.
+
+
+--- Page 10 ---
+Geonho Lee, Janghwan Lee, Sukjin Hong, Minsoo Kim,
+Euijai Ahn, Du-Seong Chang, and Jungwook Choi.
+2025a. Rilq: Rank-insensitive lora-based quantiza-
+tion error compensation for boosting 2-bit large lan-
+guage model accuracy. In Proceedings of the AAAI
+Conference on Artificial Intelligence, volume 39,
+pages 18091–18100.
+Sangjun Lee, Seung taek Woo, Jungyu Jin, Changhun
+Lee, and Eunhyeok Park. 2025b. Amq: Enabling au-
+toml for mixed-precision weight-only quantization of
+large language models. Preprint, arXiv:2509.12019.
+Yixiao Li, Yifan Yu, Chen Liang, Pengcheng He, Nikos
+Karampatziakis, Weizhu Chen, and Tuo Zhao. 2023.
+Loftq: Lora-fine-tuning-aware quantization for large
+language models. Preprint, arXiv:2310.08659.
+Baohao Liao, Christian Herold, Shahram Khadivi, and
+Christof Monz. 2024.
+Apiq: Finetuning of 2-bit
+quantized large language model.
+In Proceedings
+of the 2024 Conference on Empirical Methods in
+Natural Language Processing, pages 20996–21020.
+Ji Lin, Jie Tang, Haotao Tang, Shuxin Yang, Xiaoxia
+Dang, and Song Han. 2023. Awq: Activation-aware
+weight quantization for llm compression and acceler-
+ation. arXiv preprint arXiv:2306.00978.
+Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo
+Molchanov, Yu-Chiang Frank Wang, Kwang-Ting
+Cheng, and Min-Hung Chen. 2024. Dora: Weight-
+decomposed low-rank adaptation. In Forty-first In-
+ternational Conference on Machine Learning.
+Xinyin Ma, Gongfan Fang, and Xinchao Wang. 2023.
+Llm-pruner: On the structural pruning of large lan-
+guage models. In Advances in Neural Information
+Processing Systems.
+Stephen Merity, Caiming Xiong, James Bradbury, and
+Richard Socher. 2016. Pointer sentinel mixture mod-
+els.
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine
+Lee, Sharan Narang, Michael Matena, Yanqi Zhou,
+Wei Li, and Peter J. Liu. 2023. Exploring the limits
+of transfer learning with a unified text-to-text trans-
+former. Preprint, arXiv:1910.10683.
+Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavat-
+ula, and Yejin Choi. 2021. Winogrande: An adver-
+sarial winograd schema challenge at scale. Commu-
+nications of the ACM, 64(9):99–106.
+Mingjie Sun, Zhuang Liu, Anna Bair, and J. Zico Kolter.
+2024. A simple and effective pruning approach for
+large language models. Preprint, arXiv:2306.11695.
+Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann
+Dubois, Xuechen Li, Carlos Guestrin, Percy Liang,
+and Tatsunori B. Hashimoto. 2023.
+Stanford al-
+paca: An instruction-following llama model. Stan-
+ford CRFM.
+Ian Tenney, Dipanjan Das, and Ellie Pavlick. 2019.
+Bert rediscovers the classical nlp pipeline. Preprint,
+arXiv:1905.05950.
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier
+Martinet, Marie-Anne Lachaux, Timothée Lacroix,
+Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal
+Azhar, Aurelien Rodriguez, Armand Joulin, Edouard
+Grave, and Guillaume Lample. 2023.
+Llama:
+Open and efficient foundation language models.
+arXiv:2302.13971.
+Mojtaba
+Valipour,
+Mehdi
+Rezagholizadeh,
+Ivan
+Kobyzev, and Ali Ghodsi. 2023. Dylora: Parame-
+ter efficient tuning of pre-trained models using dy-
+namic search-free low-rank adaptation.
+Preprint,
+arXiv:2210.07558.
+Zhongwei Wan, Xin Wang, Che Liu, Samiul Alam,
+Yu Zheng, Jiachen Liu, Zhongnan Qu, Shen Yan,
+Yi Zhu, Quanlu Zhang, and 1 others. 2023. Efficient
+large language models: A survey. Transactions on
+Machine Learning Research.
+Xinyuan Wang, Yanchi Liu, Wei Cheng, Xujiang
+Zhao, Zhengzhang Chen, Wenchao Yu, Yanjie Fu,
+and Haifeng Chen. 2025. Mixllm: Dynamic rout-
+ing in mixed large language models.
+Preprint,
+arXiv:2502.18482.
+Yuhui Xu, Lingxi Xie, Xiaotao Gu, Xin Chen, Heng
+Chang, Hengheng Zhang, Zhensu Chen, Xiaopeng
+Zhang, and Qi Tian. 2023. Qa-lora: Quantization-
+aware low-rank adaptation of large language models.
+arXiv preprint arXiv:2309.14717.
+An Yang, Anfeng Li, and Baosong Yang et al.
+2025.
+Qwen3 technical report.
+Preprint,
+arXiv:2505.09388.
+Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali
+Farhadi, and Yejin Choi. 2019. Hellaswag: Can a
+machine really finish your sentence? In Proceedings
+of the 57th Annual Meeting of the Association for
+Computational Linguistics, pages 4791–4800.
+Qingru Zhang, Minshuo Chen, Alexander Bukharin,
+Nikos Karampatziakis, Pengcheng He, Yu Cheng,
+Weizhu Chen, and Tuo Zhao. 2023. Adalora: Adap-
+tive budget allocation for parameter-efficient fine-
+tuning. arXiv preprint arXiv:2303.10512.
+Yilong Zhao, Chien-Yu Lin, Kan Zhu, Zihao Ye, Lequn
+Chen, Size Zheng, Luis Ceze, Arvind Krishnamurthy,
+Tianqi Chen, and Baris Kasikci. 2024. Atom: Low-
+bit quantization for efficient and accurate llm serving.
+Preprint, arXiv:2310.19102.
+Changhai Zhou, Shijie Han, Lining Yang, Yuhua Zhou,
+Xu Cheng, Yibin Wang, and Hongguang Li. 2025.
+RankAdaptor: Hierarchical rank allocation for ef-
+ficient fine-tuning pruned LLMs via performance
+model. In Findings of the Association for Computa-
+tional Linguistics: NAACL 2025, pages 5781–5795,
+Albuquerque, New Mexico. Association for Compu-
+tational Linguistics.
+
+
+--- Page 11 ---
+A
+Use of LLMs
+In preparing this paper, LLMs were employed
+solely for language refinement purposes, such as
+improving grammar, clarity, and style of expression.
+All research questions, conceptual frameworks, the-
+oretical arguments, methodological designs, data
+analyses, and conclusions presented in this work
+were independently conceived and executed by the
+author. The LLMs did not generate, alter, or in-
+fluence the underlying ideas, interpretations, or
+findings. Their use was limited to assisting in pol-
+ishing the readability and fluency of the manuscript
+while preserving the originality and integrity of the
+scholarly contributions.
+Table 4: Comparison of gradient norms and relative
+entropy as initialization metrics on Llama2-13B. Bold
+values indicate the best performance for each task. Ac-
+curacy is reported as %
+Initialization Metric
+BoolQ
+PIQA
+HellaS
+WinoG
+ARC(E)
+ARC(C)
+OBQA
+Average
+Gradient Norms
+80.79
+80.13
+79.16
+71.69
+78.72
+50.97
+45.40
+69.51
+Relative Entropy
+81.08
+80.83
+79.80
+71.98
+79.13
+51.65
+45.60
+70.07
+Table 5: Sensitivity analysis of PRGA under different
+iteration counts and population sizes on Llama3.1-8B.
+Bold values indicate the best configuration.
+Iterations
+Population Size
+Average Improvement (%)
+Total Time (min)
+5
+3
++0.8
+72
+5
+5
++1.2
+90
+10
+5
++1.5
+135
+5
+20
++1.6
+225
+10
+20
++2.3
+270
+Table 6: Performance comparison with fair bit-width
+configurations for Llama2-13B. Accuracy is reported as
+%
+Method
+BoolQ
+PIQA
+HellaS
+WinoG
+ARC(E)
+ARC(C)
+OBQA
+Average
+AdaLoRA
+81.08
+80.13
+79.21
+71.74
+79.51
+50.12
+45.60
+69.77
+LoftQ
+80.93
+79.47
+79.02
+71.34
+79.26
+51.20
+45.60
+69.98
+QR-Adaptor
+81.84
+81.45
+80.08
+72.69
+80.64
+52.82
+45.80
+70.76
+B
+Additional Experimental Results
+In this section, we provide supplementary exper-
+imental results that were omitted from the main
+text due to space constraints. This includes eval-
+uations on compact models, comparisons with a
+wider range of baselines, results on varying model
+generations, and analyses of different training set-
+tings.
+B.1
+Additional General NLU Benchmarks
+Performance
+We extended our evaluation to cover general natural
+language understanding tasks. The main goal here
+is to compare our method directly against QLoRA.
+We focused specifically on the challenging 2-bit
+and 3-bit quantization settings. These extreme com-
+pression rates usually cause a significant drop in
+model performance.
+We tested this on a diverse set of six models.
+This includes the Qwen3 family (1.7B, 4B, and 8B)
+and the LLaMA series (LLaMA-3-8B, LLaMA-
+3.2-3B, and LLaMA-3.2-1B). Table 7 presents the
+detailed results. You can see a clear advantage in
+our approach.
+QLoRA tends to struggle when the bit-width
+drops to 2-bit. The performance gap becomes quite
+obvious there. In contrast, our method maintains a
+higher accuracy. We achieve this by dynamically
+allocating bits and ranks. We assign more resources
+to the sensitive layers and compress the robust ones.
+This strategy is particularly effective for smaller
+models like LLaMA-3.2-1B. It keeps them usable
+even under heavy compression.
+B.2
+Results on Compact Models
+Small language models (SLMs) are particularly
+sensitive to quantization noise.
+We report the
+performance of LLaMA-3.2-1B/3B and Qwen-3-
+1.7B in Table 8.
+B.3
+Comparison with State-of-the-Art
+Quantization Methods
+We
+compare
+QR-Adaptor
+against
+recent
+quantization-aware methods, including LoftQ,
+ApiQ, and RILQ. Table 9 presents the comprehen-
+sive results on LLaMa3.1-8B.
+LoftQ relies on iterative initialization to re-
+duce quantization error. However, its performance
+proves unstable. LoftQ achieves its peak average
+accuracy of 68.82% at 1 iteration. Extending the
+initialization to 5 or 10 iterations causes signifi-
+cant degradation. The accuracy drops to 66.45%
+and 65.70%, respectively. In contrast, QR-Adaptor
+(≤4-bit) demonstrates superior stability and ef-
+fectiveness. It achieves an average accuracy of
+69.73%, surpassing the best LoftQ result by nearly
+1%.
+In the low-bit regime (approx. 2-bit), we com-
+pare our method with ApiQ and RILQ. These base-
+lines suffer notable performance drops on complex
+
+
+--- Page 12 ---
+Table 7: Performance comparison on General NLU Benchmarks. We report the average accuracy across standard
+datasets. The comparison covers QLoRA at 2-bit and 3-bit settings versus our method. "Avg." denotes the average
+score of all evaluated tasks.
+Model
+Full Precision
+2-bit / Low-bit Regime
+3-bit / Mid-bit Regime
+(BF16)
+QLoRA (2-bit)
+Ours
+∆
+QLoRA (3-bit)
+Ours
+∆
+Qwen3-1.7B
+57.4
+51.5
+53.8
++2.3
+54.0
+55.6
++1.6
+Qwen3-4B
+65.1
+58.5
+61.2
++2.7
+61.5
+63.5
++2.0
+Qwen3-8B
+70.2
+63.5
+66.2
++2.7
+66.5
+68.5
++2.0
+LLaMA-3.2-1B
+54.5
+48.5
+50.8
++2.3
+51.0
+52.6
++1.6
+LLaMA-3.2-3B
+63.3
+56.5
+59.0
++2.5
+59.5
+61.5
++2.0
+LLaMA-3-8B
+70.8
+64.0
+66.8
++2.8
+67.0
+69.0
++2.0
+Table 8: Main Results on General NLU Benchmarks (Remaining Models). Bold indicates the best result in each
+column.
+Model
+Method
+Avg.
+Avg.
+Wiki2
+C4
+ARC-c
+ARC-e
+Hella
+PIQA
+Wino
+BoolQ
+OQA
+Avg.
+Bit
+Rank
+↓
+↓
+↑
+↑
+↑
+↑
+↑
+↑
+↑
+Acc. ↑
+Qwen Family
+Qwen3-1.7B
+LoRA (FP16)
+16.0
+16.0
+15.65
+17.82
+38.5
+68.2
+64.5
+70.5
+59.2
+72.8
+28.4
+57.4
+QLoRA (4-bit)
+4.0
+16.0
+16.15
+18.95
+36.2
+66.1
+62.1
+68.8
+57.1
+70.5
+26.8
+55.4
+AdaLoRA
+16.0
+12.8
+15.92
+18.25
+37.6
+67.3
+63.5
+69.6
+58.3
+71.8
+27.6
+56.5
+AMQ + LoRA
+4.50
+16.0
+16.05
+18.55
+38.2
+67.8
+63.8
+69.0
+57.5
+71.2
+27.2
+56.4
+QR-Adaptor-4
+3.5
+10.3
+15.85
+18.35
+37.2
+67.0
+63.2
+69.5
+58.0
+71.5
+27.5
+56.3
+QR-Adaptor-6
+5.2
+11.8
+15.55
+17.65
+39.0
+68.5
+65.0
+70.8
+59.8
+73.0
+28.8
+57.8
+LLaMA Family
+LLaMA-3.2-3B
+LoRA (FP16)
+16.0
+16.0
+9.41
+11.08
+46.5
+76.8
+70.5
+74.8
+64.5
+77.5
+32.8
+63.3
+QLoRA (4-bit)
+4.0
+16.0
+9.95
+11.85
+44.2
+74.5
+68.0
+72.8
+62.0
+75.2
+30.5
+61.0
+AdaLoRA
+16.0
+12.8
+9.62
+11.38
+45.5
+75.8
+69.2
+73.8
+63.2
+76.5
+31.8
+62.3
+AMQ + LoRA
+4.14
+16.0
+9.75
+11.55
+45.8
+76.0
+69.5
+73.0
+62.8
+75.5
+31.0
+61.9
+QR-Adaptor-4
+3.5
+10.3
+9.58
+11.42
+45.5
+75.5
+69.2
+73.8
+63.2
+76.5
+31.5
+62.2
+QR-Adaptor-6
+5.2
+11.8
+9.32
+10.95
+47.0
+77.2
+71.0
+75.2
+65.0
+77.8
+33.0
+63.7
+LLaMA-3.2-1B
+LoRA (FP16)
+16.0
+16.0
+11.86
+13.92
+36.5
+66.8
+61.5
+66.2
+56.8
+68.5
+25.2
+54.5
+QLoRA (4-bit)
+4.0
+16.0
+12.65
+15.15
+34.2
+64.5
+59.0
+64.5
+54.5
+66.2
+23.5
+52.3
+AdaLoRA
+16.0
+12.8
+12.15
+14.28
+35.5
+65.8
+60.2
+65.5
+55.8
+67.5
+24.5
+53.5
+AMQ + LoRA
+4.50
+16.0
+12.35
+14.65
+35.2
+65.5
+60.0
+65.2
+55.5
+67.2
+24.2
+53.3
+QR-Adaptor-4
+3.5
+10.2
+12.18
+14.35
+35.2
+65.5
+60.0
+65.5
+55.5
+67.2
+24.5
+53.3
+QR-Adaptor-6
+5.2
+11.7
+11.75
+13.80
+37.0
+67.2
+62.0
+66.5
+57.2
+68.8
+25.5
+54.9
+reasoning tasks like GSM8K. ApiQ achieves an
+average accuracy of 62.53%, while RILQ reaches
+63.16%. QR-Adaptor (Mixed 2/4-bit) outperforms
+both baselines with 64.40% accuracy. By identi-
+fying and protecting sensitive layers with higher
+bit-widths, our method effectively minimizes preci-
+sion loss.
+B.4
+Scalability Across Model Families
+To verify generalizability, we extend our evaluation
+to LLaMA-2(Table 12), LLaMA-3.1(Table 13),
+and Qwen-2.5(Table 11).
+B.5
+Performance on Large-Scale Datasets
+(HC3)
+To assess the impact of training data scale, we fine-
+tuned LLaMA-3-8B on the HC3 dataset(Table 14).
+B.6
+Impact of Training Duration
+While increasing the fine-tuning epochs for
+AdaLoRA can lead to some performance improve-
+ments, these gains are marginal and AdaLoRA
+still does not outperform other methods like LoRA,
+QLoRA, or our proposed QR-Adaptor, the results
+provided in Table 15.Extending the training of
+AdaLoRA from 2 epochs to 5 epochs results in
+a slight performance increase. However, this im-
+provement is not substantial and comes at the cost
+of significantly longer training times. The results
+
+
+--- Page 13 ---
+Table 9: Comparison with state-of-the-art quantization methods on LLaMa3.1-8B. We compare QR-Adaptor against
+initialization-based methods (LoftQ) and compensation-based methods (ApiQ, RILQ). The results demonstrate that
+QR-Adaptor achieves the best trade-off between compression rate and accuracy.
+Method
+Bit
+ARC(C)
+ARC(E)
+BoolQ
+GSM8K
+HellaS
+OBQA
+PIQA
+WinoG
+Average
+4-bit / Initialization Methods
+LoftQ (1 iter)
+4
+54.86
+82.74
+82.26
+51.40
+78.65
+46.00
+81.45
+73.24
+68.82
+LoftQ (5 iters)
+4
+52.65
+81.82
+81.53
+39.65
+78.50
+43.40
+81.39
+72.69
+66.45
+LoftQ (10 iters)
+4
+51.88
+81.31
+79.66
+38.44
+78.01
+43.20
+81.12
+71.98
+65.70
+QR-Adaptor (≤4-bit)
+3.63
+56.15
+82.78
+82.45
+54.12
+79.58
+45.60
+82.12
+75.01
+69.73
+2-bit / Compensation Methods
+ApiQ
+2
+48.12
+76.45
+75.32
+28.45
+72.15
+38.20
+75.67
+65.89
+62.53
+RILQ
+2
+48.78
+76.98
+75.89
+29.45
+72.78
+38.80
+76.12
+66.45
+63.16
+QR-Adaptor (Mixed)
+2.5
+50.23
+78.01
+76.89
+31.45
+73.89
+39.80
+77.12
+67.78
+64.40
+Table 10: Hyperparameters for the QR-Adaptor search process.
+Parameter
+Stage
+Value / Description
+General Search Configuration
+Bit-width Search Space (Q)
+All
+{2, 4, 8}
+LoRA Rank Search Space (R)
+All
+{2, 4, 6, . . . , 16}
+Calibration Dataset
+All
+A random subset of 1024 samples from the C4 dataset.
+Fine-tuning Epochs (per evaluation)
+All
+1 epoch on the calibration dataset.
+Stage 1: Task-Informed Initialization
+Importance Score Metric (I(l))
+Initialization
+Gradient-based saliency score (magnitude of Fisher Information).
+Initial Population Size (Npop)
+Initialization
+1
+Stage 2: Global Exploration (PRGA)
+Algorithm
+PRGA
+NSGA-II (Non-dominated Sorting Genetic Algorithm II)
+Number of Generations
+PRGA
+5
+Population Size
+PRGA
+10
+Selection Mechanism
+PRGA
+Tournament selection based on non-dominated rank and crowding distance.
+Crossover Operator
+PRGA
+Uniform Crossover with a probability of 0.9.
+Mutation Operator
+PRGA
+Per-layer random mutation: for each layer, with probability 0.1,
+re-sample its bit-width and rank from Q and R.
+Stage 3: Local Refinement (Bayesian Optimization)
+Surrogate Model
+BO
+Gaussian Process (GP)
+GP Kernel
+BO
+Matérn 5/2 kernel with Automatic Relevance Determination (ARD).
+Acquisition Function
+BO
+Expected Improvement (EI).
+Number of Iterations
+BO
+5 iterations per configuration refined from the Pareto front.
+suggest that adaptive rank adjustment alone, as
+in AdaLoRA, may not be the most effective ap-
+proach. The combination of adaptive rank with
+mixed-precision quantization, as in QR-Adaptor,
+yields superior performance.
+C
+Implementation Details
+C.1
+More Implementation Details
+In optimizing the pruned Llama2-7B model, a
+carefully designed hyperparameter configuration
+has been implemented to strike a balance between
+model performance and computational efficiency.
+The model is fine-tuned using a learning rate of
+3 × 10−4, with a batch size of 128, divided into
+micro-batches of 4 to effectively manage memory
+limitations. Input sequences are capped at 256 to-
+kens, and a dropout rate of 0.05 is applied to the
+LoRA layers, specifically targeting the query, key,
+value, and output projections, as well as the gate,
+down, and up projections. Layer-specific quantiza-
+tion is applied at both 4-bit and 8-bit levels, opti-
+mizing memory usage while maintaining computa-
+tional accuracy. The training is performed using the
+paged AdamW optimizer with 32-bit precision, en-
+suring both stability and efficiency. These settings
+have been rigorously tested and refined through
+the Optuna framework to achieve an optimal bal-
+ance between model performance and resource ef-
+ficiency.
+
+
+--- Page 14 ---
+Table 11: Performance comparison across different model architectures (r=8). Bold figures represent the best
+performance for each model. Accuracy is reported as %.
+Model
+Method
+Bit
+ARC(C)
+ARC(E)
+BoolQ
+GSM8K
+HellaS
+OBQA
+PIQA
+WinoG
+Average
+Qwen-2.5-7B
+LoRA
+16
+56.01
+83.48
+82.97
+54.03
+79.01
+45.00
+81.95
+74.98
+69.68
+QLoRA
+4
+54.02
+82.04
+81.53
+44.11
+78.02
+44.00
+81.04
+72.96
+67.22
+AdaLoRA
+4
+51.03
+80.51
+80.04
+37.23
+77.04
+42.60
+80.53
+72.01
+65.11
+LoftQ
+41
+53.96
+82.15
+81.87
+43.84
+77.93
+43.80
+80.72
+72.54
+67.11
+QR-Adaptor (≤4bit)
+3.875
+54.89
+82.71
+82.25
+49.87
+78.73
+45.20
+81.49
+73.40
+68.56
+QR-Adaptor (Optimal)
+5.125
+56.52
+84.01
+83.49
+56.03
+80.52
+46.00
+82.51
+75.52
+70.58
+Qwen-2.5-3B
+LoRA
+16
+52.98
+81.03
+80.01
+45.02
+76.01
+42.00
+79.03
+70.99
+65.88
+QLoRA
+4
+51.01
+79.02
+79.03
+36.04
+75.01
+41.00
+78.02
+68.97
+63.51
+AdaLoRA
+4
+49.03
+78.01
+78.02
+29.01
+74.03
+40.00
+77.01
+68.03
+61.64
+LoftQ
+41
+50.92
+79.23
+78.87
+35.48
+74.95
+40.60
+77.87
+68.65
+63.32
+QR-Adaptor (≤4bit)
+3.375
+51.87
+79.91
+79.76
+41.03
+75.45
+41.80
+78.43
+69.41
+64.69
+QR-Adaptor (Optimal)
+4.875
+53.53
+81.51
+80.52
+47.01
+77.03
+43.00
+79.51
+71.52
+66.70
+LLaMA-3.2-3B
+LoRA
+16
+53.51
+81.23
+80.51
+46.03
+76.51
+42.60
+79.52
+71.31
+66.39
+QLoRA
+4
+51.52
+79.51
+79.52
+37.01
+75.53
+41.60
+78.53
+69.51
+64.08
+AdaLoRA
+4
+49.53
+78.52
+78.51
+30.03
+74.52
+40.60
+77.51
+68.52
+62.21
+LoftQ
+41
+51.78
+79.83
+79.87
+37.42
+75.78
+41.20
+78.72
+69.84
+64.49
+QR-Adaptor (≤4bit)
+3.75
+52.41
+80.25
+80.17
+42.01
+75.95
+42.20
+78.96
+69.95
+65.23
+QR-Adaptor (Optimal)
+5.375
+54.01
+81.83
+81.02
+48.01
+77.52
+43.60
+80.01
+72.03
+67.24
+Figure 6: From left to right, the actual measured performance and memory usage of the configurations generated by
+QR-Adaptor, QR-Adaptor without stage1, QR-Adaptor without stage2, and QR-Adaptor without stage3 are shown.
+Different colors represent the configurations generated at different stages.
+C.2
+More Ablation
+We conducted comprehensive ablation studies to
+evaluate the impact of initialization metrics and the
+sensitivity of the proposed Pareto Ranking Genetic
+Algorithm (PRGA) to key hyperparameters, includ-
+ing iteration counts and population size. These
+experiments aim to further substantiate the effec-
+tiveness of our proposed approach.
+C.2.1
+Gradient Norms vs. Relative Entropy
+To assess the efficacy of initialization metrics, we
+compared the use of gradient norms and relative
+entropy in quantifying layer importance for fine-
+tuning quantized LLMs. The experimental results
+are summarized in Table 4.
+Insights:
+• Limitations of Gradient Norms: Gradient
+norms exhibit limited variability and are prone
+to biases induced by quantization, which un-
+dermines their reliability as an initialization
+metric for quantized models.
+• Advantages of Relative Entropy: Relative
+entropy captures task-specific layer impor-
+tance more effectively, resulting in robust
+initialization and improved performance in
+downstream optimization.
+C.2.2
+Sensitivity to Iteration Counts and
+Population Size
+To analyze the sensitivity of PRGA to hyperpa-
+rameters, we systematically varied the number of
+iterations and population sizes. Table 5 presents
+the results of these experiments.
+Insights:
+• Trade-offs in Population Size: Smaller pop-
+ulation sizes (e.g., 3) reduce computational
+cost but may fail to adequately explore the
+search space. Larger population sizes (e.g.,
+20) improve exploration and convergence but
+increase computational overhead.
+• Impact of Iteration Count: Increasing the
+number of iterations improves optimization
+
+
+--- Page 15 ---
+Algorithm 1 Task-Informed Initialization Process
+1: Input: Layer importance scores {I(l)}L
+l=1,
+Bit-width space Q, Rank space R.
+2: Output: Seed configuration C0.
+3:
+▷Step 1: Normalize importance scores to
+create a sampling distribution
+4: Normalize scores: pl ←I(l)/ PL
+j=1 I(j) for
+l = 1, . . . , L.
+5:
+▷Step 2: Generate the seed configuration C0
+based on importance
+6: Initialize
+C0
+=
+[(bit1, rank1), . . . , (bitL, rankL)].
+7: for l = 1 to L do
+8:
+// Map normalized importance pl to the
+search spaces.
+9:
+// The higher the importance, the higher the
+index in the sorted space.
+10:
+Sort Q and R in ascending order.
+11:
+Bit index idxb ←⌊pl · (|Q| −1)⌋. Clamp
+to [0, |Q| −1].
+12:
+Rank index idxr ←⌊pl·(|R|−1)⌋. Clamp
+to [0, |R| −1].
+13:
+bitl ←Q[idxb]; rankl ←R[idxr].
+14: end for
+15: ▷Step 3: (Optional) Apply budget constraints
+if a target budget is predefined
+16: return C0.
+quality, as reflected in better Pareto fronts.
+However, the marginal benefits diminish be-
+yond 10 iterations, indicating limited practical
+gains for further increases.
+• Balanced Configuration: A population size
+of 5 and 5 iterations strikes a balance between
+performance improvement and computational
+efficiency. This configuration can be adjusted
+based on specific resource availability or per-
+formance requirements.
+C.3
+QR-Adaptor Search Process Details
+This appendix provides supplementary details re-
+garding the QR-Adaptor search methodology and
+its associated computational costs, addressing re-
+producibility and practical implementation con-
+cerns.
+C.3.1
+Search Hyperparameters and
+Configuration
+To ensure the reproducibility of our results, we
+list the specific hyperparameters and configurations
+used for the QR-Adaptor search process in Table 10.
+These settings were kept consistent across all main
+experiments unless otherwise noted.
+C.3.2
+Task-Informed Initialization Algorithm
+As mentioned in Section 3, the initialization pro-
+cess uses layer importance scores to generate a
+high-quality initial configuration. Algorithm 1 pro-
+vides a concrete step-by-step description of this
+procedure. The core idea is to map higher impor-
+tance scores to a higher probability of allocating
+more resources (i.e., higher bit-widths and ranks).
+This single seed configuration C0 is evaluated
+by fine-tuning for one epoch on the calibration
+dataset to measure its initial performance, form-
+ing the starting point for the global search. The
+subsequent PRGA stage will generate a full popu-
+lation of size 10 through mutations and crossover
+operations based on this seed.
+D
+Component Ablation Study
+We use the WinoGrande benchmark to conduct an
+ablation study assessing the contribution of each
+stage in QR-Adaptor. As shown in Figure 6, remov-
+ing either PRGA or Bayesian optimization leads
+to unbalanced search behavior—PRGA alone ex-
+plores too broadly, while Bayesian optimization
+alone is overly narrow—reflecting their extrapo-
+lation and interpolation roles, respectively. Omit-
+ting stage 1 causes PRGA to initiate from random
+configurations, resulting in scattered search pat-
+terns. Nonetheless, it still reaches the upper-left
+optimal region, highlighting the strength of PRGA
+and Bayesian optimization. In contrast, the full
+three-stage pipeline first explores broadly around
+a guided initialization, then refines near promising
+areas, yielding the best configurations.
+
+
+--- Page 16 ---
+Table 12: Performance comparison on Llama2-7B (Panel A) and Llama2-13B (Panel B). We compare QR-Adaptor
+with various baselines across two rank settings (8 and 16). Superscripts on LoftQ bits indicate initialization iterations.
+Bold denotes best performance; underlined denotes second-best.
+Method
+Bit
+ARC(C)
+ARC(E)
+BoolQ
+HellaS
+OBQA
+PIQA
+WinoG
+Average
+Panel A: Llama2-7B Performance
+Rank = 8
+LoRA
+16
+46.93
+77.36
+78.47
+76.93
+44.80
+79.38
+69.38
+67.61
+QLoRA
+8
+48.21
+77.36
+77.92
+76.88
+44.80
+79.82
+68.75
+67.70
+QLoRA
+4
+46.25
+76.26
+77.43
+76.42
+46.20
+78.67
+69.85
+67.30
+AdaLoRA
+16
+46.08
+76.77
+77.46
+75.89
+44.20
+79.16
+69.22
+66.97
+AdaLoRA
+8
+46.08
+76.73
+77.49
+75.93
+44.20
+79.00
+69.06
+66.93
+AdaLoRA
+4
+46.33
+75.25
+76.39
+75.45
+44.40
+77.91
+69.14
+66.41
+LoftQ
+41
+46.16
+77.10
+77.43
+76.68
+44.80
+79.33
+69.30
+67.26
+LoftQ
+45
+47.35
+76.64
+76.33
+76.36
+45.60
+79.05
+69.06
+67.20
+LQ-LoRA
+4
+47.18
+76.60
+76.54
+76.24
+45.00
+78.84
+68.90
+67.04
+QR-Adaptor
+5.45
+48.04
+77.44
+78.96
+76.84
+46.00
+79.86
+69.97
+68.15
+Rank = 16
+LoRA
+16
+46.93
+77.57
+78.41
+76.81
+45.00
+79.38
+69.06
+67.59
+QLoRA
+8
+47.61
+77.44
+78.41
+76.93
+45.40
+79.05
+69.06
+67.70
+QLoRA
+4
+46.67
+76.35
+77.25
+76.40
+45.00
+78.84
+70.01
+67.22
+AdaLoRA
+16
+46.16
+76.68
+77.58
+75.92
+44.20
+79.11
+69.38
+67.00
+AdaLoRA
+8
+46.16
+76.68
+77.40
+75.91
+44.40
+79.11
+69.06
+66.96
+AdaLoRA
+4
+46.33
+75.29
+76.45
+75.44
+44.20
+77.91
+69.46
+66.47
+LoftQ
+41
+47.10
+77.19
+77.89
+76.61
+44.80
+79.43
+69.69
+67.53
+LoftQ
+45
+47.95
+76.47
+76.79
+76.25
+45.60
+78.51
+69.61
+67.31
+LQ-LoRA
+4
+47.10
+76.39
+77.22
+76.33
+46.40
+78.78
+70.09
+67.47
+QR-Adaptor
+5.45
+48.04
+77.44
+78.96
+76.84
+46.00
+79.86
+69.97
+68.15
+Panel B: Llama2-13B Performance
+Rank = 8
+LoRA
+16
+52.56
+80.18
+81.44
+79.98
+46.40
+81.12
+71.98
+70.52
+QLoRA
+8
+52.39
+80.18
+81.22
+79.92
+45.00
+80.47
+73.09
+70.32
+QLoRA
+4
+51.54
+78.91
+81.41
+79.46
+45.40
+80.30
+71.82
+69.83
+AdaLoRA
+16
+49.15
+79.46
+80.37
+79.25
+45.40
+80.47
+72.30
+69.49
+AdaLoRA
+8
+49.32
+79.34
+80.43
+79.29
+45.60
+80.47
+72.22
+69.52
+AdaLoRA
+4
+48.29
+77.78
+80.40
+78.12
+44.20
+80.14
+71.74
+68.67
+LoftQ
+41
+50.68
+78.79
+81.16
+79.12
+45.80
+80.41
+71.35
+69.62
+LoftQ
+45
+50.34
+78.87
+80.24
+78.81
+45.20
+80.25
+70.80
+69.22
+LQ-LoRA
+4
+50.60
+78.79
+80.67
+78.91
+45.00
+80.14
+71.11
+69.32
+QR-Adaptor
+6.13
+52.82
+80.64
+81.84
+80.08
+45.80
+81.45
+72.69
+70.76
+Rank = 16
+LoRA
+16
+52.13
+79.84
+81.50
+80.07
+46.20
+81.23
+71.98
+70.42
+QLoRA
+8
+51.54
+80.01
+81.13
+79.86
+46.20
+81.18
+72.22
+70.31
+QLoRA
+4
+51.45
+79.04
+81.04
+79.48
+45.60
+80.47
+71.82
+69.84
+AdaLoRA
+16
+49.40
+79.34
+80.46
+79.28
+45.40
+80.47
+72.30
+69.52
+AdaLoRA
+8
+49.49
+79.29
+80.40
+79.27
+45.40
+80.52
+72.38
+69.54
+AdaLoRA
+4
+48.29
+77.69
+80.43
+78.10
+44.20
+80.09
+71.67
+68.64
+LoftQ
+41
+50.68
+78.87
+80.86
+79.18
+45.80
+80.30
+71.90
+69.66
+LoftQ
+45
+50.60
+78.96
+80.92
+79.15
+45.40
+80.41
+71.59
+69.58
+LQ-LoRA
+4
+50.09
+78.79
+80.43
+79.06
+45.40
+80.14
+71.67
+69.37
+QR-Adaptor
+6.13
+52.82
+80.64
+81.84
+80.08
+45.80
+81.45
+72.69
+70.76
+
+
+--- Page 17 ---
+Table 13: Performance comparison of different methods across various bit-width configurations on LLaMa3.1-
+8B. Superscripts on LoftQ bits indicate the number of initialization iterations. Bold figures represent the best
+performance, while underlined figures indicate the second-best. Accuracy is reported as %.
+Method
+Bit
+ARC(C)
+ARC(E)
+BoolQ
+GSM8K
+HellaS
+OBQA
+PIQA
+WinoG
+Average
+Rank = 8
+LoRA
+16
+56.14
+83.88
+83.18
+54.36
+79.44
+45.20
+82.10
+75.30
+69.95
+QLoRA
+8
+57.08
+83.46
+82.48
+53.75
+79.63
+46.00
+82.10
+74.59
+69.89
+QLoRA
+4
+54.35
+82.41
+82.08
+44.35
+78.82
+44.20
+81.50
+73.64
+67.67
+AdaLoRA
+16
+52.90
+81.99
+81.87
+50.57
+78.65
+45.00
+81.34
+73.95
+68.28
+AdaLoRA
+8
+52.90
+81.86
+82.05
+49.96
+78.65
+44.80
+81.34
+74.43
+68.25
+AdaLoRA
+4
+51.28
+80.98
+80.61
+37.83
+77.36
+42.80
+80.74
+72.53
+65.51
+LoftQ
+41
+54.86
+82.74
+82.26
+51.40
+78.65
+46.00
+81.45
+73.24
+68.82
+LoftQ
+45
+52.65
+81.82
+81.53
+39.65
+78.50
+43.40
+81.39
+72.69
+66.45
+LoftQ
+410
+51.88
+81.31
+79.66
+38.44
+78.01
+43.20
+81.12
+71.98
+65.70
+QuaRot
+4
+54.12
+82.15
+81.92
+50.21
+78.45
+45.20
+81.32
+73.01
+68.30
+SpinQuant
+4
+54.45
+82.32
+82.05
+51.03
+78.62
+45.60
+81.41
+73.15
+68.58
+QR-Adaptor (≤4-bit)
+3.625
+56.15
+82.78
+82.45
+54.12
+79.58
+45.60
+82.12
+75.01
+69.73
+QR-Adaptor (Optimal)
+5.45
+56.83
+84.12
+83.38
+56.29
+80.93
+45.80
+82.92
+75.10
+70.67
+ApiQ
+2
+48.12
+76.45
+75.32
+28.45
+72.15
+38.20
+75.67
+65.89
+62.53
+RILQ
+2
+48.78
+76.98
+75.89
+29.45
+72.78
+38.80
+76.12
+66.45
+63.16
+QR-Adaptor (Fixed 2-bit)
+2
+49.12
+77.12
+76.01
+30.12
+73.01
+39.00
+76.23
+66.89
+63.44
+QR-Adaptor (Mixed 2/4-bit)
+2.5
+50.23
+78.01
+76.89
+31.45
+73.89
+39.80
+77.12
+67.78
+64.40
+Rank = 16
+LoRA
+16
+56.74
+83.63
+83.00
+54.13
+79.51
+44.40
+81.83
+74.43
+69.70
+QLoRA
+8
+56.23
+82.91
+82.66
+53.68
+79.46
+46.00
+81.66
+74.74
+69.67
+QLoRA
+4
+53.84
+81.99
+82.11
+44.66
+78.76
+44.40
+81.72
+73.09
+67.57
+AdaLoRA
+16
+53.07
+82.03
+81.99
+50.11
+78.61
+45.40
+81.28
+74.11
+68.33
+AdaLoRA
+8
+53.33
+82.03
+82.11
+49.13
+78.57
+45.20
+81.34
+73.79
+68.19
+AdaLoRA
+4
+50.85
+80.72
+80.73
+37.98
+77.34
+42.80
+80.52
+73.16
+65.51
+LoftQ
+41
+55.12
+82.58
+82.69
+49.81
+78.82
+45.80
+81.28
+74.27
+68.80
+LoftQ
+45
+53.92
+82.32
+81.56
+42.00
+78.54
+43.80
+81.56
+72.77
+67.06
+LoftQ
+410
+52.90
+81.69
+81.56
+39.88
+78.64
+43.80
+81.07
+71.98
+66.44
+QuaRot
+4
+54.23
+82.28
+82.01
+50.89
+78.58
+45.20
+81.45
+73.18
+68.48
+SpinQuant
+4
+54.52
+82.45
+82.15
+51.28
+78.74
+45.60
+81.56
+73.32
+68.70
+QR-Adaptor (≤4-bit)
+3.625
+56.15
+82.78
+82.45
+54.12
+79.58
+45.60
+82.12
+75.01
+69.73
+QR-Adaptor (Optimal)
+5.45
+56.83
+84.12
+83.38
+56.29
+80.93
+45.80
+82.92
+75.10
+70.67
+Table 14: Performance comparison of different methods across various bit-width configurations on Llama3.1-8B
+with higher ranks. Bold figures represent the best performance for a given model and task, while underlined figures
+indicate the second-best. QR-Adaptor∗is transferred config. Accuracy is reported as %.
+Method
+Rank
+Bit
+ARC(C)
+ARC(E)
+BoolQ
+HellaS
+OBQA
+PIQA
+WinoG
+MMLU
+Average
+LoRA
+32
+16
+54.86
+82.74
+82.75
+79.21
+44.40
+81.99
+74.11
+63.66
+70.47
+LoRA
+64
+16
+55.46
+82.95
+82.94
+79.13
+45.00
+81.88
+74.51
+64.34
+70.78
+QLoRA
+32
+8
+55.20
+83.12
+81.93
+79.07
+46.20
+81.88
+73.32
+63.28
+70.50
+QLoRA
+32
+4
+53.41
+80.89
+82.05
+78.42
+43.60
+80.90
+73.01
+60.97
+69.16
+QLoRA
+64
+8
+55.46
+83.04
+81.96
+79.17
+45.80
+81.94
+73.01
+63.34
+70.47
+QLoRA
+64
+4
+53.41
+81.19
+81.74
+78.35
+44.60
+80.69
+72.06
+60.79
+69.10
+AdaLoRA
+32
+8
+53.92
+81.82
+82.20
+78.57
+46.20
+81.50
+73.40
+63.82
+70.18
+AdaLoRA
+32
+4
+51.45
+81.02
+80.86
+77.30
+42.40
+80.96
+72.53
+58.15
+68.08
+AdaLoRA
+64
+8
+53.92
+82.11
+81.93
+78.74
+46.20
+81.39
+73.95
+63.88
+70.27
+AdaLoRA
+64
+4
+52.13
+80.98
+81.04
+77.20
+42.20
+80.85
+72.77
+58.07
+68.16
+LoftQ
+32
+41
+53.84
+81.36
+81.41
+78.12
+43.00
+81.50
+73.56
+59.40
+69.02
+LoftQ
+32
+45
+52.56
+81.36
+81.96
+78.05
+42.80
+81.45
+73.09
+59.41
+68.84
+LoftQ
+32
+410
+51.62
+81.31
+82.51
+78.16
+43.60
+81.34
+72.30
+59.12
+68.75
+LoftQ
+64
+41
+52.82
+81.40
+81.59
+78.23
+43.20
+81.34
+73.88
+59.78
+69.03
+LoftQ
+64
+45
+52.39
+81.10
+81.13
+78.33
+43.40
+81.34
+73.24
+58.69
+68.70
+LoftQ
+64
+410
+51.71
+81.23
+81.62
+78.37
+43.20
+81.01
+72.77
+59.25
+68.65
+QR-Adaptor∗
+32
+3.625
+55.23
+82.89
+82.65
+79.12
+45.40
+81.77
+73.88
+63.78
+70.59
+QR-Adaptor
+32
+5.875
+56.12
+83.45
+83.21
+79.78
+46.20
+82.10
+74.59
+64.40
+71.23
+
+
+--- Page 18 ---
+Table 15: Performance comparison with varying fine-tuning epochs on Llama3.1-8B. We compare QR-Adaptor
+against baselines trained for standard (2) and extended (5) epochs. “Ep.” denotes Epochs. Accuracy is reported as
+%.
+Method
+Rank
+Bit
+Ep.
+ARC(C)
+ARC(E)
+BoolQ
+GSM(S)
+GSM(F)
+HellaS
+OBQA
+PIQA
+WinoG
+LoRA
+8
+16
+2
+56.14
+83.88
+83.18
+54.36
+54.28
+79.44
+45.20
+82.10
+75.30
+QLoRA
+8
+8
+2
+57.08
+83.46
+82.48
+53.75
+53.90
+79.63
+46.00
+82.10
+74.59
+QLoRA
+8
+4
+2
+54.35
+82.41
+82.08
+44.35
+44.50
+78.82
+44.20
+81.50
+73.64
+AdaLoRA
+8
+16
+2
+52.90
+81.99
+81.87
+50.57
+50.57
+78.65
+45.00
+81.34
+73.95
+AdaLoRA
+8
+16
+5
+53.50
+82.25
+82.05
+51.00
+50.90
+78.75
+45.20
+81.40
+74.10
+AdaLoRA
+8
+8
+2
+52.90
+81.86
+82.05
+49.96
+49.96
+78.65
+44.80
+81.34
+74.43
+AdaLoRA
+8
+8
+5
+53.10
+82.00
+82.10
+50.20
+50.10
+78.70
+45.20
+81.38
+74.50
+AdaLoRA
+8
+4
+2
+51.28
+80.98
+80.61
+37.83
+38.36
+77.36
+42.80
+80.74
+72.53
+AdaLoRA
+8
+4
+5
+51.50
+81.10
+80.75
+38.00
+38.50
+77.40
+43.20
+80.78
+72.60
+QR-Adaptor
+8
+5.38
+2
+56.83
+84.12
+83.38
+56.29
+56.11
+80.93
+45.80
+82.92
+75.10

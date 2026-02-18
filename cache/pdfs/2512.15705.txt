@@ -1,0 +1,1916 @@
+--- Page 1 ---
+Dynamic Rebatching for Efficient Early-Exit Inference with DREX
+Xuting Liu
+University of Pennsylvania
+Daniel Alexander
+University of Pennsylvania
+Siva Kesava Reddy Kakarla
+Microsoft Research
+Behnaz Arzani
+Microsoft Research
+Vincent Liu
+University of Pennsylvania
+Abstract
+Early-Exit (EE) is a Large Language Model (LLM) archi-
+tecture that accelerates inference by allowing easier tokens
+to be generated using only a subset of the model’s layers.
+However, traditional batching frameworks are ill-suited for
+EE LLMs, as not all requests in a batch may be ready to exit
+at the same time. Existing solutions either force a uniform
+decision on the batch, which overlooks EE opportunities, or
+degrade output quality by forcing premature exits. We pro-
+pose Dynamic Rebatching, a solution where we dynamically
+reorganize the batch at each early-exit point. Requests that
+meet the exit criteria are immediately processed, while those
+that continue are held in a buffer, re-grouped into a new batch,
+and forwarded to deeper layers. We introduce DREX, an
+early-exit inference system that implements Dynamic Re-
+batching with two key optimizations: 1) a copy-free rebatch-
+ing buffer that avoids physical data movement, and 2) an EE
+and SLA-aware scheduler that analytically predicts whether
+a given rebatching operation will be profitable. DREX also
+efficiently handles the missing KV cache from skipped layers
+using memory-efficient state-copying. Our evaluation shows
+that DREX improves throughput by 2-12% compared to base-
+line approaches while maintaining output quality. Crucially,
+DREX completely eliminates involuntary exits, providing a
+key guarantee for preserving the output quality intended by
+the EE model.
+1
+Introduction
+Large Language Models (LLMs) have demonstrated re-
+markable capabilities across a range of tasks, but demand
+tremendous computational resources to do so. As such, a
+wide variety of optimizations has been proposed to reduce
+their resource consumption or otherwise improve their effi-
+ciency [3,12,13,22,28,44,45,48,49]. A recent and promis-
+ing proposal along this line of research, Early Exiting (EE),
+focuses on dynamically allocating less compute budget to
+tokens deemed ‘easy.’ [5,10,17,19,30,38,40]
+At a high level, EE augments a model with exit ramps at
+intermediate layers. As a token propagates through layers
+and reaches an exit ramp, it will early-exit, generating the
+next token immediately, if its confidence score exceeds a
+predefined threshold. Otherwise it continues to deep layers.
+Thus, an ‘easy’ token only takes a fraction of the model’s total
+computational cost, while a ‘hard’ token can still leverage
+the capacity of the entire model. The immense potential of
+early exiting in enhancing inference efficiency has ignited
+a surge of recent work on refining the technique, whether
+through improved exit ramp architectures or better tuning of
+their placement and decision thresholds [9,11,21,33].
+Unfortunately, EE models are not yet ready for production.
+As a simple example, consider a cornerstone of modern ML
+execution: batching. Batching has been a core feature of ML
+systems since the advent of deep learning [20], and is a part
+of every practical LLM deployment. Despite its importance,
+it is still unclear how to best apply batching to EE LLMs. A
+common approach is to enforce a uniform decision for the
+entire batch, often based on consensus or majority voting [31].
+However, these grouped exit policies can lead to suboptimal
+or unexpected outcomes. Requests that are forced to continue
+computation despite being ready to exit (involuntary stays)
+limit potential throughput gains. Conversely, requests that are
+forced to exit prematurely when they still need more computa-
+tion (involuntary exits) can destroy output quality. This effect
+compounds as the damage of a single incorrect token can
+cascade to all following tokens. There are similar examples
+for other critical techniques (see §3.2).
+To the best of our knowledge, this paper is the first to
+examine—in depth—the integration of early exits into end-
+to-end LLM serving pipelines. Leveraging our findings, we
+present DREX, a novel serving system designed to support
+efficient EE inference by adapting foundational optimizations
+to an EE execution flow. DREX comprises several optimiza-
+tions that, together, ensure that (a) requests exit only when
+they are ready, (b) requests only do so when it improves per-
+formance, and (c) early exits do not significantly impact the
+performance of future iterations.
+At the core of DREX’s approach is Dynamic Rebatching.
+Instead of forcing batch-wide exit decisions, Dynamic Re-
+batching reorganizes the batch on the fly at every early-exit
+point, allowing each request to follow its optimal execution
+path. When a split decision occurs, requests that exit early
+generate their token and are immediately processed, while
+those that continue are temporarily held in a conceptual buffer.
+Once the buffer accumulates a sufficient number of requests,
+they are re-grouped into a new batch and forwarded to the
+deeper model layers. This reorganization allows Dynamic
+Rebatching to fully exploit every early-exit opportunity while
+guaranteeing zero involuntary exits.
+1
+arXiv:2512.15705v1  [cs.DC]  17 Dec 2025
+
+
+--- Page 2 ---
+A naive implementation of buffering and rebatching, how-
+ever, is insufficient. To that end, DREX improves both the
+management of EE decisions/requests and their performance.
+For the former, we note that each rebatching operation
+introduces computational and scheduling overhead that eats
+away and, in some cases, completely negates the benefits of
+EE. To address this pitfall, DREX introduces techniques that
+take a principled, analytical approach to predicting whether a
+given rebatching operation would be profitable, given the state
+of the requests in the batch, predicted rebatching overheads,
+profiled iteration and model latencies, and the current status of
+requests’ SLA. Based on those predictions, DREX can make
+informed decisions about whether to divide a batch, whether
+to eschew an EE opportunity, and when to flush batches from
+the buffer despite their completeness.
+On top of the above, DREX substantially improves the
+overhead and memory efficiency of EE and Dynamic Rebatch-
+ing. First, the rebatching buffer is a logical construct; we avoid
+any physical data movement of hidden states or KV cache by
+leveraging modern attention kernel APIs to manipulate batch
+composition through virtual tensor indexing [12,13,36,46].
+This makes the overhead of rebatching largely independent of
+model size or sequence length; on the Llama-EE-70B model,
+this overhead is less than 6% of a standard iteration time. Sec-
+ond, we address the challenge of what to do with the KV cache
+of the skipped tokens [38]. Instead of physically duplicating
+the last computed KV cache entry across all skipped layers,
+DREX utilizes virtual memory mappings. This allows the
+skipped layers’ KV cache entries to share the same physical
+memory block, eliminating memory redundancy and—on top
+of the performance benefits of EE—reducing CUDA memory
+usage by as much as 18.3% compared to a traditional LLM.
+We evaluate DREX on a variety of EE LLMs using the
+text summarization workload and metrics from HELM [18,
+24]. Our results show that DREX consistently outperforms
+existing state-of-the-art EE batching methods and baseline
+grouped exit policies, improving throughput by 2–12% while
+maintaining an equal or better P95 confidence score—a key
+measure of EE quality. For one exception, the greedy grouped
+exit policy achieves higher throughput, but it does so at the
+cost of extremely low quality (a P95 confidence score of
+0.03) due to high rates of involuntary exits. Crucially, we
+demonstrate that DREX completely eliminates involuntary
+exits, providing a key guarantee for maintaining the output
+quality intended by the EE mechanism.
+2
+Background on LLM Serving
+The recent rise in the popularity of LLMs has led to a surge in
+demand for token generation and the GPUs needed to compute
+them. In this section, we introduce existing techniques for
+improving the efficiency of inference before introducing the
+Early Exit optimization in §3.
+LLM autoregressive inference comprises two phases. In the
+prefill phase, the model processes the user’s input sequence
+to generate the first output token. Then, in the decode phase,
+the model takes each newly generated token, appends it to the
+input sequence, and produces the next token—this process
+repeats until it meets some stopping condition [44]. This pro-
+cess can take place on a single GPU or across multiple GPUs.
+In the latter case, the most common types of parallelism in
+serving are Tensor, Sequence, and Expert Parallelism [14], all
+of which involve individual layers of the model being sharded
+over a group of GPUs that proceed in lockstep. There are ex-
+ceptions, e.g., Pipeline Parallelism, but these are less common
+in serving applications.
+To improve the efficiency of LLM serving, modern serving
+frameworks incorporate a wide range of optimizations [3,12,
+13,22,25,28,45,48,49]. Of these, the two most classic—KV
+caching and batching—were adopted early in the development
+of LLMs (going back to the landmark Vaswani et al. [44] pa-
+per) and have proven central to achieving good performance,
+particularly in the decoding phase.
+KV caching. Each attention layer of an LLM computes states
+known as keys (K) and values (V) for every token in the input
+sequence. In the decode phase, these K and V matrices are
+combined with the query (Q) matrix of the most recent token
+to generate the next output. Every subsequent iteration of the
+decode phase then reuses the K and V matrices of the entire
+sequence history in its QKV computation. When operators
+cache them, they avoid the need to repeatedly recompute these
+matrices and substantially reduce the computational demands
+of the attention mechanism.
+Batching. More broadly, the decode phase is substantially
+less arithmetically intense than the prefill phase, which often
+leads to underutilization of expensive GPU resources. An
+important method of improving utilization is to batch multiple
+different requests to the model into a single operation. For
+the model’s dense layers, batching allows the GPU to do
+more work per loaded model weight. For its attention layers,
+batching permits more parallelism among the self-attention
+operations, at least at low sequence lengths [8]. Both improve
+the compute resource utilization and throughput of the decode
+phase. Applicability can be expanded using techniques like
+continuous batching [49], which adds new requests into the
+batch continuously when existing ones finish.
+3
+Early Exiting (EE) LLMs
+A recent and promising technique—Early Exiting (EE)—has
+garnered significant interest as a way to further improve infer-
+ence efficiency and meet the continually growing demand for
+token generation [5,9,10,17,19,21,30,33,38,40].
+At a high level, EE models enable certain inputs to leave
+the inference pipeline before traversing all transformer layers,
+allowing them to produce an output earlier and skipping a
+substantial portion of their computation. Of course, not all
+2
+
+
+--- Page 3 ---
+The
+sky
+is
+blue
+Shallow Layers
+EE ramp
+is
+EOS
+Deep Layers
+sky
+blue
+Figure 1: Conceptual diagram of an
+LLM with EE. Each token is a sepa-
+rate iteration. The sequence exits early
+in the 2nd and 4th iterations (when out-
+putting the tokens “is” and “EOS.”)
+Batch
+C1
+dark
+sky
+Kakeya
+wait
+Shallow Layers
+EE ramp
+is
+for
+Deep Layers
+matter
+needle
+(a) C1: A split decision happens as the 2nd
+and 4th sequence in the batch decide to
+early exit, while others decide to stay.
+The
+sky
+is
+KV
+KV
+KV
+KV
+KV
+KV
+KV
+KV
+KV
+EE ramp
+is
+KV
+KV
+KV
+KV
+KV
+KV
+sky
+?
+?
+C2
+(b) C2: the early-exited token’s KV cache
+is missing from the skipped layers. Subse-
+quent iterations need those values.
+Figure 2: The challenges of operationalizing Figure 1.
+Non-EE
+EE Config 1
+EE Config 2
+Non-EE EE-LLM Apparate Miao et al.
+0
+10
+20
+30
+Throughput (tokens/s)
+(a) Batch size = 1
+Non-EE
+Apparate
+Miao et al.
+0
+50
+100
+(b) Batch size = 8
+Figure 3: Early Exiting (EE) provides a significant throughput
+boost of up to 33% for non-batched inference on SOTA frame-
+works (EE-LLM [9]), Apparate [11], and Miao et al. [31]).
+However, this advantage diminishes with batching, where the
+same EE methods offer only marginal gains of less than 2%
+and can sometimes even reduce throughput.
+tokens can be determined this way, so EE models incorpo-
+rate binary classifier modules (often called EE ramps) that
+help the models to decide—at designated layers—whether
+the intermediate representation is sufficient to generate the
+output token. If so, they terminate inference early. If not, they
+continue execution through the remaining layers, as usual.
+These EE ramps can be placed at one or more layer bound-
+aries, with placement of the ramp influencing both the inci-
+dence and potential savings of the early exit. Figure 1 shows
+a diagram of how this process works (at least conceptually).
+When a token Early Exits, we can save the resources con-
+sumed by the deeper layers.
+3.1
+Quantifying the Opportunity
+The potential of the above technique to save resources has
+garnered steadily growing interest from both academia [5,
+11,17,21,29,43] and industry [9,10,15,16,38,40]. In Fig-
+ure 3a, we show a simple microbenchmark of this opportunity:
+SOTA EE frameworks increase the throughput of a Llama-
+2-13B model by 14%–33% with different configurations of
+EE ramp location and confidence threshold. Assuming the
+models and ramps are well aligned, the system saves compute
+and improves throughput at minimal cost to accuracy.
+We note that there has been extensive research on optimiz-
+ing where we place the EE ramp, how to improve its accuracy,
+and how to tune the threshold we use [5,38,43]. For example,
+Apparate [11] continuously monitors the output quality and
+tunes where it places the EE ramp and the confidence thresh-
+old it uses. In this work, we treat these concerns as orthogonal,
+assume the accuracy of the EE ramp’s prediction, and treat its
+placement and the threshold as given. In fact, we show DREX
+can fully leverage improvements in any of these dimensions
+(more so than any of the benchmarks we compared against)
+and has the highest inference throughput and accuracy when
+we assume accurate predictions from the EE ramp.
+3.2
+Challenges in Operationalizing EE
+Despite the promise and seeming simplicity of the Early Exit
+strategy, we observe that operationalizing it remains a chal-
+lenging task—one that has been largely untouched by prior
+work. In particular, we note that while it is possible to add
+inter-layer off-ramp logic into most LLM inference solutions,
+e.g., vLLM [22], SGLang [51], and TensorRT-LLM [2], doing
+so raises critical design questions that cannot be ignored.
+3.2.1
+Handling Split EE Decisions
+As discussed in §2, one of the most foundational optimizations
+for LLM serving (and indeed, most hardware-accelerated ML)
+is batching. Unfortunately, it is not at all clear how to apply
+batching to EE LLMs.
+3
+
+
+--- Page 4 ---
+EE off-ramps are applied on a per-request basis to deter-
+mine whether the ramp has sufficient confidence in the current
+token output. In the case of a batch of requests, it is possi-
+ble for a ‘split’ to happen: some of the requests have a high
+enough confidence score to permit an early exit, while others
+in the same batch do not. The example in Figure 2a shows
+such a case, where the ramp’s recommendations differ for half
+of the members of the batch. These split decisions make it
+harder to manage exiting requests and lead to resource under-
+utilization if the deeper layers of the model are forced to
+operate on significantly reduced batch sizes.
+Early work in this space, e.g., [9], assumed batch sizes of 1.
+More recently, approaches like [11,31] have begun to incor-
+porate batching into EE inference, but in constrained ways.
+Apparate [11], for instance, proposes an architecture in which
+early exited requests generate an output token immediately
+but remain in the batch and continue to deeper transformer
+layers. This approach improves the output latency of the in-
+ference pipeline but hurts throughput.
+In contrast, approaches like [31] actually allow for early ex-
+its, but take a ‘grouped exit’ approach, where EE decisions are
+all-or-nothing over the entire batch. The artifact of [31], for
+example, checks for a ‘consensus’ across all the requests in a
+batch and only exits if all members of the batch are above the
+confidence threshold. While always safe, consensus substan-
+tially reduces the requests that EE and the associated savings
+that EE brings. This reduction in efficacy gets worse with
+the batch size. As shown in Figure 3b, EE with a batch size
+of 8 has marginal throughput improvements with Apparate
+and [31], and can even reduce throughput due to the overhead
+of checking for EE.
+More generally, we note that there is a space of possible
+grouped exit policies, but all of them are faced with the same
+fundamental tradeoff:
+Do we force requests to exit prematurely, or do we force
+requests to give up their opportunity to EE?
+To try to quantify the degree to which different designs are
+subject to this tradeoff, we define the metrics involuntary
+exits and involuntary stays. Involuntary exits capture the
+number of early-exit tokens that should have continued to the
+deeper layers but did not, and involuntary stays capture the
+number of non-exited tokens that met the criteria to EE but
+were forced to continue. In Table 1, we report percentages for
+both these metrics as a function of the total number of tokens
+and use this metric to compare three different grouped exit
+approaches. The rules we compare are:
+• Consensus: Exits the group only if every request in the
+batch agrees to exit. This rule eliminates involuntary exits
+but severely limits EE opportunities, and we see many
+involuntary stays.
+• Greedy: Exits the group if at least one request wants to
+exit. This maximizes EE opportunities, but it forces many
+requests to involuntarily exit, reducing output quality.
+Policy
+Involuntary Exit(%)
+Involuntary Stay(%)
+BS = 4
+BS = 8
+BS = 4
+BS = 8
+Consensus
+0
+0
+29.7
+32.1
+Majority
+22.3
+34.2
+23.2
+26.4
+Greedy
+25.9
+35.1
+0
+0
+Table 1: Percentage of tokens that make involuntary choices
+based on different EE rules, using batch sizes of 4 and 8. In-
+voluntary exits potentially degrade output quality; Involuntary
+stays give up EE opportunities and lead to worse throughput.
+2.8
+2.9
+3
+3.1
+22
+23
+24
+Memory redundancy 10.9%
+KV Cache Size (GB)
+Throughput (tokens/s)
+DREX
+EE-LLM
+Non-EE
+EE Threshold
+0.6
+0.7
+0.8
+Figure 4: Comparison of throughput and KV cache size for
+Llama-EE-13B generating 4000 tokens at a batch size of 1.
+Both EE-LLM and DREX use state-copying. DREX employs
+virtual copying to reduce memory consumption. A lower
+early-exit (EE) threshold allows for more exits, increasing
+throughput and but also duplicated KV cache entries in EE-
+LLM.
+• Majority: Makes the decision based on a majority vote.
+In case of a tie, it compares the median confidence score
+of the group against the exit threshold. This rule attempts
+to balance the extremes of Consensus and Greedy, but it
+cannot eliminate involuntary outcomes entirely.
+3.2.2
+Handling the Missing KV Cache
+Even single token generation contains issues when placed
+in the broader context of LLM serving systems. Specifically,
+while EE enables the model to completely skip the processing
+of deeper layers, the autoregressive nature of decoding means
+that their results may still be necessary for future tokens. Any
+such future token that enters the deep layers will need to
+refer back to the KV entries in the attention block for all
+previous tokens in the sequence, including those that early
+exited. Figure 2b depicts this case, which causes issues during
+the third iteration, where the processing of ‘is’ is blocked by
+the missing values from the skipped portion of ‘sky’ token.
+How should we fill in these missing entries? When should
+we fill them in? Existing systems that incorporate early exits
+take one of two approaches, each with its own limitations.
+KV-recomputation. This approach was first introduced in
+Synchronized Parallel Decoding [5] and is used in EE-LLM. It
+4
+
+
+--- Page 5 ---
+includes the EE tokens in the next forward pass, which allows
+the pipeline to recompute the KV-cache entries. The recom-
+putation adds additional work, but in principle, the marginal
+latency should be small. Unfortunately, while this approach
+works for single requests (batch size of 1), we find that it also
+breaks down in the face of batching. In particular, needing
+to recompute a subset of the batch creates a heterogeneous
+batch where regular requests are batched with recomputation
+requests. This requires a more complex attention mask and
+reduces the efficiency of current attention kernels, erasing
+most of the gains of EE.
+State-copying. This is a computationally cheaper approach
+that duplicates the KV cache at the exit point to all subsequent,
+skipped layers [15,38]. Existing work [31,38] has adopted
+state-copying to enable batched EE inference. However, state-
+copying leads to substantial KV cache redundancy and creates
+significant memory inefficiencies. As shown in Figure 4, in-
+efficient implementation of state-copying in EE-LLM leads
+to up to 10.9% redundant KV cache when generating 4000
+tokens with Llama-EE-13B.
+4
+DREX Overview
+In this paper, we present DREX, a system that addresses the
+above challenges in order to unleash the full potential of EE.
+In DREX, exits are no longer ‘grouped,’ applying over the
+entire batch. Instead, requests are free to follow their own
+EE decisions based on what is best for their current token.
+When requests do EE, the missing KV cache is then mirrored
+efficiently, without wasting GPU memory or cache space.
+The core technique, which we call Dynamic Rebatching,
+allows requests that do not exit early to be temporarily held
+back, while EE requests leave the pipeline immediately; their
+KV cache is repopulated lazily on the next access. Once
+DREX accumulates enough requests, it reorganizes them into
+a new batch and forwards this batch to the deeper layers.
+While conceptually simple, this process has the potential
+to introduce significant overhead, both as part of the rebatch-
+ing operation itself and as a result of temporarily holding
+requests to improve batch compute utilization. One of our
+core intellectual contributions is, thus, the design of a series
+of performance optimizations tailored toward fast rebatching
+and KV cache repopulation. We further introduce two novel
+mechanisms to ensure throughput gain and SLA compliance
+despite the remaining overheads:
+1. Adaptive rebatching threshold (§5.1): if the predicted
+gain from exiting a subset of a batch is less than the
+predicted rebatching overhead, DREX forgoes the un-
+profitable EE.
+2. SLA-aware forced flushing (§5.3): if requests’ SLA dead-
+lines approach without the system accumulating a suf-
+ficiently large batch, DREX will forcefully flush the
+Scheduler
+Buffer
+Manager
+Cache
+Manager
+DREX
+5
+Schedule
+next batch
+1
+Output
+EE tokens
+s2
+s4
+4
+Fill missing
+KV cache
+KV4
+KV2
+Batch
+s1
+s2
+s3
+s4
+Shallow Layers
+EE Ramp
+s1
+s3
+2
+Buffer
+non-EE
+3
+Flush buffer
+when full
+Deep Layers
+Figure 5: System architecture. DREX executes these 5 steps
+to handle a split EE decision.
+smaller batches. This flushing prediction further influ-
+ences the initial EE decisions to prevent requests with
+approaching deadlines from entering the buffer.
+Our evaluation shows that, on top of DREX’s benefits
+to throughput and GPU utilization, the above optimizations
+improve overall throughput by 9% and significantly reduce
+the additional latency introduced by re-batching, improving
+overall responsiveness by 58.4%.
+System workflow. Figure 5 shows the progression of request
+processing through DREX. When the EEs are not triggered,
+DREX processes requests identically to existing systems.
+Where it differs is when one or more requests within a batch
+surpass the confidence threshold of an EE ramp. In the case
+that all the requests in a batch make a uniform decision to
+EE, the batch exits as a single unit ( 1 ), ready to be scheduled
+for another iteration immediately (modulo removing requests
+that have reached an EOS). On the other hand, if there is a
+split decision, DREX has a few options, which it chooses
+between based on its prediction of the marginal performance
+improvement of each decision.
+In some cases, i.e., if the proportion of EE requests in
+the batch is small and not worth the overhead of rebatching,
+DREX will ignore the EE decision and purposely force the
+entire batch through the deep layers. Otherwise, DREX will
+allow the target requests to EE and collect the remaining
+requests in a rebatching buffer ( 2 ). Figure 5 illustrates the
+latter case: requests s2 and s4 EE while s1 and s3 do not. A per-
+model DREX buffer manager coordinates with the scheduler
+and decides between two further options. One option is to
+immediately process the remaining requests, flushing them
+through the deep layers ( 3 ), e.g., if the requests are reaching
+their SLA deadline. The other option is to hold them and
+instead let the scheduler focus on forming a new batch of
+requests ( 5 ), potentially folding in the EE requests along with
+new ones using the continuous batching algorithm from [49].
+5
+
+
+--- Page 6 ---
+Variable
+Description
+t f
+Time per normal iteration (all layers).
+ts
+Time per shallow iteration (shallow layers).
+t(i,j)
+s
+Time per shallow iteration that starts at the ith buffer and
+exits at the jth ramp.
+td
+Time per deep iteration (deep layers).
+ti
+d
+Time per deep iteration that starts at the ith buffer.
+b
+Batch size.
+b′
+Number of EE requests in a shallow iteration.
+c
+Overhead of Dynamic Rebatching.
+Table 2: List of notations.
+In both cases, a cache manager uses a memory-efficient
+state-copying solution and fills the missing KV-cache for the
+tokens that exited ( 4 ). The cache manager passes a reference
+to this KV-cache to the deeper layers.
+5
+DREX and Dynamic Rebatching
+As mentioned in the preceding section, DREX is built on top
+of existing production batched LLM inference platforms, and
+in many instances (e.g., prefill or non-EE decode), it functions
+identically to those systems. Where it begins to differ is when
+an EE ramp indicates that one or more requests in the batch
+are candidates for an EE.
+In this section, we describe how the batch is handled, with
+a focus on the most complex case, where the EE ramp makes
+a split decision. If it instead arrives at a unanimous decision
+to EE, the batch exits and proceeds to §5.4.
+5.1
+To EE or Not to EE
+DREX’s first task is to determine whether the EEs are worth
+it at all. While early-exiting a whole batch is typically com-
+putationally beneficial, the benefits from early-exiting and
+rebatching a split batch are more complicated. Only the sub-
+set of requests that EE saves computation resources; the re-
+maining requests incur additional overhead as they enter and
+exit the buffer. Therefore, DREX disables EE for a batch
+when the fraction of EE requests is so small that the predicted
+savings from EE do not exceed the overhead. DREX derives
+the break-even point, i.e., the minimum number of requests
+in a batch required for EE to generate net computation sav-
+ings, referred to as the Adaptive Rebatching Threshold, by
+comparing the overhead against the expected gain.
+Overhead of Dynamic Rebatching. The overhead of rebatch-
+ing comes from adding/removing requests from the rebatch-
+ing buffer and the CPU-GPU synchronization caused by the
+scheduler. These overheads are largely independent of the
+number of requests that enter or exit the buffer because we
+implement the reorganization of hidden states and the KV
+cache through copy-free operations via virtual tensors.
+We can calculate the overall overhead by predicting end-
+to-end iteration times. Our notation is in Table 2. Specifically,
+Shallow Layers
+EE Ramp
+Buffer
+Deep Layers
+t f
+ts
+td
+}c
+(a) A full iteration that does not
+involve EE or rebatching takes
+time t f . A shallow iteration takes
+time ts and a deep iteration takes
+time td.
+Shallow Layers
+EE Ramp
+Buffer
+Shallow Layers
+EE Ramp
+Buffer
+Deep Layers
+t f
+t(0.1)
+s
+t(0,n)
+s
+tn
+d
+}c
+t1
+d
+}c
+(b) The multi-exits case. The
+overhead c is the same for re-
+batching operations at all buffers.
+ti
+d is the time of a deep iteration
+that starts from buffer i.
+Figure 6: Full, shallow, and deep iterations with Dynamic
+Rebatching. (a) is a model with a single exit. (b) has n exits
+(only two are shown).
+in DREX, there are three types of iterations:
+• Full: where we have no early exit. All requests pass
+through all layers and take tf time to do so.
+• Shallow: where one or more requests early exit and the
+batch goes through the shallow layers only and takes ts
+time. If we have splits when we arrive at the EE ramp,
+then ts includes the overhead needed to add the requests
+that do not exit to the rebatching buffer.
+• Deep: where we flush the rebatching buffer. The requests
+that do not early exit go through the deep layers and take
+td time. The time td includes the overhead of retrieving
+the requests from the buffer.
+A non-EE request that goes through dynamic rebatching
+experiences a total time of ts +td to generate its next token,
+compared to tf in a standard full iteration (Figure 6a). The
+overhead of Dynamic Re-batching, c, is:
+c = ts +td −tf
+(1)
+Savings from EE. The EE savings come from skipping the
+deep layers. The difference between a full and a shallow
+iteration time quantifies the saving:
+savings = tf −ts = td −c
+(2)
+Break-even analysis. Finally, for early exiting with Dynamic
+Rebatching to be profitable, the proportionate savings must
+exceed the overhead. Suppose DREX operates at batch size
+b. In a split decision, b′ requests want to EE, enjoying the sav-
+ings, while the remaining b−b′ requests need to be rebatched,
+taking the overhead. Therefore, to compare the proportionate
+savings and overhead:
+b′ ·savings > (b−b′)·c
+(3)
+b′ ·(td −c) > (b−b′)·c
+(4)
+6
+
+
+--- Page 7 ---
+Full Iteration tf
+Dynamic Rebatching
+Deep Iteration td
+Buffer In
+Shallow Iteration ts
+Buffer Out
+Post Processing
+Scheduler Sync
+0
+5
+10
+15
+20
+25
+30
+35
+tf
+Time (ms)
+0
+10
+20
+30
+ts
+td
+0
+2
+4
+6
+c
+Overhead
+14%
+16%
+26%
+43%
+(a) Llama-EE 13B model run-
+ning at batch size = 8. Dynamic
+Rebatching Threshold = 5.35
+11.10 ·
+8 = 3.86.
+0
+10
+20
+30
+40
+50
+60
+70
+80
+tf
+0
+20
+40
+60
+80
+ts
+td
+0
+2
+4
+6
+8
+10
+c
+Overhead
+7%
+9%
+27%
+57%
+(b) Llama-EE 70B model run-
+ning at batch size = 8. Dynamic
+Rebatching Threshold = 7.92
+33.30 ·
+8 = 1.90.
+Figure 7: Iteration time and overhead breakdown. Notice that
+the overhead comes from both shallow and deep iterations.
+The overhead has taken into account the extra post-processing
+of output tokens, as the shallow and deep iterations each have
+post-processing, while a full iteration only post-processes
+once. The gain for early exiting in a larger model is more
+significant, and the ratio of overhead and gain ( c
+td ) is smaller,
+leading to a lower ART and more EE.
+By rearranging the terms, we derive the threshold for b′:
+b′ > c
+td
+·b
+(5)
+this threshold is the Adaptive Rebatching Threshold (ART):
+ART = Overhead
+Saving
+·Batch size
+= c
+td
+·b
+(6)
+Applying the ART. DREX updates the overhead (c) and deep
+iteration time (td) periodically (every 100 steps) to ensure
+ART adapts to the current system state. DREX profiles and
+averages the iteration latencies to perform this update.
+Two examples are shown in Figure 7a and Figure 7b. On the
+Llama-EE-13B model, overhead c is 5.35 ms, deep iteration
+time td is 11.10 ms, and batch size b is 8. This leads to an
+ART of 3.86, which means DREX only allows EE when 4
+or more requests in the batch of 8 want to early exit. The
+Llama-EE-70B model has a smaller ART of 1.9, allowing for
+more EE opportunities, the savings from EE in a larger model
+are more significant.
+Extension to multiple exit ramps. We can also apply the
+same analysis to EE models that have multiple EE ramps.
+The overhead, c, remains constant regardless of which ramp
+a split decision occurs—the underlying operations are inde-
+pendent of the ramp or buffer location. The saving term be-
+comes ti
+d, the time to execute the remaining layers from ramp
+i to the last layer. Then the ART at ramp i is:
+ART(i) = c
+ti
+d
+·b
+(7)
+5.2
+Buffering Left-Behind Requests
+If DREX ends up splitting the batch, allowing a portion of the
+requests to exit while others continue to the deep layers, we
+need a place to store the requests that are left behind until (a)
+there are sufficient left-behind requests to form a full batch or
+(b) sufficient time passes that requests need to be flushed to
+meet SLAs (see §5.3).
+Crucially, the ‘left-behind’ buffer is a logical construct—
+there is no additional allocation of memory, and tensors are
+never copied during this process. Rather, a centralized buffer
+manager simply maintains a list of requests that did not exit
+early and are awaiting processing in the deep layers.
+When the buffer is finally flushed into a subsequent deep
+iteration, only the subset of requests marked as in buffer is
+processed, even if they were originally from different batches.
+This dynamic selection of the active sequences for different
+stages of the model is handled efficiently at the kernel level.
+For instance, FlashAttention [12,13] provides APIs that al-
+low for arbitrary ordering and selection of requests within a
+batch through the cache_batch_idx argument, which spec-
+ifies to the attention kernel exactly which KV cache entry
+corresponds to each request in the reordered, selected batch.
+This allows DREX to organize requests through different
+execution paths and dynamic batches without incurring any
+data movement overhead for the hidden states or KV cache.
+5.3
+Flushing the Buffer
+Eventually, the left-behind requests must be flushed through
+the deeper layers to generate their outputs. A per-model buffer
+manager makes this decision in cooperation with the main
+scheduler. Three factors influence the timing:
+1. The size of the next fresh batch in the scheduler.
+2. The number of requests in the buffer.
+3. How long the oldest request in the buffer has waited.
+Our goal is to use the optimal batch size when we process
+requests in the deeper layers, but at the same time, prevent
+requests in the buffer from starving. We allow the buffer man-
+ager to preempt the scheduler when needed in order to achieve
+these objectives. This means the scheduler temporarily holds
+requests if the buffer manager decides to flush the buffer.
+7
+
+
+--- Page 8 ---
+Incorporating batch size. The buffer manager tries to flush
+the buffer when we have the batch size that achieves op-
+timal throughput, i.e., when the number of requests in the
+buffer (bbuffer) is greater than or equal to the size of the next
+batch available from the scheduler (bscheduler). This condition,
+bbuffer ≥bscheduler, covers two scenarios. First, when the buffer
+becomes full (i.e., reaches its maximum configured batch size).
+Second, when the buffer is not full, but the scheduler cannot
+form a new batch larger than the current buffer size. In both
+cases, flushing the buffer ensures that the deep layers are uti-
+lized with the largest possible batch and otherwise prioritizes
+older requests.
+Incorporating age and SLA. Only considering batch size
+in scheduling, there is a possibility—albeit small—that one
+or more requests can starve in the ‘left behind’ buffer. In
+particular, this can happen if (1) there are sufficient requests
+entering the system that the scheduler consistently has enough
+new requests to form a batch, and (2) no members of those new
+batches are added to the buffer, i.e., the EE criteria is so strict
+or lax that there is never a split EE decision. Note that low
+load is insufficient to trigger starvation as bbuffer ≥bscheduler
+in a system with no new requests.
+To prevent starvation and improve SLA adherence, we con-
+sider the expected completion time and SLA of the requests
+when we flush the rebatching buffer. The flush condition is:
+bbuffer ·(1+
+α
+max{rSLA −rexpected,ε}) ≥bscheduler
+where rexpected = age+L−l. rexpected is the expected number
+of iterations this request takes to finish and is calculated by
+adding its current age in number of iterations and the max
+output length, minus current length. rSLA is the request com-
+pletion time (RCT) requirement from SLA in terms of number
+of iterations. It is computed as RCT divided by profiled stan-
+dard iteration time. ε is a small value to avoid dividing by
+zero or a negative value.
+This allows the buffer to flush when bbuffer < bscheduler as
+the ageoldest term grows. It is easier to meet this condition
+when (bbuffer) is large. DREX also includes a parameter, α ≥
+0, that users can tune to set the strength of this constraint.
+They can disable this behavior by setting α = 0.
+5.4
+Filling In the Missing State
+Finally, if any prompts that were previously EEed make a pass
+through the deep layers, DREX efficiently fills in the missing
+KV cache entries for those layers. As mentioned in §3.2.2,
+many prior systems rely on inefficient recomputation or state
+copying that results in expensive copies and redundant data.
+Instead, DREX
+implements
+memory-efficient state-
+copying supported by recent advances in low-level GPU vir-
+tual memory support [35] and application-level virtual mem-
+ory management tools such as vAttention [36] and vTen-
+sor [46]. Instead of physically duplicating the KV cache for
+an early-exited token across all skipped layers, DREX creates
+virtual mappings to fill the missing KV cache. When a token
+exits at a given layer, the Pytorch Tensor objects that corre-
+spond to KV cache entries for all subsequent, skipped layers
+are mapped to the same physical memory block as the last
+computed layer’s KV cache. DREX leverages vAttention’s
+vMemMap to map a handle to a physical GPU memory block to
+a virtual tensor. The physical tensor is shared on a read-only
+basis for the attention computation in the following decoding
+iterations, eliminating any memory redundancy.
+6
+Implementation
+We implement DREX on top of Sarathi-Serve [3] using ap-
+proximately 1,500 lines of Python code and 10 lines of CUDA
+code to interact with the vAttention [36] API. We also im-
+plement Llama-EE and Qwen-EE models using the ramp
+architecture from Apparate [11] to be served by DREX. We
+implement Early Exit LLM utilities that are extensible to dif-
+ferent models and EE decision algorithms using ∼500 lines
+of Python code.
+DREX is the first open-sourced LLM inference framework
+to support batched EE inference using Dynamic Rebatching or
+group EE rules, including Consensus, Greedy, and Majority.
+Scheduler. The scheduler builds upon the continuous batch-
+ing algorithm implemented in vLLM [22]. In coordination
+with the buffer manager, it determines the next batch for exe-
+cution. If the buffer manager’s flushing conditions (§5.3) are
+met, the next batch is formed from the sequences in the buffer.
+If not, the scheduler attempts to add new sequences from the
+waiting queue, following the continuous batching algorithm.
+The scheduler also handles request preemption. If GPU
+memory becomes full, the scheduler evicts sequences and
+their KV cache to free up space. The eviction policy is adapted
+from vLLM with a key modification that sequences in the
+rebatching buffer are prioritized for eviction to minimize the
+performance impact on actively processing requests. The sec-
+ond prioritization is the original vLLM policy where the most
+recent request will be evicted. Evicted sequences can have
+their KV cache offloaded to CPU memory or be deleted en-
+tirely, to be recomputed later.
+Early exit utilities. DREX provides a set of flexible and ex-
+tensible utilities to convert a standard LLM into an Early
+Exit LLM. The core abstraction is a simple interface,
+getIndividualDecision(Tensor), which any EE
+algorithm must implement. This function takes a tensor of hid-
+den states for the current batch and returns a binary EEMask
+tensor of the same length, where a 1 indicates an early exit
+and a 0 for continuation. Group decision functions, such as
+Majority, use the EEMask from this individual evaluation
+to make a collective decision for the entire batch, while Dy-
+namic Rebatching just uses EEMask to arrange each sequence.
+Users can configure their models with one or more EE ramps,
+8
+
+
+--- Page 9 ---
+EE Configuration
+(ramp idx, conf threshold)
+Model
+Total layers
+Config 1
+Config 2
+Qwen-EE-14B
+40
+(30, 0.7)
+(30, 0.9)
+Llama-EE-13B
+40
+(25, 0.8)
+(30, 0.9)
+Llama-EE-70B
+80
+(50, 0.7)
+(50, 0.9)
+Table 3: Models and their EE configurations.
+defined by the following properties:
+• An exit location specified by a layer index.
+• An EE policy, supported policies are Dynamic Rebatching,
+latency-only, and a suite of group decision rules.
+• A getIndividualDecision() implementation, which may
+require hyperparameters such as a confidence threshold.
+DREX provides a default implementation of the popular
+Softmax confidence score algorithm [5,11,38].
+7
+Evaluation
+We evaluate DREX with a wide range of models, batch sizes,
+and EE configurations against various baselines. Our evalua-
+tion results show that:
+• Dynamic Rebatching improves inference throughput by
+harvesting compute savings from early exiting while pro-
+viding a confidence guarantee (§7.1).
+• The Adaptive Rebatching Threshold increases throughput
+compared to a naive rebatching approach (§7.2).
+• Dynamic Rebatching introduces a trade-off with request
+completion time, as requests are not processed on a FCFS
+basis but rather dynamically rearranged to optimize for
+throughput (§7.3).
+• The memory-efficient state-copying mechanism reduces
+memory redundancy and memory copy operations (§7.4).
+Model and EE configuration. We evaluate DREX using
+three EE large language models: Llama-EE-13B, Llama-EE-
+70B, and Qwen-EE-14B. All models are implemented with
+DREX’s early exit utilities and employ an EE ramp archi-
+tecture with a Softmax confidence classifier, which we adapt
+from Apparate’s Llama-EE [11,42] (to the best of our knowl-
+edge, the most recent open-sourced EE LLM). The Qwen-EE-
+14B model is created by applying this same architecture to
+the base Qwen-14B model [6].
+We use Apparate to tune and select the two optimal EE
+configurations (defined by a ramp location and a confidence
+threshold) for each model, which are listed in Table 3.
+Hardware. Llama-EE-13B and Qwen-EE-14B run on a Run-
+Pod [1] NVIDIA A100 node with 80GB VRAM. Llama-EE-
+70B runs on a NVIDIA H200 node with 141GB VRAM.
+Task and dataset. We evaluate our system on the text sum-
+marization task from HELM [24], using the CNN/Daily Mail
+dataset [18]. Each entry in this dataset consists of a news
+article and a corresponding reference summary. The LLM is
+prompted to summarize the article, and the generated output
+is then compared against the reference summary to evaluate
+its quality. To accommodate the 4096-token context limit of
+Llama-EE, we filtered the dataset to include only those en-
+tries with articles shorter than 2048 tokens, resulting in 2160
+entries for our experiments.
+Metrics. Our experiments involve metrics in three categories:
+inference speed performance, output quality, and early exit
+statistics, listed in Table 4.
+Baselines. As there are no existing open-source serving frame-
+works that support batched EE LLM inference, we implement
+several baselines to cover different approaches to batching
+with EE LLMs:
+• Latency-only: early-exited sequences generate a token
+but remain in the batch for deep-layer computation, sacri-
+ficing throughput for reduced inter-token latency. It was
+proposed by Apparate [11].
+• Consensus: A grouped exit policy where the entire batch
+exits only if all sequences agree, maximizing quality at
+the cost of EE opportunities. It was proposed by [31].
+• Majority: A grouped exit policy where the batch’s action
+is determined by a majority vote among the sequences.
+• Greedy: A grouped exit policy where the entire batch exits
+if at least one sequence meets the exit criteria, maximizing
+EE opportunities at the risk of degrading quality.
+7.1
+Better Throughput With Confidence
+We compare the throughput and P95 confidence score of
+different EE approaches in Figure 8. The P95 confidence score
+captures token-level output quality. It quantifies the impact
+of involuntary exits on the least confident exits. Our results
+show that Dynamic Rebatching improves throughput by as
+much as 12% compared to the non-EE baseline with Llama-
+EE-70B. Furthermore, Rebatching consistently outperforms
+all baseline EE approaches by 2%–10.3% except for Greedy.
+However, Greedy’s higher throughput comes at a significant
+cost to output quality, with an average P95 confidence score
+that is 96% worse, a direct result of its aggressive group exit
+decisions.
+Figure 9 illustrates the proportion of early-exited tokens
+for each approach, with the involuntary portion shaded. A
+higher EE proportion leads to greater compute savings and
+thus higher throughput, but involuntary exits degrade output
+quality. With the Greedy approach, over 97% of tokens exit
+early, but more than 35% of these are involuntary, resulting in
+the highest throughput but the lowest output quality. In con-
+trast, Dynamic Rebatching achieves the second-highest EE
+proportion while guaranteeing zero involuntary exits. At the
+9
+
+
+--- Page 10 ---
+Category
+Metric
+Definition
+Performance
+Throughput
+Total number of output tokens generated per second.
+RCT
+Time between when a request is scheduled to when it is complete.
+Quality
+Confidence score
+Softmax confidence scores of the EE tokens, indicating the model’s certainty and output quality.
+BERT Score [50]
+Measures the semantic similarity between the generated summary and the reference summary. A higher score indicates
+better quality.
+EE Stats
+EE Proportion
+Ratio of early-exited tokens to the total number of generated tokens.
+Involuntary Exit
+Percentage of tokens that were forced to exit, despite not meeting their individual confidence threshold.
+Involuntary Stay
+Percentage of tokens that were forced to continue, despite meeting their individual confidence threshold to exit.
+Table 4: Evaluation metrics.
+other extreme, the Consensus policy is so conservative that
+its EE proportion is negligible; the overhead of checking for
+exits actually causes its throughput to fall below the non-EE
+baseline. The Latency-only approach has an EE proportion of
+zero as no sequences are actually removed from the computa-
+tion path, which also makes its throughput close to or below
+the non-EE baseline.
+When comparing throughput and BERT score in Figure 10,
+we find that the BERT score tends to decrease as a model
+makes more early exits, even when the model’s confidence is
+high. This leads to Rebatching having a lower BERT score
+than baselines that are more conservative with early exiting.
+We argue that this discrepancy highlights a limitation in cur-
+rent EE models and configurations, and that more advanced
+EE models whose confidence scores better correlate with
+end-to-end quality metrics would resolve this issue.
+Evaluation results with 2 exits in Figure 11 show similar
+trends. We configured the Llama-EE-70B model with exits at
+layer 40 with a confidence threshold of 0.7 and layer 60 with a
+confidence threshold of 0.9. While the Greedy policy achieves
+higher throughput, Rebatching surpasses its output quality
+with an 11% higher BERT score. Furthermore, compared to all
+other policies, Rebatching consistently increases throughput
+by 4.5–8.6% across various batch sizes while maintaining a
+nearly identical BERT score with a ∼1% difference.
+7.2
+Impact of Adaptive Rebatching Threshold
+To maximize performance, DREX’s Adaptive Rebatching
+Threshold (ART) selectively triggers rebatching only when
+it is profitable. We evaluated its effectiveness by manually
+setting the threshold. For a rebatching threshold x, EE and
+rebatching are triggered only if at least x+1 requests in the
+batch elect to early-exit.
+As shown in Table 5, a stricter (higher) threshold reduces
+the overall EE proportion and increases involuntary stays.
+While forgoing EE can limit gains, it is beneficial when the
+overhead of rebatching outweighs the computational savings
+from a small number of exits. Our evaluation confirms that
+DREX’s dynamic calculation correctly identifies the optimal
+ART that delivers the highest throughput. The calculation pro-
+cess is explained in Figure 7. For the Llama-EE-13B model,
+the optimal threshold improved throughput by 9% compared
+Model Setting
+ART
+Throughput
+EE %
+Invol. Stay
+Llama-EE-13B
+EE layer=25, conf=0.8
+Batch=8
+0
+116.80
+46.3
+0
+1
+117.14
+35.9
+2.7
+2
+124.45
+13.2
+12.3
+3*
+127.35
+6.8
+19.9
+4
+121.09
+3.3
+26.2
+5
+118.06
+1.3
+31.5
+Llama-EE-70B
+EE layer=50, conf=0.7
+Batch=8
+0
+132.97
+46.5
+0
+1*
+133.18
+46.2
+1.7
+2
+129.29
+29.0
+10.6
+3
+122.79
+8.2
+20.9
+4
+121.38
+3.5
+26.8
+5
+119.53
+1.2
+30.8
+Table 5: Impact of rebatching threshold. The optimal Adaptive
+Rebatching Threshold identified by DREX is marked with a
+*, which yields the highest throughput (in bold).
+to a naive rebatching strategy. This mechanism is particularly
+crucial for smaller models, where the narrower margin of
+computational savings from EE makes avoiding unprofitable
+rebatching even more critical.
+7.3
+Request Completion Time (RCT)
+Figure 12 demonstrates that SLA-aware scheduling (§5.3)
+effectively balances throughput and RCT under varying SLA
+pressure. With no SLA pressure (pressure=1), the system
+prioritizes throughput, improving it by 11.4% over the Con-
+sensus policy, at the cost of increasing average and tail RCT
+by 1.4× and 3×, respectively. Conversely, under extreme pres-
+sure(pressure=1), the focus shifts to minimizing RCT. Here,
+all requests are urgent, so DREX avoids placing any request
+into the rebatching buffer, causing the scheduler to essentially
+practice the Consensus grouped exit rule. SLA-aware schedul-
+ing increases average RCT by up to 58.4%, confirming it can
+dynamically adapt to SLA pressure by automatically trading
+throughput for latency.
+7.4
+Memory Operation
+To quantify the benefits of memory-efficient state-copying
+(§5.4), we use the NSight Sys profiler to measure the total
+size of CUDA memory operations, which tracks the physical
+10
+
+
+--- Page 11 ---
+Rebatching
+Consensus
+Majority
+Greedy
+Latency Only
+Non-EE
+Config 1
+Config 2
+Throughput of Non-EE
+0
+0.5
+1
+50
+100
+150
+P95 Confidence Score
+Throughput
+(a) Qwen-EE-14B
+0
+0.5
+1
+50
+100
+150
+P95 Confidence Score
+(b) Llama-EE-13B
+0
+0.5
+1
+50
+100
+150
+P95 Confidence Score
+(c) Llama-EE-70B
+Figure 8: Compares the throughput and P95 confidence score of different EE approaches. Data points on the upper portion use a
+batch size of 8, and the lower portion a batch size of 4. Rebatching improves throughput by as much as 12% compared to non-EE
+Llama-EE-70B while maintaining equal or better P95 confidence score, a measure of output quality.
+Rebatch
+Consensus
+Majority
+Greedy
+Latency
+Only
+0
+20
+40
+60
+80
+100
+EE Token Proportion (%)
+0
+100
+200
+Throughput
+(a) Qwen-EE-14B
+Rebatch
+Consensus
+Majority
+Greedy
+Latency
+Only
+0
+20
+40
+60
+80
+100
+EE Token Proportion (%)
+0
+50
+100
+150
+Throughput
+(b) Llama-EE-13B
+Rebatch
+Consensus
+Majority
+Greedy
+Latency
+Only
+0
+20
+40
+60
+80
+100
+EE Token Proportion (%)
+0
+50
+100
+150
+Throughput
+(c) Llama-EE-70B
+Figure 9: Compares the EE proportion and throughput of different EE approaches. EE proportion is shown as a bar, with
+involuntary exits shaded. Throughput is marked with circles. Rebatching improves throughput over the non-EE baseline and
+guarantees zero involuntary exit.
+0.7
+0.75
+0.8
+100
+200
+BERT Score
+Throughput (tokens/s)
+(a) Qwen-EE-14B
+0.7
+0.75
+0.8
+50
+100
+150
+BERT Score
+Throughput (tokens/s)
+(b) Llama-EE-13B
+0.7
+0.75
+0.8
+50
+100
+150
+BERT Score
+Throughput (tokens/s)
+(c) Llama-EE-70B
+Figure 10: Compares the throughput and BERT score of different EE approaches. Data points on the upper portion use a batch
+size of 8, and the lower portion a batch size of 4
+movement of data blocks and is unaffected by DREX’s vir-
+tual memory operations. As shown in Figure 13, in 3 samples
+taken at different iterations when running the same work-
+load, memory-efficient state-copying consistently incurs less
+memory access. This reduction is more significant with fre-
+quent EEs, achieving a maximum savings of 18.3% under the
+Greedy policy and an average savings of 5.7%.
+8
+Related Work
+There have been extensive efforts in optimizing LLM infer-
+ence and designing Early Exiting LLMs.
+System-level inference frameworks. LLM inference frame-
+works focus on infrastructure and computational optimiza-
+tions to efficiently serve LLMs at scale. Core frameworks like
+TensorRT-LLM [2], Sarathi-Serve [3], vLLM [22], Orca [49],
+11
+
+
+--- Page 12 ---
+0.68
+0.7
+0.72
+0.74
+0.76
+0.78
+0.8
+0.82
+0.84
+50
+100
+150
+BERT Score
+Throughput (tokens/s)
+Rebatching
+Consensus
+Majority
+Greedy
+Latency Only
+Non-EE
+Figure 11: Compares the throughput and BERT score of dif-
+ferent EE approaches with the 2-exit Llama-EE-70B model.
+Rebatching
+Consensus
+Majority
+Greedy
+Latency Only
+Non-EE
+5
+10
+15
+20
+110
+120
+130
+140
+150
+Average Request Completion Time (s)
+Throughput (tokens/sec)
+0
+0.2
+0.4
+0.6
+0.8
+1
+(a) Throughput vs. Average RCT
+10
+20
+30
+110
+120
+130
+140
+150
+Average Request Completion Time (s)
+Throughput (tokens/sec)
+0
+0.2
+0.4
+0.6
+0.8
+1
+(b) Throughput vs. P95 RCT
+Figure 12: Comparing the throughput and request comple-
+tion time(RCT). With no SLA pressure, Rebatching increases
+throughput by 11.4% over the Consensus policy but raises
+average and tail RCT by 1.4x and 3x, respectively. SLA-aware
+scheduling sacrifices throughput to meet SLAs, increasing
+average RCT by up to 58.4%. Under tighter SLA pressure,
+Rebatching’s performance converges with that of Consensus.
+and SGLang [51] deliver high throughput and low latency
+by leveraging advanced batching, distributed serving, and
+hardware-aware strategies. A slew of optimizations, e.g., to
+kernels and memory management [12,13,36,45,46,48], GPU
+virtualization [35], quantization [25], and KV cache compres-
+sion [28] further accelerate inference. DREX is complemen-
+tary to all of this work.
+Model-level approaches. DREX is also related to the sub-
+field of early exiting, which has a long history in Deep Neu-
+ral Networks (DNNs) [32, 34, 39, 41, 52] and has been ex-
+tended to transformer-based generative LLMs through meth-
+ods like DAT [15], CALM [38], FREE [5], DEED [40], and
+others [17,19,43], which allow selective early termination to
+save computational power.
+Dynamic
+computation
+techniques
+like
+Mixture-of-
+Depths [37], Mixture-of-Recursions [4], FlexDepth [29],
+and ShortGPT [30] adapts layer depth on a per-token
+basis. Apparate [11], EE-Tuning [33], and HELIOS [21]
+tune exit confidence thresholds, layer selection, and model
+10
+25
+50
+2
+4
+6
+Iterations
+Memory Ops Size (GB)
+Greedy
+Consensus
+Rebatching
+Majority
+Baseline
+Memory-efficient
+Figure 13: Memory-
+efficient
+state
+copying, shown
+in
+solid lines, reduces
+CUDA
+memory
+operation size by as
+much as 18.3% with
+Greedy policy, which
+early exits the most
+frequently, and
+on
+average by 5.7%.
+choice dynamically to match computational effort to input
+complexity, balancing
+latency, throughput, and output
+quality. Hybrid methods combine early exit with speculative
+decoding [7,23], e.g., [16,26,27,47], leveraging faster draft
+models derived from the full model consisting of the earlier
+layers, whereas SkipDecode [10] enforces unified exit points
+to enable predictable computation budgets with minimal
+accuracy loss.
+DREX tackles a very different problem, focusing on opera-
+tionalizing existing models, rather than improving the models
+themselves. We believe that DREX’s techniques also apply
+to most of the above models, but deep exploration of all of
+those models is out of the scope of this work.
+9
+Conclusion
+We introduced DREX, the first serving framework that makes
+EE language models practical. Its core idea—Dynamic
+Rebatching—lets each request exit or continue independently
+while remaining requests are regrouped into new batches.
+DREX is implemented with two synergistic optimizations: a
+copy-free rebatching buffer that regroups hidden states and
+KV cache without moving physical blocks, and memory-
+efficient state-copying to resolve the missing KV cache with-
+out redundancy.
+DREX improves throughput by 2–12% over baselines,
+maintains or improves P95 quality, and eliminates involun-
+tary exits. The ART determines whether rebatching pays
+off by comparing expected compute savings with rebatching
+overhead, providing an 8% throughput gain. The SLA-aware
+scheduler prioritizes near-deadline requests, improving tail
+completion time by 58.4% without sacrificing exit fidelity.
+12
+
+
+--- Page 13 ---
+References
+[1] Runpod | the cloud built for ai. [Online; accessed 2025-08-18].
+[2] Welcome to tensorrt-llm’s documentation! — tensorrt-llm.
+[Online; accessed 2025-08-07].
+[3] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan,
+Nipun Kwatra, Bhargav S. Gulavani, Alexey Tumanov, and
+Ramachandran Ramjee. Taming throughput-latency tradeoff
+in llm inference with sarathi-serve. OSDI’24, USA, 2024.
+USENIX Association.
+[4] Sangmin Bae, Yujin Kim, Reza Bayat, Sungnyun Kim, Jiyoun
+Ha, Tal Schuster, Adam Fisch, Hrayr Harutyunyan, Ziwei Ji,
+Aaron Courville, and Se-Young Yun. Mixture-of-recursions:
+Learning dynamic recursive depths for adaptive token-level
+computation, 2025.
+[5] Sangmin Bae, Jongwoo Ko, Hwanjun Song, and Se-Young Yun.
+Fast and robust early-exiting framework for autoregressive lan-
+guage models with synchronized parallel decoding. In Houda
+Bouamor, Juan Pino, and Kalika Bali, editors, Proceedings of
+the 2023 Conference on Empirical Methods in Natural Lan-
+guage Processing, pages 5910–5924, Singapore, December
+2023. Association for Computational Linguistics.
+[6] Jinze Bai, Shuai Bai, Yunfei Chu, Zeyu Cui, Kai Dang, Xi-
+aodong Deng, Yang Fan, Wenbin Ge, Yu Han, Fei Huang,
+Binyuan Hui, Luo Ji, Mei Li, Junyang Lin, Runji Lin, Day-
+iheng Liu, Gao Liu, Chengqiang Lu, Keming Lu, Jianxin Ma,
+Rui Men, Xingzhang Ren, Xuancheng Ren, Chuanqi Tan, Sinan
+Tan, Jianhong Tu, Peng Wang, Shijie Wang, Wei Wang, Sheng-
+guang Wu, Benfeng Xu, Jin Xu, An Yang, Hao Yang, Jian
+Yang, Shusheng Yang, Yang Yao, Bowen Yu, Hongyi Yuan,
+Zheng Yuan, Jianwei Zhang, Xingxuan Zhang, Yichang Zhang,
+Zhenru Zhang, Chang Zhou, Jingren Zhou, Xiaohuan Zhou,
+and Tianhang Zhu. Qwen technical report, 2023.
+[7] Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Ja-
+son D. Lee, Deming Chen, and Tri Dao. Medusa: Simple
+llm inference acceleration framework with multiple decoding
+heads. In Proceedings of the 41st International Conference on
+Machine Learning, ICML’24. JMLR.org, 2024.
+[8] Lequn Chen. Dissecting batching effects in gpt inference, May
+2023.
+[9] Yanxi Chen, Xuchen Pan, Yaliang Li, Bolin Ding, and Jingren
+Zhou. Ee-llm: large-scale training and inference of early-exit
+large language models with 3d parallelism. In Proceedings
+of the 41st International Conference on Machine Learning,
+ICML’24. JMLR.org, 2024.
+[10] Luciano Del Corro, Allie Del Giorno, Sahaj Agarwal, Bin Yu,
+Ahmed Awadallah, and Subhabrata Mukherjee. Skipdecode:
+Autoregressive skip decoding with batching and caching for
+efficient llm inference, 2023.
+[11] Yinwei Dai, Rui Pan, Anand Iyer, Kai Li, and Ravi Netravali.
+Apparate: Rethinking early exits to tame latency-throughput
+tensions in ml serving. In Proceedings of the ACM SIGOPS
+30th Symposium on Operating Systems Principles, SOSP ’24,
+page 607–623, New York, NY, USA, 2024. Association for
+Computing Machinery.
+[12] Tri Dao. Flashattention-2: Faster attention with better paral-
+lelism and work partitioning. In The Twelfth International
+Conference on Learning Representations, 2024.
+[13] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christo-
+pher Ré. Flashattention: fast and memory-efficient exact at-
+tention with io-awareness. In Proceedings of the 36th Interna-
+tional Conference on Neural Information Processing Systems,
+NIPS ’22, Red Hook, NY, USA, 2022. Curran Associates Inc.
+[14] DeepSeek-AI, Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang,
+Bochao Wu, Chengda Lu, Chenggang Zhao, Chengqi Deng,
+Chenyu Zhang, Chong Ruan, Damai Dai, Daya Guo, Dejian
+Yang, Deli Chen, Dongjie Ji, Erhang Li, Fangyun Lin, Fu-
+cong Dai, Fuli Luo, Guangbo Hao, Guanting Chen, Guowei
+Li, H. Zhang, Han Bao, Hanwei Xu, Haocheng Wang, Haowei
+Zhang, Honghui Ding, Huajian Xin, Huazuo Gao, Hui Li, Hui
+Qu, J. L. Cai, Jian Liang, Jianzhong Guo, Jiaqi Ni, Jiashi Li,
+Jiawei Wang, Jin Chen, Jingchang Chen, Jingyang Yuan, Jun-
+jie Qiu, Junlong Li, Junxiao Song, Kai Dong, Kai Hu, Kaige
+Gao, Kang Guan, Kexin Huang, Kuai Yu, Lean Wang, Lecong
+Zhang, Lei Xu, Leyi Xia, Liang Zhao, Litong Wang, Liyue
+Zhang, Meng Li, Miaojun Wang, Mingchuan Zhang, Minghua
+Zhang, Minghui Tang, Mingming Li, Ning Tian, Panpan Huang,
+Peiyi Wang, Peng Zhang, Qiancheng Wang, Qihao Zhu, Qinyu
+Chen, Qiushi Du, R. J. Chen, R. L. Jin, Ruiqi Ge, Ruisong
+Zhang, Ruizhe Pan, Runji Wang, Runxin Xu, Ruoyu Zhang,
+Ruyi Chen, S. S. Li, Shanghao Lu, Shangyan Zhou, Shanhuang
+Chen, Shaoqing Wu, Shengfeng Ye, Shengfeng Ye, Shirong
+Ma, Shiyu Wang, Shuang Zhou, Shuiping Yu, Shunfeng Zhou,
+Shuting Pan, T. Wang, Tao Yun, Tian Pei, Tianyu Sun, W. L.
+Xiao, Wangding Zeng, Wanjia Zhao, Wei An, Wen Liu, Wen-
+feng Liang, Wenjun Gao, Wenqin Yu, Wentao Zhang, X. Q.
+Li, Xiangyue Jin, Xianzu Wang, Xiao Bi, Xiaodong Liu, Xi-
+aohan Wang, Xiaojin Shen, Xiaokang Chen, Xiaokang Zhang,
+Xiaosha Chen, Xiaotao Nie, Xiaowen Sun, Xiaoxiang Wang,
+Xin Cheng, Xin Liu, Xin Xie, Xingchao Liu, Xingkai Yu, Xin-
+nan Song, Xinxia Shan, Xinyi Zhou, Xinyu Yang, Xinyuan Li,
+Xuecheng Su, Xuheng Lin, Y. K. Li, Y. Q. Wang, Y. X. Wei,
+Y. X. Zhu, Yang Zhang, Yanhong Xu, Yanhong Xu, Yanping
+Huang, Yao Li, Yao Zhao, Yaofeng Sun, Yaohui Li, Yaohui
+Wang, Yi Yu, Yi Zheng, Yichao Zhang, Yifan Shi, Yiliang
+Xiong, Ying He, Ying Tang, Yishi Piao, Yisong Wang, Yixuan
+Tan, Yiyang Ma, Yiyuan Liu, Yongqiang Guo, Yu Wu, Yuan
+Ou, Yuchen Zhu, Yuduan Wang, Yue Gong, Yuheng Zou, Yujia
+He, Yukun Zha, Yunfan Xiong, Yunxian Ma, Yuting Yan, Yux-
+iang Luo, Yuxiang You, Yuxuan Liu, Yuyang Zhou, Z. F. Wu,
+Z. Z. Ren, Zehui Ren, Zhangli Sha, Zhe Fu, Zhean Xu, Zhen
+Huang, Zhen Zhang, Zhenda Xie, Zhengyan Zhang, Zhewen
+Hao, Zhibin Gou, Zhicheng Ma, Zhigang Yan, Zhihong Shao,
+Zhipeng Xu, Zhiyu Wu, Zhongyu Zhang, Zhuoshu Li, Zihui
+Gu, Zijia Zhu, Zijun Liu, Zilin Li, Ziwei Xie, Ziyang Song,
+Ziyi Gao, and Zizheng Pan. Deepseek-v3 technical report,
+2025.
+[15] Maha Elbayad, Jiatao Gu, Edouard Grave, and Michael Auli.
+Depth-adaptive transformer. In International Conference on
+Learning Representations, 2020.
+[16] Mostafa Elhoushi, Akshat Shrivastava, Diana Liskovich, Basil
+Hosmer, Bram Wasti, Liangzhen Lai, Anas Mahmoud, Bilge
+Acun, Saurabh Agarwal, Ahmed Roman, Ahmed Aly, Beidi
+13
+
+
+--- Page 14 ---
+Chen, and Carole-Jean Wu. LayerSkip: Enabling early exit in-
+ference and self-speculative decoding. In Lun-Wei Ku, Andre
+Martins, and Vivek Srikumar, editors, Proceedings of the 62nd
+Annual Meeting of the Association for Computational Linguis-
+tics (Volume 1: Long Papers), pages 12622–12642, Bangkok,
+Thailand, August 2024. Association for Computational Lin-
+guistics.
+[17] Siqi Fan, Xin Jiang, Xiang Li, Xuying Meng, Peng Han, Shuo
+Shang, Aixin Sun, Yequan Wang, and Zhongyuan Wang. Not
+all layers of llms are necessary during inference, 2024.
+[18] Karl Moritz Hermann, Tomáš Koˇciský, Edward Grefenstette,
+Lasse Espeholt, Will Kay, Mustafa Suleyman, and Phil Blun-
+som. Teaching machines to read and comprehend. In Proceed-
+ings of the 29th International Conference on Neural Informa-
+tion Processing Systems - Volume 1, NIPS’15, page 1693–1701,
+Cambridge, MA, USA, 2015. MIT Press.
+[19] Benyamin Jamialahmadi, Parsa Kavehzadeh, Mehdi Reza-
+gholizadeh, Parsa Farinneya, Hossein Rajabzadeh, Aref Jafari,
+Boxing Chen, and Marzieh S. Tahaei. Balcony: A lightweight
+approach to dynamic inference of generative language models,
+2025.
+[20] Alex Krizhevsky, Ilya Sutskever, and Geoffrey E Hinton. Ima-
+genet classification with deep convolutional neural networks.
+In F. Pereira, C.J. Burges, L. Bottou, and K.Q. Weinberger,
+editors, Advances in Neural Information Processing Systems,
+volume 25. Curran Associates, Inc., 2012.
+[21] Avinash Kumar, Shashank Nag, Jason Clemons, Lizy John, and
+Poulami Das. Helios: Adaptive model and early-exit selection
+for efficient llm inference serving, 2025.
+[22] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lian-
+min Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and
+Ion Stoica. Efficient memory management for large language
+model serving with pagedattention. In Proceedings of the
+29th Symposium on Operating Systems Principles, SOSP ’23,
+page 611–626, New York, NY, USA, 2023. Association for
+Computing Machinery.
+[23] Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast in-
+ference from transformers via speculative decoding. In Pro-
+ceedings of the 40th International Conference on Machine
+Learning, ICML’23. JMLR.org, 2023.
+[24] Percy Liang, Rishi Bommasani, Tony Lee, Dimitris Tsipras,
+Dilara Soylu, Michihiro Yasunaga, Yian Zhang, Deepak
+Narayanan, Yuhuai Wu, Ananya Kumar, Benjamin Newman,
+Binhang Yuan, Bobby Yan, Ce Zhang, Christian Cosgrove,
+Christopher D. Manning, Christopher Ré, Diana Acosta-Navas,
+Drew A. Hudson, Eric Zelikman, Esin Durmus, Faisal Ladhak,
+Frieda Rong, Hongyu Ren, Huaxiu Yao, Jue Wang, Keshav San-
+thanam, Laurel Orr, Lucia Zheng, Mert Yuksekgonul, Mirac
+Suzgun, Nathan Kim, Neel Guha, Niladri Chatterji, Omar Khat-
+tab, Peter Henderson, Qian Huang, Ryan Chi, Sang Michael
+Xie, Shibani Santurkar, Surya Ganguli, Tatsunori Hashimoto,
+Thomas Icard, Tianyi Zhang, Vishrav Chaudhary, William
+Wang, Xuechen Li, Yifan Mai, Yuhui Zhang, and Yuta Ko-
+reeda. Holistic evaluation of language models, 2023.
+[25] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Guangxuan
+Xiao, and Song Han. Awq: Activation-aware weight quantiza-
+tion for on-device llm compression and acceleration. GetMo-
+bile: Mobile Comp. and Comm., 28(4):12–17, January 2025.
+[26] Fangcheng Liu, Yehui Tang, Zhenhua Liu, Yunsheng Ni, Duyu
+Tang, Kai Han, and Yunhe Wang. Kangaroo: lossless self-
+speculative decoding for accelerating llms via double early
+exiting. In Proceedings of the 38th International Conference
+on Neural Information Processing Systems, NIPS ’24, Red
+Hook, NY, USA, 2025. Curran Associates Inc.
+[27] Jiahao Liu, Qifan Wang, Jingang Wang, and Xunliang Cai.
+Speculative decoding via early-exiting for faster LLM infer-
+ence with Thompson sampling control mechanism. In Lun-
+Wei Ku, Andre Martins, and Vivek Srikumar, editors, Findings
+of the Association for Computational Linguistics: ACL 2024,
+pages 3027–3043, Bangkok, Thailand, August 2024. Associa-
+tion for Computational Linguistics.
+[28] Yuhan Liu, Hanchen Li, Yihua Cheng, Siddhant Ray, Yuyang
+Huang, Qizheng Zhang, Kuntai Du, Jiayi Yao, Shan Lu,
+Ganesh Ananthanarayanan, Michael Maire, Henry Hoffmann,
+Ari Holtzman, and Junchen Jiang. Cachegen: Kv cache com-
+pression and streaming for fast large language model serv-
+ing. In Proceedings of the ACM SIGCOMM 2024 Conference,
+ACM SIGCOMM ’24, page 38–56, New York, NY, USA, 2024.
+Association for Computing Machinery.
+[29] Xuan Luo, Weizhi Wang, and Xifeng Yan. Adaptive layer-
+skipping in pre-trained llms, 2025.
+[30] Xin Men, Mingyu Xu, Qingyu Zhang, Qianhao Yuan, Bingning
+Wang, Hongyu Lin, Yaojie Lu, Xianpei Han, and Weipeng
+Chen. ShortGPT: Layers in large language models are more
+redundant than you expect. In Wanxiang Che, Joyce Nabende,
+Ekaterina Shutova, and Mohammad Taher Pilehvar, editors,
+Findings of the Association for Computational Linguistics:
+ACL 2025, pages 20192–20204, Vienna, Austria, July 2025.
+Association for Computational Linguistics.
+[31] Ruijie Miao, Yihan Yan, Xinshuo Yao, and Tong Yang. An
+efficient inference framework for early-exit large language
+models. arXiv preprint arXiv:2407.20272, 2024.
+[32] Anand Padmanabha Iyer, Mingyu Guan, Yinwei Dai, Rui Pan,
+Swapnil Gandhi, and Ravi Netravali. Improving dnn inference
+throughput using practical, per-input compute adaptation. In
+Proceedings of the ACM SIGOPS 30th Symposium on Operat-
+ing Systems Principles, SOSP ’24, page 624–639, New York,
+NY, USA, 2024. Association for Computing Machinery.
+[33] Xuchen Pan, Yanxi Chen, Yaliang Li, Bolin Ding, and Jingren
+Zhou. Ee-tuning: An economical yet scalable solution for
+tuning early-exit large language models, 2024.
+[34] Priyadarshini Panda, Abhronil Sengupta, and Kaushik Roy.
+Conditional deep learning for energy-efficient and enhanced
+pattern recognition. In 2016 Design, Automation & Test in Eu-
+rope Conference & Exhibition (DATE), pages 475–480, 2016.
+[35] Cory Perry. Introducing low-level gpu virtual memory man-
+agement | nvidia technical blog, 12 2020. [Online; accessed
+2025-08-12].
+[36] Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramachandran
+Ramjee, and Ashish Panwar. vattention: Dynamic memory
+14
+
+
+--- Page 15 ---
+management for serving llms without pagedattention. In Pro-
+ceedings of the 30th ACM International Conference on Archi-
+tectural Support for Programming Languages and Operating
+Systems, Volume 1, ASPLOS ’25, page 1133–1150, New York,
+NY, USA, 2025. Association for Computing Machinery.
+[37] David Raposo, Sam Ritter, Blake Richards, Timothy Lillicrap,
+Peter Conway Humphreys, and Adam Santoro. Mixture-of-
+depths: Dynamically allocating compute in transformer-based
+language models, 2024.
+[38] Tal Schuster, Adam Fisch, Jai Gupta, Mostafa Dehghani, Dara
+Bahri, Vinh Q. Tran, Yi Tay, and Donald Metzler. Confident
+adaptive language modeling. NIPS ’22, Red Hook, NY, USA,
+2022. Curran Associates Inc.
+[39] Yechao She, Tuo Shi, Jianping Wang, and Bin Liu. Dynamic
+batching and early-exiting for accurate and timely edge infer-
+ence. In 2024 IEEE 99th Vehicular Technology Conference
+(VTC2024-Spring), pages 1–6, 2024.
+[40] Peng Tang, Pengkai Zhu, Tian Li, Srikar Appalaraju, Vijay
+Mahadevan, and R. Manmatha. DEED: Dynamic early exit on
+decoder for accelerating encoder-decoder transformer models.
+In Kevin Duh, Helena Gomez, and Steven Bethard, editors,
+Findings of the Association for Computational Linguistics:
+NAACL 2024, pages 116–131, Mexico City, Mexico, June 2024.
+Association for Computational Linguistics.
+[41] Surat Teerapittayanon, Bradley McDanel, and H.T. Kung.
+Branchynet: Fast inference via early exiting from deep neural
+networks. In 2016 23rd International Conference on Pattern
+Recognition (ICPR), pages 2464–2469, 2016.
+[42] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Mar-
+tinet, Marie-Anne Lachaux, Timothée Lacroix, Baptiste Roz-
+ière, Naman Goyal, Eric Hambro, Faisal Azhar, Aurelien Ro-
+driguez, Armand Joulin, Edouard Grave, and Guillaume Lam-
+ple. Llama: Open and efficient foundation language models,
+2023.
+[43] Neeraj Varshney, Agneet Chatterjee, Mihir Parmar, and Chitta
+Baral. Investigating acceleration of LLaMA inference by en-
+abling intermediate layer decoding via instruction tuning with
+‘LITE’. In Kevin Duh, Helena Gomez, and Steven Bethard,
+editors, Findings of the Association for Computational Linguis-
+tics: NAACL 2024, pages 3656–3677, Mexico City, Mexico,
+June 2024. Association for Computational Linguistics.
+[44] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszko-
+reit, Llion Jones, Aidan N. Gomez, Łukasz Kaiser, and Illia
+Polosukhin. Attention is all you need. In Proceedings of the
+31st International Conference on Neural Information Process-
+ing Systems, NIPS’17, page 6000–6010, Red Hook, NY, USA,
+2017. Curran Associates Inc.
+[45] Mengdi Wu, Xinhao Cheng, Shengyu Liu, Chunan Shi, Jianan
+Ji, Kit Ao, Praveen Velliengiri, Xupeng Miao, Oded Padon, and
+Zhihao Jia. Mirage: A multi-level superoptimizer for tensor
+programs, 2025.
+[46] Jiale Xu, Rui Zhang, Cong Guo, Weiming Hu, Zihan Liu,
+Feiyang Wu, Yu Feng, Shixuan Sun, Changxu Shao, Yuhong
+Guo, Junping Zhao, Ke Zhang, Minyi Guo, and Jingwen Leng.
+vtensor: Flexible virtual tensor management for efficient llm
+serving, 2024.
+[47] Jiaming Xu, Jiayi Pan, Yongkang Zhou, Siming Chen, Jinhao
+Li, Yaoxiu Lian, Junyi Wu, and Guohao Dai. Specee: Accel-
+erating large language model inference with speculative early
+exiting. In Proceedings of the 52nd Annual International Sym-
+posium on Computer Architecture, ISCA ’25, page 467–481,
+New York, NY, USA, 2025. Association for Computing Ma-
+chinery.
+[48] Zihao Ye, Lequn Chen, Ruihang Lai, Wuwei Lin, Yineng
+Zhang, Stephanie Wang, Tianqi Chen, Baris Kasikci, Vinod
+Grover, Arvind Krishnamurthy, and Luis Ceze. Flashinfer:
+Efficient and customizable attention engine for llm inference
+serving, 2025.
+[49] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong
+Kim, and Byung-Gon Chun.
+Orca: A distributed serving
+system for Transformer-Based generative models. In 16th
+USENIX Symposium on Operating Systems Design and Im-
+plementation (OSDI 22), pages 521–538, Carlsbad, CA, July
+2022. USENIX Association.
+[50] Tianyi Zhang, Varsha Kishore, Felix Wu, Kilian Q. Weinberger,
+and Yoav Artzi. Bertscore: Evaluating text generation with
+BERT. In 8th International Conference on Learning Represen-
+tations, ICLR 2020, Addis Ababa, Ethiopia, April 26-30, 2020.
+OpenReview.net, 2020.
+[51] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun,
+Jeff Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion
+Stoica, Joseph E. Gonzalez, Clark Barrett, and Ying Sheng.
+Sglang: efficient execution of structured language model pro-
+grams. In Proceedings of the 38th International Conference on
+Neural Information Processing Systems, NIPS ’24, Red Hook,
+NY, USA, 2025. Curran Associates Inc.
+[52] Wangchunshu Zhou, Canwen Xu, Tao Ge, Julian McAuley,
+Ke Xu, and Furu Wei. Bert loses patience: fast and robust infer-
+ence with early exit. In Proceedings of the 34th International
+Conference on Neural Information Processing Systems, NIPS
+’20, Red Hook, NY, USA, 2020. Curran Associates Inc.
+15
