@@ -203,21 +203,8 @@ def _paper_row(paper: dict, rank: int = 0) -> str:
     pub_date = paper.get('published_date', '')[:10]
     affiliations = paper.get('affiliations', '')
 
-    # Brief with expandable "Read more" for long summaries
-    full_brief = _markdown_to_html(paper.get('brief', ''))
-    brief_preview = full_brief[:300]
-
-    # Create expandable brief if longer than 300 chars
-    if len(full_brief) > 300:
-        brief_html = f'''{brief_preview}...
-    <details style="margin-top:8px;">
-      <summary style="color:{COLORS['accent_primary']}; cursor:pointer; font-weight:600; font-size:12px; list-style:none;">▶ Read more</summary>
-      <div style="margin-top:8px; padding-top:8px; border-top:1px solid {COLORS['border']};">
-        {full_brief}
-      </div>
-    </details>'''
-    else:
-        brief_html = full_brief
+    # Brief — always show in full (<details> is stripped by Gmail)
+    brief_html = _markdown_to_html(paper.get('brief', ''))
 
     # Modern rank badge
     rank_label = f'<span style="display:inline-block; background:{COLORS["accent_primary"]}; color:white; padding:2px 10px; border-radius:12px; font-size:11px; font-weight:700; margin-right:8px;">#{rank}</span>' if rank else ''
@@ -392,12 +379,10 @@ def _render_front_card(front: dict, front_methods: dict,
   {methods_html}
   {summary_html}
   <div style="margin-top:8px;">
-    <details style="cursor:pointer;">
-      <summary style="font-size:12px; color:{COLORS['link']}; font-weight:bold;">Papers in this front</summary>
-      <div style="margin-top:4px; padding-left:8px;">
-        {papers_html}
-      </div>
-    </details>
+    <div style="font-size:12px; color:{COLORS['link']}; font-weight:bold; margin-bottom:4px;">Papers in this front</div>
+    <div style="padding-left:8px;">
+      {papers_html}
+    </div>
   </div>
 </td></tr>"""
 

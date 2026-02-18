@@ -33,6 +33,14 @@ INDEX_PATH   = REPO_ROOT / "docs" / "index.md"
 TOP_N = 5            # papers shown in Most Recent and Best Papers
 MAX_FULL_LIST = 500  # safety cap for the full collapsible list
 
+# ── Category display order ────────────────────────────────────────────────────
+
+CATEGORY_ORDER = [
+    "LLMs for Algorithm Design",
+    "Generative AI for OR",
+    "OR for Generative AI",
+]
+
 # ── Status emoji mapping (L2 research front status) ──────────────────────────
 
 STATUS_EMOJI = {
@@ -124,14 +132,8 @@ def _title_cell(title: str, brief: str) -> str:
     return f"**{plain}**"
 
 
-def _links_cell(aid: str, code: str, db_code_url: str = "") -> str:
-    """Combined PDF + Code links cell.
-
-    Always shows a clickable pdf link.
-    If a code URL is available (db_code_url or extracted from code string),
-    shows a clickable [code] link; otherwise shows plain unlinked 'code'.
-    """
-    pdf_link = f"[pdf](http://arxiv.org/abs/{aid})"
+def _resolve_code_url(code: str, db_code_url: str = "") -> str:
+    """Extract a raw code URL from db_code_url or a pipe-string code field."""
     url = db_code_url or ""
     if not url:
         m = re.search(r'\[link\]\((.+?)\)', code)
@@ -139,8 +141,23 @@ def _links_cell(aid: str, code: str, db_code_url: str = "") -> str:
             url = m.group(1)
         elif code.strip().startswith("http"):
             url = code.strip()
+    return url
+
+
+def _links_cell(aid: str, code: str, db_code_url: str = "") -> str:
+    """Markdown link version — for use in markdown tables (Most Recent, Best Papers)."""
+    url = _resolve_code_url(code, db_code_url)
+    pdf_link = f"[pdf](http://arxiv.org/abs/{aid})"
     code_part = f"[code]({url})" if url else "code"
     return f"{pdf_link} / {code_part}"
+
+
+def _links_cell_html(aid: str, code: str, db_code_url: str = "") -> str:
+    """HTML <a> tag version — for use inside HTML tables (Full list)."""
+    url = _resolve_code_url(code, db_code_url)
+    pdf_part = f'<a href="http://arxiv.org/abs/{aid}">pdf</a>'
+    code_part = f'<a href="{url}">code</a>' if url else "code"
+    return f"{pdf_part} / {code_part}"
 
 
 def _is_visible(info: dict) -> bool:
@@ -209,7 +226,7 @@ def _load_fronts(db: Database, category: str) -> list:
         return []
     snapshot = row["d"]
     rows = db.fetchall(
-        """SELECT name, status, size, dominant_methods, dominant_problems
+        """SELECT name, status, size, dominant_methods, dominant_problems, core_papers
            FROM research_fronts
            WHERE category = ? AND snapshot_date = ?
            ORDER BY size DESC""",
@@ -225,12 +242,17 @@ def _load_fronts(db: Database, category: str) -> list:
             problems = json.loads(r["dominant_problems"] or "[]")[:2]
         except Exception:
             problems = []
+        try:
+            core_papers = json.loads(r["core_papers"] or "[]")
+        except Exception:
+            core_papers = []
         fronts.append({
-            "name":     r["name"] or "Unnamed front",
-            "status":   r["status"] or "stable",
-            "size":     r["size"] or 0,
-            "methods":  methods,
-            "problems": problems,
+            "name":        r["name"] or "Unnamed front",
+            "status":      r["status"] or "stable",
+            "size":        r["size"] or 0,
+            "methods":     methods,
+            "problems":    problems,
+            "core_papers": core_papers,
         })
     return fronts
 
@@ -301,9 +323,29 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
         for f in fronts:
             methods_str  = ", ".join(_readable_tag(m) for m in f["methods"])  if f["methods"]  else "—"
             problems_str = ", ".join(_readable_tag(p) for p in f["problems"]) if f["problems"] else "—"
+            emoji = STATUS_EMOJI.get(f["status"], "")
+            status_cell = f"{emoji} {f['status'].capitalize()}" if emoji else f['status'].capitalize()
+
+            # Build collapsible paper list inside the Front Name cell
+            paper_links = []
+            for pid in f.get("core_papers", []):
+                clean_pid = _clean_id(pid)
+                content = papers.get(clean_pid)
+                if content:
+                    _, ptitle, _, _, _, _, _ = _parse(content)
+                    plain = _plain_title(ptitle)
+                    paper_links.append(
+                        f'• <a href="http://arxiv.org/abs/{clean_pid}">{plain}</a>'
+                    )
+            if paper_links:
+                inner = "<br>".join(paper_links)
+                name_cell = (f"<details><summary>{f['name']}</summary>"
+                             f"{inner}</details>")
+            else:
+                name_cell = f['name']
+
             lines.append(
-                f"| {f['status'].capitalize()} "
-                f"| {f['name']} | {f['size']} "
+                f"| {status_cell} | {name_cell} | {f['size']} "
                 f"| {methods_str} | {problems_str} |"
             )
         lines.append("")
@@ -320,8 +362,8 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
     lines.append(f"<summary>📋 Full list ({visible_total} papers, sorted by date)</summary>\n")
     lines.append(
         '<table><colgroup>'
-        '<col width="7%"><col width="9%"><col width="27%">'
-        '<col width="14%"><col width="16%"><col width="10%"><col width="17%">'
+        '<col width="5%"><col width="7%"><col width="34%">'
+        '<col width="13%"><col width="16%"><col width="5%"><col width="20%">'
         '</colgroup>'
     )
     lines.append(
@@ -343,7 +385,7 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
         venue     = info.get("venue") or json_venue
         brief     = info.get("brief", "")
         score_str = f"{info['score']}/30" if info else "—"
-        links     = _links_cell(aid, json_code, info.get("code_url", ""))
+        links     = _links_cell_html(aid, json_code, info.get("code_url", ""))
         lines.append(
             f'<tr>'
             f'<td><small>{score_str}</small></td>'
@@ -402,7 +444,12 @@ def generate_readme(json_path: Path, out_path: Path, to_web: bool = False):
             print(f"[WARN] No papers found — skipping {out_path.name}", flush=True)
             return
 
-        for category, papers in data.items():
+        ordered = sorted(
+            data.keys(),
+            key=lambda c: CATEGORY_ORDER.index(c) if c in CATEGORY_ORDER else len(CATEGORY_ORDER)
+        )
+        for category in ordered:
+            papers = data[category]
             if not papers:
                 continue
             print(f"  [{category}] {len(papers)} papers ...", flush=True)
@@ -439,9 +486,9 @@ def generate_readme(json_path: Path, out_path: Path, to_web: bool = False):
             fronts = _load_fronts(db, category)
             sections.append(_render_category(category, papers, l1, fronts))
 
-    # Table of contents
+    # Table of contents (same order as sections)
     toc_lines = ["<details>", "  <summary>Table of Contents</summary>", "  <ol>"]
-    for category in data:
+    for category in ordered:
         slug = category.replace(" ", "-").lower()
         toc_lines.append(f"    <li><a href=#{slug}>{category}</a></li>")
     toc_lines += ["  </ol>", "</details>\n"]

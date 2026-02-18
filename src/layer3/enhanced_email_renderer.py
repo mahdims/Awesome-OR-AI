@@ -104,21 +104,8 @@ def _priority_paper_row(item: dict, rank: int) -> str:
     pub_date = paper.get('published_date', '')[:10]
     affiliations = paper.get('affiliations', '')
 
-    # Brief with expandable "Read more" for long summaries (convert markdown to HTML)
-    full_brief = _markdown_to_html(paper.get('brief', ''))
-    brief_preview = full_brief[:250]
-
-    # Create expandable brief if longer than 250 chars
-    if len(full_brief) > 250:
-        brief_html = f'''{brief_preview}...
-    <details style="margin-top:8px;">
-      <summary style="color:{COLORS['accent_primary']}; cursor:pointer; font-weight:600; font-size:12px; list-style:none;">▶ Read more</summary>
-      <div style="margin-top:8px; padding-top:8px; border-top:1px solid {COLORS['border']};">
-        {full_brief}
-      </div>
-    </details>'''
-    else:
-        brief_html = full_brief
+    # Brief — always show in full (<details> is stripped by Gmail)
+    brief_html = _markdown_to_html(paper.get('brief', ''))
 
     # MPI scores as muted chips
     mpi_chips = f'''<span style="background:{COLORS['accent_bg']}; color:{COLORS['text_muted']}; padding:2px 8px; border-radius:999px; font-weight:600; font-size:10px; margin-right:4px;">M={m}</span>
@@ -200,30 +187,19 @@ def _front_card_with_affiliations(front: dict, aff_info: Optional[dict]) -> str:
             f'{" ".join(method_tags)}</div>'
         )
 
-    # Summary with Read more / Read less toggle via <details>
+    # Summary — always show in full (<details> is stripped by Gmail)
     summary_html = ''
     if summary and not summary.startswith('['):
         paragraphs = [p.strip() for p in summary.replace('\\n\\n', '\n\n').split('\n\n') if p.strip()]
-        first_para = _markdown_to_html(paragraphs[0]) if paragraphs else ''
-        rest_paras = ''.join(
-            f'<p style="margin:8px 0 0;">{_markdown_to_html(p)}</p>'
-            for p in paragraphs[1:]
+        all_paras = ''.join(
+            f'<p style="margin:{"0" if i == 0 else "8px"} 0 0;">{_markdown_to_html(p)}</p>'
+            for i, p in enumerate(paragraphs)
         )
-
-        if rest_paras:
-            summary_html = f'''<div style="margin-top:10px; font-size:13px; line-height:1.6; color:{COLORS["text"]}; padding:12px; background:{COLORS["accent_bg"]}; border-radius:12px; border-left:3px solid {COLORS["accent_secondary"]};">
-  {first_para}
-  <details style="margin-top:6px;">
-    <summary style="cursor:pointer; font-size:11px; color:{COLORS["accent_primary"]}; font-weight:600; list-style:none; outline:none;">&#9660; Read full analysis</summary>
-    <div style="margin-top:8px; padding-top:8px; border-top:1px solid {COLORS["border"]};">{rest_paras}</div>
-  </details>
-</div>'''
-        else:
-            summary_html = (
-                f'<div style="margin-top:10px; font-size:13px; line-height:1.6; color:{COLORS["text"]}; '
-                f'padding:12px; background:{COLORS["accent_bg"]}; border-radius:12px; '
-                f'border-left:3px solid {COLORS["accent_secondary"]};">{first_para}</div>'
-            )
+        summary_html = (
+            f'<div style="margin-top:10px; font-size:13px; line-height:1.6; color:{COLORS["text"]}; '
+            f'padding:12px; background:{COLORS["accent_bg"]}; border-radius:12px; '
+            f'border-left:3px solid {COLORS["accent_secondary"]};">{all_paras}</div>'
+        )
 
     papers_count = f'<span style="background:{COLORS["accent_bg"]}; color:{COLORS["text"]}; padding:4px 12px; border-radius:999px; font-size:10px; font-weight:600; display:inline-block;">{size} papers</span>'
 
@@ -257,13 +233,11 @@ def _front_card_with_affiliations(front: dict, aff_info: Optional[dict]) -> str:
                 f'</li>'
             )
         papers_html = (
-            f'<details style="margin-top:10px;">'
-            f'<summary style="cursor:pointer; font-size:11px; color:{COLORS["accent_primary"]}; '
-            f'font-weight:600; list-style:none; outline:none;">'
-            f'&#9660; {len(papers_detail)} papers in this front</summary>'
-            f'<ul style="margin:8px 0 0; padding:0; border-top:1px solid {COLORS["border"]};">'
+            f'<div style="margin-top:10px; font-size:11px; color:{COLORS["accent_primary"]}; font-weight:600;">'
+            f'{len(papers_detail)} papers in this front</div>'
+            f'<ul style="margin:4px 0 0; padding:0; border-top:1px solid {COLORS["border"]};">'
             + ''.join(rows)
-            + '</ul></details>'
+            + '</ul>'
         )
 
     return f"""<tr><td style="padding:16px 24px; border-bottom:1px solid {COLORS['border']}; background:{COLORS['card_bg']};">
