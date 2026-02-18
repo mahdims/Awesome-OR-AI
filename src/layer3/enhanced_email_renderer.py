@@ -104,8 +104,18 @@ def _priority_paper_row(item: dict, rank: int) -> str:
     pub_date = paper.get('published_date', '')[:10]
     affiliations = paper.get('affiliations', '')
 
-    # Brief — always show in full (<details> is stripped by Gmail)
-    brief_html = _markdown_to_html(paper.get('brief', ''))
+    # Brief with Gmail-compatible checkbox toggle
+    full_brief = _markdown_to_html(paper.get('brief', ''))
+    safe_id = (arxiv_id or 'x').replace('.', '-')
+    if len(full_brief) > 250:
+        brief_html = (
+            f"{full_brief[:250]}..."
+            f'<input type="checkbox" id="rd-{safe_id}" class="rd-cb">'
+            f'<label for="rd-{safe_id}" style="color:{COLORS["accent_primary"]}; cursor:pointer; font-weight:600; font-size:12px; display:block; margin-top:6px;">▶ Read more</label>'
+            f'<div class="rd-content" style="padding-top:8px; border-top:1px solid {COLORS["border"]}; margin-top:6px;">{full_brief}</div>'
+        )
+    else:
+        brief_html = full_brief
 
     # MPI scores as muted chips
     mpi_chips = f'''<span style="background:{COLORS['accent_bg']}; color:{COLORS['text_muted']}; padding:2px 8px; border-radius:999px; font-weight:600; font-size:10px; margin-right:4px;">M={m}</span>
@@ -187,19 +197,33 @@ def _front_card_with_affiliations(front: dict, aff_info: Optional[dict]) -> str:
             f'{" ".join(method_tags)}</div>'
         )
 
-    # Summary — always show in full (<details> is stripped by Gmail)
+    # Summary with Gmail-compatible checkbox toggle
     summary_html = ''
     if summary and not summary.startswith('['):
         paragraphs = [p.strip() for p in summary.replace('\\n\\n', '\n\n').split('\n\n') if p.strip()]
-        all_paras = ''.join(
-            f'<p style="margin:{"0" if i == 0 else "8px"} 0 0;">{_markdown_to_html(p)}</p>'
-            for i, p in enumerate(paragraphs)
+        first_para = _markdown_to_html(paragraphs[0]) if paragraphs else ''
+        rest_paras = ''.join(
+            f'<p style="margin:8px 0 0;">{_markdown_to_html(p)}</p>'
+            for p in paragraphs[1:]
         )
-        summary_html = (
-            f'<div style="margin-top:10px; font-size:13px; line-height:1.6; color:{COLORS["text"]}; '
-            f'padding:12px; background:{COLORS["accent_bg"]}; border-radius:12px; '
-            f'border-left:3px solid {COLORS["accent_secondary"]};">{all_paras}</div>'
-        )
+        if rest_paras:
+            summary_html = (
+                f'<div style="margin-top:10px; font-size:13px; line-height:1.6; color:{COLORS["text"]}; '
+                f'padding:12px; background:{COLORS["accent_bg"]}; border-radius:12px; '
+                f'border-left:3px solid {COLORS["accent_secondary"]};">'
+                f'<p style="margin:0;">{first_para}</p>'
+                f'<input type="checkbox" id="fs-{short_id}" class="rd-cb">'
+                f'<label for="fs-{short_id}" style="color:{COLORS["accent_primary"]}; cursor:pointer; font-weight:600; font-size:11px; display:block; margin-top:6px;">&#9660; Read full analysis</label>'
+                f'<div class="rd-content" style="padding-top:8px; border-top:1px solid {COLORS["border"]}; margin-top:6px;">{rest_paras}</div>'
+                f'</div>'
+            )
+        else:
+            summary_html = (
+                f'<div style="margin-top:10px; font-size:13px; line-height:1.6; color:{COLORS["text"]}; '
+                f'padding:12px; background:{COLORS["accent_bg"]}; border-radius:12px; '
+                f'border-left:3px solid {COLORS["accent_secondary"]};">'
+                f'<p style="margin:0;">{first_para}</p></div>'
+            )
 
     papers_count = f'<span style="background:{COLORS["accent_bg"]}; color:{COLORS["text"]}; padding:4px 12px; border-radius:999px; font-size:10px; font-weight:600; display:inline-block;">{size} papers</span>'
 
@@ -233,11 +257,12 @@ def _front_card_with_affiliations(front: dict, aff_info: Optional[dict]) -> str:
                 f'</li>'
             )
         papers_html = (
-            f'<div style="margin-top:10px; font-size:11px; color:{COLORS["accent_primary"]}; font-weight:600;">'
-            f'{len(papers_detail)} papers in this front</div>'
+            f'<input type="checkbox" id="fp-{short_id}" class="rd-cb">'
+            f'<label for="fp-{short_id}" style="margin-top:10px; font-size:11px; color:{COLORS["accent_primary"]}; font-weight:600; cursor:pointer; display:block;">&#9660; {len(papers_detail)} papers in this front</label>'
+            f'<div class="rd-content">'
             f'<ul style="margin:4px 0 0; padding:0; border-top:1px solid {COLORS["border"]};">'
             + ''.join(rows)
-            + '</ul>'
+            + '</ul></div>'
         )
 
     return f"""<tr><td style="padding:16px 24px; border-bottom:1px solid {COLORS['border']}; background:{COLORS['card_bg']};">

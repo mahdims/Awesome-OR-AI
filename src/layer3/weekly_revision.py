@@ -154,7 +154,8 @@ def revise_living_review(category: str, db: Database,
     # Replace "## Research Fronts" ... "## Bridge Papers" or "---"
     fronts_pattern = r'## Research Fronts.*?(?=## Bridge Papers|---\s*\n\*Generated)'
     if re.search(fronts_pattern, content, re.DOTALL):
-        content = re.sub(fronts_pattern, fronts_text + '\n\n', content, flags=re.DOTALL)
+        _ft = fronts_text + '\n\n'
+        content = re.sub(fronts_pattern, lambda m: _ft, content, flags=re.DOTALL)
     else:
         # Append if marker not found
         content += '\n\n' + fronts_text
@@ -163,7 +164,8 @@ def revise_living_review(category: str, db: Database,
     bridge_pattern = r'## Bridge Papers.*?(?=---\s*\n\*Generated|\Z)'
     if bridges_text:
         if re.search(bridge_pattern, content, re.DOTALL):
-            content = re.sub(bridge_pattern, bridges_text + '\n\n', content, flags=re.DOTALL)
+            _bt = bridges_text + '\n\n'
+            content = re.sub(bridge_pattern, lambda m: _bt, content, flags=re.DOTALL)
         else:
             content += '\n\n' + bridges_text
 

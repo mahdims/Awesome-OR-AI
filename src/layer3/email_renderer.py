@@ -130,12 +130,19 @@ def _wrap_email(title: str, body: str, date_str: str = None,
 
     return f"""<!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>{title}</title></head>
+<head><meta charset="utf-8"><title>{title}</title>
+<style>
+/* Gmail-compatible toggle: checkbox + sibling selector */
+.rd-cb {{ display:none; }}
+.rd-content {{ max-height:0; overflow:hidden; transition:max-height .2s ease; }}
+.rd-cb:checked ~ .rd-content {{ max-height:9999px; }}
+</style>
+</head>
 <body style="margin:0; padding:0; background:{COLORS['bg']}; font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; color:{COLORS['text']}; font-size:14px; line-height:1.5;">
 <div style="display:none; max-height:0; overflow:hidden; mso-hide:all; opacity:0; color:transparent;">Research Intelligence curated digest — Latest papers, research fronts, and framework evolution.</div>
 <table width="100%" cellpadding="0" cellspacing="0" style="background:{COLORS['bg']};">
-<tr><td align="center" style="padding:16px 10px;">
-<table width="680" cellpadding="0" cellspacing="0" style="max-width:680px; width:100%;">
+<tr><td align="center" style="padding:0;">
+<table width="85%" cellpadding="0" cellspacing="0" style="width:85%;">
 
 <tr><td style="background:linear-gradient(135deg, {COLORS['gradient_start']} 0%, {COLORS['gradient_end']} 100%); color:white; padding:20px 24px; border-radius:16px 16px 0 0;">
 <table width="100%" cellpadding="0" cellspacing="0">
@@ -203,8 +210,18 @@ def _paper_row(paper: dict, rank: int = 0) -> str:
     pub_date = paper.get('published_date', '')[:10]
     affiliations = paper.get('affiliations', '')
 
-    # Brief — always show in full (<details> is stripped by Gmail)
-    brief_html = _markdown_to_html(paper.get('brief', ''))
+    # Brief with Gmail-compatible checkbox toggle
+    full_brief = _markdown_to_html(paper.get('brief', ''))
+    safe_id = (arxiv_id or 'x').replace('.', '-')
+    if len(full_brief) > 300:
+        brief_html = (
+            f"{full_brief[:300]}..."
+            f'<input type="checkbox" id="rd-{safe_id}" class="rd-cb">'
+            f'<label for="rd-{safe_id}" style="color:{COLORS["accent_primary"]}; cursor:pointer; font-weight:600; font-size:12px; display:block; margin-top:6px;">▶ Read more</label>'
+            f'<div class="rd-content" style="padding-top:8px; border-top:1px solid {COLORS["border"]}; margin-top:6px;">{full_brief}</div>'
+        )
+    else:
+        brief_html = full_brief
 
     # Modern rank badge
     rank_label = f'<span style="display:inline-block; background:{COLORS["accent_primary"]}; color:white; padding:2px 10px; border-radius:12px; font-size:11px; font-weight:700; margin-right:8px;">#{rank}</span>' if rank else ''
@@ -379,8 +396,9 @@ def _render_front_card(front: dict, front_methods: dict,
   {methods_html}
   {summary_html}
   <div style="margin-top:8px;">
-    <div style="font-size:12px; color:{COLORS['link']}; font-weight:bold; margin-bottom:4px;">Papers in this front</div>
-    <div style="padding-left:8px;">
+    <input type="checkbox" id="fp-{short_id}" class="rd-cb">
+    <label for="fp-{short_id}" style="font-size:12px; color:{COLORS['link']}; font-weight:bold; cursor:pointer; display:block;">▶ Papers in this front</label>
+    <div class="rd-content" style="padding-left:8px;">
       {papers_html}
     </div>
   </div>
