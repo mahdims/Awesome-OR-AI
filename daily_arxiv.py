@@ -1107,6 +1107,52 @@ def update_json_file(filename,data_dict):
     with open(filename, "w", encoding='utf-8') as f:
         json.dump(json_data, f)
 
+def _sync_papers_to_db(data_dict):
+    """Write papers from data_dict into the `papers` intake table in the DB.
+
+    data_dict: list of {category: {arxiv_id: pipe_string}} (same as update_json_file).
+    Safe to call after update_json_file — idempotent upsert.
+    """
+    if _Database is None:
+        return
+    try:
+        db = _Database()
+        with db:
+            for chunk in data_dict:
+                for category, papers in chunk.items():
+                    for arxiv_id, content in papers.items():
+                        s = str(content)
+                        parts = s.split("|")
+                        try:
+                            if len(parts) >= 9:
+                                raw_date, title, authors = parts[1].strip(), parts[2].strip(), parts[3].strip()
+                                affiliation = parts[4].strip()
+                                venue = parts[5].strip()
+                                raw_code = parts[7].strip()
+                            elif len(parts) >= 8:
+                                raw_date, title, authors = parts[1].strip(), parts[2].strip(), parts[3].strip()
+                                affiliation = ""
+                                venue = parts[4].strip()
+                                raw_code = parts[6].strip()
+                            else:
+                                raw_date, title, authors = parts[1].strip(), parts[2].strip(), parts[3].strip()
+                                affiliation, venue = "", ""
+                                raw_code = parts[5].strip()
+                        except IndexError:
+                            continue
+                        date_clean = re.sub(r'\*+', '', raw_date).strip()
+                        title_clean = re.sub(r'\*+', '', title).strip()
+                        m = re.match(r'\[([^\]]+)\]', title_clean)
+                        if m:
+                            title_clean = m.group(1)
+                        url_m = re.search(r'\[link\]\((.+?)\)', raw_code)
+                        code_url = url_m.group(1) if url_m else ""
+                        db.upsert_paper(arxiv_id, category, title_clean, authors,
+                                        date_clean, affiliation, venue, code_url)
+    except Exception as e:
+        logging.warning(f"[papers table] Sync failed (non-fatal): {e}")
+
+
 def json_to_md(filename,md_filename,
                task = '',
                to_web = False,
@@ -1318,8 +1364,17 @@ def demo(**config):
         if config['update_paper_links']:
             print("  Enriching paper links (readme JSON) ...", end=" ", flush=True)
             update_paper_links(json_file)
+            # Sync enriched data back to papers table
+            if _Database:
+                try:
+                    db = _Database()
+                    with db:
+                        db.migrate_json_to_papers(json_file)
+                except Exception as e:
+                    logging.warning(f"[papers table] Sync after update_paper_links failed: {e}")
         else:
             update_json_file(json_file, data_collector)
+            _sync_papers_to_db(data_collector)
         print("done", flush=True)
 
     # 2. update docs JSON file (to gitpage)
@@ -1469,6 +1524,7 @@ def redo_category(category_name, **config):
     print(f"\n[4/5] Saving results ...", flush=True)
     if publish_readme:
         update_json_file(config['json_readme_path'], data_collector)
+        _sync_papers_to_db(data_collector)
         print(f"  JSON (readme) updated", flush=True)
     if publish_gitpage:
         update_json_file(config['json_gitpage_path'], data_collector_web)

@@ -55,7 +55,7 @@ def extract_framework_lineages(db: Database,
         papers = db.get_papers_by_category(category)
     else:
         papers = [dict(r) for r in db.fetchall(
-            "SELECT * FROM paper_analyses ORDER BY published_date DESC"
+            "SELECT * FROM paper_analyses WHERE is_relevant = 1 ORDER BY published_date DESC"
         )]
 
     lineages = defaultdict(list)

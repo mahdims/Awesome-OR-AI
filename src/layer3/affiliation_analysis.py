@@ -162,7 +162,7 @@ def get_top_affiliations_overall(db: Database,
         papers = db.get_papers_by_category(category)
     else:
         papers = [dict(r) for r in db.fetchall(
-            "SELECT affiliations FROM paper_analyses"
+            "SELECT affiliations FROM paper_analyses WHERE is_relevant = 1"
         )]
 
     aff_counter = Counter()

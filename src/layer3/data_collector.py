@@ -271,10 +271,10 @@ def collect_monthly_data(category: str, db: Database,
     """
     weekly = collect_weekly_data(category, db, days=days)
 
-    # Also include ALL papers for the full review
+    # Also include ALL relevant papers for the full review
     all_rows = db.fetchall(
         """SELECT * FROM paper_analyses
-           WHERE category = ?
+           WHERE category = ? AND is_relevant = 1
            ORDER BY published_date DESC""",
         (category,)
     )

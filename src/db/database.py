@@ -51,6 +51,7 @@ class Database:
             self.conn.execute("ALTER TABLE paper_analyses ADD COLUMN venue TEXT")
         except Exception:
             pass  # column already exists
+        self.conn.commit()
         return self
 
     def close(self):
@@ -99,7 +100,11 @@ class Database:
     def _compute_is_relevant(relevance, significance) -> int:
         """Return 1 if paper passes the positioning filter, 0 otherwise.
 
-        Threshold: max(methodological, problem, inspirational) >= 6  OR  must_read == True.
+        Threshold: (max(M,P,I) >= 6  AND  sum(M,P,I) >= 18)  OR  must_read == True.
+
+        The dual condition ensures papers score well in at least one dimension
+        (max >= 6) AND have sufficient overall relevance (sum >= 18), preventing
+        one-dimensional papers (e.g. 10/0/0) from passing. must_read overrides.
         Accepts either a dict or a JSON string for both arguments.
         """
         if isinstance(relevance, str):
@@ -114,12 +119,13 @@ class Database:
                 significance = {}
         rel = relevance or {}
         sig = significance or {}
-        max_score = max(
-            rel.get('methodological', 0),
-            rel.get('problem', 0),
-            rel.get('inspirational', 0),
-        )
-        return 1 if (max_score >= 6 or sig.get('must_read', False)) else 0
+        m = rel.get('methodological', 0)
+        p = rel.get('problem', 0)
+        i = rel.get('inspirational', 0)
+        max_score = max(m, p, i)
+        sum_score = m + p + i
+        passes_scores = (max_score >= 6 and sum_score >= 18)
+        return 1 if (passes_scores or sig.get('must_read', False)) else 0
 
     def insert_analysis(self, analysis: Dict):
         """Insert new paper analysis."""
@@ -366,6 +372,119 @@ class Database:
                 except (json.JSONDecodeError, TypeError):
                     pass
         self.commit()
+
+    # === Fetched Papers (intake table) ===
+
+    def upsert_paper(self, arxiv_id: str, category: str, title: str = "",
+                     authors: str = "", date: str = "", affiliation: str = "",
+                     venue: str = "", code_url: str = ""):
+        """Insert or update a fetched paper in the intake table.
+
+        Only updates non-empty fields; never overwrites with blank values.
+        """
+        self.execute(
+            """INSERT INTO papers (arxiv_id, category, title, authors, date, affiliation, venue, code_url)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(arxiv_id, category) DO UPDATE SET
+                   title       = CASE WHEN excluded.title != ''       THEN excluded.title       ELSE title END,
+                   authors     = CASE WHEN excluded.authors != ''     THEN excluded.authors     ELSE authors END,
+                   date        = CASE WHEN excluded.date != ''        THEN excluded.date        ELSE date END,
+                   affiliation = CASE WHEN excluded.affiliation != '' THEN excluded.affiliation ELSE affiliation END,
+                   venue       = CASE WHEN excluded.venue != ''       THEN excluded.venue       ELSE venue END,
+                   code_url    = CASE WHEN excluded.code_url != ''    THEN excluded.code_url    ELSE code_url END""",
+            (arxiv_id, category, title or "", authors or "", date or "",
+             affiliation or "", venue or "", code_url or "")
+        )
+
+    def get_all_papers(self, category: str = None) -> Dict[str, List[Dict]]:
+        """Return all fetched papers grouped by category.
+
+        Returns: {category_name: [{arxiv_id, title, authors, date, affiliation, venue, code_url}, ...]}
+        """
+        if category:
+            rows = self.fetchall(
+                "SELECT * FROM papers WHERE category = ? ORDER BY date DESC",
+                (category,)
+            )
+        else:
+            rows = self.fetchall(
+                "SELECT * FROM papers ORDER BY category, date DESC"
+            )
+        result: Dict[str, List[Dict]] = {}
+        for row in rows:
+            d = dict(row)
+            cat = d['category']
+            if cat not in result:
+                result[cat] = []
+            result[cat].append(d)
+        return result
+
+    def get_unanalyzed_paper_ids(self, category: str) -> List[str]:
+        """Return arxiv_ids of papers in `papers` table not yet in `paper_analyses`."""
+        rows = self.fetchall(
+            """SELECT p.arxiv_id FROM papers p
+               WHERE p.category = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM paper_analyses a WHERE a.arxiv_id = p.arxiv_id
+               )""",
+            (category,)
+        )
+        return [row['arxiv_id'] for row in rows]
+
+    def migrate_json_to_papers(self, json_path) -> int:
+        """One-time migration: populate `papers` table from docs/or-llm-daily.json.
+
+        Safe to call repeatedly — uses ON CONFLICT DO UPDATE (upsert).
+        Returns number of papers upserted.
+        """
+        import json as _json
+        import re as _re
+        path = Path(json_path)
+        if not path.exists():
+            return 0
+
+        with open(path, encoding='utf-8') as f:
+            data = _json.load(f)
+
+        count = 0
+        for cat, papers in data.items():
+            for pid, content in papers.items():
+                s = str(content)
+                parts = s.split("|")
+                try:
+                    if len(parts) >= 9:
+                        raw_date, title, authors = parts[1].strip(), parts[2].strip(), parts[3].strip()
+                        affiliation = parts[4].strip()
+                        venue = parts[5].strip()
+                        raw_code = parts[7].strip()
+                    elif len(parts) >= 8:
+                        raw_date, title, authors = parts[1].strip(), parts[2].strip(), parts[3].strip()
+                        affiliation = ""
+                        venue = parts[4].strip()
+                        raw_code = parts[6].strip()
+                    else:
+                        raw_date, title, authors = parts[1].strip(), parts[2].strip(), parts[3].strip()
+                        affiliation, venue = "", ""
+                        raw_code = parts[5].strip()
+                except IndexError:
+                    continue
+
+                # Clean date (strip markdown bold)
+                date_clean = _re.sub(r'\*+', '', raw_date).strip()
+                # Clean title
+                title_clean = _re.sub(r'\*+', '', title).strip()
+                m = _re.match(r'\[([^\]]+)\]', title_clean)
+                if m:
+                    title_clean = m.group(1)
+                # Extract code URL
+                url_m = _re.search(r'\[link\]\((.+?)\)', raw_code)
+                code_url = url_m.group(1) if url_m else ""
+
+                self.upsert_paper(pid, cat, title_clean, authors, date_clean,
+                                  affiliation, venue, code_url)
+                count += 1
+        self.commit()
+        return count
 
     # === Review Updates ===
 

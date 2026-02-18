@@ -165,6 +165,27 @@ CREATE INDEX IF NOT EXISTS idx_bridge_category ON bridge_papers(category, snapsh
 CREATE INDEX IF NOT EXISTS idx_bridge_score ON bridge_papers(bridge_score DESC);
 
 -- ============================================================================
+-- INTAKE: Fetched Papers (all papers that passed Stage-1 filter)
+-- Replaces docs/or-llm-daily.json as the single source of truth for the paper list.
+-- Includes unanalyzed papers (not yet in paper_analyses).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS papers (
+    arxiv_id    TEXT NOT NULL,
+    category    TEXT NOT NULL,
+    title       TEXT,
+    authors     TEXT,           -- "First Author et.al." string
+    date        TEXT,           -- Published date YYYY-MM-DD
+    affiliation TEXT,
+    venue       TEXT,
+    code_url    TEXT,           -- Extracted URL (not markdown link)
+    fetched_at  TEXT DEFAULT (date('now')),
+    PRIMARY KEY (arxiv_id, category)
+);
+
+CREATE INDEX IF NOT EXISTS idx_papers_category ON papers(category, date DESC);
+
+-- ============================================================================
 -- LAYER 3: Living Review Metadata
 -- ============================================================================
 

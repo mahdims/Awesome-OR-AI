@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from layer1.pipeline import PaperAnalysisPipeline
 from db.database import Database
 
+# Fallback JSON path used only when the papers table is empty (first run)
 JSON_PATH = Path("docs/or-llm-daily.json")
 
 def parse_pipe_delimited_paper(content: str, arxiv_id: str) -> dict:
@@ -94,71 +95,89 @@ def main():
         print("\nAlternatively, you can configure different models in src/config.py")
         return 1
 
-    # Load papers from existing JSON
-    if not JSON_PATH.exists():
-        print(f"ERROR: Paper database not found at {JSON_PATH}")
-        print("Run daily_arxiv.py first to collect papers")
-        return 1
-
-    with open(JSON_PATH) as f:
-        data = json.load(f)
-
     print(f"{'='*70}")
     print(f"LAYER 1: DEEP PAPER ANALYSIS")
     print(f"{'='*70}")
-    print(f"Source: {JSON_PATH}")
-    print(f"Categories: {len(data)}")
+
+    db = Database()
+
+    # One-time migration: if papers table is empty, seed it from JSON
+    with db:
+        row = db.fetchone("SELECT COUNT(*) as cnt FROM papers")
+        if row and row['cnt'] == 0 and JSON_PATH.exists():
+            print(f"[MIGRATE] papers table is empty — seeding from {JSON_PATH} ...")
+            n = db.migrate_json_to_papers(JSON_PATH)
+            print(f"  Migrated {n} papers into papers table")
+
+    # Load paper list from DB (papers table)
+    with db:
+        all_papers_by_cat = db.get_all_papers()
+
+    if args.category:
+        if args.category not in all_papers_by_cat:
+            print(f"[WARN] Category not found in papers table: {args.category}")
+            # Fallback to JSON
+            if JSON_PATH.exists():
+                with open(JSON_PATH) as f:
+                    data = json.load(f)
+                all_papers_by_cat = {k: {p['arxiv_id']: p for p in plist}
+                                     for k, plist in db.get_all_papers().items()}
+            else:
+                return 1
+        categories = [args.category]
+    else:
+        categories = list(all_papers_by_cat.keys())
+
+    print(f"Source: papers table (DB)")
+    print(f"Categories: {len(categories)}")
     print(f"{'='*70}\n")
 
-    # Initialize pipeline (API key read from environment via config)
+    # Initialize pipeline
     if not args.dry_run:
         pipeline = PaperAnalysisPipeline()
-        db = Database()
-    else:
-        db = Database()
 
     total_papers = 0
     total_unanalyzed = 0
     papers_to_analyze = []
 
     # Process each category
-    categories = [args.category] if args.category else data.keys()
-
     for category in categories:
-        if category not in data:
-            print(f"[WARN] Category not found: {category}")
-            continue
-
-        papers = data[category]
+        cat_papers = all_papers_by_cat.get(category, [])
         print(f"\n{'='*70}")
         print(f"Category: {category}")
         print(f"{'='*70}")
 
-        # Get unanalyzed papers
-        paper_ids = list(papers.keys())
+        paper_ids = [p['arxiv_id'] for p in cat_papers]
         total_papers += len(paper_ids)
 
         with db:
-            unanalyzed = db.get_unanalyzed_papers(category, paper_ids)
+            unanalyzed_ids = db.get_unanalyzed_paper_ids(category)
 
         print(f"Total papers: {len(paper_ids)}")
-        print(f"Already analyzed: {len(paper_ids) - len(unanalyzed)}")
-        print(f"Unanalyzed: {len(unanalyzed)}")
+        print(f"Already analyzed: {len(paper_ids) - len(unanalyzed_ids)}")
+        print(f"Unanalyzed: {len(unanalyzed_ids)}")
 
-        if not unanalyzed:
+        if not unanalyzed_ids:
             print("  [INFO] All papers in this category already analyzed!")
             continue
 
-        total_unanalyzed += len(unanalyzed)
+        total_unanalyzed += len(unanalyzed_ids)
 
-        # Parse unanalyzed papers
-        for arxiv_id in unanalyzed:
-            content = papers[arxiv_id]
-            parsed = parse_pipe_delimited_paper(content, arxiv_id)
-
-            if parsed:
-                parsed['category'] = category
-                papers_to_analyze.append(parsed)
+        # Build paper dicts for unanalyzed IDs
+        paper_lookup = {p['arxiv_id']: p for p in cat_papers}
+        for arxiv_id in unanalyzed_ids:
+            p = paper_lookup.get(arxiv_id)
+            if p is None:
+                continue
+            papers_to_analyze.append({
+                'arxiv_id':       arxiv_id,
+                'title':          p.get('title', ''),
+                'authors':        [p.get('authors', 'Unknown').split()[0]] if p.get('authors') else ['Unknown'],
+                'affiliation':    p.get('affiliation', ''),
+                'abstract':       '',  # fetched from PDF
+                'published_date': p.get('date', ''),
+                'category':       category,
+            })
 
     # Apply max limit
     if args.max:
@@ -202,6 +221,12 @@ def main():
     else:
         print(f"\n✗ No papers were successfully analyzed")
         return 1
+
+    # Backfill is_relevant for any papers that pre-date automatic flag computation
+    print(f"\n[BACKFILL] Recomputing is_relevant flags for all papers...")
+    with db:
+        updated = db.recompute_relevance_flags()
+    print(f"  is_relevant flag set for {updated} papers")
 
     return 0
 
