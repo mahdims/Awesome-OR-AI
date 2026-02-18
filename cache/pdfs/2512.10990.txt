@@ -1,0 +1,1936 @@
+--- Page 1 ---
+Dora: QoE-Aware Hybrid Parallelism for Distributed
+Edge AI
+Jianli Jin∗
+UIUC
+jianlij2@illinois.edu
+Ziyang Lin∗
+UIUC
+ziyang10@illinois.edu
+Qianli Dong
+Northwestern University
+qianlid@northwestern.edu
+Yi Chen
+University of California, Riverside
+ychen1329@ucr.edu
+Jayanth Srinivasa
+Cisco Research
+jasriniv@cisco.com
+Myungjin Lee
+Cisco Research
+myungjle@cisco.com
+Zhaowei Tan
+University of California, Riverside
+ztan@ucr.edu
+Fan Lai
+UIUC
+fanlai@illinois.edu
+Abstract
+With the proliferation of edge AI applications, satisfying user
+quality of experience (QoE) requirements, such as model in-
+ference latency, has become a first-class objective, as these
+models operate in resource-constrained settings and directly
+interact with users. Yet, modern AI models routinely exceed
+the resource capacity of individual devices, necessitating dis-
+tributed execution across heterogeneous devices over vari-
+able and contention-prone networks. Existing planners for
+hybrid (e.g., data and pipeline) parallelism largely optimize
+for throughput or device utilization, overlooking QoE, lead-
+ing to severe resource inefficiency (e.g., unnecessary energy
+drain), or QoE violations under runtime dynamics.
+We present Dora, a framework for QoE-aware hybrid par-
+allelism in distributed edge AI training and inference. Dora
+jointly optimizes heterogeneous computation, contention-
+prone networks, and multi-dimensional QoE objectives via
+three key mechanisms: (i) a heterogeneity-aware model par-
+titioner that determines and assigns model partitions across
+devices, forming a compact set of QoE-compliant plans; (ii)
+a contention-aware network scheduler further refines these
+candidate plans by maximizing compute–communication
+overlap; and (iii) a runtime adapter that adaptively com-
+poses multiple plans to maximize global efficiency while
+respecting overall QoEs. Across representative edge deploy-
+ments—including smart homes, traffic analytics, and small
+edge clusters—Dora achieves 1.1–6.3× faster execution and,
+alternatively, reduces energy consumption by 21–82%, all
+while maintaining QoE under runtime dynamics.
+1
+Introduction
+The proliferation of on-device AI applications—ranging from
+large language models (LLMs)-powered assistants [17, 28, 31]
+∗Both authors contributed equally to this research.
+and smart robotics [4, 27] to video surveillance [22] with mul-
+timodal LLMs—has brought Quality of Experience (QoE) to
+the forefront of edge AI tuning and inference. Unlike cloud-
+based deployments, where the system’s primary objective is
+to maximize throughput [28, 39] or resource efficiency [3]
+for aggregate performance across users, on-device AI often
+serves individual users, needing to satisfy per-user QoE re-
+quirements such as training or serving latency [6, 10] and
+energy efficiency [28].
+Aligning execution with these QoE targets not only en-
+sures service quality but also improves system efficiency:
+exceeding QoE thresholds yields diminishing perceptual re-
+turns while wasting scarce resources. For example, in feder-
+ated learning, clients only need to train quickly enough to
+avoid delaying the global aggregation round across hundreds
+of clients [12, 14]; in continuous or personalized learning,
+training needs only keep pace with data generation (e.g., sen-
+sor events or app usage), thereby reducing interference with
+foreground tasks and conserving energy. On the inference
+side, users interacting with on-device LLMs expect token
+generation rates aligned with human reading or interaction
+speed [18, 34], and edge cameras for traffic analytics need
+only track the natural rate of scene evolution [2, 5].
+However, meeting QoE requirements on a single edge de-
+vice is increasingly untenable (§2.1). Emerging applications
+depend on high-accuracy models that, while modest by cloud
+standards, saturate the compute, memory, and energy en-
+velopes of edge devices. Running Qwen3-4B alone requires
+roughly 12 GB of memory, while iPhone 15 offers only 6GB of
+RAM. Worse, even a fully charged iPhone 15 can sustain less
+than an hour of operation when running assistive edge-AI
+agents (e.g., small multimodal LLMs for visually impaired in-
+dividuals) [5, 19]. Increasingly, edge environments have mul-
+tiple compute-capable devices—smartphones, tablets, laptops
+in a home, or multiple AI cameras at an intersection—creating
+arXiv:2512.10990v1  [cs.DC]  9 Dec 2025
+
+
+--- Page 2 ---
+opportunities for QoE-aware, distributed model execution
+across edge devices. The goal is not merely to eliminate
+resource slack or maximize raw throughput, but to shape ex-
+ecution around user-driven QoE objectives while operating
+under the dynamism of real-world edge environments.
+Enforcing QoE-aware hybrid parallelism, such as com-
+bining data and pipeline parallelism across edge devices,
+introduces unique challenges (§2). Unlike controllable, ho-
+mogeneous cloud settings with abundant and predictable
+network bandwidth, edge deployments consist of devices
+with heterogeneous compute and memory capabilities, and
+communication over contention-prone wireless channels
+(e.g., WiFi) or irregular wired structures (e.g., chains or rings).
+Even very recent edge AI advances for distributed model ex-
+ecution [30] have largely overlooked these network effects,
+leading to 4× efficiency degradation, as contention erases
+the benefits of model parallelism. Under dynamics, these sys-
+tems frequently trigger heavy-weight replanning or model
+migration, stalling the service, while their emphasis on maxi-
+mizing raw throughput can cascade into QoE violations such
+as rapid battery drain or thermal throttling.
+This paper introduces Dora, a framework for distributed
+edge AI training and inference that generates parallelism
+plans explicitly to satisfy user-defined QoE objectives (e.g.,
+execution latency, energy usage). By aligning application-
+level performance needs with underlying model execution,
+Dora identifies the optimal balance between QoE and system
+efficiency, preventing unnecessary resource consumption
+while supporting existing edge AI software stacks with a few
+lines of code changes in APIs (§3).
+Overcoming the aforementioned challenges requires man-
+agement over the interplay of heterogeneity, contention,
+and multi-objective requirements. Even without network
+effects or QoE constraints, identifying an optimal hybrid
+parallelism plan under heterogeneous compute resources is
+already NP-hard [26]. Network contention further exacer-
+bates this challenge: computation dependencies that span
+shared links and irregular topologies can negate the gains
+of distributed computation, rendering compute-optimized
+plans ineffective. Dora tackles this interplay through: (i) a
+model partitioner that accounts for device heterogeneity to
+identify a compact set of QoE-compliant, compute–energy ef-
+ficient candidate plans (§4.1); and (ii) a contention-aware net-
+work scheduler that refines these candidates by adaptively
+allocating communication over networks to maximize com-
+putation–communication overlap, enabling Dora to select
+the plan that maximizes energy efficiency while satisfying
+user-specified QoE objectives (§4.2).
+Yet (offline) planning alone is insufficient, as edge envi-
+ronments are inherently dynamic: device capabilities shift
+due to background workloads or thermal events, and band-
+width fluctuates on subsecond timescales, rendering a pre-
+determined plan quickly suboptimal or even infeasible. To
+sustain QoE, Dora employs a runtime adapter that composes
+and switches among the Pareto-optimal plans over time,
+maximizing global efficiency while satisfying long-term QoE
+targets. It coordinates with the network planner to deliver
+rapid, low-overhead network re-planning to absorb tran-
+sient dynamics, while minimizing the cost of plan switching.
+This design enables second-scale responsiveness to dynamics
+while maintaining high overall efficiency (§4.3).
+We evaluate Dora across representative real-world edge
+AI deployments—including smart homes, traffic monitoring
+systems, and small edge clusters—and across modern model
+families (e.g., Qwen3) for both training and inference work-
+loads. Our results show that Dora delivers 1.1–6.3× higher
+model execution speed compared to state-of-the-art hybrid
+parallelism planners [20, 26, 30], and, to the best of our knowl-
+edge, represents the first framework to enable QoE-aware
+hybrid parallelism for edge AI. While meeting target QoE
+levels, Dora achieves 20.7–82% resource savings and adapts
+to runtime dynamics within seconds, ensuring sustained and
+efficient edge AI service.
+Overall, this paper makes the following contributions:
+• We introduce a new QoE-driven formulation of dis-
+tributed model parallelism for edge AI to maximize
+resource efficiency without hurting user experience.
+• We design a novel hybrid-parallelism planner to ac-
+count for heterogeneous compute, network contention,
+and dynamics, thereby maximizing QoE and efficiency.
+• We implement Dora and demonstrate 1.1–6.3× effi-
+ciency gains across real-world edge AI settings.
+2
+Background and Motivation
+We begin with a primer on QoE in edge AI, followed by the
+challenges it faces (§2.1), and conclude with the limitations
+of current advances that motivate our work (§2.2).
+2.1
+Quality of Experience in Edge AI
+Edge AI has become essential as end-user applications in-
+creasingly require real-time, privacy-preserving, and context-
+specific intelligence that cloud execution cannot reliably or
+cost-effectively provide [15, 19]. Tasks—such as on-device
+model tuning and personalization (e.g., federated learning,
+continual adaptation to user-specific behavior), as well as
+latency-sensitive inference for assistants, robotics, and emerg-
+ing on-device AI agents—require executing models in situ,
+close to the user and environment.
+QoE Requirements in Edge AI. For practical use, model
+execution must satisfy user-specific QoE constraints (e.g., on
+latency, compute, memory, and energy). For example, model
+2
+
+
+--- Page 3 ---
+0.6B
+8B
+14B
+3B
+30B
+0
+20
+40
+60
+80
+Accuracy (%)
+LLM
+MLLM
+28.5
+65.0
+76.0
+26.0
+65.5
+75.5
+37.0
+65.8
+34.2
+64.3
+Business
+Health
+Digital Farming
+MedicineAI
+(a) Qwen-3/Omni Performance.
+S20
+M15 4050 4060 V100 A40
+0.00
+0.05
+0.10
+0.15
+0.20
+0.25
+Time Between Tokens (sec)
+0.19 0.20
+0.17
+0.15
+0.11
+0.06
+(b) Qwen3-0.6B speed.
+Figure 1: (a) Edge AI desires higher-accuracy (thus often
+larger) models to unlock more applications, which yet of-
+ten exceed the capacity of single devices. (b) Increasingly,
+edge environments have devices with comparable compute.
+personalization should keep pace with data generation or
+complete within natural idle windows (e.g., charging periods
+or user sleep) [13, 15]; LLM generation needs to outpace
+user reading speed to avoid interaction stalls (e.g., < 200 ms
+per token [18])1; AR Navigation should process frames in 50
+ms [11]; and all executions must remain within device-level
+energy budgets [2, 19].
+Achieving practical use further requires high model ac-
+curacy (e.g., >75% for on-device health assistants), which
+pushes developers toward using larger models: our eval-
+uation (Figure 1a) of modern AI models (e.g., Qwen3 and
+Qwen2.5-Omni) on MMLU and MMMU-Pro benchmarks [9]
+shows about 50% accuracy gains when scaling from 0.6B to
+14B parameters. Yet such models often exceed typical de-
+vice envelopes. Even an INT4-quantized Qwen3-14B still
+demands >8 GB RAM for inference, whereas devices like the
+iPhone 15 Plus offer only 6 GB, resulting in the fundamental
+tension between QoE requirements and on-device capability.
+At the same time, we notice that edge environments in-
+creasingly include multiple compute-capable devices (Fig-
+ure 1b), such as smartphones (e.g., Samsung S20), tablets,
+and laptops (e.g., NVIDIA RTX 4060) at home or networks of
+cameras in traffic monitoring, opening a new opportunity for
+QoE-aware, distributed model training and inference across
+multiple devices to adapt to user QoE requirements.
+2.2
+Limitations of Existing Solutions
+Existing advances in distributed model execution, such as
+Megatron-LM [20] and PyTorch-FSDP [35], primarily rely on
+three forms of hybrid parallelism that partition model (e.g.,
+weights) or data across machines for collaborative execution:
+• Data Parallelism, which partitions the dataset across ma-
+chine groups, each maintaining a full model replica and
+synchronizing updates after every training iteration;
+• Pipeline Parallelism, which splits the model into sequen-
+tial layers assigned to different machines, passing inter-
+mediate layer outputs between stages;
+1LLMs process and generate text in units of tokens. For instance, the word
+“streaming” may be broken down into two tokens: “stream” and “ing.”
+Qwen-0.6
+Qwen-1.7
+10
+20
+30
+Latency per iteration(s)
+12.3
+28.4
+10.4
+15.5
+34.3
+13.2
+D2D
+Edge
+Optimal
+(a) Training Speed.
+Qwen-0.6
+Qwen-1.7
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+Time between tokens(s)
+0.8
+1.8
+0.6
+0.9
+2.2
+0.8
+D2D
+Edge
+Optimal
+(b) Inference Speed.
+Figure 2: Existing advances overlook heterogeneous hard-
+ware and network contention, leading to poor efficiency.
+• Tensor Parallelism, which partitions individual layers
+into sub-tensors across machines to further reduce per-
+machine memory footprint.
+While effective in cloud-scale environments, these ap-
+proaches, and even recent edge-targeted systems such as As-
+teroid [30], face fundamental limitations in meeting QoE re-
+quirements in resource-constrained and heterogeneous edge
+environments under dynamics (e.g., bandwidth changes).
+L1: Hardware and network heterogeneity and contention
+degrade efficiency. Edge devices vary widely in compute
+and memory capacity, and their inter-device communica-
+tion often occurs over shared, irregular, and contention-
+prone links (e.g., WiFi meshes or chained camera topologies).
+However, existing distributed execution frameworks com-
+monly assume homogeneous hardware [38] and/or uniform,
+contention-free D2D bandwidth (e.g., Asteroid [30]). In real
+edge environments, these assumptions routinely break down,
+causing parallelism plans to become suboptimal or invalid
+and leading to substantial efficiency losses.
+As shown in Figure 2, we evaluate a home deployment
+with two laptops and two phones connected via a shared
+650 Mbps WiFi network using Asteroid. We compare three
+settings: (1) D2D, an idealized environment where every
+device pair is given a dedicated 650 Mbps link with no con-
+tention; (2) Edge, where Asteroid’s generated parallelism
+plan is executed on the actual WiFi network; and (3) Optimal,
+a brute-force search that identifies the true optimal plan un-
+der the real network conditions. We observe that Asteroid’s
+plan suffers a 2.4× latency degradation when deployed in
+the real environment due to mismatches between assumed
+and actual network behavior, and remains 2.8× slower than
+the optimal hybrid parallelism plan.
+L2: Ignoring QoE constraints leads to ineffective execu-
+tion. Beyond suboptimal execution speed, existing hybrid
+parallelism planners largely ignore users’ QoE and device
+constraints, resulting in ineffective execution and excessive
+resource consumption. As shown in Figure 3a, generating
+the same response with Qwen-3 at different target speeds
+leads to starkly different energy costs: modestly slowing gen-
+eration, while still meeting QoE, can reduce energy usage by
+3
+
+
+--- Page 4 ---
+2.5
+7.5
+12.5
+17.5
+22.5
+Serving Throughput (tokens/sec)
+0
+2
+4
+6
+8
+10
+Energy  10
+2 Wh
+Laptop-1.7B
+Laptop-0.6B
+Desktop-1.7B
+Desktop-0.6B
+(a) Energy vs. Inference Speed.
+0
+10
+20
+30
+40
+50
+Time (sec)
+0
+2
+4
+6
+8
+10
+Throughput (tokens/sec)
+Download
+Video
+Watch
+Video
+Optimal
+Asteroid
+(b) Serving under dynamics.
+Figure 3: Existing advances ignore QoE, incurring ineffective
+efficiency and failing to sustain service under dynamics.
+more than an order of magnitude. Energy consumption fur-
+ther varies across devices (e.g., Laptop vs. Desktop by 2.5×),
+indicating that aligning execution with QoE targets and de-
+vice characteristics with informed parallelism can unlock
+substantial efficiency gains.
+L3: Slow responsiveness fails to handle runtime dy-
+namics. Maintaining QoE in edge environments requires
+rapid adaptation: devices may start foreground applications,
+experience bandwidth fluctuations, or enter thermal throt-
+tling, all of which can invalidate existing parallelism plans,
+spike latency, and stall service (e.g., due to plan switching).
+Figure 3b shows a representative case where a user down-
+loads and streams a video, introducing both network and
+compute interference. These common dynamics increase
+the end-to-end distributed inference latency of the Asteroid-
+generated plan by more than 38%. Unfortunately, existing
+planners require minutes to replan and switch plans (§6.3),
+orders of magnitude slower than typical edge fluctuations
+and rendering QoE guarantees infeasible under dynamics.
+3
+Dora Overview
+In this section, we introduce Dora, a QoE-aware hybrid par-
+allelism planner for distributed ML model execution in edge
+environments, including training, fine-tuning, and inference.
+Design Space. Dora accounts for heterogeneous device ca-
+pabilities (e.g., compute capability, network topology) and
+runtime dynamics to meet per-user QoE requirements such
+as execution speed and energy usage. This makes Dora appli-
+cable to diverse modern edge settings, such as smart homes
+with multiple personal devices, LAN-connected sensor net-
+works (e.g., camera clusters), and edge clusters with a num-
+ber of servers. We formalize QoE-aware hybrid parallelism
+planning in Dora as the following optimization problem:
+min
+∑︁
+𝑖∈D
+𝐸𝑖
+plan
+(1)
+s.t.
+𝑇plan ≤𝑇QoE
+(E2E latency constraint)
+𝐸𝑖
+plan ≤𝐸𝑖
+QoE, ∀𝑖∈D
+(Device energy constraint)
+𝑀𝑖
+plan ≤𝑀𝑖
+QoE, ∀𝑖∈D
+(Device memory constraint)
+Model
+Phase 1
+Model 
+Partioner
+Command
+QoE
+Latency
+Devices
+Network Scheduler
+Phase 2
+Runtime Adapter
+Top k Plans
+Network Topology
+mb0
+mb1
+mb0
+mb1
+mb2
+mb3
+Max Overlap
+Optimal Plan
+Backend
+Pytorch
+ONNX
+OR
+OR
+llama.cpp
+Figure 4: Dora decomposes the intertwined effects of hetero-
+geneous compute capabilities, contention-prone networks,
+and dynamics into three-phase optimizations.
+Here, 𝑇plan denotes the model execution latency under
+a given parallelism plan, while 𝑇QoE specifies the latency
+requirement (e.g., < 200 ms/token). The planner must respect
+each device’s local energy and memory budgets (𝐸𝑖
+QoE, 𝑀𝑖
+QoE).
+This formulation accommodates additional QoE constraints
+common in edge deployments (e.g., limiting computational
+usage to avoid interfering with foreground apps) without
+altering the core design.
+However, directly solving this constrained problem is
+challenging due to the intertwined effects of heterogeneous
+compute capabilities, contention-prone networks, and multi-
+dimensional QoE requirements. Even the subproblem of find-
+ing an optimal parallelism plan under heterogeneous com-
+pute alone is NP-hard [26]. Worse yet, even when the com-
+putation graph is fixed, variations in inter-device commu-
+nication patterns and network contention can lead to large
+swings in execution latency (§2.2).
+To make this space tractable while retaining QoE fidelity,
+Dora applies a Lagrangian relaxation [7] to convert the la-
+tency constraint into an unconstrained objective:
+min
+∑︁
+𝑖∈D
+𝐸𝑖
+plan + 𝜆·  𝑇plan −𝑇QoE
+
++
+(2)
+where (·)+ penalizes only QoE violations and 𝜆controls
+the tradeoff between energy savings and latency slack.
+As training exposes a broader set of parallelism challenges
+and the same formulation naturally applies to inference
+(which omits backward propagation), we use training as
+the primary example throughout the paper. We later show
+that Dora provides substantial benefits for inference too (§6).
+Workflow. At its core, Dora enables QoE-aware efficient
+parallelism by decomposing the intertwined effects of het-
+erogeneous compute capabilities, contention-prone network
+connections, and dynamics into three-phase optimizations,
+progressively pruning and refining plans to ensure decision
+quality while achieving second-scale decision efficiency. Fig-
+ure 4 illustrates the overall workflow of Dora: 1 Model
+Partitioner: Upon receiving a model execution request and
+user-specified QoE requirements, the Model Partitioner ac-
+counts for heterogeneous device resources and generates a
+set of QoE-compliant candidate parallelism plans. Each plan
+4
+
+
+--- Page 5 ---
+specifies how model states (e.g., weights) are partitioned (e.g.,
+via data, tensor, or pipeline parallelism) and placed across
+devices. 2 Network Scheduler: For each pre-selected QoE-
+compliant plan, the Network Scheduler optimizes end-to-end
+efficiency by maximizing communication–computation over-
+lap under heterogeneous and contention-prone networks
+(e.g., by deciding when to send traffic). It then selects the plan
+that yields the best overall efficiency. 3 Runtime Adaptor:
+During execution, the Runtime Adaptor dynamically adjusts
+the chosen plan, such as by reconfiguring communication
+schedules or switching parallelism strategies, to maintain
+QoE guarantees in the presence of runtime dynamics.
+4
+Dora Design
+We next introduce how Dora pushes the QoE-efficiency fron-
+tier of model parallelism into an efficient three-phase plan-
+ning process without sacrificing decision quality:
+• Phase 1 (Heter-Compute, Energy, and QoE-Aware):
+Quickly identify promising plans that satisfy QoE con-
+straints, accounting for heterogeneous devices yet relax-
+ing network complexity for fast pruning (§4.1).
+• Phase 2 (Heter-Network Aware): Incorporate network
+conditions to refine Stage 1 identified QoE-compliant
+plans and select the global optimal (§4.2).
+• Phase 3 (Dynamics Aware): Maintain QoE under run-
+time dynamics with fast, low-cost adjustments to model
+parallelism and network scheduling (§4.3).
+4.1
+Model Partitioner
+The model parallelism planner must jointly consider compu-
+tation placement and inter-device communication behavior
+(e.g., bandwidth allocation) to optimize the model’s end-to-
+end latency. However, considering these two simultaneously
+induces an exponential number of feasible parallelism plans,
+making search computationally infeasible. Our key insight
+is to first extract a tractable subset of promising plans by
+temporarily relaxing network contention.
+We assume a contention-free communication environ-
+ment in which every device pair (𝑖, 𝑗) can utilize its peak
+point-to-point bandwidth, i.e., the bandwidth attainable when
+the pair communicates in isolation. This assumption enlarges
+the feasible communication budget and therefore produces
+a superset of all QoE-compliant plans: in real deployments,
+bandwidth can only be lower due to contention, so any plan
+under the relaxed model can only become slower, not faster,
+under real conditions. Under this simplified modeling, the
+model partitioner efficiently identifies plans that satisfy QoE
+constraints and are compute- and energy-efficient, which are
+then refined and ranked in later stages under realistic net-
+work conditions to recover the globally optimal plan (§4.2).
+Planning Graph Construction. To capture computational
+dependencies of model layers, Dora employs a planning
+graph abstraction. We represent the target model as a di-
+rected acyclic graph 𝐺𝑀= (𝑉𝑀, 𝐸𝑀) based on model struc-
+ture, where each node denotes one or more layers. Adjacent
+layers whose combined size contributes less than Δ (e.g., 5%)
+of total model parameters are merged into a single node.
+This lightweight compression preserves structural accuracy
+while reducing graph size, thus planning overhead.
+This abstraction improves existing advances, which as-
+sume a strictly linear (chain-structured) execution order to
+scale planning for homogeneous clusters, based on two key
+observations. First, edge deployments are smaller in scale,
+while exhibiting greater heterogeneity in compute capabil-
+ity and contention-prone network conditions. Here, graph-
+based modeling is essential: it exposes fine-grained opportu-
+nities for parallelism and for overlapping computation with
+communication, yielding up to 31% latency improvement
+over chain-based formulations (§6.3).
+Second, modern ML models increasingly adopt non-chain
+structures. For example, multimodal LLMs integrate multiple
+modality-specific encoders and projectors (text, image, audio)
+that run concurrently around a shared LLM backbone. This
+further motivates a graph-centric representation.
+With the model represented as 𝐺𝑀, we express a hybrid
+parallelism plan 𝑃for 𝐺𝑀as a directed acyclic graph 𝐺𝑃=
+(𝑉𝑃, 𝐸𝑃). Each node 𝑣∈𝑉𝑃denotes a pipeline stage and is
+associated with a tuple (𝐺𝑣, 𝐷𝑣, 𝐵𝑣):𝐺𝑣is the model subgraph
+assigned to the stage; 𝐷𝑣⊆𝐷is the set of devices executing
+that stage. When |𝐷𝑣| > 1, the stage uses data parallelism
+across devices in 𝐷𝑣on the model partition 𝐺𝑣. 𝐵𝑣specifies
+the microbatch allocation across devices in 𝐷𝑣, where each
+entry 𝐵𝑣[𝑑𝑖] indicates how many samples device𝑑𝑖processes.
+A microbatch 𝐵𝑚partitions the global batch 𝐵, enabling
+pipelined execution and compute–communication overlap,
+and satisfies Í
+𝑑𝑖∈𝐷𝑣𝐵𝑣[𝑑𝑖] = 𝐵𝑚for every pipeline stage. As
+in prior work on distributed cloud and edge AI execution, we
+restrict tensor parallelism to within a single node (e.g., edge
+servers with multiple GPUs) due to its high communication
+intensity [26, 38].
+Each edge𝑒∈𝐸𝑃represents a dependency between pipeline
+parallelism stages. Together, this formulation defines how
+the model is partitioned, how stages are mapped to heteroge-
+neous devices, and how microbatches flow and synchronize
+across the distributed execution pipeline.
+Heterogeneity- and QoE-aware Graph Partitioning. Dora
+aims to minimize total resource consumption (e.g., energy)
+under explicit QoE constraints by optimally partitioning the
+model into pipeline stages and assigning each stage to hetero-
+geneous devices, which together form data-parallel groups.
+We formulate the problem as a dynamic programming (DP)
+5
+
+
+--- Page 6 ---
+Figure 5: Dora performs plan expansion to explore hybrid
+parallelism plans using a graph-level dynamic programming
+approach; each transition is optimized for the objective value.
+search, where each DP transition (plan expansion) selects
+the option that minimizes the objective in Eq. (2).
+To make the DP tractable on graphs, we first perform a
+serial decomposition of the model execution graph 𝐺𝑀so that
+each decomposed component 𝑔∈𝐺𝑀forms an independent
+serial chain of nodes. We then apply DP to each component
+to compute its locally optimal plan. Finally, we compose all
+partial plans to obtain the globally optimal plan for the entire
+model graph 𝐺𝑀. This DP formulation enables principled
+exploration of the search space over data, pipeline, and tensor
+parallelism, while pruning suboptimal prefixes early.
+As shown in Figure 5, within a decomposed component
+𝑔, the DP state is defined as 𝑄(𝑗,𝑠,𝑛), which denotes the
+optimal plan for partitioning the first 𝑗chains into 𝑠pipeline
+stages and assigning these stages to the first 𝑛devices. When
+we update 𝑄(𝑗,𝑠,𝑛), we consider two cases: (1) the 𝑗th chain
+spans multiple pipeline stages, or (2) the 𝑗th chain is entirely
+contained within a single pipeline stage (possibly bundled
+with several preceding chains). We introduce two DP sub-
+states to capture these cases:
+• 𝑄1(𝑗,𝑙,𝑠,𝑛): the best objective value obtained by assign-
+ing the first 𝑗−1 chains and the first 𝑙layers of the 𝑗th
+chain into 𝑠pipeline stages, and assigning these stages
+to the first 𝑛devices;
+• 𝑄2(𝑗,𝑘,𝑠,𝑛): the best objective value obtained by assign-
+ing chains 𝑘,𝑘+1, . . . , 𝑗entirely to a single pipeline stage,
+while partitioning the preceding 𝑘−1 chains into 𝑠−1
+stages, and finally assigning all resulting stages to the
+first 𝑛devices.
+These states’ updates are given by:
+𝑄1(𝑗,𝑙,𝑠,𝑛) = min
+𝑙′,𝑛′ b
+𝑄1(𝑗,𝑙′ →𝑙, 𝑠−1, 𝑛′ →𝑛)
+(3)
+𝑄2(𝑗,𝑘,𝑠,𝑛) = min
+𝑛′ b
+𝑄2(𝑘→𝑗, 𝑠−1, 𝑛′ →𝑛)
+(4)
+𝑄(𝑗,𝑠,𝑛) = min 𝑄1(𝑗, 𝐿,𝑠,𝑛), min
+1≤𝑘<𝑗𝑄2(𝑗,𝑘,𝑠,𝑛)
+(5)
+where 𝐿is the total number of layers in the 𝑗th chain.
+Algorithm 1 QoE-aware Hybrid Parallelism
+1: function ParallelismPlanner(𝐺𝑀, 𝐷)
+// Identify Top-K computation-optimized plans (§4.1)
+2:
+plans ←ModelPartitioner(𝐺𝑀, 𝐷)
+3:
+plan_candidates ←SelectTopK(plans)
+// Perform network-aware plan refinement (§4.2)
+4:
+plan_candidates ←NetworkScheduler(plan_candidates)
+// Perform runtime plan adaptation (§4.3)
+5:
+hybrid_plan ←RuntimeAdaptor(plan_candidates)
+6:
+return hybrid_plan
+7:
+8: function ModelPartitioner(𝐺𝑀, 𝐷)
+9:
+Serial decompose 𝐺𝑀to component set 𝐶
+10:
+for 𝑗from 1 to 𝐽do
+11:
+for 𝑛from 1 to 𝑁do
+12:
+Initialize 𝑄1(𝑗, 0,𝑠,𝑛)
+13:
+for 𝑙from 1 to 𝑁𝑗do
+14:
+Update 𝑄1(𝑗,𝑙,𝑠,𝑛) from Eq. (3) as 𝑄1
+15:
+for 𝑘from 1 to 𝑗do
+16:
+Update 𝑄2(𝑗,𝑘,𝑠,𝑛) from Eq. (4) as 𝑄2
+17:
+Update 𝑄(𝑗,𝑠,𝑛) from Eq. (5)
+18:
+return 𝑃
+Algorithm 1 illustrates our core parallelism algorithm. We
+process components following their topological order in the
+graph; for each component, the DP iteratively expands partial
+plans until the entire model graph 𝐺𝑀is covered, yielding
+the final device-parallel partition.
+For the transition in Eq. (3) (Line 14), b
+𝑄1 denotes the ob-
+jective of a plan obtained by combining: (1) an optimal plan
+𝑄1(𝑗,𝑙′,𝑠−1,𝑛′), which partitions the first 𝑗−1 chains and
+first 𝑙′ layers of 𝑗𝑡ℎchain to 𝑠−1 stages, and assign stages
+across the first 𝑛′ devices; (2) a new pipeline stage contain-
+ing layers (𝑙′ + 1) through 𝑙of chain 𝑗, assigned to devices
+(𝑛′ + 1) through 𝑛. The base case 𝑄1(𝑗, 0,𝑠−1,𝑛) naturally
+degenerates to 𝑄(𝑗−1,𝑠−1,𝑛).
+For the transition in Eq. (4) (Line 16), b
+𝑄2(𝑘→𝑗,𝑠−1,𝑛′ →
+𝑛) consists of: (1) an optimal prefix plan 𝑄(𝑘−1,𝑠−1,𝑛′) that
+partitions the first (𝑘−1) chains into (𝑠−1) stages over 𝑛′
+devices, and (2) a new pipeline stage containing the entire
+consecutive block of chains 𝑘through 𝑗, assigned to devices
+from (𝑛′ + 1) to 𝑛.
+Achieving Load Balance for Hybrid Parallelism. Our
+DP formulation above optimizes execution latency for the
+given micro-batch size using data, pipeline, and tensor par-
+allelism. However, data parallelism in training introduces
+an additional challenge: the micro-batch size assigned to
+each data-parallel replica must be balanced across devices.
+Otherwise, the slowest replica elongates the iteration during
+gradient aggregation.
+To achieve load-balanced execution, we allocate micro-
+batches proportionally to device speeds. For a replica group
+6
+
+
+--- Page 7 ---
+0
+20
+40
+60
+80
+100
+120
+Time (sec)
+0 1 2 3
+4
+0123
+4
+0
+1
+2
+3
+4
+0
+1
+2
+3
+4
+0
+1
+2
+3
+4
+0 1 2 3 4
+0
+1
+2
+3
+4
+0
+1
+2
+3
+4
+S0
+S1
+S2
+S3
+FP for
+microbatch i
+BP for
+microbatch i
+Forward
+communication
+Backward
+communication
+Figure 6: A toy example illustrating communication and com-
+putation overlap across microbatches during model training.
+with 𝑥devices, let 𝑁𝑏,𝑖be the number of micro-batches as-
+signed to device 𝑖. If 𝑇𝑖denotes the per-micro-batch latency
+of device𝑖, the execution time of that replica is approximately
+linear in its workload, i.e., 𝑓(𝑁𝑏,𝑖,𝑇𝑖) ∝𝑁𝑏,𝑖· 𝑇𝑖. Hence, bal-
+ancing workloads reduces to assigning
+𝑁𝑏,𝑖≈
+1/𝑇𝑖
+Í
+𝑗(1/𝑇𝑗) · 𝑀
+𝑏,
+where 𝑀is the global batch size and 𝑏is the micro-batch
+size. This simple proportional rule yields near-optimal load
+balance while avoiding an expensive integer optimization.
+Thus far, we have selected the parallelism plan based on
+ideal network conditions, where each device pair can use
+its peak bandwidth. In practice, however, contention—e.g.,
+shared WiFi bandwidth or wired links—can change the end-
+to-end performance. Our key insight is that, even though
+the true optimal plan under real network conditions may
+not be the best plan, it would appear within the top few
+candidates: all plans are ranked under the same idealized
+network, the best real-world plan still tends to stay near the
+top. Therefore, at each DP transition (Line 4), Dora keeps
+the top-𝐾most promising plans. These top-𝐾heterogeneity-
+aware candidates are then passed to the next phase (§4.2) for
+refinement under realistic network conditions.
+4.2
+Network Scheduler
+We now introduce a network-aware scheduler to refine the
+top candidate plans produced in Phase 1. Its goal is to maxi-
+mize communication–computation overlap—as illustrated by
+the toy example in Figure 6—across both forward/backward
+propagation and micro-batch execution. Crucially, this re-
+finement accounts for real network conditions, including
+asymmetric links, bandwidth heterogeneity, irregular topolo-
+gies, and runtime contention. The scheduler considers these
+factors to refine candidate plans, and ultimately selects the re-
+fined plan that achieves the best end-to-end efficiency while
+satisfying the QoE constraints.
+Communication-Expanded Planning Graph. To account
+for these network effects, we extend the original planning
+graph 𝐺= (𝑉, 𝐸) (§4.1) into a communication-expanded plan-
+ning (CEP) graph 𝐺′ = (𝑉′, 𝐸′). The CEP graph augments 𝐺
+by inserting communication nodes (tasks) and corresponding
+dependencies, while preserving the durations and ordering
+of all computation nodes (tasks).
+Each node 𝑣type
+𝑖,𝑗
+in 𝐺′ represents either a computation or
+a communication task for the 𝑗-th microbatch at the 𝑖-th
+pipeline stage. The edge set 𝐸′ captures all execution de-
+pendencies, including inter-device transfers (e.g., sending
+activations or gradients between layers on different devices).
+Each node 𝑖is annotated with a compute duration 𝐷𝑖and
+a bandwidth demand 𝐵𝑖. For computation nodes, 𝐵𝑖= 0.
+For a communication node that transfers 𝑇units of data, the
+bandwidth–duration product satisfies 𝐷𝑖·𝐵𝑖= 𝑇. This formu-
+lation enables the scheduler to flexibly trade transfer time for
+allocated bandwidth under contention, slowing down non-
+critical transfers to preserve bandwidth for latency-sensitive
+ones, improving overall performance.
+Formally, let 𝐼𝑖= [𝐹𝑖,𝑇𝑖] denote the scheduled start and
+finish times of node 𝑖, and let 𝑅bw denote the total available
+bandwidth on each link per time unit. The network-aware
+scheduling problem can then be formulated as the following
+Linear Programming (LP) problem:
+min
+𝐼
+max
+𝑖
+𝑇𝑖
+(Minimize E2E latency) (6)
+s.t.
+𝑇𝑖= 𝐹𝑖+ 𝐷𝑖
+(Node duration)
+𝑇𝑗≤𝐹𝑖, ∀(𝑗,𝑖) ∈𝐸′
+(Dependency constraints)
+∑︁
+𝑖:𝐹𝑖≤𝑡<𝑇𝑖
+𝐵𝑖≤𝑅bw, ∀𝑡
+(Bandwidth feasibility)
+This formulation jointly determines the execution order
+of communication tasks and their bandwidth allocations,
+allowing the network scheduler to minimize end-to-end la-
+tency under contention while preserving all computation
+tasks and dependencies produced by the Model Partitioner.
+It offers two additional advantages: First, it generalizes to
+diverse network topologies (e.g., ring-based LANs, hierar-
+chical wired networks, or shared WiFi) and accommodates
+heterogeneous bandwidth distributions. Second, solving this
+LP is lightweight in edge AI settings: the number of devices,
+which is the size of each communication-expanded planning
+graph, is inherently small. Our evaluation across representa-
+tive real-world edge deployments shows that Dora computes
+the network-aware scheduling decisions for each candidate
+plan within sub-second latency (§6.3).
+Jointly Optimizing Communication and Computation.
+Our lightweight CEP design allows Dora to refine multi-
+ple candidate plans efficiently (in seconds §6.3) and even in
+parallel, since plans are independent once produced by the
+Model Partitioner. Dora retrieves the Top-𝐾candidates from
+Phase 1, constructs a communication-expanded planning
+graph for each, optimizes its schedule, and selects the plan
+achieving the highest overall efficiency.
+7
+
+
+--- Page 8 ---
+However, explicitly controlling bandwidth allocation in
+edge environments is often difficult or infeasible (e.g., requir-
+ing privileged access to the WiFi Access Points). To overcome
+this limitation, Dora transforms spatial bandwidth sharing
+into temporal sharing by splitting each communication trans-
+fer into multiple data chunks. Concretely, a transfer of total
+size 𝑇is divided into 𝑤subtasks, each modeled as an in-
+dependent communication task with duration: 𝐷𝑖=
+𝑇
+𝑅bw·𝑤.
+This chunking strategy allows devices to effectively control
+when and how many chunks to transmit, thereby realizing
+the intended network scheduling behavior without requiring
+direct manipulation of physical bandwidth allocation.
+Combining the Phase 1 and 2 optimizations, our evaluation
+shows that Dora delivers near-optimal performance while
+completing end-to-end planning within seconds (§6.2).
+4.3
+Runtime Adapter
+At runtime, edge environments are inherently dynamic: de-
+vice compute capacity and network conditions can fluctuate
+(e.g., due to competing foreground or background workloads),
+and devices may even drop out due to mobility or energy
+constraints. Such variability can quickly render a static par-
+allelism plan suboptimal.
+Dora incorporates a lightweight Runtime Adapter that
+performs fast, on-the-fly replanning to maximize long-term
+efficiency gains. It maintains high efficiency and QoE by sat-
+isfying two deployment-driven objectives: (1) Maximized Ef-
+ficiency for interruptible workloads (e.g., training or tuning).
+These workloads often optimize for long-term QoE metrics,
+such as “completing a tuning job by 9 AM,” so minor
+pauses are acceptable; and (2) Minimal Service Interruption
+for continuous workloads (e.g., online serving), where QoE
+(and model execution) should remain uninterrupted as much
+as possible, even at the cost of efficiency loss.
+Maximizing Long-term Efficiency Gains. Interruptible
+workloads offer greater flexibility to pursue more aggressive
+efficiency optimization: as shown in Figure 7, different paral-
+lelism plans present different QoE-efficiency tradeoffs, so we
+can strategically mix multiple plans over time to maximize
+overall efficiency without violating long-term QoE targets.
+For example, suppose Plan A would miss the deadline if used
+alone, but is highly energy-efficient. Dora can first execute
+under Plan A to harvest its energy savings, and later switch
+to a faster plan to ensure the job still completes before the
+deadline.
+However, this approach introduces two key challenges: (1)
+How should Dora identify the right set of plans to combine
+over time to maximize efficiency while still meeting long-
+term QoE? and (2) How can the system remain robust to
+uncertainties—such as resource fluctuations—that may later
+invalidate “fast” plans and risk violating the QoE deadline?
+5
+6
+7
+8
+9
+10
+Training latency (s)
+4
+5
+6
+7
+8
+9
+10
+Energy (J)
+Pareto Frontier
+Parallelism Plan
+Figure 7: Parallelism plans exhibit diverse latency-energy
+tradeoffs, allowing meeting QoEs with mixed plans.
+To address both challenges, we introduce a uniform-progress
+heuristic that amortizes the end-to-end QoE target over short
+decision horizons. At runtime, Dora periodically assesses
+the remaining workload 𝑊rem and deadline 𝐷rem, partition-
+ing the future into horizons of length Δ. For each hori-
+zon, it computes an expected progress requirement EPΔ =
+(Δ/𝐷rem) · 𝑊rem, representing the minimum useful work
+needed to remain on schedule. This formulation provides
+robustness and flexibility: if a horizon falls short due to tran-
+sient slowdowns, the next horizon re-evaluates 𝑊rem and
+𝐷rem, naturally increasing EPΔ to compensate. Thus, deficits
+are automatically absorbed and corrected over time.
+Within each horizon, the Runtime Adapter selects a mix-
+ture of plans that jointly satisfy the horizon’s expected-
+progress target while optimizing the global QoE-aware objec-
+tive introduced in Eq. (2). Let P denote the QoE-compliant,
+Pareto-optimal plans generated earlier. For each plan 𝑝∈P,
+we use its latency 𝑟𝑝, energy rate 𝑒𝑝, and switching overhead
+𝑑𝑝to determine the useful execution time and additional
+energy cost within a horizon of length Δ. The decision vari-
+able 𝑥𝑝∈[0, 1] specifies the fraction of the horizon assigned
+to plan 𝑝. The Runtime Adapter then solves a small linear
+program that determines the optimal mixture:
+min
+{𝑥𝑝≥0}
+Obj 𝑥𝑝; Eq. 2
+(7)
+s.t.
+∑︁
+𝑝∈P
+𝑟𝑝𝑥𝑝(Δ −𝑑𝑝) ≥EPΔ,
+(8)
+Constraint (8) ensures that the horizon completes suffi-
+cient work to maintain uniform progress toward the QoE
+goal under useful execution time Δ −𝑑𝑝.
+This formulation enables Dora to react quickly to resource
+variations without endangering long-term QoE. Because the
+LP is extremely small, involving only a handful of plans, it
+can be solved in milliseconds (§6.2).
+Achieving Minimal Service Interruption Under Dy-
+namics. For continuous workloads, when runtime condi-
+tions fluctuate, Dora first attempts to accommodate these
+changes by adjusting the network scheduling derived in
+Stage 2 without altering the computation plan. This strategy
+handles transient dynamics such as short-lived bandwidth
+drops or momentary device QoE downgrades. As network
+schedule adjustments can be computed and enforced within
+8
+
+
+--- Page 9 ---
+subseconds (§4.2), this allows Dora to avoid any service stalls
+for the majority of runtime disturbances.
+For substantial or persistent changes—such as large, sus-
+tained shifts in device capability or QoE requirements, or
+cases where adjusted network scheduling cannot satisfy QoE,
+replanning and plan switching become unavoidable for any
+model parallelism workflows. Fortunately, Dora’s planning
+overhead is minimal (only a few seconds), so the dominant
+cost is the switching of model states (e.g., loading model
+weights). To further reduce this cost, Dora introduces two
+complementary optimizations once a new plan is selected
+based on the current resource settings: (1) Asynchronous
+Switching: While the model continues executing under the
+current plan, Dora proactively begins transferring immutable
+states required by the new plan. For example, model weights
+used in inference are immutable, allowing devices to load
+weights for the new placement in the background without
+interrupting ongoing execution; and (2) Delta Switching: De-
+vices transfer only the missing states that differ between the
+old and new plans. For example, a device fetches weights
+only for layers newly assigned to it.
+Together, our evaluation shows that Dora can complete
+adaptation, including migration, within a few seconds (§6.3).
+5
+Implementation
+We implemented a prototype of Dora in roughly 4,000 lines of
+code, supporting distributed edge AI training and inference
+atop ONNX Runtime [1] and PyTorch.
+Dora’s execution backend enables hybrid model paral-
+lelism across heterogeneous devices. The system is imple-
+mented in Python and builds on PyTorch PiPPy and Dis-
+tributed Data Parallel (DDP). Our design composes existing
+single-parallelism libraries while using PyTorch’s low-level
+communication primitives to support efficient data exchange.
+A key requirement of Dora’s phase-two network scheduler
+is the ability to fragment communication transfers into fine-
+grained sub-transfers to enable network scheduling.
+Dora designates the most capable device as a coordinator,
+which issues periodic heartbeats to track device health and
+resource status. When fluctuations remain small (within 10%),
+the runtime adapter invokes only the phase-two network
+optimization, avoiding the overhead of a full re-partition. The
+heartbeat mechanism also functions as a lightweight failure
+detector: if a device or the coordinator becomes unresponsive,
+the system initiates a consensus-based recovery protocol that
+triggers re-planning and ensures continued progress.
+6
+Evaluations
+We evaluate Dora across four realistic edge AI deployments
+and diverse model families. Our key findings are:
+Bert
+Qwen3-0.6B
+Qwen3-1.7B
+Qwen-Omni
+Model Size
+0.1B
+0.6B
+1.7B
+6B
+Table 1: Our evaluations span model training and inference
+of multiple sizes, including both LLMs and MLLMs.
+Edge Device
+Accelerator
+Memory
+Samsung Galaxy S25
+Snapdragon 8 Elite
+12GB
+Xiaomi 15
+Snapdragon 8 Elite
+12GB
+MediaTek Genio 520
+MediaTek 8th Gen NPU
+16GB
+MediaTek Genio 720
+MediaTek 8th Gen NPU
+16GB
+Alienware 16 Laptop
+RTX 4050
+6GB
+Lenovo Laptop
+RTX 4060
+8GB
+Edge Server 1
+NVIDIA V100
+16GB
+Edge Server 2
+NVIDIA A40
+16GB
+Table 2: Specifications of edge devices used in experiments.
+Setting
+Devices
+Network Topo
+Smart home 1
+2×4060ti, 3×4050
+900 Mbps (WiFi)
+Smart home 2
+2×4050, 2×Mi15, S25
+600 Mbps (WiFi)
+Traffic monitor
+2×M720, 2×M520
+200 Mbps (Wired Ring)
+Edge Cluster
+2×A40, 2×V100
+4 Gbps (Wired Ring)
+Table 3: Evaluations span four representative edge settings.
+• Dora discovers better model parallelism plans, achieving
+1.1– 6.3× faster training and inference (§6.2);
+• Dora reduces energy consumption by 20.7–82% while
+fully meeting QoE requirements (§6.2);
+• Dora consistently outperforms existing advances across
+diverse devices, networks, and workload scales (§6.3).
+6.1
+Experiment Setup
+Models and Datasets. As shown in Table 1, our evaluation
+spans modern AI models of multiple sizes, including both
+LLMs and multimodal LLMs with audio and image encoders.
+For text-based models (e.g., BERT and Qwen3-1.7B), we use
+the real-world LMSys-Chat dataset [37] for both training
+and inference experiments. Note that Dora operates strictly
+at the systems level and does not alter model quality. For
+multimodal workloads, we evaluate the Qwen2.5-Omni-7B
+model on the MMMU-Pro benchmark [32], covering diverse
+domains such as digital farming and medical AI, as well as
+on AudioSet [8], a large-scale dataset containing both visual
+and auditory inputs.
+Edge Environment Setup. We evaluate Dora using six het-
+erogeneous edge devices and two commodity edge servers
+(Table 2). Our evaluations span four representative edge
+environments (Table 3): Smart Home 1 and Smart Home 2
+model typical households equipped with laptops, desktops,
+and smartphones, but with different WiFi capabilities and in-
+home bandwidth constraints. Traffic Monitoring represents
+a deployment where smart cameras at an intersection collab-
+oratively analyze video and audio streams; these devices are
+connected through a ring-style topology commonly found
+in multi-camera sensing systems [25]. Finally, Edge-Server
+captures small lab or enterprise clusters consisting of GPUs
+connected via high-speed, low-contention links.
+9
+
+
+--- Page 10 ---
+Bert
+Qwen0.6 Qwen1.7
+Omni
+100
+101
+102
+103
+Per-iteration time (s)
+Smart Home 1
+Bert
+Qwen0.6 Qwen1.7
+Omni
+Smart Home 2
+Bert
+Qwen0.6 Qwen1.7
+Omni
+Traffic Monitor
+Bert
+Qwen0.6 Qwen1.7
+Omni
+Edge Cluster
+EdgeShard
+Alpa
+Metis
+Asteroid
+Dora
+Figure 8: Dora achieves 1.1–6.3× better training latency across settings and models.
+Bert
+Qwen0.6Qwen1.7
+Omni
+10
+1
+100
+101
+Time Between Tokens (s)
+Smart Home 2
+Bert
+Qwen0.6Qwen1.7
+Omni
+Traffic Monitor
+EdgeShard
+Alpa
+Metis
+Asteroid
+Dora
+Figure 9: Dora achieves better serving latency by 1.2–2.8×.
+Baselines. We compare Dora against multiple state-of-the-
+art model parallelism planners:
+• Asteroid [30]: a model parallelism planner for edge AI
+training, yet overlooks network contention and topology.
+• EdgeShard [33]: a distributed training framework using
+pipeline parallelism.
+• Alpa [38]: an advanced parallelism planner combining
+data, pipeline, tensor parallelisms for cloud AI training.
+• Metis [26]: a device heterogeneity-aware planner for
+cloud AI training.
+Metrics. Dora aims to improve the following metrics for
+both training and inference workloads:
+• Latency: per-iteration duration for model training and
+tuning jobs, and serving latency for inference workloads
+(e.g., per-token generation latency in LLMs).
+• Energy: the amount of energy consumption in meeting
+the QoE requirements.
+• Responsiveness: the reaction time to decide a plan.
+We report the mean values over five runs per experiment.
+6.2
+End-to-end Performance
+Dora achieves superior model execution speed for both
+edge AI training and inference. Figure 8 reports training
+latency across models and environments; Figure 9 shows the
+corresponding inference performance. Under the memory-
+constrained Traffic Monitor setting, EdgeShard fails to pro-
+duce a valid plan: its four-stage pipeline overloads the first
+stage with activation memory, leading to repeated OOM
+failures. Across all environments, Dora delivers consistently
+faster training: in the Edge Cluster setting, it outperforms the
+best baseline by at least 1.1×, and in the network-contentious
+Bert
+Qwen0.6 Qwen1.7
+Omni
+100
+101
+Per-iteration Energy saving(J)
+Smart Home 2
+Bert
+Qwen0.6 Qwen1.7
+Omni
+Traffic Monitor
+EdgeShard
+Alpa
+Metis
+Asteroid
+Dora
+Figure 10: Dora reduces energy consumption by 15%–82%.
+Smart Home 2, it achieves 6.3× faster training. Similarly,
+Dora achieves 1.2–2.8× faster inference.
+A notable pattern emerges in Qwen-0.6B training under
+Smart Home 1 and Smart Home 2: all baseline methods
+converge to nearly identical latencies. This plateau arises
+because communication over the shared network becomes
+the dominant bottleneck. Existing baselines either optimize
+only computation or simplify the network into idealized
+D2D links, ignoring bandwidth contention. As a result, they
+collapse to the same suboptimal plan once communication
+saturates. In contrast, Dora explicitly models shared-link
+contention and orchestrates communication to mitigate it,
+yielding sustained speedups of 1.9× and 3.3× over the best
+baseline in these challenging settings.
+Dora saves energy for edge AI training and inference
+while meeting QoE requirements. Figure 11 shows the
+aggregate energy consumption of participating devices for
+achieving the target QoE training iteration speed, and Fig-
+ure 10 shows the same for inference. We define QoE con-
+straint as𝑇𝑄𝑜𝐸as 0.8× (training and inference) latency perfor-
+mance of the best baseline and performed additional ablation
+studies on varying QoE tightness later (§6.3). In scenarios
+with low device heterogeneity, such as Traffic Monitor and
+Edge Cluster, Dora achieves an energy reduction of over 15%
+while ensuring the QoE requirements. In the Smart Home 2
+setting, which features higher heterogeneity, Dora achieves
+substantial energy savings ranging from 57.5% to 82.2%. Sim-
+ilarly, across all setting Dora achieves 15% to 82% energy
+savings on inference.
+10
+
+
+--- Page 11 ---
+Bert
+Qwen0.6 Qwen1.7
+Omni
+101
+102
+103
+Per-Iteration Energy Saving (J)
+Smart Home 1
+Bert
+Qwen0.6 Qwen1.7
+Omni
+Smart Home 2
+Bert
+Qwen0.6 Qwen1.7
+Omni
+Traffic Monitor
+Bert
+Qwen0.6 Qwen1.7
+Omni
+Edge Cluster
+EdgeShard
+Alpa
+Metis
+Asteroid
+Dora
+Figure 11: Dora reduces energy consumption by 10%–82% in meeting training QoE requirements.
+6.5
+7.0
+7.5
+8.0
+8.5
+9.0
+Train Completion Target (Hours)
+4.5
+5.5
+6.5
+7.5
+8.5
+9.5
+Energy Consumption (J)
+Mixture Plans
+Single Plan
+Figure
+12:
+The
+Runtime
+Adapter attains better ef-
+ficiency
+through
+mixing
+plans.
+0
+50
+100
+150
+Time (sec)
+0
+50
+100
+150
+200
+Bandwidth (Mbps)
+Phase1+2
+Phase1 Only
+Figure 13: Network scheduler
+achieves efficient and flexible
+searching.
+Smart Home 2
+Traffic Monitor
+Metis Asteroid Dora Metis Asteroid Dora
+Bert
+0.32
+0.17
+0.12
+0.28
+0.13
+0.11
+Qwen-1.7B
+0.85
+0.50
+0.20
+0.78
+0.39
+0.17
+Omni
+1.383
+1.14
+0.79
+1.25
+1.02
+0.72
+Table 4: Dora enables faster planning (sec) for edge AI.
+Dora enables higher long-term effectiveness via multi-
+-plan orchestration. We next evaluate Dora under long-
+running workloads. Figure 12 reports the total energy con-
+sumption for completing a 6,000-iteration tuning job in the
+Smart Home 2 setting. We compare Dora’s multi-plan or-
+chestration (§4.3) against the best single-plan alternative, en-
+suring both satisfy varying job-deadline requirements from
+6.5 to 9 hours. Across all QoE regimes, Dora consistently
+achieves a substantially lower objective, improving energy
+efficiency by up to 31.8% (e.g., when the deadline requirement
+is 6.7 hours). This demonstrates that adapting the execution
+plan over time, rather than committing to a fixed one, yields
+significantly better long-term effectiveness.
+Dora is scalable and more responsive than existing ap-
+proaches. We evaluate Dora’s planning overhead against
+baseline methods. As shown in Table 4, the phase-one model
+partitioner achieves subsecond planning, giving Dora the
+flexibility to prioritize either rapid adaptation or deeper
+search for improved plan quality. Moreover, Dora’s contention-
+aware network scheduler exposes a tunable search space that
+allows the system to trade minimal accuracy loss for substan-
+tial responsiveness. As illustrated in Figure 13, this enables
+Dora to rapidly produce new schedules under bandwidth or
+compute fluctuations, achieving the responsiveness needed
+to sustain QoE.
+Phase1 only Phase2 only Phase1+2
+0
+50
+100
+150
+200
+Time latency (iteration/s)
+182.2
+173.6
+133.1
+109.2
+99.3
+87
+Qwen-omni
+Qwen-1.7
+(a) Training speed.
+Phase1 only Phase2 only
+Phase1+2
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+Time Between Tokens (s)
+0.52
+0.34
+0.33
+0.32
+0.20
+0.14
+Qwen-omni
+Qwen-1.7
+(b) Inference speed.
+Figure 14: Performance breakdown of Dora.
+6.3
+Ablation Studies
+Performance breakdown by components. Figure 14 quan-
+tifies the contributions of Dora’s two-phase planner to end-
+to-end latency. To isolate each design, we evaluate two vari-
+ants: (1) Phase 1 only, which applies Dora’s model partitioner
+without network-aware refinement; and (2) Phase 2 only,
+which uses an even partitioning strategy like EdgeShard [33]
+and applies Dora’s network-aware scheduler.
+For Qwen-Omni training, Dora reduces latency by 23%
+through Phase 2 and by 26% through Phase 1. For inference,
+where computation dominates, Phase 1 provides up to 37%
+latency reduction, while Phase 2 still delivers meaningful
+benefits—saving 25% for Qwen-1.7B inference. Overall, the
+two phases contribute complementary optimizations, jointly
+enabling Dora’s end-to-end performance gains.
+Performance breakdown by Time. Figure 13 reports the
+network bandwidth utilization over a training iteration in
+the Traffic Monitor setting, where we again break down the
+Dora performance into two phases. We notice that with
+Phase 2 (network scheduler), Dora achieves faster iteration
+by substantially improving the network resource utilization.
+Impact of QoE–Efficiency Tradeoffs (𝜆). We next exam-
+ine how the trade-off parameter 𝜆in the objective Eq. 2
+influences the balance between energy consumption and
+time latency in the generated plans. Using Traffic Monitor
+setup we vary 𝜆from 0.1 to 1.0 in increments of 0.2 for both
+the Qwen-1.7B model, and analyze the resulting movement
+of the Pareto frontier. As shown in Figure 15, increasing 𝜆
+shifts the frontier toward the lower-right region, reflecting
+a stronger preference for energy savings over latency and
+demonstrating the effectiveness of 𝜆in steering the planner’s
+objectives.
+11
+
+
+--- Page 12 ---
+150
+200
+250
+Time latency (s)
+80
+100
+120
+140
+160
+180
+Energy Consumption (J)
+ = 0.1
+ = 0.5
+ = 1
+Overall frontier
+(a) Training
+4
+6
+8
+10
+Time Between Tokens (s)
+5.0
+7.5
+10.0
+12.5
+15.0
+Energy Consumption (J)
+ = 0.1
+ = 0.5
+ = 1
+Overall frontier
+(b) Inference
+Figure 15: Dora discovers Pareto-optimal plans for different
+latency-energy tradeoffs (𝜆).
+0
+15
+30
+45
+60
+75
+Time (sec)
+0
+2
+4
+6
+8
+10
+12
+Throughput (tokens/sec)
+Download
+Video
+Watch
+Video
+Dora
+Asteroid
+Optimal
+Figure 16: Dora efficiently
+reacts to dynamics, achiev-
+ing close-to-optimal perfor-
+mance.
+1
+5
+10
+15
+k candidate
+140
+160
+180
+200
+edge best time latency
+204.35
+155.41
+144.40
+144.00
+Figure 17: Impact of Top-K
+plans.
+Notably, Dora consistently produces a rich set of high-
+quality candidate plans along a concave frontier. Such a con-
+cave structure provides users with a flexible and well-covered
+spectrum of energy–latency trade-offs, and it expands the
+solution space available to the Runtime Adaptor for mixing
+plans to pursue global optimality. This behavior highlights
+both the efficiency of Dora’s search procedure and the high
+quality of the resulting solutions.
+Impact of Runtime Dynamics. To evaluate Dora’s respon-
+siveness under runtime dynamics, we run model inference in
+the Smart Home 2 environment using the Qwen-1.7B model.
+During execution, we deliberately induce interference by
+first downloading videos on the 4060 desktop and later ren-
+dering and watching them, thereby introducing network and
+compute contention to the background inference workload.
+Figure 16 compares the performance of Asteroid, Dora,
+and an optimal oracle that instantaneously switches to the
+best plan upon any resource change with zero overhead. In
+contrast to this idealized baseline, Dora leverages its Phase 2
+network-aware scheduler to rapidly refine communication
+schedules in response to transient fluctuations. Because these
+adjustments avoid model-state migration, the overhead re-
+mains minimal. We observe that Dora consistently tracks the
+optimal oracle closely and reacts within subseconds, main-
+taining QoE under dynamic conditions.
+Impact of Top-K Candidates. We next ablate the number
+of Top-K plans generated by Phase 1 and passed to Phase 2.
+As anticipated in Figure 17, Dora achieves near-optimal per-
+formance even with a small number of candidates, validating
+the hypothesis that the overall best plan is typically included
+among the top candidates identified in Phase 1.
+7
+Related Work
+Edge AI Training and Inference. The growing adoption
+of edge AI accelerators has enabled deployments that im-
+prove efficiency (e.g., reduced Internet traffic [29]), accuracy
+(e.g., personalized models), and privacy (e.g., in-situ learn-
+ing). Applications span real-world assistive agents [5], dig-
+ital agriculture [2], and traffic monitoring [16], motivating
+advances in quantization [24], sparsification [36], and light-
+weight model design [40]. However, these efforts largely
+optimize computation on a single device, leaving open the
+challenge of coordinating complex execution across hetero-
+geneous and bandwidth-constrained edge environments.
+Hybrid Parallelism. Most model-parallel systems target
+cloud environments. Megatron [20] introduces pipeline and
+tensor parallelism and configures them across GPUs using
+simple heuristics (e.g., prioritizing pipeline over data paral-
+lelism). Alpa [38] automates data, tensor, and pipeline par-
+allelism across homogeneous cloud GPUs, while Metis [26]
+extends this automation to load-balance heterogeneous ac-
+celerators. Sailor [23] jointly selects GPU placements and
+parallelism strategies across cloud datacenters for cost effi-
+ciency. In contrast, Dora bridges application-level QoE re-
+quirements with device-level parallel execution, explicitly
+modeling shared-network contention and coordinating mul-
+tiple plans over time.
+QoE-aware Serving. Recent systems, such as Andes [18],
+Tempo [34], and MoonCake [21], have aligned LLM request
+serving with application-level QoE requirements by schedul-
+ing requests based on priority or slack to deadlines. While
+conceptually related, these systems focus on request-level
+scheduling in cloud datacenters and for model inference
+only. Dora addresses a distinct challenge: QoE-aware paral-
+lelism for both model training and serving in heterogeneous,
+contention-prone, and dynamically evolving edge environ-
+ments. As such, Dora is complementary to these efforts.
+8
+Conclusion
+This paper presents Dora, a hybrid-parallelism planner that
+partitions and orchestrates model execution across hetero-
+geneous devices for both edge training and inference. Dora
+combines a three-phase workflow: (i) heterogeneity-aware
+model partitioning, (ii) network-aware scheduling to miti-
+gate communication contention, and (iii) a runtime adaptor
+that mixes plans to maximize long-term efficiency under dy-
+namics. Our evaluation across diverse models, environments,
+and workloads shows that Dora delivers substantial latency
+reductions and energy savings under QoE constraints.
+12
+
+
+--- Page 13 ---
+References
+[1] [n. d.]. ONNX. https://github.com/onnx/onnx.
+[2] Vikram Adve, Steve Brown, Alan Fern, Baskar Ganapathysubrama-
+nian, Ananth Kalyanaraman, Shashi Shekhar, Ilias Tagkopoulos, and
+Jessica Wedow. 2025. Advancing AI in Agriculture through Large-Scale
+Collaborative Research. Commun. ACM (2025).
+[3] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun
+Kwatra, Bhargav Gulavani, Alexey Tumanov, and Ramachandran Ram-
+jee. 2024. Taming Throughput-Latency Tradeoff in LLM Inference with
+Sarathi-Serve. In 18th USENIX Symposium on Operating Systems Design
+and Implementation (OSDI 24). USENIX Association, Santa Clara, CA,
+117–134.
+https://www.usenix.org/conference/osdi24/presentation/
+agrawal
+[4] Anthony Brohan, Noah Brown, Justice Carbajal, Yevgen Chebotar, Xi
+Chen, Krzysztof Choromanski, Tianli Ding, Danny Driess, Avinava
+Dubey, Chelsea Finn, Pete Florence, Chuyuan Fu, Montse Gonzalez
+Arenas, Keerthana Gopalakrishnan, Kehang Han, Karol Hausman,
+Alexander Herzog, Jasmine Hsu, Brian Ichter, Alex Irpan, Nikhil Joshi,
+Ryan Julian, Dmitry Kalashnikov, Yuheng Kuang, Isabel Leal, Lisa Lee,
+Tsang-Wei Edward Lee, Sergey Levine, Yao Lu, Henryk Michalewski,
+Igor Mordatch, Karl Pertsch, Kanishka Rao, Krista Reymann, Michael
+Ryoo, Grecia Salazar, Pannag Sanketi, Pierre Sermanet, Jaspiar Singh,
+Anikait Singh, Radu Soricut, Huong Tran, Vincent Vanhoucke, Quan
+Vuong, Ayzaan Wahid, Stefan Welker, Paul Wohlhart, Jialin Wu, Fei
+Xia, Ted Xiao, Peng Xu, Sichun Xu, Tianhe Yu, and Brianna Zitkovich.
+2023. RT-2: Vision-Language-Action Models Transfer Web Knowledge
+to Robotic Control. arXiv:2307.15818 [cs.RO] https://arxiv.org/abs/
+2307.15818
+[5] Ruei-Che Chang, Rosiana Natalie, Wenqian Xu, Jovan Zheng Feng Yap,
+and Anhong Guo. 2025. Probing the Gaps in ChatGPT’s Live Video
+Chat for Real-World Assistance for People who are Blind or Visually
+Impaired. In ASSETS.
+[6] Biyi Fang, Xiao Zeng, and Mi Zhang. 2018. NestDNN: Resource-Aware
+Multi-Tenant On-Device Deep Learning for Continuous Mobile Vi-
+sion. In Proceedings of the 24th Annual International Conference on
+Mobile Computing and Networking (New Delhi, India) (MobiCom ’18).
+Association for Computing Machinery, New York, NY, USA, 115–127.
+https://doi.org/10.1145/3241539.3241559
+[7] Marshall L. Fisher. 2004. The Lagrangian Relaxation Method for Solv-
+ing Integer Programming Problems. Manag. Sci. 50 (2004).
+[8] Jort F Gemmeke, Daniel PW Ellis, Dylan Freedman, Aren Jansen, Wade
+Lawrence, R. Channing Moore, Manoj Plakal, and Marvin Ritter. 2017.
+Audio Set: An ontology and human-labeled dataset for audio events.
+In 2017 IEEE International Conference on Acoustics, Speech and Signal
+Processing (ICASSP). IEEE, 776–780.
+[9] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas
+Mazeika, Dawn Song, and Jacob Steinhardt. 2021. Measuring Massive
+Multitask Language Understanding. arXiv: 2009.03300 (2021).
+[10] Yiping Kang, Johann Hauswald, Cao Gao, Austin Rovinski, Trevor
+Mudge, Jason Mars, and Lingjia Tang. 2017. Neurosurgeon: Collab-
+orative Intelligence Between the Cloud and Mobile Edge. SIGARCH
+Comput. Archit. News 45, 1 (April 2017), 615–629. https://doi.org/10.
+1145/3093337.3037698
+[11] Z. Jonny Kong, Qiang Xu, and Y. Charlie Hu. 2024. ARISE: High-
+Capacity AR Offloading Inference Serving via Proactive Scheduling.
+In MobiSys.
+[12] Fan Lai, Yinwei Dai, Sanjay S. Singapuram, Jiachen Liu, Xiangfeng Zhu,
+Harsha V. Madhyastha, and Mosharaf Chowdhury. 2022. FedScale:
+Benchmarking Model and System Performance of Federated Learning
+at Scale. arXiv:2105.11367 [cs.LG] https://arxiv.org/abs/2105.11367
+[13] Fan Lai, Yinwei Dai, Sanjay S. Singapuram, Jiachen Liu, Xiangfeng Zhu,
+Harsha V. Madhyastha, and Mosharaf Chowdhury. 2022. FedScale:
+Benchmarking Model and System Performance of Federated Learning
+at Scale. In International Conference on Machine Learning (ICML).
+[14] Fan Lai, Xiangfeng Zhu, Harsha V. Madhyastha, and Mosharaf Chowd-
+hury. 2021. Oort: Efficient Federated Learning via Guided Partic-
+ipant Selection. In 15th USENIX Symposium on Operating Systems
+Design and Implementation (OSDI 21). USENIX Association, 19–35.
+https://www.usenix.org/conference/osdi21/presentation/lai
+[15] Fan Lai, Xiangfeng Zhu, Harsha V. Madhyastha, and Mosharaf Chowd-
+hury. 2021. Oort: Efficient Federated Learning via Guided Participant
+Selection. In OSDI.
+[16] Jeho Lee. 2025. Towards Accurate, Adaptive, and Real-time Machine
+Perception on Resource-constrained Platforms. (2025).
+[17] Yuanchun Li, Hao Wen, Weijun Wang, Xiangyu Li, Yizhen Yuan, Guo-
+hong Liu, Jiacheng Liu, Wenxing Xu, Xiang Wang, Yi Sun, Rui Kong,
+Yile Wang, Hanfei Geng, Jian Luan, Xuefeng Jin, Zilong Ye, Guan-
+jing Xiong, Fan Zhang, Xiang Li, Mengwei Xu, Zhijun Li, Peng Li,
+Yang Liu, Ya-Qin Zhang, and Yunxin Liu. 2024. Personal LLM Agents:
+Insights and Survey about the Capability, Efficiency and Security.
+arXiv:2401.05459 [cs.HC] https://arxiv.org/abs/2401.05459
+[18] Jiachen Liu, Jae-Won Chung, Zhiyu Wu, Fan Lai, Myungjin Lee,
+and Mosharaf Chowdhury. 2024. Andes: Defining and Enhancing
+Quality-of-Experience in LLM-Based Text Streaming Services. In arXiv:
+2404.16283.
+[19] Zechun Liu, Changsheng Zhao, Forrest Iandola, Chen Lai, Yuandong
+Tian, Igor Fedorov, Yunyang Xiong, Ernie Chang, Yangyang Shi, Raghu-
+raman Krishnamoorthi, Liangzhen Lai, and Vikas Chandra. 2024. Mo-
+bileLLM: optimizing sub-billion parameter language models for on-
+device use cases. In ICML.
+[20] Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGres-
+ley, Mostofa Patwary, Vijay Korthikanti, Dmitri Vainbrand, Prethvi
+Kashinkunti, Julie Bernauer, Bryan Catanzaro, Amar Phanishayee, and
+Matei Zaharia. 2021. Efficient large-scale language model training on
+GPU clusters using megatron-LM. In Proceedings of the International
+Conference for High Performance Computing, Networking, Storage and
+Analysis (SC).
+[21] Ruoyu Qin, Zheming Li, Weiran He, Jialei Cui, Feng Ren, Mingxing
+Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu. 2025. Mooncake:
+Trading More Storage for Less Computation — A KVCache-centric
+Architecture for Serving LLM Chatbot. In FAST.
+[22] Ulindu De Silva, Leon Fernando, Billy Lau Pik Lik, Zann Koh, Sam Con-
+rad Joyce, Belinda Yuen, and Chau Yuen. 2025. Large Language Mod-
+els for Video Surveillance Applications.
+arXiv:2501.02850 [cs.CV]
+https://arxiv.org/abs/2501.02850
+[23] Foteini Strati, Zhendong Zhang, George Manos, Ixeia Sánchez Périz,
+Qinghao Hu, Tiancheng Chen, Berk Buzcu, Song Han, Pamela Delgado,
+and Ana Klimovic. 2025. Sailor: Automating Distributed Training over
+Dynamic, Heterogeneous, and Geo-distributed Clusters. In SOSP.
+[24] Yansong Sun, Jialuo He, Dirk Kutscher, and Huangxun Chen. 2025.
+AdaptQNet: Optimizing Quantized DNN on Microcontrollers via Adap-
+tive Heterogeneous Processing Unit Utilization. In Mobicom.
+[25] Kinh Tieu, G. Dalley, and W.E.L. Grimson. 2005. Inference of non-
+overlapping camera network topology by measuring statistical de-
+pendence. In Tenth IEEE International Conference on Computer Vision
+(ICCV’05) Volume 1, Vol. 2. 1842–1849 Vol. 2. https://doi.org/10.1109/
+ICCV.2005.122
+[26] Taegeon Um, Byungsoo Oh, Minyoung Kang, Woo-Yeon Lee, Goeun
+Kim, Dongseob Kim, Youngtaek Kim, Mohd Muzzammil, and Myeong-
+jae Jeon. 2024. Metis: Fast Automatic Distributed Training on Hetero-
+geneous GPUs. In ATC.
+13
+
+
+--- Page 14 ---
+[27] Jiaqi Wang, Zihao Wu, Yiwei Li, Hanqi Jiang, Peng Shu, Enze Shi,
+Huawen Hu, Chong Ma, Yiheng Liu, Xuhui Wang, Yincheng Yao,
+Xuan Liu, Huaqin Zhao, Zhengliang Liu, Haixing Dai, Lin Zhao, Bao
+Ge, Xiang Li, Tianming Liu, and Shu Zhang. 2024. Large Language
+Models for Robotics: Opportunities, Challenges, and Perspectives.
+arXiv:2401.04334 [cs.RO] https://arxiv.org/abs/2401.04334
+[28] Xubin Wang, Zhiqing Tang, Jianxiong Guo, Tianhui Meng, Chenhao
+Wang, Tian Wang, and Weijia Jia. 2025. Empowering Edge Intelligence:
+A Comprehensive Survey on On-Device AI Models. Comput. Surveys
+57, 9 (April 2025), 1–39. https://doi.org/10.1145/3724420
+[29] Yongji Wu, Matthew Lentz, Danyang Zhuo, and Yao Lu. 2022. Serv-
+ing and Optimizing Machine Learning Workflows on Heterogeneous
+Infrastructures. (2022).
+[30] Shengyuan Ye, Liekang Zeng, Xiaowen Chu, Guoliang Xing, and
+Xu Chen. 2024. Asteroid: Resource-Efficient Hybrid Pipeline Par-
+allelism for Collaborative DNN Training on Heterogeneous Edge
+Devices.
+Proceedings of the 28th Annual International Conference
+on Mobile Computing And Networking (05 2024), 312–326.
+https:
+//doi.org/10.1145/3636534.3649363
+[31] Zhongzhi Yu, Zheng Wang, Yuhan Li, Haoran You, Ruijie Gao, Xiaoya
+Zhou, Sreenidhi Reedy Bommu, Yang Katie Zhao, and Yingyan Celine
+Lin. 2024.
+EDGE-LLM: Enabling Efficient Large Language Model
+Adaptation on Edge Devices via Layerwise Unified Compression and
+Adaptive Layer Tuning and Voting. arXiv:2406.15758 [cs.LG] https:
+//arxiv.org/abs/2406.15758
+[32] Xiang Yue, Tianyu Zheng, Yuansheng Ni, Yubo Wang, Kai Zhang,
+Shengbang Tong, Yuxuan Sun, Botao Yu, Ge Zhang, Huan Sun, Yu Su,
+Wenhu Chen, and Graham Neubig. 2025. MMMU-Pro: A More Robust
+Multi-discipline Multimodal Understanding Benchmark. (2025).
+[33] Mingjin Zhang, Xiaoming Shen, Jiannong Cao, Zeyang Cui, and Shan
+Jiang. 2024. Edgeshard: Efficient llm inference via collaborative edge
+computing. IEEE Internet of Things Journal (2024).
+[34] Wei Zhang, Zhiyu Wu, Yi Mu, Banruo Liu, Myungjin Lee, and Fan
+Lai. 2025. Tempo: Application-aware LLM Serving with Mixed SLO
+Requirements. In arXiv: 2504.20068.
+[35] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang,
+Min Xu, Less Wright, Hamid Shojanazeri, Myle Ott, Sam Shleifer, Alban
+Desmaison, Can Balioglu, Pritam Damania, Bernard Nguyen, Geeta
+Chauhan, Yuchen Hao, Ajit Mathews, and Shen Li. 2023. PyTorch FSDP:
+Experiences on Scaling Fully Sharded Data Parallel. VLDB (2023).
+[36] Haizhong Zheng, Xiaoyan Bai, Xueshen Liu, Z. Morley Mao, Beidi
+Chen, Fan Lai, and Atul Prakash. 2024. Learn To be Efficient: Build
+Structured Sparsity in Large Language Models. (2024).
+[37] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Tianle Li, Siyuan Zhuang,
+Zhanghao Wu, Yonghao Zhuang, Zhuohan Li, Zi Lin, Eric P. Xing,
+Joseph E. Gonzalez, Ion Stoica, and Hao Zhang. 2024. LMSYS-Chat-1M:
+A Large-Scale Real-World LLM Conversation Dataset. (2024).
+[38] Lianmin Zheng, Zhuohan Li, Hao Zhang, Yonghao Zhuang, Zhifeng
+Chen, Yanping Huang, Yida Wang, Yuanzhong Xu, Danyang Zhuo,
+Eric P. Xing, Joseph E. Gonzalez, and Ion Stoica. 2022. Alpa: Au-
+tomating Inter- and Intra-Operator Parallelism for Distributed Deep
+Learning. In 16th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 22). USENIX Association, Carlsbad, CA, 559–
+578. https://www.usenix.org/conference/osdi22/presentation/zheng-
+lianmin
+[39] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-
+anzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: Disaggregating
+Prefill and Decoding for Goodput-optimized Large Language Model
+Serving. arXiv:2401.09670 [cs.DC] https://arxiv.org/abs/2401.09670
+[40] Yuxuan Zhu, Jiachen Liu, Mosharaf Chowdhury, and Fan Lai. 2024. Fed-
+Trans: Efficient Federated Learning via Multi-Model Transformation.
+(2024).
+A
+Model Profiling
+Algorithm 2 Efficient Plan Profiler
+1: function StartPhaseTimeEst(P, 𝐵𝐿𝑖𝑠𝑡,d)
+2:
+S = (2 ∗𝐿𝑒𝑛(P)-1) ; //get total amount of steps
+3:
+Initialize 𝐶𝑟𝑖𝑡𝑖𝑃𝑎𝑡ℎ𝑇;
+4:
+for 𝑝from 𝑑to 𝑆do //iterate all possible peak steps
+5:
+Initialize 𝐶𝑢𝑟𝑟𝑃𝑎𝑡ℎ𝑇;
+6:
+for 𝑖from 0 to 𝑝do //Necessary tasks on the
+critical path
+7:
+𝐶𝑢𝑟𝑟𝑃𝑎𝑡ℎ𝑇+ = 𝐵𝑓𝑖
+8:
+𝐶𝑢𝑟𝑟𝑃𝑎𝑡ℎ𝑇+ = (𝑆−𝑝) ∗max𝑖∈[0,𝑝] 𝐵𝑓𝑖
+9:
+for 𝑖from 𝑝down to 𝑑+ 1 do //Add rest back-
+ward dependency tasks
+10:
+𝐶𝑢𝑟𝑟𝑃𝑎𝑡ℎ𝑇+ = 𝐵𝑏𝑖
+11:
+if 𝐶𝑢𝑟𝑟𝑃𝑎𝑡ℎ𝑇> 𝐶𝑟𝑖𝑡𝑖𝑃𝑎𝑡ℎ𝑇then
+12:
+𝐶𝑟𝑖𝑡𝑖𝑃𝑎𝑡ℎ𝑇= 𝐶𝑢𝑟𝑟𝑃𝑎𝑡ℎ𝑇
+13:
+Return 𝐶𝑟𝑖𝑡𝑖𝑃𝑎𝑡ℎ𝑇
+14:
+15: function EndPhaseTimeEst(P, 𝐵𝐿𝑖𝑠𝑡,d)
+16:
+S = (2 ∗𝐿𝑒𝑛(P)-1) ;
+17:
+Initialize 𝐶𝑟𝑖𝑡𝑖𝑃𝑎𝑡ℎ𝑇𝐿𝑖𝑠𝑡;
+18:
+for 𝑠from 0 to 𝑆−1 do // calculate end phase time
+latency for each step
+19:
+Initialize 𝐶𝑟𝑖𝑡𝑖𝑃𝑎𝑡ℎ𝑇;
+20:
+for 𝑝from𝑚𝑎𝑥(𝑠,𝑑) to 𝑆do //iterate all possible
+peak steps
+21:
+Initialize 𝐶𝑢𝑟𝑟𝑃𝑎𝑡ℎ𝑇;
+22:
+for 𝑖from 0 to 𝑝do //Necessary tasks on the
+critical path
+23:
+𝐶𝑢𝑟𝑟𝑃𝑎𝑡ℎ𝑇+ = 𝐵𝑏𝑖
+24:
+𝐶𝑢𝑟𝑟𝑃𝑎𝑡ℎ𝑇+ = (𝑆−𝑝) ∗max𝑖∈[0,𝑝] 𝐵𝑏𝑖
+25:
+for 𝑖from 𝑝down to 𝑑+ 1 do //Add rest
+backward dependency tasks
+26:
+𝐶𝑢𝑟𝑟𝑃𝑎𝑡ℎ𝑇+ = 𝐵𝑓𝑖
+27:
+if 𝐶𝑢𝑟𝑟𝑃𝑎𝑡ℎ𝑇> 𝐶𝑟𝑖𝑡𝑖𝑃𝑎𝑡ℎ𝑇then
+28:
+𝐶𝑟𝑖𝑡𝑖𝑃𝑎𝑡ℎ𝑇= 𝐶𝑢𝑟𝑟𝑃𝑎𝑡ℎ𝑇
+29:
+𝐶𝑟𝑖𝑡𝑖𝑃𝑎𝑡ℎ𝑇𝐿𝑖𝑠𝑡[𝑠] = 𝐶𝑟𝑖𝑡𝑖𝑃𝑎𝑡ℎ𝑇
+30:
+Return 𝐶𝑟𝑖𝑡𝑖𝑃𝑎𝑡ℎ𝑇𝐿𝑖𝑠𝑡
+14
+
+
+--- Page 15 ---
+15
+
+
+--- Page 16 ---
+16

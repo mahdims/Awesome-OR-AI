@@ -1,0 +1,2203 @@
+--- Page 1 ---
+PROSERVE: Unified Multi-Priority Request Scheduling for LLM Serving
+Weizhe Huang1, Tao Peng1, Tongxuan Liu1, Donghe Jin1, Xianzhe Dong2, Ke Zhang3
+1JD.com
+2USTC
+3Unaffiliated
+Abstract
+The widespread deployment of large language models
+(LLMs) for interactive applications necessitates serving sys-
+tems that can handle thousands of concurrent requests with di-
+verse Service Level Objective (SLO) requirements. A critical
+yet often overlooked dimension in this context is the inher-
+ent priority difference among clients; for instance, business-
+critical functions demand higher performance guarantees,
+as fulfilling such requests yields significantly greater busi-
+ness value. However, existing LLM serving schedulers fail
+to jointly optimize for both SLO attainment and client-level
+priorities.
+To bridge this gap, we first formalize multi-priority re-
+quest scheduling as a service gain maximization problem,
+where satisfying latency requirements for requests of differ-
+ent priorities contributes varying levels of gain. We then pro-
+pose PROSERVE, a unified two-tier scheduling framework
+designed to maximize overall service gain. At the engine
+level, SlideBatching dynamically adapts batch formation and
+request ordering under varying load conditions, employing
+a sliding boundary mechanism to balance deadline-first and
+density-first strategies. At the service level, GoRouting per-
+forms gain-oriented and capability-aware dispatching across
+distributed instances, proactively reserving capacity for future
+high-priority or long requests. Extensive evaluation across
+four open-source datasets and a real-world industrial trace
+demonstrates that PROSERVE consistently outperforms state-
+of-the-art baselines, improving system gain by up to 35% and
+boosting SLO attainment by up to 52%.
+1
+Introduction
+Large language models (LLMs) [10, 19, 41] have become
+foundational to a wide range of interactive applications, from
+chatbots [23] to autonomous agents [16]. As these LLM ser-
+vices are deployed at scale, they need to handle thousands of
+concurrent online requests with stringent and heterogeneous
+Service Level Objective (SLO) requirements [31,46].
+0
+2
+4
+6
+8
+10
+12
+14
+16
+18
+20
+22
+24
+Time (Hours)
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+Input Tokens per 10 Minutes
+1e6
+High Priority
+Medium Priority
+Low Priority
+Figure 1: Workload trace of online requests with different
+priorities over one day from our real industrial dataset.
+Beyond SLO diversity, a critical yet often neglected di-
+mension is the inherent priority difference among the
+clients themselves. In real-world enterprise scenarios, for
+instance, business-critical functions demand higher perfor-
+mance guarantees than non-critical ones. To illustrate this,
+Figure 1 presents a real workload trace from our industrial
+dataset, which shows that requests of different priorities ex-
+hibit similar arrival patterns and load dynamics, yet satisfying
+a high-priority request typically yields significantly greater
+business value than satisfying a low-priority one. Therefore,
+an effective serving system must not only respect per-request
+SLOs, but also differentiate service based on client priority.
+However, existing LLM serving schedulers fail to jointly
+account for both SLO diversity and client-level priorities. One
+line of work [5,31,42] addresses SLO heterogeneity by implic-
+itly prioritizing requests with tighter deadlines, yet overlooks
+the inherent priority differences among the clients themselves.
+Another line of work [4,30,36] focuses on co-scheduling on-
+line and offline tasks, treating all online requests as uniformly
+high-priority (to be served with SLO guarantees) and offline
+ones as best-effort low-priority tasks without explicit latency
+requirements. This design makes such approaches inapplica-
+ble to our scenario, where both high- and low-priority requests
+carry their own latency requirements. Other works [27, 29]
+consider online client priority but inadequately account for
+SLO attainment. Llumnix [29] merely reserves static mem-
+ory without providing explicit latency guarantees. Weighted
+VTC [27], inspired by Linux’s Completely Fair Scheduler
+(CFS) [24], enforces token-based proportional fairness across
+1
+arXiv:2512.12928v1  [cs.DC]  15 Dec 2025
+
+
+--- Page 2 ---
+priority classes but cannot explicitly satisfy per-request la-
+tency target, which is yet critical in LLM serving. Conse-
+quently, there lacks a principled framework to simultaneously
+optimize for client priority and SLO attainment.
+To bridge this gap, we first formulate the multi-priority
+request scheduling problem as a service gain maximiza-
+tion task(§2), where satisfying a high-priority1 request’s la-
+tency requirement contributes substantially more service gain
+than low-priority one. We then jointly account for request pri-
+ority and SLO requirements and propose a novel Token-level
+Deadline-aware Gain (TDG) function (§2) that quantifies the
+gain obtained from meeting the SLO of a specific-priority
+request. This formula explicitly captures the inherent differ-
+ences of gain across different priority levels, while respecting
+the individual latency target for each request.
+However, solving this problem introduces significant chal-
+lenges in scheduler design. First, a fundamental trade-off
+exists between minimizing overall latency and favoring
+high-priority requests (§3.1). While naive policies like
+First-Come-First-Served (FCFS) [32] or recent SLO-aware
+schedulers [4,5,31] optimize overall latency and SLO attain-
+ment, they fail to differentiate request priorities, leading to in-
+sufficient service for high-priority requests. Conversely, an al-
+ternative strict-priority policy blindly prioritizes high-priority
+requests and starves low-priority ones. Both of them result
+in suboptimal total system gain. Second, we observe that the
+effectiveness of different batch scheduling policies varies sig-
+nificantly with load (§3.2). Under dynamic workloads shown
+in Figure 1, static scheduling policies may struggle to adapt
+across all load levels, limiting their effectiveness. Third, in
+distributed deployments, existing common global dispatchers
+(e.g., least-load) lack awareness of request priority and suffer
+from the over-balancing issue (§3.3). This may cause them
+to fail to accommodate future high-priority or long requests
+even when sufficient capacity is potentially available.
+To address these challenges, we present PROSERVE (§4),
+a unified two-tier scheduling framework designed to maxi-
+mize service gain from multi-priority requests. At the engine
+layer, we introduce SlideBatching (§4.2), a local batch sched-
+uler that dynamically adapts its policy based on real-time
+load. It adaptively partitions the request queue into urgent
+and non-urgent subsets and applies tailored strategies. At
+the service layer, we design GoRouting (§4.3), a global re-
+quest router that performs gain-oriented, capability-aware dis-
+patching across distributed instances. It maintains awareness
+of local scheduler states and proactively reserves capacity
+for future high-priority or long requests. We evaluate PROS-
+ERVE against multiple common and state-of-the-art sched-
+ulers across four open-source datasets and one large-scale
+real-world industrial dataset. Extensive experiments demon-
+strate that PROSERVE consistently and significantly outper-
+forms state-of-the-art baselines, improving system gain by up
+1Throughout this paper, we equate the request priority with the priority
+of the client from which it originates.
+to 35% and boosting overall SLO attainment by up to 52%.
+Our main contributions are summarized as follows:
+• We formally define the multi-priority scheduling sce-
+nario and formulate it as a service gain maximization
+problem. We also propose a novel gain function TDG,
+which quantifies per-request gain while evaluating token
+delivery against deadlines.
+• We introduce SlideBatching, a novel engine-level batch
+scheduler that dynamically adjusts request ordering
+strategies based on real-time load conditions.
+• We design GoRouting, a service-level router that proac-
+tively monitors instance and request states and employs
+a gain-oriented, capability-aware routing policy.
+• We demonstrate through extensive experiments that
+ProSched achieves superior and robust performance
+across diverse datasets and models.
+2
+Characterizing Request Priority and Service
+Objectives
+Existing scheduling methods typically map request attributes
+(e.g., sequence length [9,11,13,38], SLO constraints [5,31,42],
+online/offline type [4,30,36]) to execution priorities. However,
+they often fail to account for the inherent priority differences
+among the online clients themselves. Although all online
+requests come with their own SLO requirements, fulfilling the
+SLO for a high-priority request yields greater system gain than
+doing so for a low-priority one. To address this more general
+scenario, we formalize this multi-priority request scheduling
+problem as follows:
+Objective Definition.
+Let request r have a priority p(r),
+where each priority level is associated with a priority weight
+wp(r) indicating its relative importance. If a request meets its
+latency target (e.g., SLOs), the system accrues the associated
+gain f(r). The system’s objective is to maximize the total gain
+across the served request set R: max f(R) = max∑r∈R f(r).
+The core issue then shifts to defining a proper per-request
+gain function f(r) based on wp(r) and its own SLOr.
+Strawman Proposal 1: Weighted SLO Attainment.
+An
+intuitive idea is to weight the standard SLO attainment by
+priority:
+fW(r) = wp(r) ·I[TTFTr ≤TTFT r
+SLO,TPOTr ≤TPOT r
+SLO],
+(1)
+However, this formulation suffers from three key drawbacks:
+(1) Discard-or-Postpone Trick: Since gain is awarded only
+if both TTFT and TPOT SLOs are met, the system can im-
+mediately discard or indefinitely postpone any request whose
+TTFT SLO is deemed unattainable, as the gain for that request
+is already lost. This trick, while potentially improving the met-
+ric, significantly degrades user experience. (2) Insensitivity to
+Per-Token Latency: As an average metric, TPOT obscures the
+variability in per-token delivery times. For instance, a request
+with high initial latency but very fast subsequent tokens can
+2
+
+
+--- Page 3 ---
+Gain Function
+Vanilla SLO
+Weighted SLO
+Tempo [44]
+TA-SLO
+TDG(Ours)
+Distinguishes Request Priority
+×
+✓
+×
+✓
+✓
+Aware of Per-Token Latency
+×
+×
+✓
+✓
+✓
+Distinguishes First/Decode Token Importance
+×
+×
+✓
+✓
+✓
+Robust to Discard/Postpone Trick
+×/×
+×/×
+✓/×
+✓/×
+✓/✓
+Table 1: The feature comparison of different per-request gain function.
+yield the same TPOT as one with uniformly moderate latency.
+Consequently, both would attain the same gain fW(r), despite
+offering substantially different user experiences. (3) Undif-
+ferentiated Importance of First and Decode Token: In prac-
+tice, TTFT and TPOT reflect different dimensions of service
+quality. TTFT measures the system’s initial responsiveness,
+whereas TPOT reflects the output fluency. A single, combined
+SLO condition fails to account for their differing impacts on
+the overall user experience.
+Refined Proposal 2: Token-level Gain with TBT.
+To over-
+come these issues, we shift from the request-level SLO attain-
+ment to token-level gain function that aggregates the timely
+delivery of each output token. Inspired by prior work [44],
+our refined proposal is to replace TPOT with Time Between
+Tokens (TBT), leading to the initial Token-level Accumulated
+SLO (TA-SLO) formulation:
+fTA−SLO(r) = wp(r) ·(wp ·I[TTFTr < TTFT r
+SLO]+
+∑
+i
+wd ·I[TBTr,i < TBT r
+SLO]),
+(2)
+where TBTr,i = tr,i −tr,i−1 is the interval between consecutive
+tokens and tr,i denotes the output time of the i-th token of the
+request r. Here, wp and wd weight the importance of the first
+versus subsequent tokens.
+However, Postponed Decoding Trick also persists in this
+definition. If a token is already detected to miss its TBT SLO,
+the system might intentionally delay its output to make the
+next token’s TBT easier to achieve. This distorts the gain cal-
+culation and stems from the negative monotonicity of the TBT
+metric: completing one token earlier can negatively impact
+the TBT SLO attainment of the next.
+Our Final Proposal: Token-level Deadline-aware Gain
+(TDG).
+To overcome above limitations, we rethink a funda-
+mental shift in perspective: the gain for a token is interpreted
+as a binary indicator of whether its output timing harms user
+experience. The individual token deadline represents the lat-
+est acceptable output time that does not degrade perceived
+quality. A token delivered after this deadline yields no gain
+(as it harms user experience), whereas earlier completion does
+not increase the gain for that specific token. Based on this
+insight, we replace TBT with the fixed deadline and introduce
+the Token-level Deadline-aware Gain (TDG):
+fTDG(r) = ∑
+i
+wr(i)·I[tr,i < deadliner,i],
+deadliner,i = TTFT r
+SLO +(i−1)·TPOT r
+SLO,
+wr(i) =
+(
+wp ·wp(r)
+, if i = 1
+wd ·wp(r)
+,otherwise ,
+(3)
+where wr(i) is the gain for delivering the i-th token before its
+deadline. Weights wp and wd distinguish the importance of the
+first versus subsequent tokens, scaled by priority weight wp(r).
+This mapping can be adapted based on application-specific
+requirements.
+A comprehensive comparison of TDG against other gain
+function is presented in Table 1. Furthermore, TDG estab-
+lishes clear monotonicity properties: (1) Positive Impact of
+Early Completion. Although a token completed early gains
+no extra direct benefit, it increases the slack for subsequent
+tokens. Potential generation stalls caused by early output can
+be mitigated by the smoothing buffer mechanism [37] that can
+be seamlessly integrated into the front-end of LLM serving
+systems. This mechanism automatically caches sequentially
+output tokens and presents them at any predetermined inter-
+vals whenever tokens are available in the buffer2. (2) Nega-
+tive Impact of Late Completion. Because deadlines are fixed
+and independent, a late token directly reduces the available
+time for subsequent ones, creating a risk of deadline-miss
+propagation. This prevents the Infinite-Postpone Trick and dis-
+courages request discarding, as doing so forfeits all potential
+future gain.
+3
+Motivation
+3.1
+The Trade-off Between Overall Latency
+and Request Priority
+Our objective gain function incorporates latency-related terms
+and the priority weights orequest, indicating that both factors
+must be considered. However, an inherent trade-off exists
+2In this work, we apply buffering [37] to all tokens, including the first
+token. If the first token can not be buffered, the deadline can be redefined as
+deadliner,i = min{TTFTr,TTFT r
+SLO}+(i −1)·TPOT r
+SLO, which can also
+align with current features.
+3
+
+
+--- Page 4 ---
+High
+Low
+Total
+Priority Level
+0.4
+0.6
+0.8
+1.0
+SLO Attainment
+ShareGPT
+Priority-First
+FCFS
+High
+Low
+Total
+Priority Level
+0.4
+0.6
+0.8
+1.0
+Azure
+Priority-First
+FCFS
+Figure 2: Latency of requests with different priorities in strict
+Priority-First and FCFS scheduling.
+between minimizing overall latency and strictly favoring high-
+priority requests.
+As shown in Figure 2, a strict priority scheduling policy
+always prioritizes high-priority requests. While this approach
+significantly improves SLO attainment for high-priority re-
+quests, the severe imbalance in computational resource allo-
+cation leads to poor overall latency guarantees for the system.
+Conversely, a mainstream First-Come-First-Served (FCFS)
+policy can achieve overall SLO attainment, but they fail to
+provide differentiated service quality between priority classes,
+resulting in overly similar SLO attainment rates for both high-
+and low-priority requests. In practice, however, guaranteeing
+lower latency for high-priority requests contributes more sub-
+stantially to the total system gain. Thus, the key challenge we
+face is: how to design an effective scheduling algorithm that
+jointly balances overall latency and priority-based differentia-
+tion, thereby maximizing total system gain.
+3.2
+The Adaptive Deficit of Static Schedulers
+Under Dynamic Workloads
+Online service workloads are volatile and unpredictable, fluc-
+tuating in intensity and priority distribution. For scheduler
+design, two key decisions must be made in each iteration: (1)
+request admission order and (2) batch capacity. Regarding the
+first, existing studies predominantly adopt fixed scheduling
+policies such as first-come-first-served (FCFS) [32], earliest-
+deadline-first (EDF) [4,21], or shortest-job-first (SJF) [11,38]
+and their variants, where FCFS can be viewed as a special
+case of EDF with uniform deadlines among requests. As for
+the second, existing inference engines such as vLLM [32] and
+xLLM [20] typically predefine a static token budget (e.g.,
+max_num_batched_tokens in vLLM) or batch size limit
+(e.g., max_num_seqs in vLLM) and maintain it unchanged
+throughout scheduling. We show that static ordering policies
+lack adaptability to changing workloads, and their effective-
+ness depends on appropriate batch capacity.
+Performance of Individual Scheduling Policies.
+Figures 3
+and 4 compare scheduling policies under fixed batch size and
+token budget constraints. EDF outperforms SJF under low
+load, but drops sharply beyond a certain load threshold. This
+occurs because EDF optimistically allocates computational
+resources to the most urgent requests, assuming all can be
+completed. Under high load, this assumption fails as many
+24
+26
+28
+30
+32
+Request Rate
+0.8
+0.9
+1.0
+TDG Ratio
+ShareGPT
+SJF
+FCFS
+EDF
+EDF Better
+SJF Better
+8
+10
+12
+14
+16
+18
+Request Rate
+0.7
+0.8
+0.9
+1.0
+Azure
+SJF
+FCFS
+EDF
+EDF Better
+SJF Better
+Figure 3: Performance of different request sorting strategies
+under the fixed token budget.
+24
+26
+28
+30
+32
+Request Rate
+0.7
+0.8
+0.9
+1.0
+TDG Ratio
+ShareGPT
+SJF
+FCFS
+EDF
+EDF Better
+SJF Better
+8
+10
+12
+14
+16
+18
+Request Rate
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Azure
+SJF
+FCFS
+EDF
+EDF Better
+SJF Better
+Figure 4: Performance of different request sorting strategies
+under the fixed batch size.
+requests become urgent simultaneously, leading to widespread
+timeouts. Below, we provide an in-depth analysis of EDF and
+SJF under both low and high load conditions.
+Figure 5 shows TTFT/TPOT distributions under low load.
+While both policies achieve high overall SLO attainment,
+SJF’s bias toward short requests delays longer ones, caus-
+ing some SLO violations. In contrast, EDF explicitly con-
+siders deadlines, preventing starvation and ensuring all re-
+quests meet their TTFT SLOs. Figure 6 tracks urgent and
+timed-out requests under high load. EDF causes a sudden
+accumulation of urgent requests during peak load, followed
+by a synchronized surge in timeouts. This vulnerability stems
+from its overly optimistic and averaged resource allocation
+strategy. In contrast, by prioritizing short requests, SJF avoids
+long-request blocking and massive delay propagation and
+maintaining stable counts of urgent and timed-out requests.
+Impact of Batch Capacity.
+Figure 7 shows how different
+scheduling policies perform across load levels and batch ca-
+pacity settings. As the token budget increases, EDF steadily
+improves and eventually stabilizes in SLO attainment. SJF
+initially improves but then degrades with further budget in-
+creases. FCFS behaves differently depending on load: under
+medium load, its SLO attainment first rises then falls; un-
+der high load, it resembles EDF’s trend. These observations
+indicate that different scheduling policies have distinct prefer-
+ences for batch capacity, and this preferred capacity can also
+fluctuate with changes in the system load. Consequently, a
+static and fixed batch capacity configuration appears insuffi-
+cient to accommodate diverse scheduling strategies or adapt
+to real-world workload dynamics.
+3.3
+Limitations of Existing Global Schedulers
+Unawareness of Local Scheduler and Request State.
+In
+a typical cluster deployment, an LLM service runs across
+4
+
+
+--- Page 5 ---
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+TTFT (s)
+0.00
+0.04
+0.08
+0.12
+0.16
+TPOT (s)
+EDF
+TTFT SLO (0.8s)
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+TTFT (s)
+0.00
+0.04
+0.08
+0.12
+0.16
+TPOT (s)
+SJF
+TTFT SLO (0.8s)
+Figure 5: Distributions of TTFT and TPOT under different
+scheduling policies in low-load scenarios.
+Timeline
+0
+100
+200
+300
+Count
+EDF - High Load
+Timeout Count
+Urgent Count
+Timeline
+0
+50
+100
+150
+200
+250
+FCFS - High Load
+Timeout Count
+Urgent Count
+Timeline
+0
+10
+20
+30
+40
+SJF - High Load
+Timeout Count
+Urgent Count
+Figure 6: Timeline of urgent and timed-out requests under
+high load for different scheduling policies.
+multiple instances. Existing global request dispatchers of-
+ten completely ignore the local scheduling strategy and the
+state of ongoing requests. For instance, they may adopt
+naive policies such as round-robin or least-load, which rely
+only on coarse-grained, instance-level load indicators like
+request count. This oversight fails to account for the im-
+pact of diverse local scheduling strategies on overall sys-
+tem performance. Especially in multi-priority scheduling,
+a later-arriving high-priority request can gain local prece-
+dence (e.g., via queue jumping), affecting both its own gain
+and that of others, thereby influencing overall system perfor-
+mance. Consequently, an effective global scheduler should
+be sufficiently aware of the local scheduling policy, along
+with near-real-time instance and per-request states, to make
+informed dispatching decisions.
+The Over-Balancing Issue.
+Existing global schedulers of-
+ten use least-load dispatching [22, 32, 40] to balance work-
+loads. However, given fluctuating request arrivals and vary-
+ing lengths, strict load-balancing can be sub-optimal by hin-
+dering SLO attainment for future high-priority or long re-
+quests. As illustrated in Figure 8, when the longer request
+R2 arrives shortly after R1, a Min-Load policy dispatches
+R1 to the less-loaded Instance B to balance load instantly,
+leaving no instance with sufficient slack for R2’s SLO. Our
+SLO-aware strategy instead dispatches R1 to the moderately
+loaded Instance A, which still meets R1’s SLO while pre-
+serving capacity on Instance B for R2. Although R1’s TTFT
+increases slightly, both requests meet their deadlines. This
+demonstrates the need to move from pure load-balancing to a
+capacity-aware, SLO-driven policy that accounts for request
+length, deadline, and local scheduler behavior.
+4
+Design
+The overall framework of PROSERVE is illustrated in Figure 9.
+PROSERVE consists of two primary components: SlideBatch-
+250
+750
+1500
+2500
+Token Budget
+0.00
+0.25
+0.50
+0.75
+1.00
+SLO Attainment
+Medium Load
+EDF
+FCFS
+SJF
+250
+750
+1500
+2500
+Token Budget
+0.00
+0.25
+0.50
+0.75
+1.00
+High Load
+EDF
+FCFS
+SJF
+Figure 7: Performance of request scheduling policies under
+varying token budgets.
+R2: 400ms
+R1: 200ms
+R1: 200ms
+R2: 400ms
+200ms
+400ms
+200ms
+400ms
+SLO=700ms
+Instance A
+Instance B
+Instance A
+Instance B
+Both R1&R2 Satisfaction
+VS.
+R1 comes before R2
+1
+2
+Min-Load Policy
+GoRouting
+1
+2
+Figure 8: A toy example of the over-balancing issue.
+ing at the engine layer and GoRouting at the service layer.
+4.1
+Batch Latency Estimator
+The estimation of batch execution time is crucial for batch
+scheduling. The batch execution time can be decomposed
+into constant overhead (e.g., kernel launch and input/output
+processing), computation time, and memory access time. In
+general scenarios, a batch may contain both prefill and de-
+code requests, where prefill requests are typically compute-
+intensive [1], dominated by linear and attention operations,
+whereas decode requests are typically memory-bound [46].
+Hence, we formulate separate linear regression models for
+prefill and decode requests as follows:
+Tpd(r) = ˜Tpd(r)+tc, ˜Tpd(r) =
+(
+˜Tp(r)
+,r is prefill
+˜Td(r)
+,r is decode
+(4)
+˜Tp(r) = ap ·lq(r)2 +bp ·lq(r)·lkv(r)+cp ·lq(r)
+(5)
+˜Td(r) = ad ·lkv(r)+bd ·1
+(6)
+where Tpd(r) denotes the estimated latency for request r in-
+cluding a constant overhead tc, while ˜Tpd(r) represents the
+core computational latency estimate excluding this fixed over-
+head. {ap,bp,cp,ad,bd} are trainable parameters. lkv(r) de-
+notes the KV cache length, and lq(r) is the number of tokens
+processed in the current forward pass. Then the execution
+time for a batch B can be estimated as:
+Tpd(B) = Tpd(Bp ∪Bd) = ∑
+r∈Bp
+˜Tp(r)+ ∑
+r∈Bd
+˜Td(r)+tc
+(7)
+We leverage offline-generated profiling batch data to train
+the models and similarly construct evaluation dataset. The
+evaluation results show that the Mean Absolute Percentage
+Error (MAPE) remains stable at approximately 4.5%.
+5
+
+
+--- Page 6 ---
+SlideBatching
+Executor
+Estimator
+Support
+Block
+Manager
+Req. State 
+Update
+Priority 1
+Adapative Partition
+Urgent
+Density-First
+Strategy
+Deadline-First
+Strategy
+Normal
+Inst. & Req. 
+State Monitor
+GoRouting
+Engine-Layer 
+Online 
+Update
+First token& 
+Prefill ends
+Last token&
+Decode ends
+Upload Info
+Routing
+Multi-Priority Clients
+Response
+Service-Layer
+Dynamic
+Budget
+Request
+Priority 2
+…
+Priority 3
+𝑖-th iteration
+Check
+Prepared Batch
+Instance State
+QueueMap
+Offline Data
+Instance P/D/Mix
+Figure 9: The overall framework of PROSERVE.
+To further enhance runtime stability under fluctuating clus-
+ter loads, we perform online updates to the latency estimator.
+Specifically, we collect the actual execution time Treal(B) and
+the estimated time Tpd(B) for each batch B within a slid-
+ing time window. We then adjust a correction factor βi in a
+momentum way: βi+1 = θ·βi +(1−θ)·mean( Treal(B)
+Tpd(B) ). The
+estimator is subsequently updated as T i+1
+pd
+←βi+1 · T i
+pd. This
+allows the estimator to continuously adapt to runtime varia-
+tions while maintaining smoothing against transient noise.
+4.2
+Local Scheduler: SlideBatching
+The key of the batch scheduling policy lies in determining
+the batch capacity and the order of requests to admit. Our
+core design principle is: when possible, satisfy all request
+deadlines to capture full system gain; when current load
+cannot meet the deadlines of all requests, prioritize high-
+priority requests to maximize overall gain. To this end, we
+propose the SlideBatching algorithm that effectively balances
+request latency and priority.
+Algorithm.
+While batch capacity is typically defined by to-
+ken budget or batch size, thanks to the latency estimator intro-
+duced in §4.1, we can directly transform token- or sequence-
+level budgets into a time-level latency budget, comparable
+to request deadlines. Algorithm 1 first sets this budget to the
+smallest remaining deadline among queued requests (line 6),
+ensuring no request misses its deadline in the current batch.
+To avoid overly small batches under high load, a lower bound
+η is enforced (line 7). The core of the algorithm is the re-
+quest ordering strategy in line 13: we prioritize URGENT re-
+quests, and within the URGENT group, we schedule requests
+in descending order of their density (line 5). The remaining
+requests are scheduled in ascending order of their remaining
+time to deadline (r.remain). The numbers of URGENT and
+NORMAL requests vary dynamically with the queue load, and
+the boundary between them “slides” accordingly.
+Adaptive Urgency Partition.
+The algorithm dynamically
+diagnoses request urgency (lines 9–13) to prioritize URGENT
+Algorithm 1 SlideBatching Algorithm
+Input: the request queue Q
+Output: prepared batch of requests B.
+1: texec,tmin ←0,∞
+2: for r in Q do
+▷Update request metric
+3:
+r.exec ←˜Tpd(r)
+4:
+r.remain ←deadliner, r.output_len+1 −r.elapsed_time
+5:
+r.density ←wr(r.output_len+1)
+r.exec
+6:
+tmin ←min(tmin,r.remain)
+7: tbudget ←max(tmin,η)
+8: for r in Q do
+▷Determine requests’ urgency
+9:
+if r.remain < γ·φ(r,Q) then
+10:
+r.state ←URGENT
+11:
+else
+12:
+r.state ←NORMAL
+13: Sort Q first by r.state, then sort URGENT requests in
+descending order of r.density and sort NORMAL requests
+in ascending order of r.remain.
+14: tbatch ←tc
+15: while Q and tbatch < tbudget and memory is enough do
+16:
+r ←Q.pop()
+17:
+tbatch ←tbatch + GETMAXCHUNK(r,tbudget −tbatch)
+18:
+B ←B∪{r}
+19: return B
+requests at risk of missing deadlines. A request is URGENT
+if it is likely to miss its deadline under current load. This
+requires a load-judgment function φ(req,Q) that compares
+estimated completion time against r.remain. Since a request
+excluded from the current batch might still be served later,
+φ should estimate whether it can be completed in any future
+batch.
+In the PD co-located setting, we approximate the latency
+budget of future batches using the current tbudget. This is rea-
+sonable because, when the queue cannot be fully served, the
+algorithm tends to saturate tbudget via ChunkedPrefill (line 18).
+Consequently, each batch contains requests that either just
+meet or miss deadlines. If such a request is still running (im-
+plying it has entered the decoding phase), the minimum re-
+maining time to deadline in the next batch will be shorter
+than its TPOTr
+SLO (which is relatively small). Given the lower
+bound η, tbudget fluctuates within [η,max(TPOTr
+SLO)], so suc-
+cessive budgets remain relatively stable. We then consider two
+alternative implementations of the load-judgment function φ.
+(1) Request-Agnostic Aggressive Estimation. We adopt a
+worst-case perspective by statically placing every request at
+the end of the NORMAL queue and evaluating whether it
+would miss its deadline under this pessimistic assumption.
+Consequently, more requests are classified as URGENT. The
+corresponding function φa is formulated as:
+φa(Q) =
+tbudget
+tbudget −tc ∑
+r∈Q
+r.exec
+(8)
+6
+
+
+--- Page 7 ---
+where tc denotes the constant per-batch overhead introduced
+in §4.1 and the term ∑r∈Q r.exec
+tbudget−tc represents the number of batch
+steps required to process the entire request queue Q.
+(2) Request-Specific Conservative Estimation. We dynami-
+cally determines a request’s position in the queue. All requests
+are assumed to reside in the NORMAL queue, which is sorted
+in ascending order of remaining time r.remain. This ordering
+reflects the expected batch-admission sequence. Denoting
+req.index as the position of request req in this sorted queue
+Q, the corresponding function φc is formulated as:
+φc(req,Q) =
+tbudget
+tbudget −tc
+req.index
+∑
+i=0
+Q[i].exec
+(9)
+For the PD disaggregation setting, we only schedule the
+prefill-only instance, as decode requests are interference-free
+and typically batched together [33]. Given that prefill exe-
+cution times are relatively long, we adopt a worst-case esti-
+mation which leads to a simplified load-judgment function:
+φp(r,Q) = ∑r∈Q r.exec+|Q|·tc, where each batch is assumed
+to contain only one request.
+Additionally, we introduce an aggressiveness coefficient
+γ (line 10), which can be adjusted manually. A larger γ
+shifts more requests towards the URGENT side, favoring
+density-first scheduling pessimistically to capture short-term
+gain, whereas a smaller γ shifts more requests toward the
+NORMAL side, favoring deadline-first scheduling optimisti-
+cally in pursuit of long-term gain.
+Analysis.
+The algorithm’s behavior adapts to the system’s
+actual load through its sliding boundary mechanism. (1) Low
+Load: The latency budget accommodates all queued requests,
+rendering the specific ordering strategy negligible in its im-
+pact. (2) Medium load: A subset of requests is classified as
+URGENT, but the batch capacity is still sufficient to accom-
+modate all urgent requests along with some normal ones. The
+scheduling policy remains predominantly deadline-first, pri-
+oritizing requests with the earliest deadlines. (3) High load:
+The number of urgent requests increases sharply, exceeding
+the batch capacity, which means that only a subset of urgent
+requests can be admitted into the current batch. As long as the
+minimum remaining time among requests is greater than the
+threshold η, each request selected for the batch is expected to
+meet its deadline and yield its gain. In this context, each lo-
+cal batch formation can be modeled as a fractional knapsack
+problem: the latency budget tbudget serves as the knapsack
+capacity, the estimated execution time r.exec as the item size
+and the token-level gain wr(i) as the item value. Supported
+by ChunkedPrefill, requests can be approximately treated as
+divisible items, making our density-first greedy strategy opti-
+mal for this classic problem formulation. (4) Very high load:
+Nearly all requests may be classified as urgent. In this extreme
+case, the scheduling policy converges to a pure density-first
+strategy, focusing solely on maximizing immediate gain per
+forward time.
+Algorithm 2 GoRouting Algorithm for PD Disagg.
+Input: prefill instance pool P, decode instance pool D, re-
+quest req, request queues PrefillQueueMap maintained
+for instances
+Output: Selected instance pair (p_inst,d_inst)
+1: ∆max ←−∞
+2: for p in P do
+▷Estimate each instance’s gain
+3:
+Q ←PrefillQueueMap[p]
+4:
+pre_gain ←ESTIMATEGAIN(Q)
+5:
+post_gain ←ESTIMATEGAIN(Q∪{req})
+▷Based on specific local scheduler
+6:
+∆p = post_gain−pre_gain
+7:
+∆max ←max(∆max,∆p)
+8: C ←{p ∈P | ∆p ≥α·∆max}
+▷Candidates
+9: if ∆max > 0 then
+10:
+L ←{p ∈C | ESTIMATEEXEC(p) < µ·TTFTSLO}
+11:
+H ←{p ∈C | ESTIMATEEXEC(p,req) > λ ·
+TTFTSLO}
+12:
+if L ̸= /0 then
+13:
+p_inst ←argminp∈L ESTIMATEEXEC(p)
+14:
+else if C −H ̸= /0 then
+15:
+p_inst ←argmaxp∈C−H ESTIMATEEXEC(p)
+16:
+else
+17:
+p_inst ←argminp∈C ESTIMATEEXEC(p)
+18: else
+19:
+p_inst ←RANDOMSELECT(P)
+▷Fallback
+20: d_inst ←LOADBALANCE(D)
+21: return (p_inst,d_inst)
+4.3
+Global Scheduler: GoRouting
+GoRouting is designed to support both PD co-located and PD
+disaggregated [46] deployments, which are widely used in
+modern engines (e.g., vLLM [32], xLLM [20]).
+Instance State Monitoring and Update.
+To accurately
+track the load of local instances while minimizing communi-
+cation overhead between the local and global schedulers, the
+global scheduler maintains a real-time list of prefill requests
+running on each instance, denoted as PrefillQueueMap.
+In the PD disaggregated setting, when the global scheduler
+dispatches a request r to a prefill instance p, it immediately up-
+dates PrefillQueueMap[p].add(r). Once a request finishes on
+instance p, an asynchronous completion signal is sent to the
+global scheduler, triggering PrefillQueueMap[p].remove(r).
+For decode instances, the global scheduler simply tracks the
+number of free blocks reported by each local instance.
+In the PD co-located setting, we similarly maintain the
+prefill request list PrefillQueueMap. However, maintaining
+the full per-request decode state in the global scheduler would
+incur substantial communication overhead. Because each de-
+code execution time is relatively short and stable, we instead
+maintain a counter nd that records the number of requests
+7
+
+
+--- Page 8 ---
+currently in the decode phase on each instance. Specifically,
+when the service returns the first token of a request to the
+front-end, it simultaneously updates PrefillQueueMap and in-
+crements nd; when the request completes, nd is decremented.
+Moreover, relying solely on PrefillQueueMap can lead to
+information lag: the scheduler may dispatch a request based
+on the current queue state, while a prefill request on some
+instance may finish imminently. Since prefill execution times
+are typically long, such lag can significantly degrade schedul-
+ing accuracy. To obtain a more precise view, the global
+scheduler also records a timestamp tsp for each update to
+PrefillQueueMap[p]. When estimating the execution time on
+instance p, the elapsed time tscurr −tsp is subtracted from the
+predicted execution time to compensate for this delay.
+Instance Selection in PD Disaggregated Settings.
+The
+request-dispatching algorithm is detailed in Alg. 2. For each
+instance p, the ESTIMATEGAIN procedure evaluates whether
+the incoming request can meet its TTFT_SLO on p and how
+its admission would affect other requests already in the queue
+(line 2-5). This yields a predicted gain before dispatching (
+pre_gain) and after dispatching (post_gain). The implementa-
+tion of ESTIMATEGAIN depends on the specific local sched-
+uler running on this prefill instance. We adopt the similar
+conservative estimation strategy described in §4.2 and employ
+φp to estimate the total execution latency. The corresponding
+gain is then derived from this estimation.
+The incremental gain for instance p is ∆p = post_gain −
+pre_gain, and the maximum gain across all instances is
+∆max = maxp∈P ∆p. A positive ∆max indicates that at least
+one instance can satisfy the request’s TTFT SLO. If the re-
+quest cannot meet its SLO on any instance, ∆max will be
+non-positive, because adding the request does not shorten
+other requests’ latencies and instead tends to increase them,
+thereby reducing the overall gain. Since multiple instances
+may yield similarly high gains (e.g., all requests can be com-
+pleted before its within its SLO), we then introduce a thresh-
+old α to obtain a candidate set C of instances whose gains
+are close to ∆max (line 17). Every instance in C is capable of
+satisfying the request’s SLO.
+As noted in §3.3, an overly balanced dispatching strategy
+struggles to accommodate fluctuating request lengths, which
+may cause subsequent long requests to miss their SLOs. To
+this end, we employ a dual-threshold capability-aware dis-
+patching policy (lines 18–29). Let L denote the subset of C
+with relatively light load, and H the subset with relatively
+high load; these are defined by an upper threshold λ and a
+lower threshold µ. The final selection proceeds as follows:
+(1) If L ̸= /0, we dispatch the request to the most idle instance
+in L to prevent under-utilization.
+(2) IfC\H = /0 (i.e., all candidates are heavily loaded), we fall
+back to a load-balancing strategy, selecting the least-loaded
+instance in C to avoid pushing any instance into overload.
+(3) Otherwise, we remove the high-loaded instances (H) from
+C and select the instance with the relatively heaviest load
+among the remaining candidates. Although this may increase
+the TTFT of the dispatched request, the properties of C guar-
+antee that the request can still meet its TTFT SLO and obtain
+its gain, while reserving capacity on lighter-loaded instances
+for future potentially high-priority and long requests.
+For decode instance, the execution of decode requests is
+not interfered with by prefill [46]. The main constraint for
+decode instances is typically memory bound. We select the
+decode instance with the largest number of free blocks.
+Instance Selection in PD Co-located Settings.
+For request
+dispatching under PD co-location, the fact that a request re-
+mains on the same instance for both prefill and decode phases
+significantly complicates the gain calculation. For simplicity,
+we assume that decode requests are always included in the
+batch (since their execution time is short and TPOT is typ-
+ically small) and that they always meet their deadlines. We
+then consider only the gain contributed by prefill requests,
+which allows us to reuse Alg. 2 almost seamlessly.
+The adjustment is that when estimating the execution time
+for prefill on the instance, we add the estimated decode time
+nd ·bd, where bd is the average decode time. Furthermore, in
+SlideBatching, the ordering of requests in the queue changes
+dynamically with the load. To avoid an overly optimistic esti-
+mate of how admitting a new request interferes with existing
+ones, we adopt a conservative strategy and implement the
+ESTIMATEGAIN based on φa (Eq. 8). In this context, the esti-
+mated tbudget is set to the minimum of the smallest remaining
+time among prefill requests and the TPOT SLO.
+4.4
+Implemantation
+PROSERVE
+is
+implemented on
+top of the
+recently
+open-sourced, high-performance LLM inference system
+xLLM [40], which is written entirely in C++. In total, we
+added approximately 4K lines of C++ code for the scheduler,
+2K lines of Python for the client and evaluation modules, and
+1K lines of shell scripts for automation. Based on preliminary
+results showing a slight performance advantage of φa over φc
+in SlideBatching, φa is adopted as the load-judgment function
+for all reported results under the PD-coloated setting.
+5
+Evaluation
+5.1
+Experimental Setup
+Datasets and Workloads.
+We evaluate our method on four
+open-source datasets: ShareGPT [26], Azure [28], Burst-
+GPT [35], and QwenTrace [34]. For datasets with real times-
+tamps (Azure, QwenTrace, and BurstGPT), we adopt a com-
+monly used scaling method [25, 35, 39]. This approach ex-
+pands the timestamps according to a pre-defined overall re-
+quest rate, and then replays the requests following the scaled
+intervals. For datasets lacking real timestamps (ShareGPT),
+8
+
+
+--- Page 9 ---
+24
+26
+28
+30
+32
+0.7
+0.8
+0.9
+1.0
+TDG Ratio
+Qwen2-7B ShareGPT
+8
+10
+12
+14
+16
+18
+0.6
+0.7
+0.8
+0.9
+1.0
+Qwen2-7B Azure
+4
+6
+8
+10
+12
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Qwen2-7B QwenTrace
+8
+10
+12
+14
+16
+0.6
+0.7
+0.8
+0.9
+1.0
+Qwen2-7B BurstGPT
+24
+26
+28
+30
+32
+0.6
+0.8
+1.0
+SLO Attainment
+8
+10
+12
+14
+16
+18
+0.6
+0.8
+1.0
+4
+6
+8
+10
+12
+0.2
+0.4
+0.6
+0.8
+1.0
+8
+10
+12
+14
+16
+0.4
+0.6
+0.8
+1.0
+10
+12
+14
+16
+18
+20
+0.6
+0.7
+0.8
+0.9
+1.0
+TDG Ratio
+Qwen3-32B ShareGPT
+4
+6
+8
+10
+12
+0.7
+0.8
+0.9
+1.0
+Qwen3-32B Azure
+3
+4
+5
+6
+7
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Qwen3-32B QwenTrace
+4
+5
+6
+7
+8
+0.7
+0.8
+0.9
+1.0
+Qwen3-32B BurstGPT
+10
+12
+14
+16
+18
+20
+Request Rate
+0.2
+0.4
+0.6
+0.8
+1.0
+SLO Attainment
+4
+6
+8
+10
+12
+Request Rate
+0.6
+0.8
+1.0
+3
+4
+5
+6
+7
+Request Rate
+0.2
+0.4
+0.6
+0.8
+1.0
+4
+5
+6
+7
+8
+Request Rate
+0.6
+0.8
+1.0
+vLLM-FCFS
+Weighted VTC
+Sarathi-FCFS
+Sarathi-Priority
+FairBatching
+ProSched
+Figure 10: Performance of different methods across different datasets and models under the single-node setting.
+We employ a Poisson distribution to simulate the request ar-
+rival pattern. Additionally, we also include our proprietary
+industrial dataset, which will be described in §5.7.
+Testbd and Models.
+We deploy PROSERVE based on the
+recent open-source xLLM [20] inference engine framework
+with the server euipped with 16 Ascend 910B NPUs, 96 phys-
+ical CPU cores, and 2 TB of RAM. And we select the Qwen2-
+7B [2] and Qwen3-32B [41] models for our experiments.
+Baselines.
+We compare PROSERVE against the following
+batch scheduling algorithms:
+• vLLM-FCFS [32]: The default scheduling algorithm in
+vLLM. It prioritizes prefill requests and employs FCFS.
+• Weighted VTC [27]: A variant of the VTC algorithm.
+VTC is designed for fairness in LLM serving, aiming
+to equalize the number of tokens served across clients.
+Building upon this, Weighted VTC assigns different pri-
+ority weights (analogous to the nice values in Linux) to
+clients, ensuring the ratio of tokens processed approxi-
+mates the ratio of assigned priority weights.
+• Sarathi-FCFS [1]: The scheduler in Sarathi-Serve,
+which employs chunked prefill. It prioritizes decode re-
+quests and uses FCFS within each request type. It uses
+profiled token budget based on TBT.
+• Sarathi-Priority: A priority-based extension of above
+Sarathi-FCFS. When ordering requests, it strictly priori-
+tizes decode requests first, followed by those with higher
+priority, and finally, those that arrived earlier.
+• FairBatching [21]: A recently proposed scheduling al-
+gorithm that employs an enhanced EDF policy. It sched-
+ules requests by prioritizing decode sequences nearing
+their deadlines, followed by prefill sequences, and finally
+the remaining decode requests.
+In multi-node experiments, we use the widely adopted Min-
+Load strategy as the global scheduler baseline, which dis-
+patches each request to the least-loaded instance. For a fair
+comparison, all schedulers including our proposed methods,
+are uniformly implemented within the xLLM [20] framework.
+Metrics.
+We select the TDG introduced in §2 as gain
+function to quantify service gain for requests of differ-
+ent priorities. We further define the system-level gain met-
+rics as TDG_Ratio = ∑r fTDG(r)
+Ideal_Gain and Miss_TDG_Ratio =
+Ideal_Gain−∑r fTDG(r)
+Ideal_Gain
+, which respectively represent the propor-
+tion of captured gain and the proportion of lost gain relative
+to the total achievable gain. In addition, we report the SLO
+attainment ratio, a standard metric widely adopted in recent
+work [8,14,31,39,42]. A request is considered to have met
+9
+
+
+--- Page 10 ---
+62
+70
+78
+86
+94
+102
+Request Rate
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+TDG Ratio (Only Prefill)
+ShareGPT
+30
+38
+46
+54
+62
+Request Rate
+0.7
+0.8
+0.9
+1.0
+Azure
+26
+34
+42
+50
+58
+Request Rate
+0.7
+0.8
+0.9
+1.0
+QwenTrace
+36
+44
+52
+60
+68
+76
+Request Rate
+0.7
+0.8
+0.9
+1.0
+BurstGPT
+ProSched
+SlideBatching+MinLoad
+FCFS+GoRouting
+FCFS+MinLoad
+Figure 11: Performance of different methods across datasets in PD disaggregated multi-node deployment.
+10
+18
+26
+34
+42
+Request Rate
+0.00
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+Miss TDG Ratio
+QwenTrace (Qwen2-7B)
+ProSched
+SlideBatching+MinLoad
+Sarathi-Priority+GoRouting
+Sarathi-Priority+MinLoad
+30
+38
+46
+54
+62
+Request Rate
+0.00
+0.05
+0.10
+0.15
+0.20
+Azure (Qwen2-7B)
+ProSched
+SlideBatching+MinLoad
+Sarathi-Priority+GoRouting
+Sarathi-Priority+MinLoad
+Figure 12: Performance of different methods across datasets
+in PD co-located multi-node deployment.
+its SLO only when both its observed TTFT and TPOT are
+strictly less than the preset SLO thresholds.
+Details.
+To simulate a multi-priority scenario, each request
+in the dataset is randomly designated as high or low prior-
+ity with a 50% probability. In our experiments, the priority
+weights are fixed at 2 and 1 for high- and low-priority requests,
+respectively. An analysis of how different priority weight con-
+figurations affect our method is provided in §5.6. The ratio
+between the first-token weight and the decode-token weight
+in TDG is configured based on the average ratio of input to
+output length from the dataset.
+5.2
+Main Results
+Single-Node Performance.
+Figure 10 compares batch
+scheduling strategies under single-node PD co-location. Fig-
+ure 10 shows that PROSERVE consistently outperforms all
+baselines in both TDG and SLO attainment across all tested
+datasets and models, demonstrating its superior ability to
+schedule multi-priority requests under varying loads. Sec-
+ond, deadline-first based strategies (e.g., FairBatching and
+Sarathi-FCFS) perform well under low load, matching PROS-
+ERVE in system gain. However, their performance degrades
+sharply at higher request rates, falling below even vLLM-
+FCFS and Weighted VTC. This confirms that while such
+strategies work under light load, they become suboptimal
+under contention and lead to widespread deadline misses,
+which aligns with our analysis in §3.2. Third, although Sarathi-
+Priority and Weighted-VTC consider priority, each has criti-
+cal flaws. Sarathi-Priority’s strict prioritization starves low-
+priority requests, hurting overall gain. Weighted VTC focuses
+10
+12
+14
+16
+18
+20
+0.6
+0.7
+0.8
+0.9
+1.0
+TDG Ratio
+ShareGPT
+4
+6
+8
+10
+12
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Azure
+10
+12
+14
+16
+18
+20
+Request Rate
+0.4
+0.6
+0.8
+1.0
+SLO Attainment
+4
+6
+8
+10
+12
+Request Rate
+0.2
+0.4
+0.6
+0.8
+1.0
+Sarathi-FCFS
+Sarathi-Priority
+Ours
+High Priority
+Low Priority
+Figure 13: Performance for different priority requests under
+various scheduling strategies using Qwen3-32B.
+only on token-based fairness and ignores SLO constraints,
+resulting in poor TDG and SLO attainment.
+Multi-Node Performance.
+Since the PD-disaggregated set-
+ting inherently favors decode requests, the TDG for decode
+tokens is almost always satisfied in our experiments. we report
+only the first-token TDG. First, as shown in Figure 11, GoR-
+outing enhances various local schedulers. While not always se-
+lecting the least-loaded node, its SLO-aware dispatch matches
+minimum-load performance under light load. At higher loads,
+it reserves capacity for future long requests, improving overall
+TDG. Second, the improvement with SlideBatching exceeds
+that with GoRouting, as GoRouting’s effectiveness depends
+on specific traffic patterns, while SlideBatching adapts better
+to diverse request arrivals. Moreover, results are consistent
+under PD co-located multi-node deployment (Figure 12), con-
+firming the effectiveness of both SlideBatching and GoRout-
+ing in this scenario.
+5.3
+Performance of Different Priorities
+To demonstrate our method’s ability to balance latency guar-
+antees for high-priority requests with overall system perfor-
+mance, Figure 13 compares TDG and SLO satisfaction across
+priority levels. PROSERVE achieves slightly better TDG and
+SLO satisfaction for high-priority over low-priority requests,
+10
+
+
+--- Page 11 ---
+0.0
+0.5
+1.0
+1.5
+2.0
+TTFT (s)
+0.04
+0.08
+0.12
+0.16
+TPOT (s)
+ours
+0.0
+0.5
+1.0
+1.5
+2.0
+TTFT (s)
+0.04
+0.08
+0.12
+0.16
+Sarathi-Priority
+0.0
+0.5
+1.0
+1.5
+2.0
+TTFT (s)
+0.04
+0.08
+0.12
+0.16
+Sarathi-FCFS
+High Priority
+Low Priority
+SLO Boundary
+Figure 14: TTFT and TPOT distributions for different priority
+requests under various scheduling strategies.
+Low
+Medium
+High
+Load Level
+0
+2
+4
+6
+Normalized Miss TDG
+0.99x
+4.15x
+5.19x
+6.93x
+1.98x
+1.23x
+0.88x
+3.65x
+3.40x
+1.00x
+1.00x
+1.00x
+ShareGPT
+Low
+Medium
+High
+Load Level
+0
+2
+4
+6
+8
+10
+1.29x
+6.36x
+6.00x
+7.18x
+1.20x
+1.16x
+9.16x
+3.78x
+6.24x
+1.00x
+1.00x
+1.00x
+Azure
+w/ only deadline
+w/ only density
+w/o latency-aware
+Ours
+Figure 15: Performance of ablation study for SlideBatching.
+maintaining a desirable priority ordering while keeping both
+at high absolute levels—consistently outperforming Sarathi-
+FCFS. In contrast, Sarathi-Priority strictly prioritizes high-
+priority requests, causing severe performance degradation
+and starvation for low-priority ones, which ultimately low-
+ers overall system gain compared to PROSERVE. Figure 14
+further compares TTFT and TPOT distributions. PROSERVE
+achieves a balanced latency distribution across priorities, with
+minimal disparity between high- and low-priority requests.
+Sarathi-Priority, however, exhibits significantly larger TTFT
+for low-priority requests, resulting in many SLO violations.
+Besides, while Sarathi’s decode-prioritized strategy yields
+slightly better TPOT, it causes substantial TTFT timeouts.
+5.4
+Ablation Study
+To validate the effectiveness of the individual modules in
+PROSERVE, we conduct an ablation study. The configurations
+w/ only deadline and w/ only density represent simplified
+versions where the Adaptive Urgency Partition module is re-
+moved, retaining only the deadline-prioritized strategy or the
+density-prioritized strategy, respectively. w/o latency-aware
+denotes disabling the latency estimator that predicts request
+latency and restricts batch capability. As shown in Figure 15,
+removing any of these modules leads to performance degrada-
+tion, demonstrating the necessity of our proposed components.
+Furthermore, w/ only deadline outperforms w/ only density
+under lower load conditions, whereas the opposite trend is
+observed under higher load. This behavior aligns with the
+insights discussed in §3.2.
+5.5
+Timeline Analysis
+Figure 16 illustrates the timeline of TDG obtained per sec-
+ond by Sarathi-FCFS and PROSERVE under relatively high
+load on the Azure dataset. Sarathi-FCFS initially achieves
+0
+20
+40
+60
+80
+100
+120
+140
+160
+180
+Time (seconds)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+TDG per Second
+×104
+ours
+Sarathi-FCFS
+Figure 16: The request servicing timelines of PROSERVE and
+baseline methods during a representative service session.
+Timeline
+0
+50
+100
+150
+200
+250
+300
+Count
+Low Load
+Normal
+Urgent
+Timeline
+0
+50
+100
+150
+200
+250
+300
+Medium Load
+Normal
+Urgent
+Timeline
+0
+50
+100
+150
+200
+250
+300
+High Load
+Normal
+Urgent
+Figure 17: The urgent and normal request distribution time-
+lines of PROSERVE under different load (request rate).
+TDG under low-load conditions; however, as the cumula-
+tive load increases, its FCFS-based scheduling can lead to
+widespread request timeouts, causing TDG to approach zero
+in subsequent service intervals. In contrast, PROSERVE can
+adaptively respond to load variations. It employs an approxi-
+mately deadline-first strategy during low-load periods, achiev-
+ing higher TDG than Sarathi-FCFS. More importantly, upon
+detecting high cumulative load conditions, PROSERVE dy-
+namically switches to its high-load scheduling mode, priori-
+tizing high-priority and relatively short requests to maintain
+sustained TDG acquisition throughout the service period. Fig-
+ure 17 further illustrates the timeline of urgent and normal
+request counts partitioned by SlideBatching under different
+loads. It can be observed that our method adaptively adjusts
+the number of each type in response to load fluctuations.
+5.6
+Priority Weight Scaling
+Figure 18 illustrates the SLO satisfaction rates of different
+priority requests and the overall system in PROSERVE under
+various load conditions as the priority weight increases. Sev-
+eral key observations can be drawn. First, across all load lev-
+els, the SLO satisfaction rate for high-priority requests shows
+a significant upward trend as the priority weight increases,
+while that of low-priority requests gradually declines. Notably,
+the overall SLO satisfaction rate remains stable, indicating
+that our method effectively balances the latency requirements
+between high- and low-priority requests. Second, under high
+load conditions, the SLO satisfaction rate of high-priority re-
+quests exhibits more pronounced improvement with increas-
+ing priority weight. This demonstrates that our method adapts
+to workload intensity by more aggressively protecting high-
+priority requests to maintain overall service gain under high
+load, while striving to guarantee latency for all requests un-
+der low-to-medium load. Third, as the priority weight grows,
+the SLO satisfaction rate of high-priority requests in PROS-
+11
+
+
+--- Page 12 ---
+1
+2
+10
+100
+Priority Weight
+0.5
+0.6
+0.7
+0.8
+0.9
+SLO Attainment
+Medium Load
+1
+2
+10
+100
+Priority Weight
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+High Load
+Ours - Overall
+Ours - High Priority
+Ours - Low Priority
+Sarathi-Priority - Overall
+Sarathi-Priority - High
+Sarathi-Priority - Low
+Figure 18: Effects of priority weight scaling on multi-priority
+request performance in PROSERVE.
+80
+112
+144
+176
+208
+Request Rate
+0.4
+0.6
+0.8
+1.0
+TDG Ratio
+vLLM-FCFS
+Weighted VTC
+Sarathi-FCFS
+Sarathi-Priority
+FairBatching
+Ours
+80
+112
+144
+176
+208
+Request Rate
+0.2
+0.4
+0.6
+0.8
+1.0
+SLO Attainment
+vLLM-FCFS
+Weighted VTC
+Sarathi-FCFS
+Sarathi-Priority
+FairBatching
+Ours
+Figure 19: Performance of different methods on a large-scale
+cluster using a proprietary industrial dataset.
+ERVE initially lags behind Sarathi-Priority but eventually sur-
+passes it. Moreover, our method consistently achieves better
+overall SLO satisfaction and low-priority request satisfaction
+than Sarathi-Priority, which strictly prioritizes high-priority
+requests. These results confirm the superiority of our approach
+in dynamically meeting the latency requirements of different
+priority levels.
+5.7
+Large-Scale Cluster Experiments
+We conduct experiments using our proprietary industrial
+dataset (the distribution is shown in Figure 1). The prior-
+ity weights for different priorities are assigned according to
+their actual business value in our production environment.
+The experiments run on a cluster of 8 servers, each equipped
+with 16 Ascend 910B NPUs. We deploy 32 instances of the
+Qwen3-32B model [41]. As shown in Figure 19, our method
+consistently outperforms all baseline methods even at this
+large scale and on the real-world industrial workload.
+6
+Related Work
+LLM Serving.
+Existing works have optimized LLM serv-
+ing systems from various perspectives, such as kernel opti-
+mization [6,7,15,43], prefix cache [45] and KV cache man-
+agement [17, 18, 25]. These system-level optimizations are
+orthogonal to our approach and can be seamlessly integrated.
+For LLM scheduling, Sarathi-Serve [1] employs chunked pre-
+fill and a stall-free batching strategy to mitigate the interfer-
+ence caused by prefill requests on decode requests. Numerous
+recent studies [3,5,12,14,31] propose a range of SLO-aware
+scheduling algorithms to improve SLO attainment.
+PD Disaggregation Optimization.
+DistServe [46] pro-
+poses a PD-disaggregated architecture to entirely avoid in-
+terference between prefill and decode phases, which has
+since been widely adopted in modern inference engines like
+vLLM [32] and xLLM [20]. Subsequent research has further
+optimized this architecture from various angles, including
+parallelization strategies [46], KV cache management [25],
+and instance orchestration [33,39]. Our scheduling algorithm
+is also designed to be effective in PD disaggregated settings.
+Priority-related Request Scheduling.
+Existing request
+scheduling methods typically map request attributes, such as
+request length, SLO capability and online/offline nature, into
+priorities. Some methods [9,11,13,38] treat shorter requests as
+higher priority, leveraging a scheduling strategy based on the
+Shortest Job First (SJF) principle. For instance, FastServe [38]
+introduces an enhanced multi-level priority queue, which dis-
+patches incoming requests into different queue levels based
+on their prefill execution time. Studies [5, 31, 42] address
+multi-SLO scenarios by treating requests with tighter SLOs
+as higher priority. However, this scenario represents a sub-
+set of our context, as our approach not only accommodates
+heterogeneous request SLOs but also incorporates the pri-
+ority of the client. Recent works [4, 30, 36] have proposed
+co-location scheduling for online and offline requests, typi-
+cally prioritizing online requests as high-priority and offline
+requests as low-priority. They generally disregard the latency
+requirements of offline requests, making them unsuitable for
+direct application in our scenario. None of the aforementioned
+methods explicitly consider the inherent priority differences
+among online clients sending the requests. Llumnix [29] allo-
+cates more reserved memory space for high-priority requests.
+VTC [27] is a fairness-oriented scheduling algorithm. Its ex-
+tension, Weighted VTC, introduces priority-specific weights
+to ensure that the ratio of processed tokens aligns with re-
+quests’ priorities. However, relying solely on static token
+quotas or memory reservation cannot explicitly guarantee
+latency requirements of high-priority requests.
+7
+Conclusion
+In this paper, we first formalize the multi-priority scheduling
+problem as a service gain maximization task, where meeting
+the latency requirements of high-priority requests typically
+yields greater service gain than satisfying those of low-priority
+requests. To address this, we propose PROSERVE, a novel
+scheduling framework consisting of: SlideBatching, the local
+scheduler, which adaptively reorders requests according to
+load and priority, and GoRouting, the global scheduler, which
+performs gain-oriented and capability-aware request dispatch-
+ing across distributed instances. Extensive experiments across
+multiple datasets validate the effectiveness of our method.
+12
+
+
+--- Page 13 ---
+References
+[1] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree
+Mohan, Nipun Kwatra, Bhargav Gulavani, Alexey
+Tumanov, and Ramachandran Ramjee.
+Taming
+{Throughput-Latency} tradeoff in {LLM} inference
+with {Sarathi-Serve}. In 18th USENIX Symposium on
+Operating Systems Design and Implementation (OSDI
+24), pages 117–134, 2024.
+[2] Shuai Bai, Keqin Chen, Xuejing Liu, Jialin Wang, Wen-
+bin Ge, Sibo Song, Kai Dang, Peng Wang, Shijie Wang,
+Jun Tang, et al. Qwen2. 5-vl technical report. arXiv
+preprint arXiv:2502.13923, 2025.
+[3] Kyungmin Bin, Seungbeom Choi, Jimyoung Son, Jieun
+Choi, Daseul Bae, Daehyeon Baek, Kihyo Moon, Min-
+sung Jang, and Hyojung Lee.
+Fineserve: Precision-
+aware kv slab and two-level scheduling for hetero-
+geneous precision llm serving.
+arXiv preprint
+arXiv:2509.06261, 2025.
+[4] Wan Borui, Zhao Juntao, Jiang Chenyu, Guo Chuanx-
+iong, and Wu Chuan.
+Efficient llm serving on hy-
+brid real-time and best-effort requests. arXiv preprint
+arXiv:2504.09590, 2025.
+[5] Siyuan Chen, Zhipeng Jia, Samira Khan, Arvind Kr-
+ishnamurthy, and Phillip B Gibbons. Slos-serve: Op-
+timized serving of multi-slo llms.
+arXiv preprint
+arXiv:2504.08784, 2025.
+[6] Tri Dao. Flashattention-2: Faster attention with bet-
+ter parallelism and work partitioning. arXiv preprint
+arXiv:2307.08691, 2023.
+[7] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and
+Christopher Ré.
+Flashattention: Fast and memory-
+efficient exact attention with io-awareness. Advances
+in neural information processing systems, 35:16344–
+16359, 2022.
+[8] Xianzhe Dong, Tongxuan Liu, Yuting Zeng, Liangyu
+Liu, Yang Liu, Siyu Wu, Yu Wu, Hailong Yang,
+Ke Zhang, and Jing Li. Hydrainfer: Hybrid disaggre-
+gated scheduling for multimodal large language model
+serving. arXiv preprint arXiv:2505.12658, 2025.
+[9] Kuntai Du, Bowen Wang, Chen Zhang, Yiming Cheng,
+Qing Lan, Hejian Sang, Yihua Cheng, Jiayi Yao, Xi-
+aoxuan Liu, Yifan Qiao, et al. Prefillonly: An infer-
+ence engine for prefill-only workloads in large language
+model applications. In Proceedings of the ACM SIGOPS
+31st Symposium on Operating Systems Principles, pages
+399–414, 2025.
+[10] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey,
+Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman,
+Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan,
+et al. The llama 3 herd of models. arXiv e-prints, pages
+arXiv–2407, 2024.
+[11] Yichao Fu, Siqi Zhu, Runlong Su, Aurick Qiao, Ion Sto-
+ica, and Hao Zhang. Efficient llm scheduling by learning
+to rank. Advances in Neural Information Processing
+Systems, 37:59006–59029, 2024.
+[12] Ke Hong, Xiuhong Li, Lufang Chen, Qiuli Mao, Guo-
+hao Dai, Xuefei Ning, Shengen Yan, Yun Liang, and
+Yu Wang. Sola: Optimizing slo attainment for large
+language model serving with state-aware scheduling. In
+Eighth Conference on Machine Learning and Systems.
+[13] Cunchen Hu, Heyang Huang, Liangliang Xu, Xusheng
+Chen, Jiang Xu, Shuang Chen, Hao Feng, Chenxi Wang,
+Sa Wang, Yungang Bao, et al. Inference without interfer-
+ence: Disaggregate llm inference for mixed downstream
+workloads. arXiv preprint arXiv:2401.11181, 2024.
+[14] Jinqi Huang, Yi Xiong, Xuebing Yu, Wenjie Huang, En-
+tong Li, Li Zeng, and Xin Chen. Slo-aware scheduling
+for large language model inferences. arXiv preprint
+arXiv:2504.14966, 2025.
+[15] Sheng-Chun
+Kao, Suvinay
+Subramanian, Gaurav
+Agrawal, Amir Yazdanbakhsh, and Tushar Krishna.
+Flat: An optimized dataflow for mitigating attention bot-
+tlenecks. In Proceedings of the 28th ACM International
+Conference on Architectural Support for Programming
+Languages and Operating Systems, Volume 2, pages
+295–310, 2023.
+[16] Md Monjurul Karim, Sangeen Khan, Dong Hoang Van,
+Xinyue Liu, Chunhui Wang, and Qiang Qu. Transform-
+ing data annotation with ai agents: A review of archi-
+tectures, reasoning, applications, and impact. Future
+Internet, 17(8):353, 2025.
+[17] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez,
+Hao Zhang, and Ion Stoica. Efficient memory manage-
+ment for large language model serving with pagedatten-
+tion. In Proceedings of the 29th symposium on operating
+systems principles, pages 611–626, 2023.
+[18] Haoyang Li, Yiming Li, Anxin Tian, Tianhao Tang,
+Zhanchao Xu, Xuejia Chen, Nicole Hu, Wei Dong, Qing
+Li, and Lei Chen. A survey on large language model
+acceleration based on kv cache management. arXiv
+preprint arXiv:2412.19442, 2024.
+[19] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao
+Wu, Chengda Lu, Chenggang Zhao, Chengqi Deng,
+13
+
+
+--- Page 14 ---
+Chenyu Zhang, Chong Ruan, et al. Deepseek-v3 techni-
+cal report. arXiv preprint arXiv:2412.19437, 2024.
+[20] Tongxuan Liu, Tao Peng, Peijun Yang, Xiaoyang Zhao,
+Xiusheng Lu, Weizhe Huang, Zirui Liu, Xiaoyu Chen,
+Zhiwei Liang, Jun Xiong, et al. xllm technical report.
+arXiv preprint arXiv:2510.14686, 2025.
+[21] Hongtao Lyu, Boyue Liu, Mingyu Wu, and Haibo Chen.
+Fairbatching: Fairness-aware batch formation for llm
+inference. arXiv preprint arXiv:2510.14392, 2025.
+[22] NVIDIA.
+Dynamo.
+https://github.com/
+ai-dynamo/dynamo, 2025.
+[23] OpenAI. Introducing chatgpt. https://openai.com/
+index/chatgpt/, 2022.
+[24] Chandandeep Singh Pabla. Completely fair scheduler.
+Linux Journal, 2009(184):4, 2009.
+[25] Ruoyu Qin, Zheming Li, Weiran He, Jialei Cui, Heyi
+Tang, Feng Ren, Teng Ma, Shangming Cai, Yineng
+Zhang, Mingxing Zhang, et al. Mooncake: A kvcache-
+centric disaggregated architecture for llm serving. ACM
+Transactions on Storage, 2024.
+[26] ShareGPT.
+Sharegpt.
+https://huggingface.co/
+datasets/anon8231489123/ShareGPT_Vicuna_
+unfiltered, 2023.
+[27] Ying Sheng, Shiyi Cao, Dacheng Li, Banghua Zhu,
+Zhuohan Li, Danyang Zhuo, Joseph E Gonzalez, and Ion
+Stoica. Fairness in serving large language models. In
+18th USENIX Symposium on Operating Systems Design
+and Implementation (OSDI 24), pages 965–988, 2024.
+[28] Jovan Stojkovic, Chaojie Zhang, Íñigo Goiri, Josep Tor-
+rellas, and Esha Choukse. Dynamollm: Designing llm
+inference clusters for performance and energy efficiency.
+In 2025 IEEE International Symposium on High Per-
+formance Computer Architecture (HPCA), pages 1348–
+1362. IEEE, 2025.
+[29] Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao,
+Xinyi Zhang, Yong Li, and Wei Lin. Llumnix: Dynamic
+scheduling for large language model serving. In 18th
+USENIX symposium on operating systems design and
+implementation (OSDI 24), pages 173–191, 2024.
+[30] Ting Sun, Penghan Wang, and Fan Lai. Hygen: Efficient
+llm serving via elastic online-offline request co-location.
+arXiv preprint arXiv:2501.14808, 2025.
+[31] Yinghao Tang, Tingfeng Lan, Xiuqi Huang, Hui Lu, and
+Wei Chen. Scorpio: Serving the right requests at the
+right time for heterogeneous slos in llm inference. arXiv
+preprint arXiv:2505.23022, 2025.
+[32] vLLM Team.
+vllm.
+https://github.com/
+vllm-project/vllm, 2025.
+[33] Chao Wang, Pengfei Zuo, Zhangyu Chen, Yunkai
+Liang, Zhou Yu, and Ming-Chang Yang.
+Prefill-
+decode aggregation or disaggregation? unifying both
+for goodput-optimized llm serving.
+arXiv preprint
+arXiv:2508.01989, 2025.
+[34] Jiahao Wang, Jinbo Han, Xingda Wei, Sijie Shen,
+Dingyan Zhang, Chenguang Fang, Rong Chen, Wenyuan
+Yu, and Haibo Chen. Kvcache cache in the wild: Char-
+acterizing and optimizing kvcache cache at a large cloud
+provider, 2025.
+[35] Yuxin Wang, Yuhan Chen, Zeyu Li, Xueze Kang, Yuchu
+Fang, Yeju Zhou, Yang Zheng, Zhenheng Tang, Xin He,
+Rui Guo, et al. Burstgpt: A real-world workload dataset
+to optimize llm serving systems. In Proceedings of the
+31st ACM SIGKDD Conference on Knowledge Discov-
+ery and Data Mining V. 2, pages 5831–5841, 2025.
+[36] Zhibin Wang, Shipeng Li, Xue Li, Yuhang Zhou,
+Zhonghui Zhang, Zibo Wang, Rong Gu, Chen Tian, Kun
+Yang, and Sheng Zhong. Echo: Efficient co-scheduling
+of hybrid online-offline tasks for large language model
+serving. arXiv preprint arXiv:2504.03651, 2025.
+[37] Zhibin Wang, Shipeng Li, Yuhang Zhou, Xue Li, Rong
+Gu, Nguyen Cam-Tu, Chen Tian, and Sheng Zhong. Re-
+visiting slo and goodput metrics in llm serving. arXiv
+preprint arXiv:2410.14257, 2024.
+[38] Bingyang Wu, Yinmin Zhong, Zili Zhang, Shengyu Liu,
+Fangyue Liu, Yuanhang Sun, Gang Huang, Xuanzhe Liu,
+and Xin Jin. Fast distributed inference serving for large
+language models. arXiv preprint arXiv:2305.05920,
+2023.
+[39] Yu Wu, Tongxuan Liu, Yuting Zeng, Siyu Wu, Jun
+Xiong, Xianzhe Dong, Hailong Yang, Ke Zhang, and
+Jing Li. Arrow: Adaptive scheduling mechanisms for
+disaggregated llm inference architecture. arXiv preprint
+arXiv:2505.11916, 2025.
+[40] xLLM Team.
+xllm.
+https://github.com/
+jd-opensource/xllm, 2025.
+[41] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang,
+Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chen-
+gen Huang, Chenxu Lv, et al. Qwen3 technical report.
+arXiv preprint arXiv:2505.09388, 2025.
+[42] Zahra Yousefijamarani, Xinglu Wang, Qian Wang, Mor-
+gan Lindsay Heisler, Taha Shabani, Niloofar Gholipour,
+Parham Yassini, Hong Chang, Kan Chen, Qiantao
+Zhang, et al. Hyperflexis: Joint design of algorithms
+and systems for multi-slo serving and fast scaling. arXiv
+preprint arXiv:2508.15919, 2025.
+14
+
+
+--- Page 15 ---
+[43] Jintao Zhang, Jia Wei, Haofeng Huang, Pengle Zhang,
+Jun Zhu, and Jianfei Chen. Sageattention: Accurate
+8-bit attention for plug-and-play inference acceleration.
+arXiv preprint arXiv:2410.02367, 2024.
+[44] Wei Zhang, Zhiyu Wu, Yi Mu, Banruo Liu, Myungjin
+Lee, and Fan Lai.
+Tempo: Application-aware llm
+serving with mixed slo requirements. arXiv preprint
+arXiv:2504.20068, 2025.
+[45] Lianmin
+Zheng, Liangsheng
+Yin, Zhiqiang
+Xie,
+Chuyue Livia Sun, Jeff Huang, Cody Hao Yu, Shiyi
+Cao, Christos Kozyrakis, Ion Stoica, Joseph E Gonzalez,
+et al. Sglang: Efficient execution of structured language
+model programs. Advances in neural information pro-
+cessing systems, 37:62557–62583, 2024.
+[46] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu,
+Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao Zhang.
+{DistServe}: Disaggregating prefill and decoding for
+goodput-optimized large language model serving. In
+18th USENIX Symposium on Operating Systems Design
+and Implementation (OSDI 24), pages 193–210, 2024.
+15
