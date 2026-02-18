@@ -131,12 +131,6 @@ def _wrap_email(title: str, body: str, date_str: str = None,
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>{title}</title>
-<style>
-/* Gmail-compatible toggle: checkbox + sibling selector */
-.rd-cb {{ display:none; }}
-.rd-content {{ max-height:0; overflow:hidden; transition:max-height .2s ease; }}
-.rd-cb:checked ~ .rd-content {{ max-height:9999px; }}
-</style>
 </head>
 <body style="margin:0; padding:0; background:{COLORS['bg']}; font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; color:{COLORS['text']}; font-size:14px; line-height:1.5;">
 <div style="display:none; max-height:0; overflow:hidden; mso-hide:all; opacity:0; color:transparent;">Research Intelligence curated digest — Latest papers, research fronts, and framework evolution.</div>
@@ -210,15 +204,14 @@ def _paper_row(paper: dict, rank: int = 0) -> str:
     pub_date = paper.get('published_date', '')[:10]
     affiliations = paper.get('affiliations', '')
 
-    # Brief with Gmail-compatible checkbox toggle
     full_brief = _markdown_to_html(paper.get('brief', ''))
-    safe_id = (arxiv_id or 'x').replace('.', '-')
     if len(full_brief) > 300:
         brief_html = (
             f"{full_brief[:300]}..."
-            f'<input type="checkbox" id="rd-{safe_id}" class="rd-cb">'
-            f'<label for="rd-{safe_id}" style="color:{COLORS["accent_primary"]}; cursor:pointer; font-weight:600; font-size:12px; display:block; margin-top:6px;">▶ Read more</label>'
-            f'<div class="rd-content" style="padding-top:8px; border-top:1px solid {COLORS["border"]}; margin-top:6px;">{full_brief}</div>'
+            f'<details style="margin-top:6px;">'
+            f'<summary style="color:{COLORS["accent_primary"]}; cursor:pointer; font-weight:600; font-size:12px; list-style:none; display:block;">&#9654; Read more</summary>'
+            f'<div style="padding-top:8px; border-top:1px solid {COLORS["border"]}; margin-top:6px;">{full_brief}</div>'
+            f'</details>'
         )
     else:
         brief_html = full_brief
@@ -396,11 +389,12 @@ def _render_front_card(front: dict, front_methods: dict,
   {methods_html}
   {summary_html}
   <div style="margin-top:8px;">
-    <input type="checkbox" id="fp-{short_id}" class="rd-cb">
-    <label for="fp-{short_id}" style="font-size:12px; color:{COLORS['link']}; font-weight:bold; cursor:pointer; display:block;">▶ Papers in this front</label>
-    <div class="rd-content" style="padding-left:8px;">
-      {papers_html}
-    </div>
+    <details>
+      <summary style="font-size:12px; color:{COLORS['link']}; font-weight:bold; cursor:pointer; list-style:none; display:block;">&#9654; Papers in this front</summary>
+      <div style="padding-left:8px; margin-top:4px;">
+        {papers_html}
+      </div>
+    </details>
   </div>
 </td></tr>"""
 

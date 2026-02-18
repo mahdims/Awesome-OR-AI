@@ -104,15 +104,14 @@ def _priority_paper_row(item: dict, rank: int) -> str:
     pub_date = paper.get('published_date', '')[:10]
     affiliations = paper.get('affiliations', '')
 
-    # Brief with Gmail-compatible checkbox toggle
     full_brief = _markdown_to_html(paper.get('brief', ''))
-    safe_id = (arxiv_id or 'x').replace('.', '-')
     if len(full_brief) > 250:
         brief_html = (
             f"{full_brief[:250]}..."
-            f'<input type="checkbox" id="rd-{safe_id}" class="rd-cb">'
-            f'<label for="rd-{safe_id}" style="color:{COLORS["accent_primary"]}; cursor:pointer; font-weight:600; font-size:12px; display:block; margin-top:6px;">▶ Read more</label>'
-            f'<div class="rd-content" style="padding-top:8px; border-top:1px solid {COLORS["border"]}; margin-top:6px;">{full_brief}</div>'
+            f'<details style="margin-top:6px;">'
+            f'<summary style="color:{COLORS["accent_primary"]}; cursor:pointer; font-weight:600; font-size:12px; list-style:none; display:block;">&#9654; Read more</summary>'
+            f'<div style="padding-top:8px; border-top:1px solid {COLORS["border"]}; margin-top:6px;">{full_brief}</div>'
+            f'</details>'
         )
     else:
         brief_html = full_brief
@@ -212,9 +211,10 @@ def _front_card_with_affiliations(front: dict, aff_info: Optional[dict]) -> str:
                 f'padding:12px; background:{COLORS["accent_bg"]}; border-radius:12px; '
                 f'border-left:3px solid {COLORS["accent_secondary"]};">'
                 f'<p style="margin:0;">{first_para}</p>'
-                f'<input type="checkbox" id="fs-{short_id}" class="rd-cb">'
-                f'<label for="fs-{short_id}" style="color:{COLORS["accent_primary"]}; cursor:pointer; font-weight:600; font-size:11px; display:block; margin-top:6px;">&#9660; Read full analysis</label>'
-                f'<div class="rd-content" style="padding-top:8px; border-top:1px solid {COLORS["border"]}; margin-top:6px;">{rest_paras}</div>'
+                f'<details style="margin-top:6px;">'
+                f'<summary style="color:{COLORS["accent_primary"]}; cursor:pointer; font-weight:600; font-size:11px; list-style:none; display:block;">&#9654; Read full analysis</summary>'
+                f'<div style="padding-top:8px; border-top:1px solid {COLORS["border"]}; margin-top:6px;">{rest_paras}</div>'
+                f'</details>'
                 f'</div>'
             )
         else:
@@ -257,12 +257,11 @@ def _front_card_with_affiliations(front: dict, aff_info: Optional[dict]) -> str:
                 f'</li>'
             )
         papers_html = (
-            f'<input type="checkbox" id="fp-{short_id}" class="rd-cb">'
-            f'<label for="fp-{short_id}" style="margin-top:10px; font-size:11px; color:{COLORS["accent_primary"]}; font-weight:600; cursor:pointer; display:block;">&#9660; {len(papers_detail)} papers in this front</label>'
-            f'<div class="rd-content">'
+            f'<details style="margin-top:10px;">'
+            f'<summary style="font-size:11px; color:{COLORS["accent_primary"]}; font-weight:600; cursor:pointer; list-style:none; display:block;">&#9654; {len(papers_detail)} papers in this front</summary>'
             f'<ul style="margin:4px 0 0; padding:0; border-top:1px solid {COLORS["border"]};">'
             + ''.join(rows)
-            + '</ul></div>'
+            + '</ul></details>'
         )
 
     return f"""<tr><td style="padding:16px 24px; border-bottom:1px solid {COLORS['border']}; background:{COLORS['card_bg']};">

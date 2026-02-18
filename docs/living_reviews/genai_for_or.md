@@ -72,6 +72,17 @@
 > Li et al. introduce MIPLIB-NL, a benchmark of 223 industrial-scale MILP instances (up to 10^7 variables) reverse-engineered from MIPLIB 2017, enforcing strict model-data separation. Results are sobering: SOTA models like GPT-4 and fine-tuned OR-LLMs drop from ~90% accuracy on existing toy benchmarks to ~18% here, failing primarily on structural consistency and index handling at scale. For us, the key takeaway is their "Loop-Based Structural Scaffold" taxonomy—a method to compress massive industrial formulations into compact LLM prompts via model-data separation. This is a mandatory read for our OR-Bench project, as it demonstrates that current evaluations are effectively measuring overfitting to toy problems rather than genuine modeling capability.
 
 
+#### 2026-02-17 (1 papers)
+
+### [Constructing Industrial-Scale Optimization Modeling Benchmark](https://arxiv.org/abs/2602.10450)
+
+**2026-02-11** | Peking University, Huawei Technologies Co., Ltd., Great Bay University | M=7 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Structure-aware reverse construction methodology from MIPLIB 2017 | *LLM role:* linguistic_polisher, interactive_assistant
+
+> Li et al. introduce MIPLIB-NL, a benchmark of 223 industrial-scale MILP instances (up to 10^7 variables) reverse-engineered from MIPLIB 2017, enforcing strict model-data separation. Results are sobering: SOTA models like GPT-4 and fine-tuned OR-LLMs drop from ~90% accuracy on existing toy benchmarks to ~18% here, failing primarily on structural consistency and index handling at scale. For us, the key takeaway is their "Loop-Based Structural Scaffold" taxonomy—a method to compress massive industrial formulations into compact LLM prompts via model-data separation. This is a mandatory read for our OR-Bench project, as it demonstrates that current evaluations are effectively measuring overfitting to toy problems rather than genuine modeling capability.
+
+
 <!-- New papers are appended here by the daily updater -->
 
 ---
