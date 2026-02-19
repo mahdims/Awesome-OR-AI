@@ -1,10 +1,21 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-02-18
+**Last Updated:** 2026-02-19
 
 ---
 
 ## Recent Papers
+
+#### 2026-02-19 (1 papers)
+
+### [ReLoop: Structured Modeling and Behavioral Verification for Reliable LLM-Based Optimization](https://arxiv.org/abs/2602.15983)
+
+**2026-02-17** | National University of Singapore, Northwestern University, City University of Hong Kong, Wenzhou University, Wenzhou Buyi Pharmacy Chain Co., Ltd. | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Structured generation (understand, formalize, synthesize, verify) with two-layer behavioral verification (L1 execution recovery, L2 solver-based perturbation testing) and diagnosis-guided repair. | *LLM role:* code_writer
+
+> ReLoop proposes a verification pipeline for LLM-generated optimization models that detects 'silent failures' (code that runs but solves the wrong problem) by perturbing input parameters and checking for expected solver objective shifts. They demonstrate that standard execution feasibility is a poor proxy for correctness (90% gap) on their new RetailOpt-190 benchmark, and that this perturbation testing significantly improves reliability. The critical takeaway is the use of sensitivity analysis as a ground-truth-free process reward signal: we can validate evolved algorithms in AlgoEvo by asserting that specific input perturbations *must* trigger output changes, filtering out semantically invalid candidates before expensive evaluation.
+
 
 #### 2026-02-18 (1 papers)
 
