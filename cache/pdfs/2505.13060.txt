@@ -1,0 +1,914 @@
+--- Page 1 ---
+arXiv:2505.13060v1  [cs.LG]  19 May 2025
+Automatic mixed precision for optimizing gained time
+with constrained loss mean-squared-error based on
+model partition to sequential sub-graphs
+Shmulik Markovich-Golan
+Daniel Ohayon
+Itay Niv
+Yair Hanani
+Intel Corporation/Habana
+{shmulik.markovich-golan, daniel1.ohayon, itay.niv, yair.hanani}@intel.com
+Abstract
+Quantization is essential for Neural Network (NN) compression, reducing model
+size and computational demands by using lower bit-width data types, though
+aggressive reduction often hampers accuracy. Mixed Precision (MP) mitigates
+this tradeoff by varying the numerical precision across network layers. This
+study focuses on automatically selecting an optimal MP configuration within
+Post-Training Quantization (PTQ) for inference. The first key contribution is
+a novel sensitivity metric derived from a first-order Taylor series expansion of
+the loss function as a function of quantization errors in weights and activations.
+This metric, based on the Mean Square Error (MSE) of the loss, is efficiently
+calculated per layer using high-precision forward and backward passes over a
+small calibration dataset. The metric is additive across layers, with low calibration
+memory overhead as weight optimization is unnecessary. The second contribution
+is an accurate hardware-aware method for predicting MP time gain by modeling
+it as additive for sequential sub-graphs. An algorithm partitions the model graph
+into sequential subgraphs, measuring time gain for each configuration using a
+few samples. After calibrating per-layer sensitivity and time gain, an Integer
+Programming (IP) problem is formulated to maximize time gain while keeping
+loss MSE below a set threshold. Memory gain and theoretical time gain based
+on Multiply and Accumulate (MAC) operations are also considered. Rigorous
+experiments on the Intel Gaudi 2 accelerator validate the approach on several Large
+Language Models (LLMs).
+1
+Introduction
+Quantization is a key technique for compressing neural networks by converting high-precision weights
+and activations to lower-precision formats, significantly reducing model size and computational load
+(Rokh et al. [2023], Gholami et al. [2021], Nagel et al. [2021], Guo [2018], Weng [2021]Lee
+et al. [2025]). This is crucial for efficient inference on accelerators and edge devices. The main
+quantization approaches are Quantization-Aware Training (QAT), Post-Training Quantization (PTQ),
+and Quantization-Aware Fine-Tuning (QFT).
+QAT incorporates quantization during training, maintaining accuracy despite aggressive quantization
+(e.g., INT4) but requires substantial data and computational resources (Jacob et al. [2018], Krish-
+namoorthi [2018]). In contrast, PTQ quantizes pre-trained models efficiently but may reduce accuracy,
+especially in low-precision scenarios (Migacz [2017], Banner et al. [2019]). QFT combines PTQ
+with fine-tuning to balance accuracy and resource efficiency (Ashkboos et al. [2024]).
+Preprint. Under review.
+
+
+--- Page 2 ---
+Mixed Precision (MP) has emerged as a key technique for optimizing Neural Network (NN) perfor-
+mance across hardware platforms (Rakka et al. [2024]). Automatic selection of MP configuration for
+inference involves search-based methods (e.g., Hessian AWare Quantization (HAWQ) and Orthogonal
+Mixed Precision Quantization (OMPQ)) and optimization-based approaches (e.g., Differentiable Neu-
+ral Architecture Search (DNAS), Hardware-Aware Automated Quantization (HAQ), Reinforcement
+Learning Approach for Deep Quantization (ReLeQ), AUTOQ). Optimization-based methods tackle
+the non-differentiability of bit-widths through reinforcement learning and hardware feedback.
+Pandey et al. [2023] proposed an MP algorithm for post-training scenarios, minimizing data us-
+age and considering hardware limitations. The algorithm first measures layer sensitivity, then
+reduces bit-width iteratively while maintaining performance. Wu et al. [2025] introduced Structured
+Mixed-precision (StruM), tailored for compatible hardware, while Chen et al. [2021] formulated
+loss minimization as a Multiple-Choice Knapsack Problem (MCKP), solved with a greedy search
+algorithm.
+In this work, we address the challenge of selecting an MP configuration that optimizes gained time or
+memory compared to the high-precision model for PTQ, while maintaining a constraint on the Mean
+Square Error (MSE) of the loss. To solve this problem, we introduce a novel sensitivity metric derived
+from the MSE of the loss of the quantized model. This metric is formulated by approximating the loss
+error as a first-order Taylor series expansion of quantization errors from weights and activations. It is
+estimated using both forward and backward passes of the model at high precision with a calibration
+dataset. The metric predicts the MSE of the loss for arbitrary MP configurations by considering
+the loss error components from different quantized layers as statistically independent. The MSE of
+a given component from a layer is calculated as the product of its sensitivity and the MSE of the
+quantization error of an individual element. Although the method requires a backward pass, the
+additional memory requirement is minimal, mainly consisting of stored activations (since weighta
+optimizer is not required).
+We also introduce a method for predicting the empirical time gained from a MP configuration, based
+on the additive execution time of sequentially computed sub-graphs. The model structure is analyzed
+to find sequential sub-graphs, each potentially comprising multiple layers or a single layer. Time
+gains for all MP configurations are measured for each group, enabling the prediction of gained time
+for any configuration. The total time gain is estimated as the sum of the gained times per group.
+The performance metric can also be expressed as memory gained or theoretical gained time based on
+the number of Multiply and Accumulate (MAC) operations per layer. To optimize the metric while
+constraining the MSE of the loss, we employ Integer Programming (IP).
+The paper continues as follows: Sec. 2 presents the proposed method, Sec. 3 details experimental
+results, and Sec. 4 discusses conclusions. Experiments include results from applying the method on
+various Large Language Models (LLMs) and validating estimates for loss MSE and gained time.
+2
+Proposed method
+In Sec. 2.1 the problem is formulated and the solution is derived based on IP optimizing a generic
+objective function with constrained loss MSE per group (sequential sub-graph). Then, the sensitivity
+and the loss MSE are derived in Sec. 2.2. Various performance metrics which can substitute the
+generic objective function are defined in Sec. 2.3. We also discuss the motivation and method for
+partitioning the model graph to sequential sub-graphs for accurately assessing the time gained by MP.
+The method is summarized in Sec. A.
+2.1
+Formulation
+Let M, X and Y respectively denote a NN, the input and output, such that:
+Y ≜M (X)
+(1)
+and let g (M (X) , Ytrue) denote the loss function where Ytrue represents the ground-truth target
+corresponding to Y. The NN is composed of L linear operations, including both standard linear
+layers and Batch General Matrix Multiplication (BGEMM) layers. Assume that the underlying
+hardware accelerator supports F distinct numerical formats. A per-layer MP configuration Ilayer is
+2
+
+
+--- Page 3 ---
+defined by a set of L × F binary indicators (one per each combination of layer and numerical format):
+Ilayer ≜
+n
+ilayer
+ℓ,f ∈{0, 1}
+o
+ℓ∈[0,L−1],f∈[0,F −1]
+(2)
+where ℓindexes the layers and f indexes the numerical formats. Each layer is assigned exactly one
+numerical format, enforcing the constraint P
+f ilayer
+ℓ,f = 1. The numerical formats are assumed to be
+various floating-point representations, differentiated by their mantissa bit widths, denoted mf.
+Now, suppose the model is partitioned into J disjoint groups of layers, {Vj}J−1
+j=0 , such that layers
+within a group exhibit dependent performance characteristics, while different groups are independent.
+Define each group as the set of layer indices comprising it, i.e., Vj ≜
+
+ℓj,0, . . . , ℓj,Lj−1
+	
+, where
+Lj is the number of layers in group j. Let Qj ∈ZLj×F Lj be the matrix enumerating all per-layer
+possible quantization configurations for group j, where each column specifies a choice of numerical
+formats for the group layers, and each of its elements is in the range [0, F −1].
+We extend the standard per-layer binary indicator into a per-group binary indicator as follows. A
+per-group MP configuration I, also denoted here as an MP configuration for brevity, is defined by a
+set of J × F Lj binary indicators (one per each combination of group and any of its F Lj possible
+quantization combinations):
+I ≜{ij,p ∈{0, 1}}j∈[0,J−1],p∈[0,F Lj −1]
+(3)
+where j indexes the groups and p indexes its quantization configurations (indicating that the configu-
+ration in p-th column of Qj is selected). Each group is assigned exactly one configuration, enforcing
+the constraint P
+p ij,p = 1. A special case arises when the entire model is sequential; this corresponds
+to J = L single layer groups with Vℓ= {ℓ}.
+Let cj ∈RF Lj be the vector of performance metric values associated with the configurations in Qj,
+and dj ∈RF Lj the corresponding loss MSE values. Define the MSE of the loss function due to
+approximation under an MP configuration as:
+E
+
+˜g2
+= E
+h
+(ˆg −g)2i
+(4)
+where E [•] denotes the expectation operator and ˆg is the perturbed loss under the MP configuration.
+Let c be a performance metric to be maximized. In this study, we evaluate several metrics: empirical
+time gain denoted cET, theoretical time gain estimated from the number of MAC operations denoted
+cTT and memory gain from reduced model size denoted cM. Execution under an MP configuration I
+aims to improve performance, while potentially increasing the loss MSE.
+Assuming a maximum allowable loss MSE of τ 2E
+
+g2
+, for a parameter τ < 1 (which is the
+normalized-Root Mean Square Error (RMSE) threshold), our objective is to determine the optimal
+MP configuration by solving:
+{ij,p}j,p = argmax{ij,p}j,p
+X
+j,p
+ij,pcj,p
+s.t.:
+X
+j,p
+ij,pdj,p ≤τ 2E
+
+g2
+,
+X
+p
+ij,p = 1 : ∀j, ij,p ∈{0, 1} : ∀j, p.
+(5)
+Define the IP loss MSE and performance metrics as:
+d ≜
+X
+j,p
+ij,pdj,p
+(6)
+c ≜
+X
+j,p
+ij,pcj,p.
+(7)
+In Sec. 2.2 and Sec. 2.3, we derive explicit expressions for the latter, respectively.
+2.2
+Loss MSE metric
+The model comprises a set of standard linear layers, denoted by Llin, and a set of BGEMM layers,
+denoted by LBGEMM. A linear layer ℓ∈Llin is defined by the operation:
+Yℓ= XℓWT
+ℓ+ 1N×1bT
+ℓ
+(8)
+3
+
+
+--- Page 4 ---
+where the dimensions of the matrices are as follows: Xℓ∈RN×Cℓ, Wℓ∈RKℓ×Cℓ, Yℓ∈RN×Kℓ,
+and bℓ∈RKℓ×1. Here, N represents the number of input samples.
+A BGEMM layer ℓ′ is defined as:
+Yℓ′ = X0,ℓ′ ⊗X1,ℓ′
+(9)
+where X0,ℓ′ and X1,ℓ′ ∈RN×Cℓ′ , and the output Yℓ′ ∈RN×1. The operator ⊗is defined such that
+the n-th element of Yℓ′ is computed by Yℓ′,n,0 ≜
+ eT
+nX0,ℓ′  eT
+nX1,ℓ′T with the selection vector
+en ∈RN×1 defined as eT
+n ≜[01×n−1, 1, 01×N−n] and is used to extract the n-th row of a matrix.
+Let zℓrepresent the extended input of layer ℓ, obtained by vectorizing the possibly quantized inputs.
+It is defined as:
+zℓ≜
+
+
+
+xT
+ℓ, wT
+ℓ
+T
+; ℓ∈Llin
+h
+xT
+0,ℓ, xT
+1,ℓ
+iT
+; ℓ∈LBGEMM
+
+.
+(10)
+Define the vectorized representations as:
+xℓ≜vec (Xℓ)
+(11a)
+wℓ≜vec (Wℓ)
+(11b)
+x0,ℓ≜vec (X0,ℓ)
+(12a)
+x1,ℓ≜vec (X1,ℓ)
+(12b)
+with dimensions xℓ∈RNCℓ×1, wℓ∈RCℓKℓ×1 and x0,ℓ, x1,ℓ∈RNCℓ×1.
+We now respectively derive expressions for the noisy loss arising from model quantization and the
+quantized extended input:
+ˆg ≜g + ˜g,
+(13)
+ˆzℓ≜zℓ+ ˜zℓ
+(14)
+where ˜zℓis the quantization noise for layer ℓ∈Llin
+S LBGEMM. And since f represents a floating-
+point format with mf mantissa bits, the noise, modeled as a scaled Uniform random variable, and its
+respective variance are given by:
+˜zℓ,k ∼|zℓ,k| 2−mf U[±1/2]
+(15)
+E
+
+˜z2
+ℓ,k
+
+= |zℓ,k|2 αf
+(16)
+for k ∈[0, |zℓ|], where U[±1/2] is a Uniform random distribution over [−0.5, 0.5], and |zℓ| denotes
+the number of elements in zℓwith αf ≜2−2mf
+12
+for f ∈[0, F −1].
+Considering the r-th input sample and (13), the noisy loss is expressed as ˆgr ≜gr + ˜gr. Assuming
+that the quantization noise is small compared to the full-precision values, a first-order Taylor series
+approximation yields:
+ˆgr ≈gr +
+X
+ℓ∈Llin
+S LBGEMM
+(˜zr
+ℓ)T ˙zr
+ℓ(17)
+˙zr
+ℓ≜∂g
+∂zℓ
+
+zr
+ℓ
+(18)
+where ˙zr
+ℓis the gradient of the loss with respect to the extended input zℓof sample r.
+The sensitivity of layer ℓand its corresponding loss MSE for numerical format f and sample r are
+respectively defined as:
+sr
+ℓ≜∥zr
+ℓ⊙˙zr
+ℓ∥2
+(19)
+dlayer,r
+ℓ,f
+≜sr
+ℓαf.
+(20)
+The variance of the contributions to the loss MSE which correspond to the elements of the extended
+input are added in super-position, and with ⊙denoting the element-wise product. Averaging over R
+input samples yields the average sensitivity and corresponding loss MSE component:
+sℓ≜1
+R
+X
+r
+sr
+ℓ
+(21)
+dlayer
+ℓ,f ≜sℓαf.
+(22)
+4
+
+
+--- Page 5 ---
+For the p-th quantization configuration, and under the assumption that quantization noise is statistically
+independent across layers, the loss MSE component which corresponds to the j-th group is given by
+the sum of per-layer contributions:
+dj,p ≜
+Lj−1
+X
+l=0
+sℓj,lαQj,lp.
+(23)
+2.3
+Performance metric
+The choice of the performance metric c significantly impacts the resulting MP configuration. We
+consider three metrics: empirical time gain, theoretical time gain, and memory gain.
+2.3.1
+Empirical Time Gain cET
+Model partition to sequential sub-graphs: The partition process is briefly described. For more
+details please refer to Sec. B. Consider representing the computation of a model as a Directed Acyclic
+Graph (DAG). Note that two adjacent sub-graphs that are connected by a single edge are computed
+sequentially since the second sub-graph depends on the output of the first sub-graph. This sequential
+computation allows us to model their combined computation time as the sum of their individual
+times, which also applies to their gained time. Our partition procedure identifies single-entry/single-
+exit sub-graphs bounded by branching and merging nodes, splitting the computation graph into as
+many sequential sub-graphs as possible. These sub-graphs form an ordered sequence {Vj}J−1
+j=0 that
+executes strictly sequentially at run-time. Predicting the computation time of concurrent layers within
+sub-graphs presents significant challenges. Operations within a sub-graph may execute in parallel,
+while the compiler is free to fuse or reorder operations. Additionally, latency depends on complex
+interactions between layer dependencies, hardware resources, and scheduling rules. We propose to
+avoid this complication and measure the gained time of each sub-graph, represented as a group of
+layers comprising it, for all their possible quantization configurations.
+Gained time based on empirical time measurements per-group vs. per-layer: Consider the
+gained time of the Attention sub-graph in LLAMA-3.1-8B, illustrated in Figure 6, which contains
+the quantizable layers: q_proj, v_proj, k_proj, qk_matmul and av_matmul. Figure 1 compares
+the measured empirical time gain cET
+j,p of the attention sub-graph against the theoretical time gain
+predicted as the corresponding sum of per-layer time gain measurements. The large discrepancies
+demonstrate that simple summation of per-layer measurements does not yield a good estimate for the
+time gain of a sub-graph which contains concurrent computations. It shows the gap that the proposed
+method addresses.
+Figure 1: Measured empirical time gain cET
+j,p of the Attention sub-graph in LLAMA-3.1-8B (in
+blue) compared to its prediction based on the summation of per-layer time gain measurements (in
+orange) and for the theoretical time gain cTT
+j,p (green) for any of its 25 MP configurations. The various
+configurations are ordered in ascending order of empirical time gain. Configurations are labeled as
+5-bit binary words which represent the numerical format of each of the 5 linear operations ( q_proj,
+v_proj, k_proj, qk_matmul, and av_matmul) with BF16 and FP8 denoted as 0 and 1, respectively.
+5
+
+
+--- Page 6 ---
+Gained time measurements: The time gain of the p-th MP configuration of the j-th group is
+measured by subtracting the end-to-end Time To First Token (TTFT) of the model with the j-th group
+configured correspondingly and the other groups configured to BF16 from the end-to-end TTFT of
+the model in BF16.
+2.3.2
+Theoretical time gain cTT
+This performance metric is defined per-layer as the theoretical time gain based on the number of MAC
+operations multiplied by the gained time of a single MAC in the f-th numerical format (compared to
+BF16), denoted δT,f.
+For a linear layer ℓ∈{Llin, LBGEMM} with N samples, input dimension Cℓ, and output dimension
+Kℓthe theoretical time gain is defined as:
+cℓ,f ≜
+
+NCℓKℓδT,f
+; ℓ∈Llin
+NC2
+ℓδT,f
+; ℓ∈LBGEMM
+(24)
+It is a simple performance metric that approximates the gained time without requiring any timing
+measurements.
+We compare theoretical and empirical time gains, i.e., cTT
+j,p and cET
+j,p, for the Attention sub-graph in
+LLAMA-3.1-8B. By definition, since the theoretical time gain is based on number of MACs, it is
+additive across layers. Therefore, the theoretical time gain of the p-th configuration of the j-group
+is cTT
+j,p = P
+l∈Vj cTT
+ℓ,Qj,p. Figure 1 compares the aforementioned theoretical versus measured time
+gain. In order to simplify the comparison we fit the theoretical and empirical time gains, by constant
+scale and bias which we apply to the theoretical time gain. Even after optimal fitting, the theoretical
+proxy fails to capture the measured behavior, indicating that MAC counts do not reflect kernel fusion,
+memory traffic, or scheduler effects. Note that the IP is not affected by multiplying the performance
+metric by a scale factor and adding a bias to it.
+2.3.3
+Memory Gain cM
+Memory savings arise exclusively from storing weights at lower precision. Intermediate tensors
+produced by BGEMM kernels can certainly be computed in FP8, but since they are not persistent
+they are stored in the stack memory. Quantizing them therefore improves latency but does not change
+the static model size. Under these observations, the additivity assumption across layers holds. Let
+δM,f be the byte reduction obtained when a single parameter element is stored in format f instead of
+BF16.
+Since memory is additive across layers, we treat each primitive layer as its own group, i.e. J = L and
+Vj = {ℓj}. For a (trivial) group j and bit-width assignment Qj,p the memory gain is:
+cℓ,f ≜
+(
+CℓKℓδM,f
+ℓ∈Llin,
+0
+ℓ∈LBGEMM.
+(25)
+cj,p ≜
+Lj−1
+X
+l=0
+cℓj,l,Qj,p.
+(26)
+These cj,p values are used by the IP with the objective of maximizing memory gain cM.
+3
+Experimental results
+This section is organized as follows. In Sec. 3.1 the experiments setup as well as the compared
+strategies are defined. Using IP to solve the accuracy vs. performance tradeoff optimally assumes
+that the loss MSE model that we use is sufficiently accurate, that it is additive across layers and that
+the empirical time gain is additive across groups. We validate these assumptions in Sec. 3.2. The IP
+in our proposed method applies a constraint on the loss MSE instead of on the accuracy degradation
+since we assume that they are correlated and since the latter is non-differentiable, nor additive across
+groups. In Sec. 3.3 we analyze the loss MSE vs. empirical time gain curve which is optimized by IP.
+Later in Sec. 3.4 we analyze the accuracy vs. performance curve.
+6
+
+
+--- Page 7 ---
+Figure 2: Layer-wise quantization patterns across MP configurations (rows) and model layers
+(columns) for IP-ET (top), Prefix (middle), and Random (bottom). Yellow: FP8, purple: BF16.
+3.1
+Setup and compared MP strategies
+We evaluate MP quantization during the prefill stage of LLM inference using Intel’s Gaudi 2 ac-
+celerator with F = 2 numerical formats (BF16 and FP8-E4M3: 4 exponent, 3 mantissa bits), the
+lm-evaluation-harness EleutherAI [2025], and Neural Compressor Intel Corporation [2024]. Our
+evaluation spans four tasks (HellaSwag Zellers et al. [2019], LAMBADA Radford et al. [2019],
+Winogrande Sakaguchi et al. [2021], and PIQA Bisk et al. [2020]), averaging 5 iterations per con-
+figuration for time measurement, 20% of the samples in each dataset for calibration and sensitivity
+measurements, and the full datasets for final evaluation. Results are reported for Meta-Llama-3.2-1B-
+Instruct (1B) (with batch size 40) and Meta-Llama-3.1-8B-Instruct (8B) models (with batch size 10).
+Each evaluation is run over 10 different randomization seeds in which we perturb the scales before
+quantization in order to assess the accuracy statistics (mean and standard-deviation) and not just a
+single noisy realization of it.
+Our proposed method combined with the different metrics yields the following strategies: IP-
+EmpiricalTime (IP-ET) maximizes empirical time gain (Sec. 2.3.1), IP-TheoreticalTime (IP-TT)
+maximizes theoretical time gain (Sec. 2.3.2), and IP-Memory (IP-M) maximizes memory gain
+(Sec. 2.3.3). Both IP-ET and IP-TT quantize linear and BGEMM layers , while IP-M quantizes only
+linear layers.
+Each of the IP strategies is compared against two baseline strategies: Random which arbitrarily selects
+layers to quantize, resulting in scattered patterns and Prefix which quantizes layers in a sequential
+order. Both baseline strategies adhere to the loss MSE threshold. Figure 2 illustrates how each
+strategy selects layers for quantization given normalized-RMSE threshold τ. Our proposed IP-ET
+strategy produces optimal configurations which maximize the performance metric under the loss
+MSE constraint, leading to its superior accuracy-performance curve shown in subsequent results.
+3.2
+Time gain and loss MSE model validation
+Considering the 1B model for MP configurations attained using the proposed method with τ ∈
+{0, 0.1%, . . . , 0.7%} in addition to the all-FP8 configuration, we depict the measured vs. theoretical
+empirical time gain (see (7)) and loss MSE, respectively, in Figure 3a and Figure 3b. Evidently our
+assumptions hold as the empirical time gain appears additive across groups and the theoretical loss
+7
+
+
+--- Page 8 ---
+(a) Loss MSE versus τ. Blue - theoretical loss MSE;
+Green - measured loss MSE using the chosen config-
+urations by IP-ET
+(b) Relative TTFT reduction versus τ. Blue - the-
+oretical gain from the group aware IP-ET; Green -
+measured gain on Gaudi 2.
+Figure 3: Empirical validation of the additivity assumption on different MP configurations
+MSE, assuming the per-layer model (21) and additivity (6), is a reliable estimate for the measured
+loss MSE.
+3.3
+Loss MSE vs. empirical time gain curve
+Figure 4 demonstrates that the IP-ET strategy is significantly and consistently better then the Random
+and Prefix strategies, yielding an appealing loss MSE vs. empirical time gain curve. Furthermore, it
+maintains markedly low loss MSE vs. empirical time gain.
+Figure 4: Theoretical loss MSE vs. empirical time gain on the 1B model across four tasks.
+3.4
+Accuracy vs. performance curve
+Figure 5a and Figure 5b illustrate the accuracy degradation vs. TTFT curves of different strategies
+for the 1B and 8B models, respectively. For both models, IP-ET consistently achieves better accuracy
+at comparable latency than the baselines. E.g., with 8B, IP-ET achieves accuracy loss below 0.1% at
+450ms TTFT, whereas other strategies require ∼600ms for similar accuracy—a 30% speedup.
+Table 1 provides a comprehensive comparison across all strategies and models. The proposed IP-based
+methods consistently outperform the baselines. Despite its limited quantization scope (linear layers
+only), IP-M still surpasses the baselines in most cases, with one exception: for 8B on LAMBADA,
+the Prefix strategy achieves slightly higher accuracy. These results confirm that sensitivity-aware,
+hardware-informed quantization significantly improves inference efficiency while preserving model
+quality. The improvement of the proposed method for the 1B model is better then the 8B model since
+the gap between the FP8 and BF16 accuracies there is larger. See Sec. C for additional results on
+per-task time gains, MAC-based gains, and memory gains.
+8
+
+
+--- Page 9 ---
+(a) 1B
+(b) 8B
+Figure 5: Average accuracy difference [%] vs. TTFT across HellaSwag, LAMBADA, Winogrande,
+and PIQA. Comparing MP quantization strategies (IP-ET, Random and Prefix)
+Model
+Strategy
+LAMBADA
+LAMBADA
+HellaSwag
+Winogrande
+PIQA
+Tasks Avg.
+ppl diff ↓[%]
+acc diff ↑[%]
+acc diff ↑[%]
+acc diff ↑[%]
+acc diff ↑[%]
+acc diff ↑[%]
+IP-ET - Empirical Time Gain Optimization (both BGEMMs and linear layers)
+Llama-3.2-1B-Instruct
+Random
+4.938 ± 0.96
+-2.107 ± 0.45
+-1.077 ± 0.35
+0.077 ± 0.93
+-0.449 ± 0.34
+-0.889 ± 0.52
+Prefix
+5.986 ± 1.61
+-2.206 ± 0.51
+-1.586 ± 0.43
+-0.271 ± 0.78
+-0.615 ± 0.55
+-1.170 ± 0.57
+IP-ET
+2.170 ± 0.32
+-1.401 ± 0.26
+-0.303 ± 0.14
+0.020 ± 0.59
+-0.169 ± 0.21
+-0.463 ± 0.30
+Llama-3.1-8B-Instruct
+Random
+1.290 ± 0.15
+-0.256 ± 0.25
+-0.071 ± 0.08
+0.085 ± 0.55
+-0.399 ± 0.26
+-0.160 ± 0.286
+Prefix
+1.075 ± 0.15
+-0.029 ± 0.24
+-0.157 ± 0.12
+-0.065 ± 0.66
+-0.566 ± 0.30
+-0.204 ± 0.33
+IP-ET
+0.922 ± 0.08
+-0.229 ± 0.17
+2.53e−4 ± 0.06
+0.276 ± 0.41
+-0.341 ± 0.17
+-0.073 ± 0.20
+IP-TT - Theoretical Time Gain Optimization (both BGEMMs and linear layers)
+Llama-3.2-1B-Instruct
+Random
+4.938 ± 0.98
+-2.107 ± 0.46
+-1.077 ± 0.35
+0.077 ± 0.85
+-0.449 ± 0.33
+-0.889 ± 0.49
+Prefix
+5.986 ± 1.62
+-2.206 ± 0.50
+-1.586 ± 0.43
+-0.271 ± 0.79
+-0.615 ± 0.54
+-1.170 ± 0.57
+IP-TT
+2.744 ± 0.43
+-1.697 ± 0.41
+-0.429 ± 0.14
+0.096 ± 0.61
+-0.102 ± 0.26
+-0.533 ± 0.35
+Llama-3.1-8B-Instruct
+Random
+1.290 ± 0.15
+-0.256 ± 0.25
+-0.071 ± 0.08
+0.085 ± 0.55
+-0.399 ± 0.26
+-0.160 ± 0.28
+Prefix
+1.075 ± 0.15
+-0.029 ± 0.24
+-0.157 ± 0.12
+-0.065 ± 0.67
+-0.566 ± 0.31
+-0.204 ± 0.33
+IP-TT
+1.002 ± 0.08
+-0.178 ± 0.15
+2.58e−4 ± 0.06
+0.185 ± 0.43
+-0.279 ± 0.19
+-0.068 ± 0.21
+IP-M - Memory Gain Optimization (only linear layers)
+Llama-3.2-1B-Instruct
+Random
+4.151 ± 1.25
+-1.886 ± 0.52
+-0.980 ± 0.35
+0.396 ± 0.87
+-0.363 ± 0.30
+-0.708 ± 0.51
+Prefix
+4.483 ± 1.41
+-1.693 ± 0.64
+-1.361 ± 0.41
+0.435 ± 0.86
+-0.554 ± 0.44
+-0.794 ± 0.59
+IP-M
+2.497 ± 0.34
+-1.512 ± 0.33
+-0.421 ± 0.15
+0.230 ± 0.67
+-0.075 ± 0.26
+-0.445 ± 0.35
+Llama-3.1-8B-Instruct
+Random
+1.073 ± 0.10
+-0.267 ± 0.21
+-0.024 ± 0.08
+0.180 ± 0.49
+-0.321 ± 0.24
+-0.108 ± 0.25
+Prefix
+0.567 ± 0.13
+0.015 ± 0.18
+-0.092 ± 0.07
+0.271 ± 0.47
+-0.457 ± 0.22
+-0.066 ± 0.23
+IP-M
+0.981 ± 0.08
+-0.160 ± 0.17
+0.012 ± 0.06
+0.280 ± 0.37
+-0.262 ± 0.16
+-0.032 ± 0.19
+Table 1: Accuracy and perplexity difference across three optimization strategies, averaged over
+different quantization configurations from high-precision (BF16) to low-precision (FP8).
+4
+Conclusions
+By utilizing a novel loss MSE and empirical time gain per sequential sub-graphs metrics, we
+introduce an automatic MP method based on IP for PTQ. The proposed loss MSE metric, which
+exhibits additive properties per layer, serves as a proxy for model accuracy. We efficiently approximate
+this metric using forward- and backward-passes over a small calibration dataset. Recognizing that
+the empirical time gain exhibits additivity solely for sequential sub-graphs—attributable to parallel
+capabilities and advanced compiler optimizations in the hardware accelerator— we formulate an
+algorithm for model partitioning. In this approach, each sub-graph is characterized as a group of
+constituent layers, and we define a performance objective function by summing the empirical time
+gain for each group. To achieve this, we measure the empirical time gains of each sub-graph over
+a limited set of samples. We validate both the approximation of the loss MSE and its additive
+nature across layers. Furthermore, we demonstrate that the empirical time gain is additive per
+group, resulting in a highly accurate estimate of the measured time gain. Finally, we evaluate the
+proposed method by comparing it against baseline strategies (Random and Prefix configurations),
+demonstrating that it consistently outperforms these approaches across various LLMs.
+9
+
+
+--- Page 10 ---
+References
+Saleh Ashkboos, Bram Verhoef, Torsten Hoefler, Evangelos Eleftheriou, and Martino Dazzi. Efqat:
+An efficient framework for quantization-aware training. arXiv preprint arXiv:2411.11038, 2024.
+URL https://arxiv.org/abs/2411.11038.
+Ron Banner, Yury Nahshan, and Daniel Soudry. Post-training 4-bit quantization of convolution
+networks for rapid-deployment. In Advances in Neural Information Processing Systems (NeurIPS),
+2019. URL https://arxiv.org/abs/1810.05723.
+Yonatan Bisk, Rowan Zellers, Ronan Le Bras, Jianfeng Gao, and Yejin Choi. Piqa: Reasoning
+about physical commonsense in natural language. In Thirty-Fourth AAAI Conference on Artificial
+Intelligence, 2020.
+Weihan Chen, Peisong Wang, and Jian Cheng. Towards mixed-precision quantization of neural
+networks via constrained optimization, 2021. URL https://arxiv.org/abs/2110.06554.
+EleutherAI.
+Language model evaluation harness.
+https://github.com/EleutherAI/
+lm-evaluation-harness, 2025.
+Amir Gholami, Sehoon Kim, Zhen Dong, Zhewei Yao, Michael W. Mahoney, and Kurt Keutzer. A
+survey of quantization methods for efficient neural network inference. 2021. https://arxiv.
+org/abs/2103.13630.
+Yunhui Guo. A survey on methods and theories of quantized neural networks. 2018. https:
+//arxiv.org/abs/1808.04752.
+Intel Corporation. Intel neural compressor. https://github.com/intel/neural-compressor,
+2024.
+Benoit Jacob, Skirmantas Kligys, Bo Chen, Menglong Zhu, Matthew Tang, Andrew Howard, Hartwig
+Adam, and Dmitry Kalenichenko. Quantization and training of neural networks for efficient integer-
+arithmetic-only inference. In Proceedings of the IEEE Conference on Computer Vision and Pattern
+Recognition (CVPR), pages 2704–2713, 2018. URL https://arxiv.org/abs/1712.05877.
+Raghuraman Krishnamoorthi. Quantizing deep convolutional networks for efficient inference: A
+whitepaper. arXiv preprint arXiv:1806.08342, 2018. URL https://arxiv.org/abs/1806.
+08342.
+Joonhyung Lee, Shmulik Markovich-Golan, Daniel Ohayon, Yair Hanani, Gunho Park, Byeongwook
+Kim, Asaf Karnieli, Uri Livne, Haihao Shen, Tai Huang, Se Jung Kwon, and Dongsoo Lee. Faster
+inference of llms using fp8 on the intel gaudi, 2025. URL https://arxiv.org/abs/2503.
+09975.
+Szymon Migacz. 8-bit inference with tensorrt. NVIDIA GPU Technology Conference (GTC), 2017.
+URL https://www.cse.iitd.ac.in/~rijurekha/course/tensorrt.pdf. Presentation.
+Markus Nagel, Marios Fournarakis, Rana Ali Amjad, Yelysei Bondarenko, Mart van Baalen, and
+Tijmen Blankevoort. A white paper on neural network quantization. 2021. https://arxiv.org/
+abs/2106.08295.
+Nilesh Prasad Pandey, Markus Nagel, Mart van Baalen, Yin Huang, Chirag Patel, and Tijmen
+Blankevoort. A practical mixed precision algorithm for post-training quantization. arXiv preprint
+arXiv:2302.05397, 2023.
+Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Language
+models are unsupervised multitask learners. 2019.
+Mariam Rakka, Mohammed E Fouda, Pramod Khargonekar, and Fadi Kurdahi. A review of state-of-
+the-art mixed-precision neural network frameworks. IEEE Transactions on Pattern Analysis and
+Machine Intelligence, 2024.
+Babak Rokh, Ali Azarpeyvand, and Alireza Khanteymoori. A comprehensive survey on model
+quantization for deep neural networks in image classification. ACM Transactions on Intelligent
+Systems and Technology, 2023. https://arxiv.org/abs/2205.07877.
+10
+
+
+--- Page 11 ---
+Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi. Winogrande: an adver-
+sarial winograd schema challenge at scale. Commun. ACM, 64(9):99–106, August 2021. ISSN
+0001-0782. doi: 10.1145/3474381. URL https://doi.org/10.1145/3474381.
+Olivia Weng. Neural network quantization for efficient inference: A survey. 2021. https://arxiv.
+org/abs/2112.06126.
+Michael Wu, Arnab Raha, Deepak A. Mathaikutty, Martin Langhammer, and Engin Tunali. Strum:
+Structured mixed precision for efficient deep learning hardware codesign, 2025. URL https:
+//arxiv.org/abs/2501.18953.
+Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. Hellaswag: Can a machine
+really finish your sentence? In Proceedings of the 57th Annual Meeting of the Association for
+Computational Linguistics, 2019.
+Appendix
+A
+Proposed method summary
+Algorithm 1 summarizes our end-to-end approach for automatic MP configuration. The method
+integrates hardware-aware timing measurements with gradient-based sensitivity analysis to determine
+optimal precision assignments. After partitioning the model into sequential sub-graphs (line 1), we
+perform sensitivity calibration through forward and backward passes on the calibration dataset (line
+2). We then measure empirical time gains for each sub-graph across different precision configurations
+(line 3), before formulating and solving the IP optimization that maximizes performance while
+respecting the loss MSE threshold (line 4). This algorithm forms the foundation for all three
+optimization strategies (IP-ET, IP-TT, and IP-M).
+Algorithm 1 Proposed automatic MP algorithm summary
+Input: A model M, a calibration dataset Dcalib and a relative RMSE threshold τ
+Output: MP configuration I (see (3))
+1: Analyze model and partition it to J sequential sub-graphs {Vj}j as described in B
+2: Sensitivity calibration
+• Wrap the model cM to enable sensitivity measurement
+• Run forward- and backward- passes over Dcalib, and obtain: sensitivity {sℓ}ℓand
+mean-square loss E
+
+g2
+(see (21))
+3: Empirical time gain measurement
+• Measure TTFT of j-th group and p-th MP configuration, for j ∈[0, J −1] and p ∈
+
+0, F Lj −1
+
+• Compute cET by subtracting the measurements from the TTFT of the model in BF16,
+4: Obtain I by solving the IP optimization problem (see (5))
+5: return I
+B
+Model Partitioning into sequential groups of layers
+Effective MP assignment requires identifying model sub-graphs which execution time is additive.
+Given a network’s computation graph, that can be formulated as a DAG with a single sink vertex -
+our partitioning algorithm splits the model to sequential sub-graphs with a single entry and a single
+exit points. Figure 6 illustrates the resulting partitioning for a Llama-3 transformer layer, showing
+the Attention and MLP blocks split into single-entry/single-exit sub-graphs (V1–V4) that serve as the
+fundamental units for our MP optimization.
+11
+
+
+--- Page 12 ---
+Algorithm 2 Partition model to sequential groups of layers
+Input: A model M
+Output: Model partition {Vj}j
+1: Construct a DAG graph of the model computation {Vertices, Edges}
+2: Add a start vertex start_vertex and denote the end vertex as end_vertex
+3: Run Breadth-first search (BFS) and denote the longest path from start_vertex to vertex as
+path_len [vertex] for each vertex ∈Vertices
+4: V = [], vertex = start_vertex
+5: while vertex ̸= end_vertex do
+6:
+Define set V ′ = {}
+7:
+cur_len = path_len[vertex] + 1
+8:
+Define the set A = next[vertex]
+9:
+while |A| > 1 do
+10:
+for vertex′ ∈A do
+11:
+if path_len[vertex′] ≤cur_len then
+12:
+A.pop(vertex′)
+13:
+V ′.push(vertex′)
+14:
+A.push(next[vertex′])
+15:
+end if
+16:
+end for
+17:
+cur_len = cur_len + 1
+18:
+end while
+19:
+vertex = A.pop()
+20:
+V ′.push(vertex)
+21:
+Pop non-quantizable vertices/layers from V ′
+22:
+if |V’|>0 then
+23:
+V.append(V ′)
+24:
+end if
+25: end while
+26: return V
+C
+Additional experimental results
+C.1
+Per task: gained time based on measurements
+Figure 7 reports for each individual task the accuracy difference (relatively to BF16) as a function
+of TTFT. The proposed IP-ET outperforms Random and Prefix strategies on most of the settings,
+particularly in the 1B model. For example, in HellaSwag using the 1B model (Figures 7a and 7b),
+IP-ET shows a significant advantage across all MP configurations.
+In LAMBADA using the 8B model (Figure 7g), Prefix yields higher accuracy, but IP-ET achieves
+lower perplexity (Figure 7i), highlighting that loss-based optimization (which is correlated to perplex-
+ity) doesn’t necessarily translate to accuracy gains.
+In Winogrande on the 1B model (Figure 7e) is particularly noisy, as reflected by large standard
+deviations in Table 1 which can explain the reason IP-ET shows no clear advantage. However, the
+rapid rise of the blue line indicates that IP-ET, achieves good accuracy by not quantizing only a few
+layers.
+C.2
+Gained time based on number of MACs
+Figure 8 shows the tradeoff between accuracy and theoretical compute time, measured by MACs.
+The x-axis denotes the theoretical time gain based on the number of MAC operations as defined in
+Sec. 2.3.2. While the y-axis reports accuracy difference relative to BF16, averaged across tasks. Our
+IP-TT (blue) consistently outperforms Random (orange) and Prefix (green) strategies, achieving a
+smaller accuracy degradation on both model sizes.
+12
+
+
+--- Page 13 ---
+(a) Attention block
+(b) MLP block
+Figure 6: Single-entry/single-exit sub-graphs (V1–V4) identified in one Llama-3 transformer layer.
+Dashed blue regions denote the latency-additive sub-graphs used in 2.3.1; residual adds are omitted
+for clarity. The final LM-head forms an additional single-layer sub-graph that is omitted from the
+illustration for brevity.
+(a) 1B
+(b) 8B
+Figure 8: Average accuracy difference [%] vs. time based on number of MACs [cycles], across Hel-
+laSwag, LAMBADA, Winogrande, and PIQA. Comparing layer selection strategies for quantization
+(IP-TT, Random, Prefix).
+C.3
+Gained memory
+Figure 9 shows the tradeoff between accuracy and total model’s memory. The x-axis values were
+calculated by subtracting BF16 model’s total memory and the memory gain (defined in Sec. 2.3.2) of
+13
+
+
+--- Page 14 ---
+(a) 1B - HellaSwag
+(b) 8B - HellaSwag
+(c) 1B - PIQA
+(d) 8B - PIQA
+(e) 1B - Winogrande
+(f) 8B - Winogrande
+(g) 1B - LAMBADA accuracy
+(h) 8B - LAMBADA accuracy
+(i) 1B - LAMBADA perplexity
+(j) 8B - LAMBADA perplexity
+Figure 7: Per task accuracy/perplexity difference vs. TTFT. Comparing layer selection strategies for
+quantization (IP-ET, Random, Prefix
+14
+
+
+--- Page 15 ---
+each configuration. While the y-axis reports accuracy difference relative to BF16, averaged across
+tasks.
+For the 1B model (Figure 9a), IP-TT (blue) consistently outperforms Random (orange) and Prefix
+(green) strategies, achieving lower accuracy loss for a given memory budget.
+For the 8B model (Figure 9b), IP-TT also performs better than other strategies, though the margin is
+small; notably, the initial FP8 configuration results in less than 0.2% accuracy difference range, since
+only linear layers are quantized in these experiments. All 8B’s MP configurations yield averaged
+accuracy difference close to zero.
+(a) 1B
+(b) 8B
+Figure 9: Average accuracy difference [%] vs. total memory across HellaSwag, LAMBADA,
+Winogrande, and PIQA. Comparing layer selection strategies for quantization (IP-M, Random,
+Prefix).
+15

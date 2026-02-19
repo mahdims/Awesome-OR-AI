@@ -1,0 +1,2644 @@
+--- Page 1 ---
+Improving GPU Multi-Tenancy Through Dynamic
+Multi-Instance GPU Reconfiguration
+Tianyu Wang
+University of Pittsburgh
+Pittsburgh, PA, USA
+tiw81@pitt.edu
+Sheng Li
+University of Pittsburgh
+Pittsburgh, PA, USA
+shl188@pitt.edu
+Bingyao Li
+University of Pittsburgh
+Pittsburgh, PA, USA
+bil35@pitt.edu
+Yue Dai
+University of Pittsburgh
+Pittsburgh, PA, USA
+yud42@pitt.edu
+Ao Li
+University of Arizona
+Tucson, AZ, USA
+aoli1@arizona.edu
+Geng Yuan
+University of Georgia
+Athens, GA, USA
+geng.yuan@uga.edu
+Yufei Ding
+University of California, San Diego
+San Diego, CA, USA
+yufeiding@ucsd.edu
+Youtao Zhang
+University of Pittsburgh
+Pittsburgh, PA, USA
+zhangyt@cs.pitt.edu
+Xulong Tang
+University of Pittsburgh
+Pittsburgh, PA, USA
+tax6@pitt.edu
+Abstract
+Continuous learning (CL) has emerged as one of the most
+popular deep learning paradigms deployed in modern cloud
+GPUs. Specifically, CL has the capability to continuously up-
+date the model parameters (through model retraining) and
+use the updated model (if available) to serve overtime arriv-
+ing inference requests. It is generally beneficial to co-locate
+the retraining and inference together to enable timely model
+updates and avoid model transfer overheads. This brings
+the need for GPU sharing among retraining and inferences.
+Meanwhile, multiple CL workloads can share the modern
+GPUs in the cloud, leading to multi-tenancy execution. In
+this paper, we observe that prior GPU-sharing techniques
+are not optimized for multi-tenancy CL workloads. Specif-
+ically, they do not coherently consider the accuracy of the
+retraining model and the inference service level objective
+(SLO) attainment. Moreover, they cannot accommodate the
+overtime dynamics (e.g., inference arrival intensity) in CL
+execution. In this paper, we propose MIGRator, a novel GPU
+reconfiguration runtime that dynamically performs GPU re-
+configuration for multi-tenancy CL workloads. MIGRator is
+based on the recent NVIDIA multi-instance GPU (MIG) to
+mitigate resource contention and formulates the reconfigura-
+tion optimization into Integer Linear Programming (ILP) to
+dynamically identify, reconfigure, and allocate the GPU in-
+stances. MIGRator leverages the “Goodput” metric in the ILP
+objective function to consider both inference SLO attainment
+and model accuracy in the reconfiguration exploration. We
+evaluate MIGRator using representative multi-tenancy CL
+workloads. The results show our approach outperforms the
+state-of-the-art GPU sharing techniques (i.e., Ekya, Astraea,
+and PARIS) by 17%, 21%, and 20%, respectively.
+1
+Introduction
+Continuous learning (CL) is one of the most popular deep
+learning paradigms and has received momentum in recent
+years [22–26, 83, 84]. In particular, CL has the capability to
+continuously update the model parameters to adapt/update
+the model to changing environments (also called “data drift”
+in the machine learning community) [84, 148, 149, 158].
+Meanwhile, CL serves overtime inference requests using
+the updated model to yield accuracy for overtime inference
+requests. Thus, CL is particularly useful for applications
+domains such as personalized medicine [150–152] and rec-
+ommendation systems [148, 149], where overtime model
+customization is needed for overtime inference accuracy.
+There are two important aspects that can affect continu-
+ous learning performance. On the one hand, the model must
+be updated in a timely manner to quickly capture the data
+drift changes. On the other hand, there are generally strict
+deadlines for inference requests to meet the Service-Level
+Objectives (SLOs) (e.g., autonomous robot [163–166]). There-
+fore, a CL inference request is only considered “valid” if it
+satisfies both conditions: i) the inference output is correct
+and ii) the SLO requirement is met. Due to this tight inter-
+action between model retraining and inference in CL, it is
+generally beneficial to co-locate the retraining and the infer-
+ences together and share the GPU in the cloud. On the one
+hand, it avoids expensive transfer of updated model after re-
+training, which can be more than 600 ×, if on separate GPUs,
+compared to the inference time [167, 168, 171]. On the other
+hand, it improves the cloud GPU utilization by co-running
+the retraining and inference and sharing the GPU. Mean-
+while, multi-tenancy is prevalent in cloud, where multiple
+CL workloads share the GPU.
+There are three basic GPU-sharing strategies supported by
+modern GPUs: i) Concurrent Multiple Kernels (CMK) [9–12],
+arXiv:2407.13126v1  [cs.DC]  18 Jul 2024
+
+
+--- Page 2 ---
+Table 1. Comparison to prior works.
+Sharing
+Minimize
+Inference Retraining
+Fine-grain
+strategy interference dynamics
+benefits
+reconfiguration
+Gpulet [14]
+MPS
+Partial
+Yes
+No
+No
+INFless [13]
+MPS
+Partial
+Yes
+No
+Yes
+Astraea [17]
+MPS
+Partial
+Yes
+No
+Yes
+Ekya [83]
+MPS
+Partial
+No
+Yes
+No
+PARIS [19]
+MIG
+Yes
+Yes
+No
+No
+MIGRator (ours)
+MIG
+Yes
+Yes
+Yes
+Yes
+ii) Multi-Process Service (MPS) [2], and iii) Multi-Instance
+GPU (MIG) [5]. The difference is that MPS partitions the GPU
+computing units (i.e., SMs), MIG partitions both the mem-
+ory and the computing units, and CMK does not partition
+resources and allows contention across co-running applica-
+tions. As such, CMK can potentially achieve higher resource
+utilization but suffer from interference. In contrast, MIG
+eliminates the interference but may have an imbalance in re-
+source allocation, leading to underutilization. We summarize
+prior works in Table 1 and label which basic sharing strategy
+they built upon. We observe that none of the prior works are
+optimized for multi-tenancy CL workloads on modern GPUs.
+First, prior MPS-based GPU resource allocation works (e.g.,
+Astreaea [17], INFless [13], and Gpulet [14]) leave memory
+shared among tenants, causing interference, especially in
+large CL models. Second, while some prior works allocate
+the resource considering the inference dynamics, i.e., infer-
+ence request arrival pattern, they are not aware of retraining
+benefits (i.e., the accuracy improvement brought by each
+retraining process), which can lead to a significant amount
+of inference requests using the stale model. Third, Ekya [83]
+is the state-of-the-art resource allocation approach for CL
+workloads. While it considers the retraining benefits, it does
+not accommodate the inference dynamics. Finally, most prior
+works only support resource reconfiguration at certain exe-
+cution time stamps. This is due to the fact that they employ
+an exhaustive search for beneficial resource allocation (e.g.,
+in Ekya [83] and MISO [21]). The search overheads prevent
+them from conducting reconfiguration at finer time granular-
+ity (e.g., per second basis) which is important in continuous
+learning [87, 88]. We quantitatively compared our approach
+to Ekya [83], Astraea [17], and PARIS [19] in Section 5.
+In this paper, we propose MIGRator, a dynamic GPU recon-
+figuration runtime for multi-tenancy continuous learning
+workloads on modern GPUs. MIGRator is built upon modern
+MIG such that the interference among co-running tasks is
+eliminated. Also, MIGRator is aware of both inference dy-
+namics and the retraining benefits in CL workloads. This
+is achieved by formulating the reconfiguration into an Inte-
+ger Linear Programming (ILP) problem, which leverages a
+metric called Goodput (detailed definition in Section 4.1.3)
+in its objective function to take into account the SLO at-
+tainment and the retraining benefits. The ILP can be solved
+efficiently with much lower overheads compared to an ex-
+haustive configuration search. Moreover, the designed ILP
+in MIGRator explores MIG reconfiguration on a finer gran-
+ularity (i.e., per second basis) to determine beneficial GPC
+allocations. The main contributions are as follows.
+• We reveal the unique challenges of GPU sharing for multi-
+tenancy continuous learning workloads. Specifically, both
+the retaining benefits and the SLO attainments have to be
+taken into account when conducting the GPU reconfigura-
+tion. As we quantitatively characterized, a naive and static
+configuration may compromise one or both, and is not able
+to accommodate the inference dynamics in CL workloads.
+• We design MIGRator which formulates the reconfigura-
+tion optimization into an Integer Linear Programming (ILP)
+problem, such that both SLO attainment and the retaining
+benefits are coherently considered during reconfiguration.
+MIGRator also leverages MIG to eliminate interference and
+allows fine-granular reconfiguration.
+• We evaluate MIGRator using representative CL workloads
+and compared it against the state-of-the-art GPU shar-
+ing strategies. Specifically, MIGRator achieves 17%, 21%,
+and 20% 𝐺𝑜𝑜𝑑𝑝𝑢𝑡compare to Ekya [83], Astraea [17], and
+PARIS [19].
+2
+Background and Related Works
+2.1
+Continuous Learning and Data Drift
+Continuous Learning (CL) is a popular deep learning para-
+digm that handles overtime model refinement through re-
+training and overtime inference requests. It is particularly
+useful in application domains where exist model customiza-
+tion such as in personalized medicine [150–152] and recom-
+mendation systems [148, 149]. A common characteristic of
+these applications is that the models need to be continuously
+updated to accommodate and adapt to possible and potential
+external environment changes, which are referred to as “data
+drifts” in the machine learning community [22, 26, 83, 84]. As
+such, CL effectively handles data drifts and is able to maintain
+high accuracy for incoming inference requests over time.
+There are two important events in continuous learning: i)
+retraining (i.e., model refinement) and ii) inferences. Specifi-
+cally, retraining is intended to update the model to handle
+data drifts. It utilizes retraining data that arrive periodically
+over time. Usually, one round of retraining is called a “re-
+training window” in continuous learning [83, 84], which is
+a time period within which the retraining process can be
+completed. The typical retraining window size is 200 sec-
+onds [83, 84]. The retraining data are assumed to be available
+at the beginning of each retraining window [83, 84]. Note
+that the updated models are only available for inference re-
+quests after the retraining procedure is completed [83, 84].
+On the other hand, unlike the retraining process, which oc-
+curs once per retraining window, inference requests arrive
+continuously during the entire retraining window.
+Both retraining and inference requests are crucial to satisfy
+continuous learning applications to achieve a high inference
+2
+
+
+--- Page 3 ---
+accuracy and high SLO (Service Level Objective) attainment.
+On the one hand, retraining is crucial for updating the model
+so that incoming inference requests can use the updated
+model, resulting in a higher inference accuracy. On the other
+hand, inference requests have specific SLO requirements to
+meet. High SLO violations are problematic in many applica-
+tions [148, 153–156]. Note that an inference request in CL is
+only considered valid if it both i) meets the SLO requirements
+and ii) return correct results.
+Therefore, when inference and retraining tasks share the
+GPU, it is non-trivial to determine how to allocate resources
+(e.g., SMs and memory) among the tasks. On the one hand,
+prioritizing retraining leads to better accuracy as the model
+is updated faster. However, this can result in more SLO vio-
+lations for inference requests due to insufficient resources.
+On the other hand, prioritizing inference brings lower SLO
+violations. However, the retraining take longer execution
+due to the lack of resources so that fewer inference requests
+can use the updated model, leading to lower accuracy as
+the model cannot adapt quickly to the new environment.
+Additionally, in multi-tenancy where multiple continuous
+learning models share the GPU, the resource requirements
+for retraining tasks (to ensure prompt model adaptation) and
+inference tasks (to guarantee SLO that can even vary over
+time) differ among models (see Section 3 for details). These
+variations make the resource allocation more challenging.
+2.2
+Multi-tenant Support on GPUs
+There are three popular multi-tenancy schemes on modern
+GPUs: i) Concurrent Mulit-Kernels (CMK), ii) Multi-Process
+Service (MPS), and iii) Multi-Instance GPUs (MIG). Specifi-
+cally, CMK does not partition the hardware resources across
+tenants and relies on GPU runtime and hardware to handle
+the competition. As such, the interference among tenants is
+more significant during execution [21, 36, 40, 43]. In contrast,
+MPS hard partitions the computing resources (i.e., Streaming
+Multi-processors) among tenants while leaving the memory
+system shared. Finally, the MIG hard partitions both com-
+puting and memory resources across tenants to provide the
+strongest execution isolation. In modern GPU, MIG supports
+a total of seven Graphic Processing Clusters (GPCs), which
+can be dynamically combined to form GPU instances. Figure
+1 plots the 12 configurations supported by MIG, where each
+configuration consists of several instances.
+3
+Motivation
+We conduct three experiments to investigate the effective-
+ness of the MIG resource partitioning for continuous learning
+applications. Due to the lack of space, we only report the
+Inception [137] and ResNet50 [138] models in this section.
+In fact, six different models were studied in the evaluation
+section, and the observations made in this section are similar
+Figure 1. MIG instance configurations on NVIDIA A100.
+SLO
+attainment
+Inference
+accuracy
+SLO
+attainment
+Inference
+accuracy
+SLO
+attainment
+Inference
+accuracy
+SLO
+attainment
+Inference
+accuracy
+Retraining
+window
+1
+2
+3
+4
+92.62
+81.29
+89.63
+73.8
+91.49
+73.64
+94.32
+74.88
+90.05
+89.4
+87.54
+78.25
+90.76
+78.14
+92.46
+79.66
+83.99
+90.5
+77.14
+81.61
+89.48
+80.38
+85.52
+81.28
+73.64
+91.27
+62.8
+81.86
+82.13
+80.99
+78.56
+82.15
+Inference
+- retraining
+6 - 1
+5 - 2
+4 - 3
+3 - 4
+GPC allocation
+Figure 2. SLO attainment(%) and inference accuracy(%) of
+ResNet50 under various GPC allocations in four retraining
+windows. The leftmost column lists GPC allocations, where
+‘6-1’ indicates 6 GPCs are allocated to the inference task, and
+1 GPC is allocated to the retraining task.
+in other models. The detailed experimental methodology can
+be found in Section 5.1.
+Dynamic resource allocation needed between re-
+training and inference. We conduct an experiment to char-
+acterize different GPC allocations between retraining and in-
+ferences for model ResNet50. We use the NC-CIFAR10 bench-
+mark [120] (details in Section 5.1), which is a widely used
+continuous learning retraining benchmark. In NC-CIFAR10,
+there are a total of 5 scenarios of training data where each
+scenario introduces two new data classes. The first scenario
+training data is used to pre-train the model, and the rest four
+scenario training data is used to retrain the model (corre-
+sponding to four retraining windows). Note that, the updated
+model is only available for inferences after the retraining fin-
+ishes. Inference requests are received over time and served
+using the most updated model. In this experiment, we mea-
+sure SLO attainment and inference accuracy. SLO attainment
+is defined as the proportion of inference requests returned
+within SLO targets compared to the total number of infer-
+ence requests received by the models, and inference accuracy
+is the proportion of inference requests that return correct
+results to the total number of inference requests received.
+From Figure 2, first, we observe that prioritizing either
+inference or retraining tasks may compromise the benefits of
+the other one. For example, compared to the allocation ‘3-4’,
+the GPC allocation ‘6-1’, which allocates more resources to
+inference tasks, achieves 18% higher SLO attainment on aver-
+age across four retraining windows but delivers an 8% lower
+3
+
+
+--- Page 4 ---
+inference accuracy. Second, we observe that the trade-off be-
+tween the benefits of allocating more resources to retraining
+or inference tasks varies across retraining windows. For ex-
+ample, comparing the ‘6-1’ allocation to the ‘3-4’ allocation in
+window 1, we see that the ‘6-1’ allocation yields 19% higher
+SLO attainment and 10% lower inference accuracy. In con-
+trast, in window 2, the ‘6-1’ allocation offers 27% higher SLO
+attainment and 8% lower inference accuracy compared to
+the ‘3-4’ allocation. The reason behind the change in trade-
+off is that both the inference request arrival rate and the
+accuracy improvement through retraining tasks vary across
+windows. These two observations motivate us to coherently
+consider both SLO attainment and the retraining benefits
+when conducting resource allocation.
+Fine-grain reconfiguration needed for multi-tenancy
+CL inferences. We use two real-world traces (Microsoft
+Azure [88] and Alibaba Cloud [87]) for Inception and
+ResNet50, respectively, to study the multi-tenancy CL in-
+ferences. Figure 3 plots the inference request arrival pattern
+(i.e., request per second) within a retraining window (i.e.,
+200 seconds). First, the arrival rate varies significantly over
+time within a model and between two models. For instance,
+during certain periods (blue boxes), ResNet50 has more infer-
+ence requests than Inception, whereas for other periods (red
+boxes), Inception has more inference requests. Consequently,
+the time period in blue boxes would prefer allocations with
+more GPCs for ResNet50 (e.g., ‘3-4’) to achieve higher SLO
+attainment, and the red box would prefer allocations with
+more GPCs for Inception (e.g., ‘4-3’). Second, the preferred
+allocation can vary every second as it is determined by the
+inference request arrival pattern. That is, ideally, in every
+second, one would need to determine the allocation that can
+provide the best SLO attainment based on both the current
+inference requests and the newly arrived inference requests.
+We characterize, at each second, the GPC allocation that
+yields the best SLO attainment and report the number of
+times these GPC allocations appear during the entire retrain-
+ing window in Figure 3. As shown, the GPC allocation that
+yields the best SLO attainment varies among all the possible
+allocations (i.e., from ‘6-1’ to ‘1-6). Therefore, static MIG
+partitioning will not work for multi-tenant CL inferences.
+Dynamic allocation needed among multi-tenancy CL
+retrainings. We further investigate the effectiveness of MIG
+in handling multi-tenant retraining tasks. To characterize the
+inference accuracy improvement brought by retraining, we
+run the inferences for both Inception and ResNet50 using the
+same inference trace from Microsoft Azure [88], i.e., the red
+curve in Figure 3. This ensures that the improvement in infer-
+ence accuracy is only affected by the retraining procedures
+between the two models, not the change of the inference re-
+quest arrival pattern between the two models. We also fixed 1
+GPC for each inference task, hence leaving 5 GPCs available
+for the retraining tasks between these two models. We apply
+300
+200
+100
+00
+25
+50
+75
+100
+125
+150
+175
+200
+seconds
+Azure trace (Inception)
+Alibaba trace (ResNet50)
+Request-per-second
+Times
+16
+42
+55
+40
+28
+19
+GPC allocation
+6 - 1
+5 - 2
+4 - 3
+3 - 4
+2 - 5
+1 - 6
+Figure 3. The figure displays the inference request per sec-
+ond for both the Azure and Alibaba traces within a single
+retraining window. The first row of the table lists GPC allo-
+cations, where ‘1-6’ indicates Inception is allocated 1 GPCs
+while ResNet50 is allocated 6 GPCs.
+86.44
+82.4
+74.23
+84.68
+89.72
+85.06
+86.46
+86.73
+88.97
+85.88
+85.84
+87.38
+85.97
+81.76
+83.21
+84.86
+1 - 4
+4 - 1
+3 - 2
+2 - 3
+GPC allocation
+Retraining 
+window
+1
+2
+3
+4
+Figure 4. Inference accuracy(%) under different GPC allo-
+cations for retraining tasks in each retraining window. The
+leftmost column of the table represents the GPC allocations,
+where ‘1-4’ indicates that the Inception retraining task is
+allocated a 1-GPC instance and the ResNet50 retraining task
+is allocated a 4-GPC instance. The highest inference accuracy
+for each retraining window is highlighted.
+a GPC allocation at the beginning of each retraining win-
+dow and maintain it during that retaining window. Figure
+4 shows the inference accuracy results, demonstrating that
+no single GPC allocation consistently achieves the highest
+inference accuracy across all windows. This variability is
+due to the variations in model accuracy improvement across
+different retraining tasks. That is, the accuracy improvement
+through retraining tasks varies across models, and even for
+the same model in different retraining windows [83, 148]. As
+such, at each retraining window, it is beneficial to allocate
+more resources to the retraining task that provides a higher
+increase in accuracy, given that allocating more resources to
+a retraining task enables a shorter retraining duration and
+allows more inference requests to benefit from the improved
+model accuracy.
+4
+MIGRator Design
+We design MIGRator, a dynamic GPU reconfiguration run-
+time for multi-tenancy continuous learning workloads on
+modern GPUs. MIGRator is built upon modern MIG such
+that the interference among co-running tasks is eliminated.
+4
+
+
+--- Page 5 ---
+Also, MIGRator is aware of both inference dynamics and
+the retraining benefits in CL workloads. This is achieved
+by formulating the reconfiguration into an Integer Linear
+Programming (ILP) problem, which leverages a metric called
+Goodput (Section 4.1.3) in its objective function to take into
+account the SLO attainment and the model accuracy. MIGRa-
+tor uses Gurobi [99] to resolve the ILP efficiently with much
+lower overheads compared to exhaustive search.
+4.1
+ILP Formulation
+In this section, we present the details of formulating the
+MIG reconfiguration into ILP. The notations used in ILP
+formulation and their descriptions are presented in Table 2.
+First, we consider the instances (denoted as (𝜆,𝛾)) of 12
+MIG-supported configurations (denoted as Λ) illustrated in
+Figure 1 as the basic units for GPU resource allocation. Thus,
+a resource allocation unit (i.e., instance) is represented by
+(𝜆,𝛾). These instances can be allocated to any inference
+(denoted as (𝑚,𝑖)) or retraining task (denoted as (𝑚,𝑟)). The
+resource allocation is subject to certain constraints listed in
+Sections 4.1.1 and 4.1.2.
+The ILP solver runs at the beginning of each retraining
+window, to generate GPU resource allocations for each sec-
+ond of the entire 200-second retraining window. Thus, each
+retraining window has 200 possible allocations (denoted
+as Φ). The ILP formulation evaluates the SLO attainment
+and inference accuracy (details of the objective function are
+provided in Section 4.1.3) coherently for each allocation se-
+quence. Then, the ILP selects the allocation sequence that
+achieves both high SLO attainment and high inference accu-
+racy during the entire retraining window. Though the ILP
+solver is called at each retraining window, it is very efficient
+and completes within 1% of the retraining window time.
+4.1.1
+General MIG Constraints in ILP.
+Ensuring valid GPU resource allocations. First, we must
+ensure that the GPU resource allocations among tasks are
+compatible with MIG-supported configurations (i.e., those
+12 configurations in Figure 1). We use a binary variable 𝐹𝑠
+𝜆
+to indicate whether a MIG-supported configuration 𝜆is se-
+lected by any task at the 𝑠𝑡ℎsecond. The 𝐹𝑠
+𝜆takes the value
+1 (indicating being selected) only if any instance (𝜆,𝛾) of
+this configuration is allocated to any task. This relationship
+can be linearized as Formula 1a, where 𝑋𝑠
+(𝑚),(𝜆,𝛾) is a binary
+variable indicating whether the instance (𝜆,𝛾) is allocated to
+model 𝑚’s inference or retraining task at the 𝑠𝑡ℎsecond. Ac-
+cordingly, the constraint to ensure the feasibility of instance
+allocation can be formulated as Formula 1b.
+Notation
+Description
+Meta
+variables
+(𝑚)
+The inference task (𝑚,𝑖) and retraining task
+(𝑚,𝑟) of model 𝑚.
+(𝑀,𝑖)
+The set of all inference tasks ((𝑚,𝑖) ∈(𝑀,𝑖)).
+(𝑀,𝑟)
+The set of all retraining tasks ((𝑚,𝑟) ∈(𝑀,𝑟)).
+(𝑀)
+The set of all tasks across all models.
+((𝑀) = (𝑀,𝑖) ∪(𝑀,𝑟))
+S
+The retraining window size in seconds (𝑠∈S).
+Λ
+NVIDIA MIG supported configurations [5].
+(𝜆,𝛾)
+The instance (𝜆,𝛾) of the configuration 𝜆(𝛾∈
+𝜆, 𝜆∈Λ)
+Φ
+A GPC allocation sequence for all tasks in current
+retraining window.
+General
+variables
+𝑋𝑠
+(𝑚,𝑖),(𝜆,𝛾)
+a binary variable indicating whether the instance
+(𝜆, 𝛾) is allocated to the inference task (𝑚,𝑖)
+in the 𝑠𝑡ℎsecond, if the instance is allocated, the
+value is set to 1; otherwise, 0
+𝑋𝑠
+(𝑚,𝑟),(𝜆,𝛾)
+a binary variable indicating whether the instance
+(𝜆, 𝛾) is allocated to the retraining task (𝑚,𝑟)
+in the 𝑠𝑡ℎsecond, if the instance is allocated, the
+value is set to 1; otherwise, 0
+𝑁𝑠
+(𝑚,𝑖)
+The number of instances allocated to the infer-
+ence task (𝑚,𝑖) in the 𝑠𝑡ℎsecond.
+𝑁𝑠
+(𝑚,𝑟)
+The number of instances allocated to the retrain-
+ing task (𝑚,𝑟) in the 𝑠𝑡ℎsecond.
+𝑌𝑠
+(𝑚,𝑖)
+The number of GPCs allocated to the inference
+task (𝑚,𝑖) in the 𝑠𝑡ℎsecond.
+𝑌𝑠
+(𝑚,𝑟)
+The number of GPCs allocated to the retraining
+task (𝑚,𝑟) in the 𝑠𝑡ℎsecond.
+Feasibility
+𝐹𝑠
+𝜆
+A binary variable indicating whether the configu-
+ration 𝜆is selected in 𝑠𝑡ℎsecond, if the configu-
+ration is selected, the value is set to 1; otherwise,
+0.
+Guarantee
+completion
+and no
+interruption
+𝐶𝑠
+(𝑚,𝑟)
+A binary variable indicating the retraining task
+(𝑚,𝑟) is running (value 1) or not (value 0) in the
+𝑠𝑡ℎsecond.
+H
+A large constant of value 10000 to help computa-
+tion in our work.
+𝑅𝑇𝑘
+(𝑚,𝑟)
+Retraining time of the task (m,r) in seconds given
+a k-GPC instance.
+Guarantee
+inference task
+deployment
+𝐿(𝑚,𝑖)
+the minimum required size of an instance that the
+inference task (𝑚,𝑖) can be deployed without
+error.
+Objective
+related
+variables
+𝐺𝑜𝑜𝑢𝑝𝑢𝑡Φ
+The total number of valid inference requests
+given the GPC allocation Φ in current retrain-
+ing window.
+𝐺𝑜𝑜𝑢𝑝𝑢𝑡𝑠
+(𝑚,𝑖)
+The total number of valid inference requests re-
+turned by task (m,i) in the 𝑠𝑡ℎsecond.
+𝑇ℎ𝑟𝑜𝑢𝑔ℎ𝑝𝑢𝑡𝑠
+(𝑚,𝑖)
+The number of inference requests processed by
+task (𝑚,𝑖) in the 𝑠𝑡ℎsecond.
+𝑐𝑎𝑝𝑎𝑏𝑖𝑙𝑖𝑡𝑦(𝑚,𝑖),(𝜆,𝛾)
+The number of inference requests can be pro-
+cessed by task (𝑚,𝑖) given the instance (𝜆,𝛾.
+𝑐𝑎𝑝𝑎𝑏𝑖𝑙𝑖𝑡𝑦𝑠
+(𝑚,𝑖)
+The total number of inference requests can be
+processed by task (𝑚,𝑖) in the 𝑠𝑡ℎ𝑠𝑒𝑐𝑜𝑛𝑑.
+𝑅𝑒𝑐𝑣𝑠
+(𝑚,𝑖)
+The number of inference requests received by
+task (𝑚,𝑖) in the 𝑠𝑡ℎ𝑠𝑒𝑐𝑜𝑛𝑑.
+𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠𝑚
+A binary variable indicating the completion of
+the retraining process of model𝑚before the 𝑠𝑡ℎ
+second, if the retraining process is completed be-
+fore 𝑠𝑡ℎsecond, the value is set to 1; otherwise,
+0.
+𝑎𝑐𝑐𝑢𝑟𝑎𝑐𝑦𝑝𝑟𝑒
+𝑚
+The model accuracy of model 𝑚before the com-
+pletion of retraining process.
+𝑎𝑐𝑐𝑢𝑟𝑎𝑐𝑦𝑝𝑜𝑠𝑡
+𝑚
+The model accuracy of model 𝑚after the com-
+pletion of retraining process.
+Detect
+reconfiguration
+𝑅𝑠
+(𝑚,𝑖)
+A binary variable indicating a reconfiguration is
+initialized (value 1) or not (value 0) for the infer-
+ence task (𝑚,𝑖) in the 𝑠𝑡ℎsecond.
+Ψ(𝑚,𝑖)
+The average reconfiguration overhead of task
+(𝑚,𝑖) in seconds during the last retraining win-
+dow.
+Helper
+variable
+H
+A large constant of value 10000 in our work.
+Table 2. Symbols used in ILP.
+Determine occupancy status for each configuration 𝜆:
+(1a)
+𝐹𝑠
+𝜆∈{0, 1}, ∀𝑠, 𝜆
+𝐹𝑠
+𝜆≤
+∑︁
+𝛾∈𝜆
+∑︁
+𝑚∈𝑀
+𝑋𝑠
+(𝑚),(𝜆,𝛾), ∀𝑠, 𝜆
+𝐹𝑠
+𝜆≥1
+H ·
+∑︁
+𝛾∈𝜆
+∑︁
+𝑚∈𝑀
+𝑋𝑠
+(𝑚),(𝜆,𝛾), ∀𝑠, 𝜆
+Ensure only one configuration 𝜆is selected from Λ:
+(1b)
+∑︁
+𝜆∈Λ
+𝐹𝑠
+𝜆= 1, ∀𝑠
+5
+
+
+--- Page 6 ---
+Prohibit instance sharing. MIGRator is built upon MIG
+and does not share MIG instances among tasks. We now
+formulate this into ILP constrain. Specifically, we use the
+binary variables 𝑋𝑠
+(𝑚,𝑖), (𝜆, 𝛾) to indicate whether the instance
+(𝜆, 𝛾) is allocated to the task (𝑚,𝑖) in the 𝑠𝑡ℎsecond. If the
+instance is allocated to the task (𝑚,𝑖), 𝑋𝑠
+(𝑚,𝑖),(𝜆,𝛾) is set to
+1; otherwise, it is set to 0. The same process is also applied
+to 𝑋𝑠
+(𝑚,𝑟),(𝜆,𝛾). The constraint to avoid instance sharing is
+formulated as Formula 2, which ensures that an instance
+(𝜆, 𝛾) can be allocated to at most one task.
+Prevent instance sharing:
+∑︁
+𝑚∈𝑀
+(𝑋𝑠
+(𝑚,𝑖),(𝜆,𝛾) + 𝑋𝑠
+(𝑚,𝑟),(𝜆,𝛾) ) ≤1, ∀𝑠,𝛾
+(2)
+4.1.2
+Task-dependent Constraints in ILP.
+The constraints listed in Section 4.1.1 ensure that the gener-
+ated GPU resource allocations are feasible and can be imple-
+mented by MIG. In this section, we list three task-dependent
+constraints.
+No interruption for retraining. MIGRator follows prior
+works [83] and does not interrupt retraining tasks once they
+start executing, due to the high interruption overhead (in-
+cluding checkpointing and reloading). To allocate the in-
+stance for the retraining task, it follows the constraint For-
+mula 3a. As such, the necessary and sufficient condition to
+prevent interruptions in the retraining process is to ensure
+that the number of GPCs allocated (𝑁(𝑚,𝑟)) to a retraining
+task remains constant every second from the start of the
+retraining process until completion. The constraint is formu-
+lated as follows. Suppose a retraining task (𝑚,𝑟) starts at the
+𝑠𝑡ℎsecond with 𝑌𝑠
+(𝑚,𝑟) GPCs allocated, and the time required
+for it to complete is 𝑅𝑇
+𝑌𝑠
+(𝑚,𝑟)
+(𝑚,𝑟) . Then we need to ensure that
+the number of GPCs allocated to this retraining task remains
+the same every second over the period 𝑠to 𝑠+ 𝑅𝑇
+𝑌𝑠
+(𝑚,𝑟)
+(𝑚,𝑟) . This
+constraint is given in Formula 3f.
+Here, 𝑧𝑠
+(𝑚,𝑟) in Formula 3f is a binary variable to indicate
+whether the training task (𝑚,𝑟) is started at the 𝑠𝑡ℎsecond.
+𝑧𝑠
+(𝑚,𝑟) is used to ensure that we only check the GPC number
+consistency within the training duration. The definition of
+𝑧𝑠
+(𝑚,𝑟) is linearly formulated in Formula 3c. In this formula-
+tion, we also need to estimate the time needed to complete a
+retraining task (𝑅𝑇
+𝑌𝑠
+(𝑚,𝑟)
+(𝑚,𝑟) in Formula 3f). To achieve this, we
+first approximate the training latency required for a model
+to be three times the inference latency with the same vol-
+ume of data and the same amount of GPU resources [134],
+where the inference latency is offline profiled. Note that a
+model’s inference task can be allocated with instances con-
+taining different numbers of GPCs. We only need to profile
+the inference latency once for each specific instance, and
+this profiling overhead is negligible. Then, we can calculate
+the training duration based on the volume of retraining data.
+Besides, the function 𝐸𝑞𝑢𝑎𝑙𝑠[147] in Formula 3e, is used to
+compare two numbers, returning 1 if they are equal and 0
+otherwise.
+Count the number of instances allocated to task (𝑚,𝑟):
+(3a)
+𝑁𝑠
+(𝑚,𝑟) =
+∑︁
+𝜆,𝛾
+𝑋𝑠
+(𝑚,𝑟),(𝜆,𝛾), ∀𝑚,𝑠
+𝑁𝑠
+(𝑚,𝑟) ≤1, ∀𝑚,𝑠
+Determine the running status for task (𝑚,𝑟):
+(3b)
+𝐶𝑠
+(𝑚,𝑟) ∈{0, 1}, ∀𝑚,𝑠
+𝐶𝑠
+(𝑚,𝑟) ≤𝑁𝑠
+𝑚,𝑟,
+𝐶𝑠
+(𝑚,𝑟) ≥1
+H · 𝑁𝑠
+𝑚,𝑟, ∀𝑚,𝑠
+Determine whether task (𝑚,𝑟) starts in 𝑠𝑡ℎsecond:
+(3c)
+𝑧𝑠
+𝑚,𝑟∈{0, 1},
+𝑧𝑠
+𝑚,𝑟≤1 −𝐶𝑠−1
+(𝑚,𝑟), ∀𝑚,𝑠
+𝑧𝑠
+𝑚,𝑟≤𝐶𝑠
+(𝑚,𝑟),
+𝑧𝑠
+𝑚,𝑟≥𝐶𝑠
+(𝑚,𝑟) −𝐶𝑠−1
+(𝑚,𝑟), ∀𝑚,𝑠
+Count the number of GPCs allocated to task (𝑚,𝑟):
+(3d)
+𝑌𝑠
+(𝑚,𝑟) =
+∑︁
+𝜆,𝛾
+𝑋𝑠
+(𝑚,𝑟),(𝜆,𝛾) · sizeof(𝜆,𝛾), ∀𝑚,𝑠
+Whether the same number of GPCs allocated to task (𝑚,𝑟):
+(3e)
+𝑞𝑠
+(𝑚,𝑟) ∈{0, 1},
+𝑞𝑠
+(𝑚,𝑟) = 𝐸𝑞𝑢𝑎𝑙𝑠(𝑌𝑠−1
+(𝑚,𝑟),𝑌𝑠
+(𝑚,𝑟) ), ∀𝑚,𝑠
+Guarantee no interruption:
+(3f)
+𝑧𝑠
+𝑚,𝑟·
+𝑠+𝑅𝑇
+𝑌𝑠
+(𝑚,𝑟)
+(𝑚,𝑟)
+∑︁
+𝑤=𝑠
+𝑞𝑤
+(𝑚,𝑟) = 𝑅𝑇
+𝑌𝑠
+(𝑚,𝑟)
+(𝑚,𝑟) , ∀𝑚,𝑠
+Completing retraining tasks within the retraining win-
+dow. As required by continuous learning application [83, 84],
+each retraining task must be completed within the current
+retraining window. This constraint can be formulated as For-
+mula 4. In this formula, we first ensure that each retraining
+task will be launched. Then we guarantee the retraining
+task must be completed within the retraining window by
+ensuring its completion time is within the window.
+Guarantee retraining task (𝑚,𝑟) will be launched:
+∑︁
+𝑠
+𝐶𝑠
+(𝑚,𝑟) > 0, ∀𝑚
+Guarantee completion within the window:
+𝑧𝑠
+(𝑚,𝑟) · (𝑠+ 𝑅𝑇
+𝑌𝑠
+(𝑚,𝑟)
+(𝑚,𝑟) ) ≤𝑆, ∀𝑚,𝑠
+(4)
+Guarantee deployment of inference task. To guarantee
+that the model can be deployed without errors (e.g., out of
+memory) and serve inference requests at any time, we need
+to ensure that each inference task is always allocated enough
+resources required for deployment. To formulate this con-
+straint, we start by calculating the number of GPCs allocated
+to the inference task (𝑚,𝑖) in the 𝑠𝑡ℎsecond, denoted as
+(𝑌𝑠
+(𝑚,𝑖)), as shown in Formula 5a. Then the constraint can
+be formulated as Formula 5b. Specifically, for each infer-
+ence task, we guarantee it is always allocated with at least
+one 𝐿(𝑚,𝑖)-GPC instance, where the 𝐿(𝑚,𝑖)-GPC instance is
+the minimum resource demand for this inference task to be
+launched without error.
+6
+
+
+--- Page 7 ---
+Count the number of GPCs allocated to task (𝑚,𝑖):
+(5a)
+𝑌𝑠
+(𝑚,𝑖) =
+∑︁
+𝜆,𝛾
+𝑋𝑠
+(𝑚,𝑖),(𝜆,𝛾) · sizeof(𝜆,𝛾), ∀𝑚,𝑠
+Guarantee deployment for task (𝑚,𝑖): 𝑌𝑠
+(𝑚,𝑖) ≥𝐿(𝑚,𝑖), ∀𝑚,𝑠
+(5b)
+4.1.3
+Objective Function.
+Our optimization goal is to ensure that the generated alloca-
+tion sequence achieves both high SLO attainment and high
+inference accuracy over the entire retraining window. Nei-
+ther SLO attainment nor inference accuracy alone can fully
+reflect system performance. Therefore, to assess system per-
+formance more accurately, we leverage the metric 𝐺𝑜𝑜𝑑𝑝𝑢𝑡,
+as shown in Equation 6. The𝐺𝑜𝑜𝑑𝑝𝑢𝑡is calculated as follows.
+For each inference request arrived during a given retrain-
+ing window, it is considered a “valid” inference request only
+if the request satisfies two conditions: i) timeliness (Satis-
+fySLO) and ii) correctness (SatisfyPrediction). Specifically,
+timeliness indicates the completion time of inference request
+meets the SLO target (i.e., the output of function SatisfySLO
+is “1” if timeliness is met, otherwise “0”). Correctness rep-
+resents the request’s inference outcome is correct (i.e., the
+output of function SatisfyPrediction is “1” if the returned
+result is correct, otherwise “0”). Both conditions are binaries
+for a request. Then, the 𝐺𝑜𝑜𝑑𝑝𝑢𝑡counts the total number
+of “valid” inference requests that satisfy the above two con-
+ditions. Therefore, a higher 𝐺𝑜𝑜𝑑𝑝𝑢𝑡indicates that more
+inference requests that contributes to SLO attainment and
+also leverage the updated model. The equation of 𝐺𝑜𝑜𝑑𝑝𝑢𝑡
+is given as follows:
+Goodput =
+∑︁
+𝑟
+SatisfySLO(𝑟) ∧SatisfyPrediction(𝑟), ∀𝑟∈inference
+requests
+(6)
+Recall our discussion at the beginning of Section 4.1, at
+the start of each retraining window, MIGRator generates
+GPC allocations on a per-second basis for the entire given
+retraining window. Subsequently, MIGRator leverages ILP
+to evaluate all the GPC allocations collectively as a GPC
+allocation sequence within a retraining window. We denote
+this GPC allocation sequence as Φ. As such, the objective
+function of our ILP is to evaluate the generated allocation
+sequences and identify the one that maximizes the number
+of valid inference requests satisfying both timeliness and
+correctness requirements:
+Maximize[𝐺𝑜𝑜𝑑𝑝𝑢𝑡Φ]
+(7)
+Here, 𝐺𝑜𝑜𝑑𝑝𝑢𝑡Φ is calculated by summing the number of
+valid inference requests from each model’s inference task
+(denoted as (𝑚,𝑖)) in each second (denoted as 𝑠) within the
+retraining window, which can be expressed as:
+𝐺𝑜𝑜𝑑𝑝𝑢𝑡Φ =
+∑︁
+𝑚,𝑠
+𝐺𝑜𝑜𝑑𝑝𝑢𝑡𝑠
+(𝑚,𝑖)
+(8)
+Specifically, 𝐺𝑜𝑜𝑑𝑝𝑢𝑡𝑠
+𝑚,𝑖is calculated by multiplying the
+number of inference requests processed for task (𝑚,𝑖) in
+the 𝑠𝑡ℎsecond (denoted as 𝑇ℎ𝑟𝑜𝑢𝑔ℎ𝑝𝑢𝑡𝑠
+(𝑚,𝑖)) by the model
+accuracy:
+𝐺𝑜𝑜𝑑𝑝𝑢𝑡𝑠
+(𝑚,𝑖) =𝑇ℎ𝑟𝑜𝑢𝑔ℎ𝑝𝑢𝑡𝑠
+(𝑚,𝑖) · [(1 −𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+𝑚) · 𝑎𝑐𝑐𝑢𝑟𝑎𝑐𝑦𝑝𝑟𝑒
+𝑚
++ 𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+𝑚· 𝑎𝑐𝑐𝑢𝑟𝑎𝑐𝑦𝑝𝑜𝑠𝑡
+𝑚
+]
+(9)
+In this equation, 𝑎𝑐𝑐𝑢𝑟𝑎𝑐𝑦𝑝𝑟𝑒
+𝑚
+and 𝑎𝑐𝑐𝑢𝑟𝑎𝑐𝑦𝑝𝑜𝑠𝑡
+𝑚
+indicates the
+pre-retraining and post-retraining accuracy of model 𝑚, re-
+spectively. Given the throughput of the inference task at
+the second, there can be two situations. First, if the model
+retraining process is not finished yet at this second 𝑠, giving
+𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+𝑚= 0, then inference requests are served with
+the model before retraining, denoted as 𝑎𝑐𝑐𝑢𝑟𝑎𝑐𝑦𝑝𝑟𝑒
+𝑚
+in the
+objective function. Second, if the model retraining process is
+finished before this second 𝑠, giving 𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+𝑚= 1, then
+the updated model is available to serve inference requests,
+denoted as 𝑎𝑐𝑐𝑢𝑟𝑎𝑐𝑦𝑝𝑜𝑠𝑡
+𝑚
+in the objective function.
+In the next section 4.1.4, we will introduce how
+we calculate the 𝑇ℎ𝑟𝑜𝑢𝑔ℎ𝑝𝑢𝑡𝑠
+(𝑚,𝑖), retraining task status
+𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+𝑚, and the post-retraining accuracy 𝑎𝑐𝑐𝑢𝑟𝑎𝑐𝑦𝑝𝑜𝑠𝑡
+𝑚
+in the objective function.
+4.1.4
+Calculating Parameters in Objective Function.
+Calculating 𝑻𝒉𝒓𝒐𝒖𝒈𝒉𝒑𝒖𝒕𝒔
+(𝒎,𝒊). To estimate how many in-
+ference requests of task (𝑚,𝑖) are processed in the 𝑠𝑡ℎ
+second (i.e., 𝑇ℎ𝑟𝑜𝑢𝑔ℎ𝑝𝑢𝑡𝑠
+(𝑚,𝑖)), we need to know i) the to-
+tal number of inference requests of task (𝑚,𝑖) in the 𝑠𝑡ℎ
+second (denoted as 𝑅𝑒𝑐𝑣𝑠
+(𝑚,𝑖)), and ii) the maximum num-
+ber of inference requests that can be processed for task
+(𝑚,𝑖) within the 𝑠𝑡ℎsecond (denoted as 𝑐𝑎𝑝𝑎𝑏𝑖𝑙𝑖𝑡𝑦𝑠
+(𝑚,𝑖)).
+Then the 𝑇ℎ𝑟𝑜𝑢𝑔ℎ𝑝𝑢𝑡𝑠
+(𝑚,𝑖) is the minimum of 𝑅𝑒𝑐𝑣𝑠
+(𝑚,𝑖) and
+𝑐𝑎𝑝𝑎𝑏𝑖𝑙𝑖𝑡𝑦𝑠
+(𝑚,𝑖), which is expressed as: 𝑇ℎ𝑟𝑜𝑢𝑔ℎ𝑝𝑢𝑡𝑠
+(𝑚,𝑖) =
+𝑚𝑖𝑛𝑖𝑚𝑢𝑚{𝑅𝑒𝑐𝑣𝑠
+(𝑚,𝑖),𝑐𝑎𝑝𝑎𝑏𝑖𝑙𝑖𝑡𝑦𝑠
+(𝑚,𝑖)}. Here we leverage the
+formula 𝑚𝑖𝑛𝑖𝑚𝑢𝑚(𝐴, 𝐵) in [147] which takes two numbers
+𝐴and 𝐵and returns the minimum value between them.
+capability of (𝑚,𝑖) in 𝑠𝑡ℎsecond :
+𝑐𝑎𝑝𝑎𝑏𝑖𝑙𝑖𝑡𝑦𝑠
+(𝑚,𝑖) =
+∑︁
+𝜆,𝛾
+𝑋𝑠
+(𝑚,𝑖),(𝜆,𝛾) · 𝑐𝑎𝑝𝑎𝑏𝑖𝑙𝑖𝑡𝑦(𝑚,𝑖),(𝜆,𝛾)
+−
+𝑅𝑠
+(𝑚,𝑖) · Ψ(𝑚,𝑖)
+Í
+𝜆,𝛾𝑋𝑠
+(𝑚,𝑖),(𝜆,𝛾)
+· 𝑐𝑎𝑝𝑎𝑏𝑖𝑙𝑖𝑡𝑦(𝑚,𝑖),(𝜆,𝛾)
+(10)
+To obtain the 𝑅𝑒𝑐𝑣𝑠
+(𝑚,𝑖), at the beginning of the retrain-
+ing window, we predict the number of inference requests
+arriving every second throughout the entire window based
+on the historical inference request arrival data from previ-
+ous windows. Specifically, we follow previous works [72–
+74] and leverage a transformer-based model Informer [71]
+for prediction. Informer is widely used due to its effective-
+ness and accuracy in long-sequence forecasting, and its ef-
+ficiency for real-time prediction. Regarding 𝑐𝑎𝑝𝑎𝑏𝑖𝑙𝑖𝑡𝑦𝑠
+(𝑚,𝑖),
+we sum up the number of inference requests that can be
+processed by each instance allocated to task (𝑚,𝑖) (denoted
+7
+
+
+--- Page 8 ---
+as 𝑐𝑎𝑝𝑎𝑏𝑖𝑙𝑖𝑡𝑦(𝑚,𝑖),(𝜆,𝛾)), where (𝜆,𝛾) represents an instance,
+as shown in Equation 10.
+Taking reconfiguration overhead into account. So
+far, we have not included the reconfiguration overhead in
+our ILP formulation. However, in reality, there are consider-
+able overheads associated with MIG reconfiguration. This
+reconfiguration overhead includes both the application as-
+pect (e.g., model initialization and parameter loading) and
+the hardware aspect (e.g., driver handling the reconfigura-
+tion). Figure 5 plots our characterization of three models
+and their reconfiguration overheads. As one can observe,
+the reconfiguration overheads can take more than 6,000 mil-
+liseconds, which is significantly longer — more than 1,000
+times — than the latency of responding to a single inference
+request. Therefore, ignoring this reconfiguration overhead
+during scheduling could lead to frequent reconfigurations,
+resulting in more operational overheads than the benefits de-
+rived from resource reconfiguration. Since the instances that
+are being reconfigured cannot serve any task, the reconfigu-
+ration overheads inevitably affect the inference throughput.
+We take this into account by Equation 10. Ψ𝑡𝑖in the equa-
+tion represents the time needed for reconfiguration, such as
+instance initialization and model loading. Specifically, when
+there is a MIG reconfiguration in the 𝑠𝑡ℎsecond and task
+(𝑚,𝑖) is affected by this reconfiguration, the throughput of
+the task (𝑚,𝑖) will inevitably drop due to the reconfiguration
+time.
+Detecting Reconfiguration. We use a binary variable
+𝑅𝑠
+(𝑚,𝑖) to indicate whether a task (𝑚,𝑖) is affected by MIG
+reconfiguration. The 𝑅𝑠
+(𝑚,𝑖) takes the value 1 (indicating task
+(𝑚,𝑖) being affected) either when the number of instances
+allocated (𝑁𝑠
+(𝑚,𝑖)) or the number of GPCs allocated (𝑌𝑠
+(𝑚,𝑖))
+to (𝑚,𝑖) changes. The 𝑅𝑠
+(𝑚,𝑖) is linearly formulated as:
+Reconfiguration variable :
+𝑅𝑠
+(𝑚,𝑖) ∈{0, 1}
+Is the same number of GPCs allocated:
+𝑒𝑞𝑢𝑎𝑙𝐺𝑃𝐶𝑠
+(𝑚,𝑖) = 𝐸𝑞𝑢𝑎𝑙𝑠(𝑌𝑠−1
+(𝑚,𝑖),𝑌𝑠
+(𝑚,𝑖) )
+Is the same number of instances allocated:
+𝑒𝑞𝑢𝑎𝑙𝐼𝑛𝑠𝑡𝑠
+(𝑚,𝑖) = 𝐸𝑞𝑢𝑎𝑙𝑠(𝑁𝑠−1
+(𝑚,𝑖), 𝑁𝑠
+(𝑚,𝑖) )
+Determine if a reconfiguration is initiated :
+𝑅𝑠
+(𝑚,𝑖) ≤𝑒𝑞𝑢𝑎𝑙𝐺𝑃𝐶𝑠
+(𝑚,𝑖) + 𝑒𝑞𝑢𝑎𝑙𝐼𝑛𝑠𝑡𝑠
+(𝑚,𝑖), ∀𝑚,𝑠
+(11)
+Here, we leverage 𝐸𝑞𝑢𝑎𝑙𝑠[147] to determine whether two
+numbers are equal, the same process we did in Formula 3e.
+If two numbers are equal, 𝐸𝑞𝑢𝑎𝑙𝑠returns value 1; otherwise,
+0.
+Detecting the completion of a retraining process
+𝑪𝒐𝒎𝒑𝒍𝒆𝒕𝒊𝒐𝒏𝒔
+𝒎and estimating post-retraining model ac-
+curacy. Given our constraint (Formula 3 and 4) that ensures
+once a retraining task (𝑚,𝑟) is launched, it must not be
+interrupted until completion, our method to determine if
+a retraining task is complete is based on the running sta-
+tus of (𝑚,𝑟). Specifically, we consider a retraining task to
+0
+1000
+2000
+3000
+4000
+5000
+6000
+7000
+ConvNeXt
+ResNet50
+MobileNet
+(ms)
+Instance destruction
+Instance initialization
+Library load
+Model load
+Figure 5. Reconfiguration overhead for ConvNeXt, ResNet50
+and MobileNet.
+be completed during the (𝑠−1)𝑡ℎsecond if it is running
+at that second but not at the subsequent 𝑠𝑡ℎsecond. The
+running status of retraining task (𝑚,𝑟) in the 𝑠𝑡ℎsecond is
+represented by a binary variable 𝐶𝑠
+(𝑚,𝑟), where 𝐶𝑠
+(𝑚,𝑟) = 1
+indicates that (𝑚,𝑟) is actively running. The detailed def-
+inition of 𝐶𝑠
+(𝑚,𝑟) is provided in Formula 3b. To explicitly
+indicate the completion status of (𝑚,𝑟), we employ a binary
+variable 𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+𝑚. When 𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+𝑚= 1, it indicates
+that the retraining task (𝑚,𝑟) has been completed before
+the 𝑠𝑡ℎsecond. The determination process for 𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+𝑚
+is linearly formulated in Formula 12. To quickly estimate
+the post-retraining model accuracy, we adopt the method-
+ology used in prior works [80, 83]. Specifically, we sample
+a small subset of the retraining data and use it to train the
+model for a few epochs. This preliminary retraining allows
+us to obtain a model accuracy improvement curve. Based on
+this curve, we are able to predict the model’s accuracy upon
+convergence when trained with the complete dataset.
+Retraining process finished in previous second:
+𝑘𝑠
+(𝑚,𝑟) ∈{0, 1},
+𝑘𝑠
+(𝑚,𝑟) ≥𝐶𝑠−1
+(𝑚,𝑟) −𝐶𝑠
+(𝑚,𝑟), ∀𝑚,𝑠
+𝑘𝑠
+(𝑚,𝑟) ≤𝐶𝑠−1
+(𝑚,𝑟),
+𝑘𝑠
+(𝑚,𝑟) ≤1 −𝐶𝑠
+(𝑚,𝑟), ∀𝑚,𝑠
+Retraining completion status:
+𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+(𝑚,𝑟) ∈{0, 1}, ∀𝑚,𝑠
+𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+𝑚≥𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠−1
+𝑚, ∀𝑚,𝑠
+𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+𝑚≥𝑘𝑠
+(𝑚,𝑟), ∀𝑚,𝑠
+𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+𝑚≤𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠−1
+𝑚
++ 𝑘𝑠
+(𝑚,𝑟), ∀𝑚,𝑠
+(12)
+After calculating 𝑇ℎ𝑟𝑜𝑢𝑔ℎ𝑝𝑢𝑡(𝑚,𝑖)𝑠, the retraining task
+status 𝐶𝑜𝑚𝑝𝑙𝑒𝑡𝑖𝑜𝑛𝑠
+𝑚and the post-retraining model accuracy
+𝑎𝑐𝑐𝑢𝑟𝑎𝑐𝑦𝑝𝑜𝑠𝑡
+𝑚
+, we can evaluate 𝐺𝑜𝑜𝑑𝑝𝑢𝑡for GPC allocations
+and identify the beneficial GPC allocation Φ for the entire
+retraining window. To address these complex resource allo-
+cation challenges efficiently, MIGRator employs the Gurobi
+solver[99], a powerful optimization tool known for its ef-
+ficiency and effectiveness in solving large-scale linear pro-
+gramming problems.
+4.2
+Efficient Transition to Optimal GPC Allocation
+So far, we have not explored any optimizations to reduce
+the reconfiguration overhead. In practice, if one can reduce
+the reconfiguration overheads, it can enable the ILP solver
+to find more beneficial GPC allocations. To this end, we
+propose a novel technique ‘pre-initialization’ that effectively
+reduces the reconfiguration overheads (Ψ(𝑚,𝑖) in Equation
+8
+
+
+--- Page 9 ---
+Pre-initialization
+A2 is running
+Reconfigure is triggered
+Reconfiguration
+overhead
+Benefits
+Reconfiguration
+overhead
+Pre-initialization enabled
+A1 is running
+A1 is running
+A2 is running
+2
+1
+1
+4
+2
+2
+2
+Allocation A1
+task 1
+task 2
+Time
+Allocation A2
+Without
+pre-initialization:
+With 
+pre-initialization:
+Figure 6. An example of pre-initialization to reduce recon-
+figuration overheads.
+10). Note that, reducing the overheads will not affect the ILP
+constraints.
+We illustrate the overhead reduction strategy using an
+example depicted in Figure 6. We assume there are two co-
+located tasks in the example. A1 and A2 represent two con-
+secutive GPU resource allocations generated by ILP for these
+tasks. Specifically, A1 requires allocating one 2-GPC instance
+to task 1 and one 1-GPC instance to task 2. A2 changes the
+allocation to one 4-GPC instance for task 1 and one 2-GPC
+instance along with one 1-GPC instance for task 2.
+Comparing allocations A1 and A2, one can observe that
+two unused 2-GPC instances in A1 can be combined to con-
+stitute the 4-GPC instance in A2 before reaching A2. Pre-
+initializing this 4-GPC instance can overlap the reconfig-
+uration process with the computation before reaching A2,
+thus hiding the reconfiguration overhead between A1 and
+A2. This allows the tasks to use the reconfigured instances
+sooner, as shown in Figure 6. Note that we only leverage
+the unused instance for ‘pre-initialization’, so that it will not
+affect any tasks running on occupied instances. After using
+ILP to obtain the whole sequence of GPU resource alloca-
+tions for the entire retraining window, MIGRator will quickly
+traverse the allocations sequence to identify opportunities
+for pre-initialization.
+5
+Evaluation
+5.1
+Experimental Setup
+System: We perform experiments on NVIDIA A100 GPU
+with 40 GB memory and CUDA 12.1. The GPU driver ver-
+sion is 550.54.15, which supports both MPS and MIG GPU
+allocation. The server installs AlmaLinux-8.7 OS.
+DNN models: We use six models with different GFLOPs
+listed in Table 3, and each model is labeled as either ‘High’
+or ‘Low’ based on its GFLOPs.
+Inference request traces: We use two real-world inference
+traces for inference tasks. One is derived from Alibaba Clus-
+ter trace [87], whereas the other is from the Microsoft Azure
+Model
+GFLOPs
+Abbreviation
+Bert𝑏𝑎𝑠𝑒
+22.2G (High)
+Bert
+ViT𝑏_16
+17.56G (High)
+ViT
+ConvNeXt𝑏𝑎𝑠𝑒
+15.36G (High)
+ConvNeXt
+Inception𝑣3
+5.71G (Low)
+Inception
+ResNet50
+4.09G (Low)
+ResNet50
+MobileNet𝑣2
+0.32G (Low)
+MobilNet
+Table 3. List of models.
+trace [88]. The trace characteristics are given early in Fig-
+ure 3. For the main results, we report the typical inference
+batch size (i.e., 1). We also report a larger inference batch
+size (i.e., 4) in Section 5.3.
+Retraining datasets: We utilize three widely-used contin-
+uous learning retraining datasets: NC-CIFAR-10 [118], NC-
+CORe50 [119], NC-20-Newsgroups [157]. Specifically, in NC-
+CIFAR10, there are a total of 5 scenarios of training data,
+and each scenario introduces two new data classes. The first
+scenario training data is used to pre-train the model, and the
+rest four scenario training data is used to retrain the model
+(corresponding to four retraining windows). In NC-CORe50,
+there are 50 classes. Models are pre-trained using the first
+five classes. Then, in each retraining window, five additional
+classes are introduced for retraining, leading to nine retrain-
+ing windows. In NC-20-Newsgroups, there are 20 classes.
+Models are pre-trained using the first two classes. Two new
+classes are added in each retraining window, resulting in a
+total of nine retraining windows. In our experiments, NC-
+20-Newsgroups is used for the language model Bert, while
+NC-CIFAR-10 and NC-CORe50 are used for vision models
+(those 5 DNN models in Table 3 except for Bert).
+Workloads: The evaluation includes 16 workloads listed in
+Table 4, where each workload consists of two co-running
+tenants (i.e., two CL models). The workloads are differenti-
+ated by different models, different retraining data sets, and
+different inference traces. We cover diverse combinations to
+show the generalizability of our design.
+The retraining window size is set to 200 seconds and fixed
+through all experiments, aligning with prior continuous
+learning works[83, 84]. We compare MIGRator with mul-
+tiple state-of-the-art GPU resource allocation works:
+• Astraea [17] Astrea is a MPS-based GPU resource man-
+agement framework. It dynamically allocates SMs among
+tasks to improve QoS and resource efficiency.
+• PARIS [19] PARIS and ELSA is a MIG-based work, which
+statically partitions GPCs based on the model’s computing
+intensity.
+• Ekya [83] Ekya is a MPS-based continuous learning the-
+state-of-art work. Ekya adjusts SM allocations for both
+inference and retraining tasks at the start and end of re-
+training processes.
+9
+
+
+--- Page 10 ---
+WorkModel-1 InferenceRetrainingModel-2 InfereceRetraining
+-load
+trace
+dataset
+trace
+dataset
+W1
+Bert
+Alibaba
+NC-20N
+ViT
+Azure
+NC-CIF
+W2
+Bert
+Alibaba
+NC-20N
+ConvNeXtAzure
+NC-CIF
+W3
+ViT
+Alibaba
+NC-CIF
+ConvNeXtAzure
+NC-CIF
+W4
+Bert
+Alibaba
+NC-20N
+Inception Azure
+NC-CIF
+W5
+ViT
+Alibaba
+NC-CIF
+ResNet50 Azure
+NC-CIF
+W6
+ConvNeXtAlibaba
+NC-CIF
+MobileNet Azure
+NC-CIF
+W7
+Inception Alibaba
+NC-CIF
+ResNet50 Azure
+NC-CIF
+W8
+ResNet50 Alibaba
+NC-CIF
+MobileNet Azure
+NC-CIF
+W9
+Bert
+Alibaba
+NC-20N
+ViT
+Azure
+NC-COR
+W10 Bert
+Alibaba
+NC-20N
+ConvNeXtAzure
+NC-COR
+W11 ViT
+Alibaba
+NC-COR
+ConvNeXtAzure
+NC-COR
+W12 Bert
+Alibaba
+NC-20N
+Inception Azure
+NC-COR
+W13 ViT
+Alibaba
+NC-COR
+ResNet50 Azure
+NC-COR
+W14 ConvNeXtAlibaba
+NC-COR
+MobileNet Azure
+NC-COR
+W15 Inception Alibaba
+NC-COR
+ResNet50 Azure
+NC-COR
+W16 ResNet50 Alibaba
+NC-COR
+MobileNet Azure
+NC-COR
+Table 4. Experitmental multi-tenancy workloads. In the re-
+training datasets, “NC-CF10”, “NC-COR”, and “NC-20N” rep-
+resents the NC-CIFAR-10 [118], NC-CORe50 [119], NC-20-
+Newsgroups [157] datasets, respectively.
+5.2
+Experimental Results
+Goodput evaluation. For each workload, we compute the
+𝐺𝑜𝑜𝑑𝑝𝑢𝑡(defined in Formula 6 in Section 4.1.3) of each re-
+training window, and sum all the 𝐺𝑜𝑜𝑑𝑝𝑢𝑡across all the re-
+training windows together as the overall execution 𝐺𝑜𝑜𝑑𝑝𝑢𝑡.
+We normalize the overall execution 𝐺𝑜𝑜𝑑𝑝𝑢𝑡to the total
+number of inference requests during the entire execution
+and report the percentage results in Figure 7. The higher the
+percentage, the more number of valid inference requests (i.e.,
+better performance). From the results, one can observe that
+MIGRator significantly and uniformly improves the overall
+𝐺𝑜𝑜𝑑𝑝𝑢𝑡compared to existing state-of-the-art approaches.
+Specifically, MIGRator improves the 𝐺𝑜𝑜𝑑𝑝𝑢𝑡by an average
+of 17%, 21%, and 20% compared to Ekya, Astraea, and PARIS,
+respectively. This is due to the capability that MIGRator de-
+termines the GPC allocation to coherently improve both the
+SLO attainment and the inference accuracy at a per-second
+granularity. The detailed reason behind the improvements
+comes from multiple aspects, including i) inference accuracy
+improvement, ii) SLO attainment improvement, and iii) co-
+running tenant interference reduction. We next elaborate on
+each in detail.
+Inference accuracy improvements. We show the in-
+ference accuracy improvements in Figure 8(b). As one can
+observe, MIGRator improves the average inference accuracy
+by 19%, and 12%, over Astraea, and PARIS. Recall that Astraea
+is an MPS-based approach that conducts the resource alloca-
+tion based on the compute intensity. While it could allocate
+more resources to retraining tasks based on the retraining
+compute intensity, it is not aware of the benefits (i.e., infer-
+ence accuracy improvements) brought by the retraining. For
+0
+20
+40
+60
+80
+100
+W1
+W2
+W3
+W4
+W5
+W6
+W7
+W8
+W9 W10 W11 W12 W13 W14 W15 W16 Avg
+Goodput(%)
+Ekya
+Astraea
+PARIS
+MIGRator
+Figure 7. 𝐺𝑜𝑜𝑑𝑝𝑢𝑡(%) of different workloads.
+SLO 
+attainment(%)
+(a) SLO attainment(%) of workloads
+(b) Inference accuracy(%) of workloads
+Inference 
+accuracy(%)
+0
+20
+40
+60
+80
+100
+W1
+W2
+W3
+W4
+W5
+W6
+W7
+W8
+W9 W10 W11 W12 W13 W14 W15 W16 Avg
+0
+20
+40
+60
+80
+100
+W1
+W2
+W3
+W4
+W5
+W6
+W7
+W8
+W9 W10 W11 W12 W13 W14 W15 W16 Avg
+Ekya
+Astraea
+PARIS
+MIGRator
+Figure 8. SLO attainment(%) and inference accuracy(%).
+PARIS, it is a MIG-based approach that statically partitions
+the GPUs based on computing intensity; it neither allows re-
+configuration during execution nor is it aware of the benefits
+brought by retraining. In contrast, our approach performs
+dynamic MIG reconfiguration and, most importantly, val-
+ues the significance of accuracy improvements when doing
+retraining in each restraining window. That is, if the retrain-
+ing is able to improve the model accuracy significantly, it is
+likely to have more resource allocation in our approach (e.g.,
+considered in the ILP objective function 7). On the other
+hand, if the accuracy improvement is not significant, our
+approach could provide more resources for SLO attainment.
+For instance, under workload W1, MIGRator improves the
+average inference accuracy by 27% and 17% compared to
+Astraea and PARIS. This is because models (Bert and ViT) en-
+counter a significant model accuracy drop (by an average of
+32.5%) when new classes are introduced, whereas retraining
+tasks boost accuracy by approximately 30%. In such scenar-
+ios, allocating more resources to accelerate the retraining
+tasks can greatly improve inference accuracy. Meanwhile,
+MIGRator achieves similar inference accuracy compared to
+Ekya. This is because Ekay also considers the retraining ben-
+efits (i.e., accuracy improvements) in resource allocation. It
+always guarantees and prioritizes enough resources for re-
+training when the benefits are significant. However, Ekay is
+not able to handle inference SLO attainment based on its cur-
+rent “always-retraining” approach, which we will elaborate
+on next.
+SLO attainment improvements. Figure 8(a) shows the
+SLO attainment achieved by MIGRator and other compari-
+son approaches. On average, MIGRator outperforms Ekya,
+10
+
+
+--- Page 11 ---
+0
+20
+40
+60
+80
+100
+W1
+W2
+W3
+W4
+W5
+W6
+W7
+W8
+W9 W10 W11 W12 W13 W14 W15 W16 Avg
+Goodput(%)
+batch size = 4
+Ekya
+Astraea
+PARIS
+MIGRator
+Figure 9. 𝐺𝑜𝑜𝑑𝑝𝑢𝑡(%) of workloads when inference batch
+size is 4.
+batch size = 1
+W1
+W2
+W3
+W4
+W5
+W6
+W7
+W8
+W9
+W10 W11 W12 W13 W14 W15 W16
+basis=0.5s
+basis=1s
+basis=3s
+basis=5s
+basis=10s
+Goodput(%)
+80
+60
+40
+20
+0
+100
+Figure 10. 𝐺𝑜𝑜𝑑𝑝𝑢𝑡(%) of workloads under the basis of vari-
+ous seconds.
+Astraea, and PARIS, by 17%, 6%, and 13%, respectively. Specifi-
+cally, Ekya and PARIS only conduct resource reconfiguration
+at i) the beginning of the retaining process and ii) the end
+of the retraining process within a given retraining window.
+Therefore, Ekya and PARIS cannot effectively respond to the
+dynamic inference request arrival pattern (generally at fine
+granularity on a second basis), thus negatively impacting
+SLO attainment. Moreover, Ekya uses exhaustive searches to
+find the beneficial configuration. The overheads with exhaus-
+tive searches prevent it from exploring the configuration on
+a per-second basis. As a result, it cannot accommodate the
+inference arrival pattern at fine granularity. PARIS doesn’t
+consider the dynamic GPC reconfiguration over time. In
+contrast, MIGRator proactively considers the inference re-
+quest arrival pattern at fine granularity and leverages ILP to
+determine potential GPC allocations on a per-second basis,
+thereby delivering higher SLO attainment. MIGRator also
+outperforms Astraea by 6%. While both MIGRator and As-
+traea enable dynamic resource allocations for inference tasks,
+Astraea is an MPS-based approach that only partitions the
+computing resources (i.e., SMs), leaving the memory band-
+width under contention. This is particularly problematic for
+large models. In contrast, MIGRator leverages MIG to parti-
+tion both compute and memory resources among co-located
+tasks, ensuring no interference and maintaining high SLO at-
+tainment. For instance, in workload W3, MIGRator improves
+SLO attainment by 8%, with an average improvement of 6%
+across all model combinations, compared to Astraea.
+Reconfiguration overhead reduction. Recall our dis-
+cussion in Section 4.2, we propose pre-initialization to reduce
+the reconfiguration overhead. We evaluated this optimiza-
+tion and observed that it achieves an 83% reduction in MIG
+reconfiguration overheads.
+5.3
+Sensitivity
+Large inference batch size. Figure 9 shows the 𝐺𝑜𝑜𝑑𝑝𝑢𝑡
+of all workloads when the inference batch size is 4 for all
+the inference tasks. As one can observe, MIGRator outper-
+forms prior works in all workloads. The reason behind the
+improvements is due to the improved SLO attainment and
+inference accuracy, similar to the scenario when batch size
+is 1 (Section 5.2). This indicates that MIGRator can automat-
+ically determine the beneficial GPC allocations for different
+batch sizes and provide additional benefits.
+Reconfiguration granularity. So far, our discussion has
+focused on the reconfiguration on a per-second basis. We
+next report the results of MIGRator reconfiguration using
+different time granularity. Figure 10 plots the results when
+we vary the granularity from 0.5 seconds to 10 seconds. As
+one can observe, 0.5-second granularity achieves the highest
+𝐺𝑜𝑜𝑑𝑝𝑢𝑡across all workloads. This is because a finer granu-
+larity allows for more frequent GPC reconfigurations, better
+capturing the inference dynamics in continuous learning. In
+contrast, the 10-second granularity has a significantly lower
+𝐺𝑜𝑜𝑑𝑝𝑢𝑡due to its limited reconfiguration frequency. How-
+ever, it is worth mentioning that a finer granularity leads to
+more search space and higher ILP overhead. We found that
+1-second granularity provides comparable 𝐺𝑜𝑜𝑑𝑝𝑢𝑡with 0.5-
+second granularity while reducing the ILP solver overheads.
+6
+Related works
+Continuous learning. Continuous learning research uti-
+lizes various strategies to maintain model accuracy over
+time. Some approaches focus on facilitating accurate and
+timely scenario change detection, which involves track-
+ing the distribution of incoming data and detecting data
+drifts [172, 173, 173]. These approaches enable timely model
+updates once the model deployment scenario changes (indi-
+cated by data drift). Some other approaches aim to find better
+model retraining hyperparameters (e.g., adaptive learning
+rates) to accelerate model convergence [176, 178] and to im-
+prove post-retraining model accuracy [177, 179]. Moreover,
+some methods propose to filter out unimportant incoming re-
+training data to reduce the training time without compromis-
+ing accuracy [174, 175], which could enables more inference
+requests benefits from the updated model. It is important to
+emphasize that these approaches are complementary to our
+design. We focus on dynamic and effective resource alloca-
+tion among multi-tenancy inference and retraining tasks in
+continuous learning, addressing the dynamic nature of both
+retraining and inference resource demands.
+GPU multi-tenant system. Optimizing GPU resource
+allocation and utilization in large-scale computing envi-
+ronments is a popular research area. Gpulet [14] leverages
+NVIDIA MPS to partition resources among co-running tasks,
+enhancing utilization and throughput. However, Gpulet
+adopts a coarse-grained resource reallocation strategy (i.e.,
+11
+
+
+--- Page 12 ---
+reallocate resources every 20 seconds) due to the high over-
+head of frequent recourse reallocation. Such a coarse gran-
+ularity is insufficient to effectively handle the dynamics in
+continuous learning applications. Another GPU resource
+allocation work INFless [13], which uses NVIDIA MPS to fa-
+cilitate device sharing, adopts a finer-grained resource sched-
+uling strategy. However, it lacks optimizations to mitigate
+MPS reconfiguration overheads, which could significantly
+degrade the system performance when frequent MPS recon-
+figuration is needed. In summary, while Gpu-let and INFless
+offer valuable approaches to GPU resource management,
+they have limitations. Our MIGRator addresses these by en-
+suring an efficient, fine-grained, and low-overhead resource
+reallocation to meet the dynamics of continuous learning
+applications.
+7
+Conclusion
+In this paper, we propose MIGRator, a dynamic GPU reconfig-
+uration runtime for multi-tenancy continuous learning work-
+loads on modern GPUs. MIGRator leverages MIG to mini-
+mize the interference among co-running tasks and enables
+fine-granular reconfigurations to improve GPU resource uti-
+lization. We formulate the reconfiguration optimization into
+an Integer Linear Programming (ILP) problem to take into
+account both the SLO attainment and retraining benefits in
+CL workloads. Experimental results indicate our approach
+significantly outperforms the state-of-the-art GPU sharing
+approaches for multi-tenant continuous learning workloads.
+References
+[1] NVIDIA, “Nvidia developer tools documentation - nsight compute,”
+2023. [Online]. Available: https://docs.nvidia.com/nsight-compute/
+NsightCompute/index.html
+[2] ——, “Nvidia gpu management and deployment - multi-process
+service,” 2023. [Online]. Available: https://docs.nvidia.com/deploy/
+mps/index.html
+[3] ——,
+“Nvidia
+hyper-q,”
+2023.
+[Online].
+Available:
+https://github.com/NVIDIA/cuda-samples/tree/master/Samples/0_
+Introduction/simpleHyperQ
+[4] ——,
+“Nvidia
+multi-streams,”
+2023.
+[Online].
+Available:
+https://github.com/NVIDIA/cuda-samples/tree/master/Samples/0_
+Introduction/simpleStreams
+[5] ——, “Nvidia driver documentation - nvidia multi-instance gpu user
+guide,” 2023. [Online]. Available: https://docs.nvidia.com/datacenter/
+tesla/mig-user-guide/
+[6] H. Shen, L. Chen, Y. Jin, L. Zhao, B. Kong, M. Philipose, A. Krishna-
+murthy, and R. Sundaram, “Nexus: A gpu cluster engine for accel-
+erating dnn-based video analysis,” in Proceedings of the 27th ACM
+Symposium on Operating Systems Principles, 2019, pp. 322–337.
+[7] J. R. Gunasekaran, C. S. Mishra, P. Thinakaran, B. Sharma, M. T.
+Kandemir, and C. R. Das, “Cocktail: A multidimensional optimization
+for model serving in cloud,” in USENIX NSDI, 2022, pp. 1041–1057.
+[8] A. Gujarati, R. Karimi, S. Alzayat, W. Hao, A. Kaufmann,
+Y. Vigfusson, and J. Mace, “Serving DNNs like clockwork:
+Performance predictability from the bottom up,” in 14th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI
+20). USENIX Association, Nov. 2020, pp. 443–462. [Online]. Available:
+https://www.usenix.org/conference/osdi20/presentation/gujarati
+[9] Q. Chen, H. Yang, J. Mars, and L. Tang, “Baymax: Qos awareness and
+increased utilization for non-preemptive accelerators in warehouse
+scale computers,” SIGPLAN Not., vol. 51, no. 4, p. 681–696, mar 2016.
+[Online]. Available: https://doi.org/10.1145/2954679.2872368
+[10] Q. Chen, H. Yang, M. Guo, R. S. Kannan, J. Mars, and L. Tang,
+“Prophet: Precise qos prediction on non-preemptive accelerators to
+improve utilization in warehouse-scale computers,” in Proceedings of
+the Twenty-Second International Conference on Architectural Support
+for Programming Languages and Operating Systems, ser. ASPLOS ’17.
+New York, NY, USA: Association for Computing Machinery, 2017, p.
+17–32. [Online]. Available: https://doi.org/10.1145/3037697.3037700
+[11] G. Yeung, D. Borowiec, R. Yang, A. Friday, R. Harper, and P. Gar-
+raghan, “Horus: Interference-aware and prediction-based scheduling
+in deep learning systems,” IEEE Transactions on Parallel and Dis-
+tributed Systems, vol. 33, no. 1, pp. 88–100, 2022.
+[12] Z. Wang, J. Yang, R. Melhem, B. Childers, Y. Zhang, and M. Guo,
+“Simultaneous multikernel gpu: Multi-tasking throughput processors
+via fine-grained sharing,” in 2016 IEEE International Symposium on
+High Performance Computer Architecture (HPCA), 2016, pp. 358–369.
+[13] Y. Yang, L. Zhao, Y. Li, H. Zhang, J. Li, M. Zhao, X. Chen, and K. Li,
+“Infless: a native serverless system for low-latency, high-throughput
+inference,” in Proceedings of the 27th ACM International Conference
+on Architectural Support for Programming Languages and Operating
+Systems, ser. ASPLOS ’22.
+New York, NY, USA: Association
+for Computing Machinery, 2022, p. 768–781. [Online]. Available:
+https://doi-org.pitt.idm.oclc.org/10.1145/3503222.3507709
+[14] S. Choi, S. Lee, Y. Kim, J. Park, Y. Kwon, and J. Huh, “Serving
+heterogeneous machine learning models on Multi-GPU servers
+with Spatio-Temporal sharing,” in 2022 USENIX Annual Technical
+Conference (USENIX ATC 22).
+Carlsbad, CA: USENIX Association,
+Jul. 2022, pp. 199–216. [Online]. Available: https://www.usenix.org/
+conference/atc22/presentation/choi-seungbeom
+[15] W. Zhang, Q. Chen, N. Zheng, W. Cui, K. Fu, and M. Guo, “Toward
+qos-awareness and improved utilization of spatial multitasking gpus,”
+IEEE Transactions on Computers, vol. 71, no. 4, pp. 866–879, 2022.
+[16] W. Zhang, W. Cui, K. Fu, Q. Chen, D. E. Mawhirter, B. Wu, C. Li, and
+M. Guo, “Laius: Towards latency awareness and improved utilization
+of spatial multitasking accelerators in datacenters,” in Proceedings of
+the ACM international conference on supercomputing, 2019, pp. 58–68.
+[17] W. Zhang, Q. Chen, K. Fu, N. Zheng, Z. Huang, J. Leng, and M. Guo,
+“Astraea: Towards qos-aware and resource-efficient multi-stage gpu
+services,” in Proceedings of the 27th ACM International Conference
+on Architectural Support for Programming Languages and Operating
+Systems, ser. ASPLOS ’22.
+New York, NY, USA: Association
+for Computing Machinery, 2022, p. 570–582. [Online]. Available:
+https://doi.org/10.1145/3503222.3507721
+[18] A. Dhakal, S. G. Kulkarni, and K. K. Ramakrishnan, “Gslice:
+Controlled spatial sharing of gpus for a scalable inference
+platform,” in Proceedings of the 11th ACM Symposium on Cloud
+Computing, ser. SoCC ’20.
+New York, NY, USA: Association
+for Computing Machinery, 2020, p. 492–506. [Online]. Available:
+https://doi.org/10.1145/3419111.3421284
+[19] Y. Kim, Y. Choi, and M. Rhu, “Paris and elsa: An elastic
+scheduling algorithm for reconfigurable multi-gpu inference
+servers,” in Proceedings of the 59th ACM/IEEE Design Automation
+Conference, ser. DAC ’22.
+New York, NY, USA: Association
+for Computing Machinery, 2022, p. 607–612. [Online]. Available:
+https://doi.org/10.1145/3489517.3530510
+[20] C. Tan, Z. Li, J. Zhang, Y. Cao, S. Qi, Z. Liu, Y. Zhu, and C. Guo,
+“Serving dnn models with multi-instance gpus: A case of the recon-
+figurable machine scheduling problem,” 2021.
+[21] B. Li, T. Patel, S. Samsi, V. Gadepally, and D. Tiwari, “Miso: Exploiting
+multi-instance gpu capability on multi-tenant gpu clusters,” in
+Proceedings of the 13th Symposium on Cloud Computing, ser. SoCC
+12
+
+
+--- Page 13 ---
+’22.
+New York, NY, USA: Association for Computing Machinery,
+2022, p. 173–189. [Online]. Available: https://doi.org/10.1145/3542929.
+3563510
+[22] S. Li, G. Yuan, Y. Dai, Y. Zhang, Y. Wang, and X. Tang, “Smartfrz: An
+efficient training framework using attention-based layer freezing,”
+in The Eleventh International Conference on Learning Representations,
+2023.
+[23] R. Aljundi, K. Kelchtermans, and T. Tuytelaars, “Task-free continual
+learning,” in Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition, 2019, pp. 11 254–11 263.
+[24] J. Xu and Z. Zhu, “Reinforced continual learning,” Advances in Neural
+Information Processing Systems, vol. 31, 2018.
+[25] G. M. Van de Ven and A. S. Tolias, “Three scenarios for continual
+learning,” arXiv preprint arXiv:1904.07734, 2019.
+[26] Z. Li and D. Hoiem, “Learning without forgetting,” IEEE transactions
+on pattern analysis and machine intelligence, vol. 40, no. 12, pp. 2935–
+2947, 2017.
+[27] S.-A. Rebuffi, A. Kolesnikov, G. Sperl, and C. H. Lampert, “icarl: In-
+cremental classifier and representation learning,” in Proceedings of
+the IEEE conference on Computer Vision and Pattern Recognition, 2017,
+pp. 2001–2010.
+[28] K. Shmelkov, C. Schmid, and K. Alahari, “Incremental learning of
+object detectors without catastrophic forgetting,” in Proceedings of the
+IEEE international conference on computer vision, 2017, pp. 3400–3409.
+[29] R. Kemker, M. McClure, A. Abitino, T. Hayes, and C. Kanan, “Mea-
+suring catastrophic forgetting in neural networks,” in Proceedings of
+the AAAI conference on artificial intelligence, vol. 32, no. 1, 2018.
+[30] D. Maltoni and V. Lomonaco, “Continuous learning in single-
+incremental-task scenarios,” Neural Networks, vol. 116, pp. 56–73,
+2019.
+[31] H. Zhang, M. Shen, Y. Huang, Y. Wen, Y. Luo, G. Gao, and K. Guan,
+“A serverless cloud-fog platform for dnn-based video analytics with
+incremental learning,” arXiv preprint arXiv:2102.03012, 2021.
+[32] L. Kuipers and H. Niederreiter, Uniform distribution of sequences.
+Courier Corporation, 2012.
+[33] Y. Gan, Y. Zhang, D. Cheng, A. Shetty, P. Rathi, N. Katarki, A. Bruno,
+J. Hu, B. Ritchken, B. Jackson, K. Hu, M. Pancholi, Y. He, B. Clancy,
+C. Colen, F. Wen, C. Leung, S. Wang, L. Zaruvinsky, M. Espinosa,
+R. Lin, Z. Liu, J. Padilla, and C. Delimitrou, “An open-source
+benchmark suite for microservices and their hardware-software
+implications for cloud & edge systems,” in Proceedings of the
+Twenty-Fourth International Conference on Architectural Support for
+Programming Languages and Operating Systems, ser. ASPLOS ’19.
+New York, NY, USA: Association for Computing Machinery, 2019, p.
+3–18. [Online]. Available: https://doi.org/10.1145/3297858.3304013
+[34] V. J. Reddi, C. Cheng, D. Kanter, P. Mattson, G. Schmuelling, C.-J.
+Wu, B. Anderson, M. Breughe, M. Charlebois, W. Chou et al., “Mlperf
+inference benchmark,” in 2020 ACM/IEEE 47th Annual International
+Symposium on Computer Architecture (ISCA).
+IEEE, 2020, pp. 446–
+459.
+[35] Z. Tong, H. Lu, M. Haenggi, and C. Poellabauer, “A stochastic ge-
+ometry approach to the modeling of dsrc for vehicular safety com-
+munication,” IEEE Transactions on Intelligent Transportation Systems,
+vol. 17, no. 5, pp. 1448–1458, 2016.
+[36] Q. Hu, J. Shu, J. Fan, and Y. Lu, “Run-time performance estimation
+and fairness-oriented scheduling policy for concurrent gpgpu appli-
+cations,” in 2016 45th International Conference on Parallel Processing
+(ICPP).
+IEEE, 2016, pp. 57–66.
+[37] A. Jog, E. Bolotin, Z. Guz, M. Parker, S. W. Keckler, M. T. Kandemir,
+and C. R. Das, “Application-aware memory system for fair and effi-
+cient execution of concurrent gpgpu applications,” in Proceedings of
+workshop on general purpose processing using GPUs, 2014, pp. 1–8.
+[38] L. Subramanian, D. Lee, V. Seshadri, H. Rastogi, and O. Mutlu, “Bliss:
+Balancing performance, fairness and complexity in memory access
+scheduling,” IEEE Transactions on Parallel and Distributed Systems,
+vol. 27, no. 10, pp. 3071–3087, 2016.
+[39] A. Jog, O. Kayiran, T. Kesten, A. Pattnaik, E. Bolotin, N. Chatterjee,
+S. W. Keckler, M. T. Kandemir, and C. R. Das, “Anatomy of gpu
+memory system for multi-application execution,” in Proceedings of
+the 2015 International Symposium on Memory Systems, 2015, pp. 223–
+234.
+[40] R. Ausavarungnirun, V. Miller, J. Landgraf, S. Ghose, J. Gandhi, A. Jog,
+C. J. Rossbach, and O. Mutlu, “Mask: Redesigning the gpu memory
+hierarchy to support multi-application concurrency,” ACM SIGPLAN
+Notices, vol. 53, no. 2, pp. 503–518, 2018.
+[41] X. Zhao, M. Jahre, and L. Eeckhout, “Hsm: A hybrid slowdown model
+for multitasking gpus,” in Proceedings of the twenty-fifth international
+conference on architectural support for programming languages and
+operating systems, 2020, pp. 1371–1385.
+[42] H. Wang, F. Luo, M. Ibrahim, O. Kayiran, and A. Jog, “Efficient and fair
+multi-programming in gpus via effective bandwidth management,”
+in 2018 IEEE International Symposium on High Performance Computer
+Architecture (HPCA).
+IEEE, 2018, pp. 247–258.
+[43] A. Jog, O. Kayiran, A. K. Mishra, M. T. Kandemir, O. Mutlu, R. Iyer, and
+C. R. Das, “Orchestrated scheduling and prefetching for gpgpus,” in
+Proceedings of the 40th Annual International Symposium on Computer
+Architecture, 2013, pp. 332–343.
+[44] A. Jog, O. Kayiran, N. Chidambaram Nachiappan, A. K. Mishra,
+M. T. Kandemir, O. Mutlu, R. Iyer, and C. R. Das, “Owl: Coopera-
+tive thread array aware scheduling techniques for improving gpgpu
+performance,” ACM SIGPLAN Notices, vol. 48, no. 4, pp. 395–406, 2013.
+[45] O. Kayıran, A. Jog, M. T. Kandemir, and C. R. Das, “Neither more
+nor less: Optimizing thread-level parallelism for gpgpus,” in Proceed-
+ings of the 22nd international conference on Parallel architectures and
+compilation techniques.
+IEEE, 2013, pp. 157–166.
+[46] O. Kayiran, A. Jog, A. Pattnaik, R. Ausavarungnirun, X. Tang, M. T.
+Kandemir, G. H. Loh, O. Mutlu, and C. R. Das, “𝜇c-states: Fine-grained
+gpu datapath power management,” in Proceedings of the 2016 Interna-
+tional Conference on Parallel Architectures and Compilation, 2016, pp.
+17–30.
+[47] T. G. Rogers, M. O’Connor, and T. M. Aamodt, “Cache-conscious
+wavefront scheduling,” in 2012 45th Annual IEEE/ACM International
+Symposium on Microarchitecture.
+IEEE, 2012, pp. 72–83.
+[48] W. Gao, Z. Ye, P. Sun, Y. Wen, and T. Zhang, “Chronus: A novel
+deadline-aware scheduler for deep learning training jobs,” in Proceed-
+ings of the ACM Symposium on Cloud Computing, 2021, pp. 609–623.
+[49] Q. Weng, L. Yang, Y. Yu, W. Wang, X. Tang, G. Yang, and
+L. Zhang, “Beware of fragmentation: Scheduling GPU-Sharing
+workloads with fragmentation gradient descent,” in 2023 USENIX
+Annual Technical Conference (USENIX ATC 23).
+Boston, MA:
+USENIX Association, Jul. 2023, pp. 995–1008. [Online]. Available:
+https://www.usenix.org/conference/atc23/presentation/weng
+[50] F. Strati, X. Ma, and A. Klimovic, “Orion: Interference-aware, fine-
+grained gpu sharing for ml applications,” in Proceedings of the Nine-
+teenth European Conference on Computer Systems, 2024, pp. 1075–
+1092.
+[51] Q. Weng, L. Yang, Y. Yu, W. Wang, X. Tang, G. Yang, and
+L. Zhang, “Beware of fragmentation: Scheduling GPU-Sharing
+workloads with fragmentation gradient descent,” in 2023 USENIX
+Annual Technical Conference (USENIX ATC 23).
+Boston, MA:
+USENIX Association, Jul. 2023, pp. 995–1008. [Online]. Available:
+https://www.usenix.org/conference/atc23/presentation/weng
+[52] P. Thinakaran, J. R. Gunasekaran, B. Sharma, M. T. Kandemir, and C. R.
+Das, “Kube-knots: Resource harvesting through dynamic container
+orchestration in gpu-based datacenters,” in 2019 IEEE International
+Conference on Cluster Computing (CLUSTER).
+IEEE, 2019, pp. 1–13.
+[53] K. Li and N. Gui, “Cms: A continuous machine-learning and serving
+platform for industrial big data,” Future Internet, vol. 12, no. 6, p. 102,
+13
+
+
+--- Page 14 ---
+2020.
+[54] W. Wang, S. Wang, J. Gao, M. Zhang, G. Chen, T. K. Ng, and B. C.
+Ooi, “Rafiki: Machine learning as an analytics service system,” arXiv
+preprint arXiv:1804.06087, 2018.
+[55] L. Zheng, Z. Li, H. Zhang, Y. Zhuang, Z. Chen, Y. Huang, Y. Wang,
+Y. Xu, D. Zhuo, E. P. Xing et al., “Alpa: Automating inter-and {Intra-
+Operator} parallelism for distributed deep learning,” in 16th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI
+22), 2022, pp. 559–578.
+[56] D. Narayanan, K. Santhanam, F. Kazhamiaka, A. Phanishayee, and
+M. Zaharia, “{Heterogeneity-Aware} cluster scheduling policies for
+deep learning workloads,” in 14th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI 20), 2020, pp. 481–498.
+[57] A. Gujarati, R. Karimi, S. Alzayat, W. Hao, A. Kaufmann, Y. Vig-
+fusson, and J. Mace, “Serving {DNNs} like clockwork: Performance
+predictability from the bottom up,” in 14th USENIX Symposium on
+Operating Systems Design and Implementation (OSDI 20), 2020, pp.
+443–462.
+[58] D. Crankshaw, X. Wang, G. Zhou, M. J. Franklin, J. E. Gonzalez,
+and I. Stoica, “Clipper: A {Low-Latency} online prediction serving
+system,” in 14th USENIX Symposium on Networked Systems Design
+and Implementation (NSDI 17), 2017, pp. 613–627.
+[59] B. Berg, D. S. Berger, S. McAllister, I. Grosof, S. Gunasekar, J. Lu,
+M. Uhlar, J. Carrig, N. Beckmann, M. Harchol-Balter et al., “The
+{CacheLib} caching engine: Design and experiences at scale,” in 14th
+USENIX Symposium on Operating Systems Design and Implementation
+(OSDI 20), 2020, pp. 753–768.
+[60] Y. Cheng, A. Anwar, and X. Duan, “Analyzing alibaba’s co-located
+datacenter workloads,” in 2018 IEEE International Conference on Big
+Data (Big Data).
+IEEE, 2018, pp. 292–297.
+[61] A. Khandelwal, Y. Tang, R. Agarwal, A. Akella, and I. Stoica, “Jiffy:
+Elastic far-memory for stateful serverless analytics,” in Proceedings
+of the Seventeenth European Conference on Computer Systems, 2022,
+pp. 697–713.
+[62] C. Lu, K. Ye, G. Xu, C.-Z. Xu, and T. Bai, “Imbalance in the cloud: An
+analysis on alibaba cluster trace,” in 2017 IEEE International Confer-
+ence on Big Data (Big Data).
+IEEE, 2017, pp. 2884–2892.
+[63] C. Reiss, A. Tumanov, G. R. Ganger, R. H. Katz, and M. A. Kozuch,
+“Heterogeneity and dynamicity of clouds at scale: Google trace anal-
+ysis,” in Proceedings of the third ACM symposium on cloud computing,
+2012, pp. 1–13.
+[64] M. Shahrad, R. Fonseca, I. Goiri, G. Chaudhry, P. Batum, J. Cooke,
+E. Laureano, C. Tresness, M. Russinovich, and R. Bianchini, “Server-
+less in the wild: Characterizing and optimizing the serverless work-
+load at a large cloud provider,” in 2020 USENIX annual technical
+conference (USENIX ATC 20), 2020, pp. 205–218.
+[65] A. Verma, L. Pedrosa, M. Korupolu, D. Oppenheimer, E. Tune, and
+J. Wilkes, “Large-scale cluster management at google with borg,” in
+Proceedings of the tenth european conference on computer systems,
+2015, pp. 1–17.
+[66] M. Vuppalapati, J. Miron, R. Agarwal, D. Truong, A. Motivala, and
+T. Cruanes, “Building an elastic query engine on disaggregated stor-
+age,” in 17th USENIX Symposium on Networked Systems Design and
+Implementation (NSDI 20), 2020, pp. 449–462.
+[67] J. Yang, Y. Yue, and K. Rashmi, “A large-scale analysis of hundreds of
+in-memory key-value cache clusters at twitter,” ACM Transactions
+on Storage (TOS), vol. 17, no. 3, pp. 1–35, 2021.
+[68] M. Vuppalapati, G. Fikioris, R. Agarwal, A. Cidon, A. Khandelwal,
+and E. Tardos, “Karma: Resource allocation for dynamic demands,”
+arXiv preprint arXiv:2305.17222, 2023.
+[69] A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez,
+Ł. Kaiser, and I. Polosukhin, “Attention is all you need,” Advances in
+neural information processing systems, vol. 30, 2017.
+[70] F. Yang, B. Pang, J. Zhang, B. Qiao, L. Wang, C. Couturier, C. Bansal,
+S. Ram, S. Qin, Z. Ma, I. n. Goiri, E. Cortez, S. Baladhandayutham,
+V. Rühle, S. Rajmohan, Q. Lin, and D. Zhang, “Spot virtual machine
+eviction prediction in microsoft cloud,” in Companion Proceedings
+of the Web Conference 2022, ser. WWW ’22.
+New York, NY, USA:
+Association for Computing Machinery, 2022, p. 152–156. [Online].
+Available: https://doi-org.pitt.idm.oclc.org/10.1145/3487553.3524229
+[71] H. Zhou, S. Zhang, J. Peng, S. Zhang, J. Li, H. Xiong, and W. Zhang,
+“Informer: Beyond efficient transformer for long sequence time-series
+forecasting,” in Proceedings of the AAAI conference on artificial intelli-
+gence, vol. 35, no. 12, 2021, pp. 11 106–11 115.
+[72] T. Wu, M. Pan, and Y. Yu, “A long-term cloud workload prediction
+framework for reserved resource allocation,” in 2022 IEEE Interna-
+tional Conference on Services Computing (SCC).
+IEEE, 2022, pp.
+134–139.
+[73] M. Gong, Y. Zhao, J. Sun, C. Han, G. Sun, and B. Yan, “Load forecasting
+of district heating system based on informer,” Energy, vol. 253, p.
+124179, 2022.
+[74] Q. Hua, D. Yang, S. Qian, H. Hu, J. Cao, and G. Xue, “Kae-informer: A
+knowledge auto-embedding informer for forecasting long-term work-
+loads of microservices,” in Proceedings of the ACM Web Conference
+2023, 2023, pp. 1551–1561.
+[75] T. Zhou, Z. Ma, Q. Wen, X. Wang, L. Sun, and R. Jin, “FEDformer:
+Frequency enhanced decomposed transformer for long-term series
+forecasting,” in Proceedings of the 39th International Conference on
+Machine Learning, ser. Proceedings of Machine Learning Research,
+K. Chaudhuri, S. Jegelka, L. Song, C. Szepesvari, G. Niu, and S. Sabato,
+Eds., vol. 162.
+PMLR, 17–23 Jul 2022, pp. 27 268–27 286. [Online].
+Available: https://proceedings.mlr.press/v162/zhou22g.html
+[76] A. T. Haryono, R. Sarno, and K. R. Sungkono, “Transformer-gated
+recurrent unit method for predicting stock price based on news
+sentiments and technical indicators,” IEEE Access, 2023.
+[77] Z. Zhu, W. Chen, R. Xia, T. Zhou, P. Niu, B. Peng, W. Wang, H. Liu,
+Z. Ma, Q. Wen et al., “eforecaster: unifying electricity forecasting
+with robust, flexible, and explainable machine learning algorithms,”
+in Proceedings of the AAAI Conference on Artificial Intelligence, vol. 37,
+no. 13, 2023, pp. 15 630–15 638.
+[78] M. Su, S. Du, J. Hu, and T. Li, “A generative adversarial network
+with attention mechanism for time series forecasting,” in 2023 8th
+International Conference on Cloud Computing and Big Data Analytics
+(ICCCBDA).
+IEEE, 2023, pp. 197–202.
+[79] Z. Zhou, C. Zhang, L. Ma, J. Gu, H. Qian, Q. Wen, L. Sun, P. Li,
+and Z. Tang, “Ahpa: Adaptive horizontal pod autoscaling systems
+on alibaba cloud container service for kubernetes,” arXiv preprint
+arXiv:2303.03640, 2023.
+[80] Y. Peng, Y. Bao, Y. Chen, C. Wu, and C. Guo, “Optimus: An efficient
+dynamic resource scheduler for deep learning clusters,” in Proceedings
+of the Thirteenth EuroSys Conference, ser. EuroSys ’18.
+New York,
+NY, USA: Association for Computing Machinery, 2018. [Online].
+Available: https://doi-org.pitt.idm.oclc.org/10.1145/3190508.3190517
+[81] SciPy,
+“scipy.optimize.nnls
+-
+scipy
+v1.11.3
+manual,”
+2023.
+[Online].
+Available:
+https://docs.scipy.org/doc/scipy/reference/
+generated/scipy.optimize.nnls.html
+[82] K. Mahajan, A. Balasubramanian, A. Singhvi, S. Venkataraman,
+A. Akella, A. Phanishayee, and S. Chawla, “Themis: Fair and efficient
+GPU cluster scheduling,” in 17th USENIX Symposium on Networked
+Systems Design and Implementation (NSDI 20).
+Santa Clara, CA:
+USENIX Association, Feb. 2020, pp. 289–304. [Online]. Available:
+https://www.usenix.org/conference/nsdi20/presentation/mahajan
+[83] R. Bhardwaj, Z. Xia, G. Ananthanarayanan, J. Jiang, Y. Shu,
+N. Karianakis, K. Hsieh, P. Bahl, and I. Stoica, “Ekya: Continuous
+learning of video analytics models on edge compute servers,”
+in 19th USENIX Symposium on Networked Systems Design and
+Implementation (NSDI 22).
+Renton, WA: USENIX Association, Apr.
+14
+
+
+--- Page 15 ---
+2022, pp. 119–135. [Online]. Available: https://www.usenix.org/
+conference/nsdi22/presentation/bhardwaj
+[84] M. Khani, G. Ananthanarayanan, K. Hsieh, J. Jiang, R. Netravali,
+Y. Shu, M. Alizadeh, and V. Bahl, “RECL: Responsive Resource-
+Efficient continuous learning for video analytics,” in 20th USENIX
+Symposium on Networked Systems Design and Implementation
+(NSDI 23).
+Boston, MA: USENIX Association, Apr. 2023, pp.
+917–932. [Online]. Available: https://www.usenix.org/conference/
+nsdi23/presentation/khani
+[85] M. Shahrad, R. Fonseca, I. Goiri, G. Chaudhry, P. Batum, J. Cooke,
+E. Laureano, C. Tresness, M. Russinovich, and R. Bianchini,
+“Serverless in the wild: Characterizing and optimizing the serverless
+workload at a large cloud provider,” in 2020 USENIX Annual Technical
+Conference (USENIX ATC 20).
+USENIX Association, Jul. 2020, pp.
+205–218. [Online]. Available: https://www.usenix.org/conference/
+atc20/presentation/shahrad
+[86] APACHE, “Apache openwhisk is a serverless, open source cloud
+platform,” 2023. [Online]. Available: https://openwhisk.apache.org/
+[87] Alibaba, “Alibaba/clusterdata: Cluster data collected from production
+clusters in alibaba for cluster management research,” 2023. [Online].
+Available: https://github.com/alibaba/clusterdata
+[88] P. Patel, E. Choukse, C. Zhang, Í. Goiri, A. Shah, S. Maleki, and
+R. Bianchini, “Splitwise: Efficient generative llm inference using
+phase splitting,” arXiv preprint arXiv:2311.18677, 2023.
+[89] Z. Zhou, Y. Zhang, and C. Delimitrou, “Aquatope: Qos-and-
+uncertainty-aware resource management for multi-stage serverless
+workflows,” in Proceedings of the 28th ACM International Conference
+on Architectural Support for Programming Languages and Operating
+Systems, Volume 1, 2022, pp. 1–14.
+[90] S. Luo, H. Xu, K. Ye, G. Xu, L. Zhang, J. He, G. Yang, and C. Xu, “Erms:
+Efficient resource management for shared microservices with sla
+guarantees,” in Proceedings of the 28th ACM International Conference
+on Architectural Support for Programming Languages and Operating
+Systems, Volume 1, 2022, pp. 62–77.
+[91] D. Gu, Y. Zhao, Y. Zhong, Y. Xiong, Z. Han, P. Cheng, F. Yang,
+G. Huang, X. Jin, and X. Liu, “Elasticflow: An elastic serverless train-
+ing platform for distributed deep learning,” in Proceedings of the 28th
+ACM International Conference on Architectural Support for Program-
+ming Languages and Operating Systems, Volume 2, 2023, pp. 266–280.
+[92] C. Jin, Z. Zhang, X. Xiang, S. Zou, G. Huang, X. Liu, and X. Jin, “Ditto:
+Efficient serverless analytics with elastic parallelism,” in Proceedings
+of the ACM SIGCOMM 2023 Conference, 2023, pp. 406–419.
+[93] S. Tuli, S. R. Poojara, S. N. Srirama, G. Casale, and N. R. Jennings,
+“Cosco: Container orchestration using co-simulation and gradient
+based optimization for fog computing environments,” IEEE Transac-
+tions on Parallel and Distributed Systems, vol. 33, no. 1, pp. 101–116,
+2022.
+[94] S. Das, V. R. Narasayya, F. Li, and M. Syamala, “Cpu sharing
+techniques for performance isolation in multi-tenant relational
+database-as-a-service,” Proc. VLDB Endow., vol. 7, no. 1, p. 37–48, sep
+2013. [Online]. Available: https://doi.org/10.14778/2732219.2732223
+[95] S. Tuli, G. Casale, L. Cherkasova, and N. R. Jennings, “Deepft: Fault-
+tolerant edge computing using a self-supervised deep surrogate
+model,” in IEEE INFOCOM 2023-IEEE Conference on Computer Com-
+munications.
+IEEE, 2023, pp. 1–10.
+[96] D. Sengupta, A. Goswami, K. Schwan, and K. Pallavi, “Scheduling
+multi-tenant cloud workloads on accelerator-based systems,” in SC’14:
+Proceedings of the International Conference for High Performance Com-
+puting, Networking, Storage and Analysis.
+IEEE, 2014, pp. 513–524.
+[97] Wikipedia, “Wikipedia, fairness measure,” 2023. [Online]. Available:
+https://en.wikipedia.org/wiki/Fairness_measure
+[98] J. Li, H. Xu, Y. Zhu, Z. Liu, C. Guo, and C. Wang, “Lyra: Elastic
+scheduling for deep learning clusters,” in Proceedings of the Eighteenth
+European Conference on Computer Systems, 2023, pp. 835–850.
+[99] Gurobi Optimization, LLC, “Gurobi Optimizer Reference Manual,”
+2023. [Online]. Available: https://www.gurobi.com
+[100] D. Ge, Q. Huangfu, Z. Wang, J. Wu, and Y. Ye, “Cardinal Optimizer
+(COPT) user guide,” https://guide.coap.online/copt/en-doc, 2022.
+[101] M. Padberg and G. Rinaldi, “A branch-and-cut algorithm for the
+resolution of large-scale symmetric traveling salesman problems,”
+SIAM review, vol. 33, no. 1, pp. 60–100, 1991.
+[102] P. C. Gilmore and R. E. Gomory, “A linear programming approach
+to the cutting-stock problem,” Operations research, vol. 9, no. 6, pp.
+849–859, 1961.
+[103] A. Lambora, K. Gupta, and K. Chopra, “Genetic algorithm-a literature
+review,” in 2019 international conference on machine learning, big data,
+cloud and parallel computing (COMITCon).
+IEEE, 2019, pp. 380–384.
+[104] A. K. Mishra, J. L. Hellerstein, W. Cirne, and C. R. Das, “Towards char-
+acterizing cloud backend workloads: insights from google compute
+clusters,” ACM SIGMETRICS Performance Evaluation Review, vol. 37,
+no. 4, pp. 34–41, 2010.
+[105] Y. Chen, A. S. Ganapathi, R. Griffith, and R. H. Katz, “Analysis and
+lessons from a publicly available google cluster trace,” EECS Depart-
+ment, University of California, Berkeley, Tech. Rep. UCB/EECS-2010-95,
+vol. 94, 2010.
+[106] Q. Zhang, M. F. Zhani, R. Boutaba, and J. L. Hellerstein, “Dynamic
+heterogeneity-aware resource provisioning in the cloud,” IEEE trans-
+actions on cloud computing, vol. 2, no. 1, pp. 14–28, 2014.
+[107] Q. Chen, Z. Wang, J. Leng, C. Li, W. Zheng, and M. Guo, “Avalon:
+towards qos awareness and improved utilization through multi-
+resource management in datacenters,” in Proceedings of the ACM
+International Conference on Supercomputing, 2019, pp. 272–283.
+[108] C. Imes, S. Hofmeyr, and H. Hoffmann, “Energy-efficient application
+resource scheduling using machine learning classifiers,” in Proceed-
+ings of the 47th International Conference on Parallel Processing, 2018,
+pp. 1–11.
+[109] K. Sembiring and A. Beyer, “Dynamic resource allocation for cloud-
+based media processing,” in Proceeding of the 23rd ACM Workshop on
+Network and Operating Systems Support for Digital Audio and Video,
+2013, pp. 49–54.
+[110] Q. Chen and M. Guo, Task scheduling for multi-core and parallel
+architectures.
+Springer, 2017.
+[111] L. Xu, Y.-R. Yeh, Y.-J. Lee, and J. Li, “A hierarchical framework
+using approximated local outlier factor for efficient anomaly
+detection,” Procedia Computer Science, vol. 19, pp. 1174–1181,
+2013, the 4th International Conference on Ambient Systems,
+Networks and Technologies (ANT 2013), the 3rd International
+Conference on Sustainable Energy Information Technology (SEIT-
+2013). [Online]. Available: https://www.sciencedirect.com/science/
+article/pii/S187705091300776X
+[112] Z. Xu, D. Kakde, and A. Chaudhuri, “Automatic hyperparameter
+tuning method for local outlier factor, with applications to anomaly
+detection,” in 2019 IEEE International Conference on Big Data (Big
+Data), 2019, pp. 4201–4207.
+[113] S. Mishra and M. Chawla, “A comparative study of local outlier
+factor algorithms for outliers detection in data streams,” in Emerging
+Technologies in Data Mining and Information Security, A. Abraham,
+P. Dutta, J. K. Mandal, A. Bhattacharya, and S. Dutta, Eds. Singapore:
+Springer Singapore, 2019, pp. 347–356.
+[114] M. M. Breunig, H.-P. Kriegel, R. T. Ng, and J. Sander, “Lof: identifying
+density-based local outliers,” in Proceedings of the 2000 ACM SIGMOD
+international conference on Management of data, 2000, pp. 93–104.
+[115] F. Pedregosa, G. Varoquaux, A. Gramfort, V. Michel, B. Thirion,
+O. Grisel, M. Blondel, P. Prettenhofer, R. Weiss, V. Dubourg,
+J. Vanderplas, A. Passos, D. Cournapeau, M. Brucher, M. Perrot,
+and E. Duchesnay, “Scikit-learn: Machine learning in Python,”
+2023. [Online]. Available: https://scikit-learn.org/stable/modules/
+generated/sklearn.neighbors.LocalOutlierFactor.html
+15
+
+
+--- Page 16 ---
+[116] S.-Y. Jiang, Q.-H. Li, K.-L. Li, H. Wang, and Z.-L. Meng, “Glof: a
+new approach for mining local outlier,” in Proceedings of the 2003
+International Conference on Machine Learning and Cybernetics (IEEE
+Cat. No. 03EX693), vol. 1.
+IEEE, 2003, pp. 157–162.
+[117] O. Alghushairy, R. Alsini, T. Soule, and X. Ma, “A review of local
+outlier factor algorithms for outlier detection in big data streams,”
+Big Data and Cognitive Computing, vol. 5, no. 1, 2021. [Online].
+Available: https://www.mdpi.com/2504-2289/5/1/1
+[118] A. Krizhevsky, V. Nair, and G. Hinton, “Cifar-10 (canadian institute
+for advanced research).” [Online]. Available: http://www.cs.toronto.
+edu/~kriz/cifar.html
+[119] V. Lomonaco and D. Maltoni, “Core50: a new dataset and benchmark
+for continuous object recognition,” in Proceedings of the 1st Annual
+Conference on Robot Learning, vol. 78, 2017, pp. 17–26.
+[120] V. Lomonaco, L. Pellegrini, A. Cossu, A. Carta, G. Graffieti, T. L. Hayes,
+M. D. Lange, M. Masana, J. Pomponi, G. van de Ven, M. Mundt, Q. She,
+K. Cooper, J. Forest, E. Belouadah, S. Calderara, G. I. Parisi, F. Cuz-
+zolin, A. Tolias, S. Scardapane, L. Antiga, S. Amhad, A. Popescu,
+C. Kanan, J. van de Weijer, T. Tuytelaars, D. Bacciu, and D. Maltoni,
+“Avalanche: an end-to-end library for continual learning,” in Proceed-
+ings of IEEE Conference on Computer Vision and Pattern Recognition,
+ser. 2nd Continual Learning in Computer Vision Workshop, 2021.
+[121] A. Paszke, S. Gross, F. Massa, A. Lerer, J. Bradbury, G. Chanan,
+T. Killeen, Z. Lin, N. Gimelshein, L. Antiga, A. Desmaison, A. Köpf,
+E. Yang, Z. DeVito, M. Raison, A. Tejani, S. Chilamkurthy, B. Steiner,
+L. Fang, J. Bai, and S. Chintala, PyTorch: An Imperative Style, High-
+Performance Deep Learning Library.
+Red Hook, NY, USA: Curran
+Associates Inc., 2019.
+[122] S. Li, Y. Zhao, R. Varma, O. Salpekar, P. Noordhuis, T. Li, A. Paszke,
+J. Smith, B. Vaughan, P. Damania, and S. Chintala, “Pytorch
+distributed: Experiences on accelerating data parallel training,” Proc.
+VLDB Endow., vol. 13, no. 12, p. 3005–3018, aug 2020. [Online].
+Available: https://doi.org/10.14778/3415478.3415530
+[123] K. Nagrecha, “Model-parallel model selection for deep learning
+systems,” in Proceedings of the 2021 International Conference on
+Management of Data, ser. SIGMOD ’21.
+New York, NY, USA:
+Association for Computing Machinery, 2021, p. 2929–2931. [Online].
+Available: https://doi.org/10.1145/3448016.3450571
+[124] C. Badue, R. Guidolini, R. V. Carneiro, P. Azevedo, V. B. Cardoso,
+A. Forechi, L. Jesus, R. Berriel, T. M. Paixao, F. Mutz et al., “Self-
+driving cars: A survey,” Expert Systems with Applications, vol. 165, p.
+113816, 2021.
+[125] P. Kaur, K. Krishan, S. K. Sharma, and T. Kanchan, “Facial-recognition
+algorithms: A literature review,” Medicine, Science and the Law, vol. 60,
+no. 2, pp. 131–139, 2020.
+[126] F. Nasirian, M. Ahmadian, and O.-K. D. Lee, “Ai-based voice assistant
+systems: Evaluating from the interaction and trust perspectives,”
+2017.
+[127] A. Abdelmaboud, D. N. Jawawi, I. Ghani, A. Elsafi, and B. Kitchenham,
+“Quality of service approaches in cloud computing: A systematic
+mapping study,” Journal of Systems and Software, vol. 101, pp. 159–
+179, 2015.
+[128] I. Odun-Ayo, S. Misra, O. Abayomi-Alli, and O. Ajayi, “Cloud
+multi-tenancy: Issues and developments,” in Companion Proceedings
+of The10th International Conference on Utility and Cloud Computing,
+ser. UCC ’17 Companion.
+New York, NY, USA: Association
+for Computing Machinery, 2017, p. 209–214. [Online]. Available:
+https://doi-org.pitt.idm.oclc.org/10.1145/3147234.3148095
+[129] H. AlJahdali, A. Albatli, P. Garraghan, P. Townend, L. Lau, and J. Xu,
+“Multi-tenancy in cloud computing,” in 2014 IEEE 8th International
+Symposium on Service Oriented System Engineering, 2014, pp. 344–351.
+[130] K. Wood and M. Anderson, “Understanding the complexity surround-
+ing multitenancy in cloud computing,” in 2011 IEEE 8th International
+Conference on e-Business Engineering, 2011, pp. 119–124.
+[131] A. Qiao, S. K. Choe, S. J. Subramanya, W. Neiswanger, Q. Ho,
+H. Zhang, G. R. Ganger, and E. P. Xing, “Pollux: Co-adaptive cluster
+scheduling for goodput-optimized deep learning,” in 15th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI
+21).
+USENIX Association, Jul. 2021, pp. 1–18. [Online]. Available:
+https://www.usenix.org/conference/osdi21/presentation/qiao
+[132] R. Gu, Y. Chen, S. Liu, H. Dai, G. Chen, K. Zhang, Y. Che, and Y. Huang,
+“Liquid: Intelligent resource estimation and network-efficient schedul-
+ing for deep learning jobs on distributed gpu clusters,” IEEE Transac-
+tions on Parallel and Distributed Systems, vol. 33, no. 11, pp. 2808–2820,
+2021.
+[133] F. Lai, Y. Dai, H. V. Madhyastha, and M. Chowdhury, “ModelKeeper:
+Accelerating DNN training via automated training warmup,”
+in 20th USENIX Symposium on Networked Systems Design and
+Implementation (NSDI 23).
+Boston, MA: USENIX Association, Apr.
+2023, pp. 769–785. [Online]. Available: https://www.usenix.org/
+conference/nsdi23/presentation/lai-fan
+[134] U. Evci, T. Gale, J. Menick, P. S. Castro, and E. Elsen, “Rigging the
+lottery: Making all tickets winners,” in International Conference on
+Machine Learning.
+PMLR, 2020, pp. 2943–2952.
+[135] Z. Wang, Z. Jia, S. Zheng, Z. Zhang, X. Fu, T. S. E. Ng, and Y. Wang,
+“Gemini: Fast failure recovery in distributed training with in-memory
+checkpoints,” in Proceedings of the 29th Symposium on Operating
+Systems Principles, ser. SOSP ’23.
+New York, NY, USA: Association
+for Computing Machinery, 2023, p. 364–381. [Online]. Available:
+https://doi.org/10.1145/3600006.3613145
+[136] B.
+Chronicles,
+“Bloom
+chronicles,”
+2022.
+[Online].
+Avail-
+able:
+https://github.com/bigscience-workshop/bigscience/blob/
+master/train/tr11-176B-ml/chronicles.md
+[137] C. Szegedy, V. Vanhoucke, S. Ioffe, J. Shlens, and Z. Wojna, “Rethink-
+ing the inception architecture for computer vision,” in Proceedings of
+the IEEE conference on computer vision and pattern recognition, 2016,
+pp. 2818–2826.
+[138] K. He, X. Zhang, S. Ren, and J. Sun, “Deep residual learning for image
+recognition,” in Proceedings of the IEEE conference on computer vision
+and pattern recognition, 2016, pp. 770–778.
+[139] W. Feller, An introduction to probability theory and its applications.
+Wiley & Sons, 1957.
+[140] A. Lambora, K. Gupta, and K. Chopra, “Genetic algorithm-a literature
+review,” in 2019 international conference on machine learning, big data,
+cloud and parallel computing (COMITCon).
+IEEE, 2019, pp. 380–384.
+[141] H. Possingham, J. Day, M. Goldfinch, and F. Salzborn, “The mathe-
+matics of designing a network of protected areas for conservation,” in
+Decision Sciences: Tools for Today. Proceedings of 12th National ASOR
+Conference.
+ASOR Adelaide, 1993, pp. 536–545.
+[142] L. Underhill, “Optimal and suboptimal reserve selection algorithms,”
+Biological Conservation, vol. 70, no. 1, pp. 85–87, 1994.
+[143] R. P. Vanderkam, Y. F. Wiersma, and D. J. King, “Heuristic algorithms
+vs. linear programs for designing efficient conservation reserve net-
+works: Evaluation of solution optimality and processing time,” Bio-
+logical conservation, vol. 137, no. 3, pp. 349–358, 2007.
+[144] F. De Turck, “Efficient resource allocation through integer linear
+programming: a detailed example,” arXiv preprint arXiv:2009.13178,
+2020.
+[145] Y. Vimont, S. Boussier, and M. Vasquez, “Reduced costs propagation
+in an efficient implicit enumeration for the 01 multidimensional
+knapsack problem,” Journal of Combinatorial Optimization, vol. 15,
+no. 2, pp. 165–178, 2008.
+[146] R. K. Ahuja, T. L. Magnanti, and J. B. Orlin, Network flows: theory,
+algorithms and applications.
+Prentice hall, 1995.
+[147] D. Kroening and O. Strichman, Decision Procedures: An Algorithmic
+Point of View, ser. Texts in Theoretical Computer Science. An EATCS
+Series.
+Springer Berlin Heidelberg, 2016. [Online]. Available:
+https://books.google.com/books?id=DRqRDQAAQBAJ
+16
+
+
+--- Page 17 ---
+[148] H. Yin, X. Zhou, B. Cui, H. Wang, K. Zheng, and Q. V. H. Nguyen,
+“Adapting to user interest drift for poi recommendation,” IEEE Trans-
+actions on Knowledge and Data Engineering, vol. 28, no. 10, pp. 2566–
+2581, 2016.
+[149] J. Chen, H. Li, Q. Xie, L. Li, and Y. Liu, “Streaming recommendation al-
+gorithm with user interest drift analysis,” in Asia-Pacific Web (APWeb)
+and Web-Age Information Management (WAIM) Joint International
+Conference on Web and Big Data.
+Springer, 2019, pp. 121–136.
+[150] T. Dong, S. Sinha, B. Zhai, D. Fudulu, J. Chan, P. Narayan, A. Judge,
+M. Caputo, A. Dimagli, U. Benedetto et al., “Performance drift in
+machine learning models for cardiac surgery risk prediction: retro-
+spective analysis,” JMIRx Med, vol. 5, no. 1, p. e45973, 2024.
+[151] H. Abdelwahab, C. Martens, N. Beck, and D. Wegener, “Investigation
+of drift detection for clinical text classification check for updates,”
+Artificial Intelligence for Personalized Medicine: Promoting Healthy
+Living and Longevity, vol. 1106, p. 43, 2023.
+[152] ——, “Investigation of drift detection for clinical text classification
+check for updates,” Artificial Intelligence for Personalized Medicine:
+Promoting Healthy Living and Longevity, vol. 1106, p. 43, 2023.
+[153] O. El Marai and T. Taleb, “Smooth and low latency video streaming
+for autonomous cars during handover,” Ieee Network, vol. 34, no. 6,
+pp. 302–309, 2020.
+[154] I. Gog, S. Kalra, P. Schafhalter, M. A. Wright, J. E. Gonzalez, and
+I. Stoica, “Pylot: A modular platform for exploring latency-accuracy
+tradeoffs in autonomous vehicles,” in 2021 IEEE International Confer-
+ence on Robotics and Automation (ICRA).
+IEEE, 2021, pp. 8806–8813.
+[155] C. Ma, N. Wang, Q. A. Chen, and C. Shen, “Slowtrack: Increasing
+the latency of camera-based perception in autonomous driving us-
+ing adversarial examples,” in Proceedings of the AAAI Conference on
+Artificial Intelligence, vol. 38, no. 5, 2024, pp. 4062–4070.
+[156] A. Collin, A. Siddiqi, Y. Imanishi, E. Rebentisch, T. Tanimichi, and
+O. L. de Weck, “Autonomous driving systems hardware and software
+architecture exploration: optimizing latency and cost under safety
+constraints,” Systems Engineering, vol. 23, no. 3, pp. 327–337, 2020.
+[157] K. Lang, “Newsweeder: Learning to filter netnews,” in Proceedings of
+the Twelfth International Conference on Machine Learning, 1995, pp.
+331–339.
+[158] S. S. Shubha and H. Shen, “Adainf: Data drift adaptive scheduling
+for accurate and slo-guaranteed multiple-model inference serving at
+edge servers,” in Proceedings of the ACM SIGCOMM 2023 Conference,
+2023, pp. 473–485.
+[159] C. S. Mishra, J. Sampson, M. T. Kandemir, V. Narayanan, and C. R.
+Das, “Usas: A sustainable continuous-learning´ framework for edge
+servers,” in 2024 IEEE International Symposium on High-Performance
+Computer Architecture (HPCA), 2024, pp. 891–907.
+[160] Y. Kim, C. Oh, J. Hwang, W. Kim, S. Oh, Y. Lee, H. Sharma, A. Yaz-
+danbakhsh, and J. Park, “Dacapo: Accelerating continuous learn-
+ing in autonomous systems for video analytics,” arXiv preprint
+arXiv:2403.14353, 2024.
+[161] L. Zhang, G. Gao, and H. Zhang, “Towards data-efficient continuous
+learning for edge video analytics via smart caching,” in Proceedings
+of the 20th ACM Conference on Embedded Networked Sensor Systems,
+2022, pp. 1136–1140.
+[162] P. Zhao, R. Dong, G. Wang, and C. Zhao, “Edgesync: Faster edge-
+model updating via adaptive continuous learning for video data drift,”
+arXiv preprint arXiv:2406.03001, 2024.
+[163] B. Liu, L. Wang, and M. Liu, “Lifelong federated reinforcement learn-
+ing: A learning architecture for navigation in cloud robotic systems,”
+IEEE Robotics and Automation Letters, vol. 4, no. 4, pp. 4555–4562,
+2019.
+[164] Y. Nan, S. Jiang, and M. Li, “Large-scale video analytics with
+cloud–edge collaborative continuous learning,” ACM Trans. Sen.
+Netw., vol. 20, no. 1, oct 2023. [Online]. Available: https:
+//doi.org/10.1145/3624478
+[165] X. Yu, J. P. Queralta, and T. Westerlund, “Towards lifelong
+federated learning in autonomous mobile robots with continuous
+sim-to-real transfer,” Procedia Computer Science, vol. 210, pp.
+86–93, 2022, the 13th International Conference on Emerging
+Ubiquitous Systems and Pervasive Networks (EUSPN) / The
+12th International Conference on Current and Future Trends
+of Information and Communication Technologies in Healthcare
+(ICTH-2022) / Affiliated Workshops. [Online]. Available: https:
+//www.sciencedirect.com/science/article/pii/S1877050922015794
+[166] S. R. Pokhrel, “Learning from data streams for automation and or-
+chestration of 6g industrial iot: toward a semantic communication
+framework,” Neural Computing and Applications, vol. 34, no. 18, pp.
+15 197–15 206, 2022.
+[167] S. Lin, X. Zhang, Y. Li, C. Joe-Wong, J. Duan, and X. Chen, “Edgec3:
+Online management for edge-cloud collaborative continuous learn-
+ing,” in 2023 20th Annual IEEE International Conference on Sensing,
+Communication, and Networking (SECON), 2023, pp. 411–419.
+[168] G. Bisicchia, S. Forti, E. Pimentel, and A. Brogi, “Continuous qos-
+compliant orchestration in the cloud-edge continuum,” Software:
+Practice and Experience.
+[169] ——, “Continuous qos-compliant orchestration in the cloud-edge
+continuum,” Software: Practice and Experience.
+[170] Y. Nan, S. Jiang, and M. Li, “Large-scale video analytics with
+cloud–edge collaborative continuous learning,” ACM Trans. Sen.
+Netw., vol. 20, no. 1, oct 2023. [Online]. Available: https:
+//doi.org/10.1145/3624478
+[171] G. Bisicchia, S. Forti, E. Pimentel, and A. Brogi, “Continuous qos-
+compliant orchestration in the cloud-edge continuum,” Software:
+Practice and Experience, 2023.
+[172] Q. Wu, Y. Chen, C. Yang, and J. Yan, “Energy-based out-of-distribution
+detection for graph neural networks,” in The Eleventh International
+Conference on Learning Representations, 2023.
+[173] W. Liu, X. Wang, J. Owens, and Y. Li, “Energy-based out-of-
+distribution detection,” Advances in neural information processing
+systems, vol. 33, pp. 21 464–21 475, 2020.
+[174] P. Panda, A. Sengupta, and K. Roy, “Conditional deep learning for
+energy-efficient and enhanced pattern recognition,” in Design, Au-
+tomation & Test in Europe Conference & Exhibition.
+IEEE, 2016, pp.
+475–480.
+[175] Y. Wu, Z. Wang, D. Zeng, Y. Shi, and J. Hu, “Enabling on-device
+self-supervised contrastive learning with selective data contrast,” in
+Design Automation Conference.
+IEEE, 2021, pp. 655–660.
+[176] G. Yang, E. Hu, I. Babuschkin, S. Sidor, X. Liu, D. Farhi,
+N. Ryder, J. Pachocki, W. Chen, and J. Gao, “Tuning large
+neural networks via zero-shot hyperparameter transfer,” in
+Advances in Neural Information Processing Systems, M. Ranzato,
+A. Beygelzimer, Y. Dauphin, P. Liang, and J. W. Vaughan, Eds.,
+vol. 34.
+Curran Associates, Inc., 2021, pp. 17 084–17 097. [Online].
+Available: https://proceedings.neurips.cc/paper_files/paper/2021/file/
+8df7c2e3c3c3be098ef7b382bd2c37ba-Paper.pdf
+[177] M. Khodak, R. Tu, T. Li, L. Li, M.-F. F. Balcan, V. Smith,
+and A. Talwalkar, “Federated hyperparameter tuning: Chal-
+lenges, baselines, and connections to weight-sharing,” in Ad-
+vances in Neural Information Processing Systems, M. Ranzato,
+A. Beygelzimer, Y. Dauphin, P. Liang, and J. W. Vaughan, Eds.,
+vol. 34.
+Curran Associates, Inc., 2021, pp. 19 184–19 197. [Online].
+Available: https://proceedings.neurips.cc/paper_files/paper/2021/file/
+a0205b87490c847182672e8d371e9948-Paper.pdf
+[178] S. Malladi, T. Gao, E. Nichani, A. Damian, J. D. Lee, D. Chen,
+and S. Arora, “Fine-tuning language models with just forward
+passes,” in Advances in Neural Information Processing Systems, A. Oh,
+T. Naumann, A. Globerson, K. Saenko, M. Hardt, and S. Levine, Eds.,
+vol. 36.
+Curran Associates, Inc., 2023, pp. 53 038–53 075. [Online].
+Available: https://proceedings.neurips.cc/paper_files/paper/2023/file/
+17
+
+
+--- Page 18 ---
+a627810151be4d13f907ac898ff7e948-Paper-Conference.pdf
+[179] H. Li, P. Chaudhari, H. Yang, M. Lam, A. Ravichandran, R. Bhotika,
+and S. Soatto, “Rethinking the hyperparameters for fine-tuning,”
+arXiv preprint arXiv:2002.11770, 2020.
+18
