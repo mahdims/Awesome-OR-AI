@@ -321,11 +321,18 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
             emoji = STATUS_EMOJI.get(f["status"], "")
             status_cell = f"{emoji} {f['status'].capitalize()}" if emoji else f['status'].capitalize()
 
-            # Sanitise summary for table cell (no pipes, no newlines)
-            summary_text = (f["summary"] or "").replace("|", "&#124;").replace("\n", " ").strip()
+            # Collapsible summary inside table cell
+            raw_summary = (f["summary"] or "").replace("|", "&#124;").strip()
+            if raw_summary:
+                analysis_cell = (
+                    f"<details><summary>View analysis</summary>"
+                    f"{raw_summary}</details>"
+                )
+            else:
+                analysis_cell = "—"
 
             lines.append(
-                f"| {status_cell} | {f['name']} | {f['size']} | {summary_text} |"
+                f"| {status_cell} | {f['name']} | {f['size']} | {analysis_cell} |"
             )
         lines.append("")
 
