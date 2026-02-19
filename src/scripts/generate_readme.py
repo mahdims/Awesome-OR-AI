@@ -321,8 +321,32 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
             emoji = STATUS_EMOJI.get(f["status"], "")
             status_cell = f"{emoji} {f['status'].capitalize()}" if emoji else f['status'].capitalize()
 
-            # Collapsible summary inside table cell
-            raw_summary = (f["summary"] or "").replace("|", "&#124;").strip()
+            # Collapsible paper list in the Papers column, sorted by score desc
+            scored_papers = []
+            for pid in f.get("core_papers", []):
+                clean_pid = _clean_id(pid)
+                content = papers.get(clean_pid)
+                if content:
+                    _, ptitle, _, _, _, _, _ = _parse(content)
+                    plain = _plain_title(ptitle)
+                    score = l1.get(clean_pid, {}).get("score", 0)
+                    scored_papers.append((score, clean_pid, plain))
+            scored_papers.sort(key=lambda x: x[0], reverse=True)
+            if scored_papers:
+                items = "".join(
+                    f'<li><a href="http://arxiv.org/abs/{pid}">{title}</a> '
+                    f'<sub>({score})</sub></li>'
+                    for score, pid, title in scored_papers
+                )
+                papers_cell = (
+                    f"<details><summary>{f['size']}</summary>"
+                    f"<ol>{items}</ol></details>"
+                )
+            else:
+                papers_cell = str(f['size'])
+
+            # Collapsible summary — newlines removed to avoid breaking the table row
+            raw_summary = (f["summary"] or "").replace("|", "&#124;").replace("\n", " ").strip()
             if raw_summary:
                 analysis_cell = (
                     f"<details><summary>View analysis</summary>"
@@ -332,7 +356,7 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
                 analysis_cell = "—"
 
             lines.append(
-                f"| {status_cell} | {f['name']} | {f['size']} | {analysis_cell} |"
+                f"| {status_cell} | {f['name']} | {papers_cell} | {analysis_cell} |"
             )
         lines.append("")
 
