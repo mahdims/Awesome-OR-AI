@@ -345,12 +345,24 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
             else:
                 papers_cell = str(f['size'])
 
-            # Collapsible summary — newlines removed to avoid breaking the table row
-            raw_summary = (f["summary"] or "").replace("|", "&#124;").replace("\n", " ").strip()
-            if raw_summary:
+            # Collapsible summary — convert markdown to HTML so bold/paragraphs
+            # render correctly inside the HTML table cell (no raw newlines allowed)
+            def _md_to_html(text: str) -> str:
+                import re as _re
+                text = text.replace("|", "&#124;")
+                # Bold: **text** → <strong>text</strong>
+                text = _re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+                # Italic: *text* → <em>text</em>
+                text = _re.sub(r'\*(.+?)\*', r'<em>\1</em>', text)
+                # Paragraph breaks → <br><br>; remaining newlines → <br>
+                text = text.replace("\n\n", "<br><br>").replace("\n", "<br>")
+                return text.strip()
+
+            html_summary = _md_to_html(f["summary"] or "")
+            if html_summary:
                 analysis_cell = (
                     f"<details><summary>View analysis</summary>"
-                    f"{raw_summary}</details>"
+                    f"{html_summary}</details>"
                 )
             else:
                 analysis_cell = "—"
