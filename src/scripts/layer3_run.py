@@ -228,7 +228,7 @@ def main():
 
     # Default days by mode
     if args.days is None:
-        args.days = {'daily': 7, 'weekly': 7, 'monthly': 30}[args.mode]
+        args.days = {'daily': 7, 'weekly': 14, 'monthly': 30}[args.mode]
 
     db = Database()
 

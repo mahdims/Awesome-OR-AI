@@ -158,7 +158,7 @@ def collect_weekly_data(category: str, db: Database,
     cutoff = (date.today() - timedelta(days=days)).isoformat()
     rows = db.fetchall(
         """SELECT * FROM paper_analyses
-           WHERE category = ? AND analysis_date >= ? AND is_relevant = 1
+           WHERE category = ? AND published_date >= ? AND is_relevant = 1
            ORDER BY published_date DESC""",
         (category, cutoff)
     )

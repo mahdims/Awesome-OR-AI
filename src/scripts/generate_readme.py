@@ -64,10 +64,6 @@ def _clean_id(arxiv_id: str) -> str:
     return re.sub(r'v\d+$', '', s)
 
 
-def _readable_tag(tag: str) -> str:
-    """Convert snake_case internal tag to human-readable Title Case."""
-    return tag.replace("_", " ").title()
-
 
 def _parse(s):
     """Return (date, title, authors, affiliation, venue, arxiv_id, code).
@@ -226,7 +222,7 @@ def _load_fronts(db: Database, category: str) -> list:
         return []
     snapshot = row["d"]
     rows = db.fetchall(
-        """SELECT name, status, size, dominant_methods, dominant_problems, core_papers
+        """SELECT name, status, size, dominant_methods, dominant_problems, core_papers, summary
            FROM research_fronts
            WHERE category = ? AND snapshot_date = ?
            ORDER BY size DESC""",
@@ -253,6 +249,7 @@ def _load_fronts(db: Database, category: str) -> list:
             "methods":     methods,
             "problems":    problems,
             "core_papers": core_papers,
+            "summary":     r["summary"] or "",
         })
     return fronts
 
@@ -318,35 +315,17 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
     # ── Research Fronts (only when L2 data exists) ────────────────────────────
     if fronts:
         lines.append("### 🔬 Research Fronts\n")
-        lines.append("| Status | Front Name | Papers | Key Methods | Problems |")
-        lines.append("|--------|-----------|--------|-------------|----------|")
+        lines.append("| Status | Front Name | Papers | Front Analysis |")
+        lines.append("|--------|-----------|--------|----------------|")
         for f in fronts:
-            methods_str  = ", ".join(_readable_tag(m) for m in f["methods"])  if f["methods"]  else "—"
-            problems_str = ", ".join(_readable_tag(p) for p in f["problems"]) if f["problems"] else "—"
             emoji = STATUS_EMOJI.get(f["status"], "")
             status_cell = f"{emoji} {f['status'].capitalize()}" if emoji else f['status'].capitalize()
 
-            # Build collapsible paper list inside the Front Name cell
-            paper_links = []
-            for pid in f.get("core_papers", []):
-                clean_pid = _clean_id(pid)
-                content = papers.get(clean_pid)
-                if content:
-                    _, ptitle, _, _, _, _, _ = _parse(content)
-                    plain = _plain_title(ptitle)
-                    paper_links.append(
-                        f'• <a href="http://arxiv.org/abs/{clean_pid}">{plain}</a>'
-                    )
-            if paper_links:
-                inner = "<br>".join(paper_links)
-                name_cell = (f"<details><summary>{f['name']}</summary>"
-                             f"{inner}</details>")
-            else:
-                name_cell = f['name']
+            # Sanitise summary for table cell (no pipes, no newlines)
+            summary_text = (f["summary"] or "").replace("|", "&#124;").replace("\n", " ").strip()
 
             lines.append(
-                f"| {status_cell} | {name_cell} | {f['size']} "
-                f"| {methods_str} | {problems_str} |"
+                f"| {status_cell} | {f['name']} | {f['size']} | {summary_text} |"
             )
         lines.append("")
 
