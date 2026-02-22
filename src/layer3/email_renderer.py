@@ -161,7 +161,7 @@ def _wrap_email(title: str, body: str, date_str: str = None,
 <table cellpadding="0" cellspacing="0" role="presentation" style="margin:0 auto;">
 <tr>
 <td style="border-radius:12px; background:{COLORS['accent_primary']};">
-<a href="#" style="display:inline-block; padding:10px 20px; font-size:12px; font-weight:700; color:#FFFFFF; text-decoration:none; border-radius:12px;">View Full Archive →</a>
+<a href="https://github.com/mahdims/Awesome-OR-AI" style="display:inline-block; padding:10px 20px; font-size:12px; font-weight:700; color:#FFFFFF; text-decoration:none; border-radius:12px;">View Full Archive →</a>
 </td>
 </tr>
 </table>
