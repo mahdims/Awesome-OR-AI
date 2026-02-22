@@ -22,6 +22,8 @@ from llm_client import create_agent_client
 from config import AGENT_MODELS
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
+PROJECT_ROOT = Path(__file__).parent.parent.parent  # layer1 -> src -> root
+RESEARCHER_PROFILE_PATH = PROJECT_ROOT / "research_config" / "researcher_profile.md"
 
 class PaperAnalysisPipeline:
     """
@@ -43,7 +45,7 @@ class PaperAnalysisPipeline:
         self.reader_prompt = (PROMPTS_DIR / "reader.txt").read_text(encoding='utf-8')
         self.methods_prompt = (PROMPTS_DIR / "methods.txt").read_text(encoding='utf-8')
         self.positioning_prompt = (PROMPTS_DIR / "positioning.txt").read_text(encoding='utf-8')
-        self.researcher_profile = (PROMPTS_DIR / "researcher_profile.md").read_text(encoding='utf-8')
+        self.researcher_profile = RESEARCHER_PROFILE_PATH.read_text(encoding='utf-8')
 
         print("[INIT] Pipeline initialized")
         print(f"  Reader:      {AGENT_MODELS.reader.provider} / {AGENT_MODELS.reader.model_name}")

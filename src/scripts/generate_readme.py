@@ -14,6 +14,7 @@ Usage:
 import json
 import re
 import sys
+import yaml
 import datetime
 from pathlib import Path
 
@@ -35,11 +36,41 @@ MAX_FULL_LIST = 500  # safety cap for the full collapsible list
 
 # ── Category display order ────────────────────────────────────────────────────
 
-CATEGORY_ORDER = [
-    "LLMs for Algorithm Design",
-    "Generative AI for OR",
-    "OR for Generative AI",
-]
+def _load_category_order():
+    """Load category order from research_config/research_domain.yaml with fallback."""
+    config_path = REPO_ROOT / "research_config" / "research_domain.yaml"
+    fallback_config_path = REPO_ROOT / "config.yaml"
+
+    # Try new config location first
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.load(f, Loader=yaml.FullLoader)
+                categories = config.get('categories', {})
+                # Return categories in the order they appear in the YAML file
+                return list(categories.keys())
+        except Exception as e:
+            print(f"[WARNING] Failed to load categories from {config_path}: {e}")
+
+    # Fallback to legacy config.yaml
+    if fallback_config_path.exists():
+        try:
+            with open(fallback_config_path, 'r', encoding='utf-8') as f:
+                config = yaml.load(f, Loader=yaml.FullLoader)
+                keywords = config.get('keywords', {})
+                return list(keywords.keys())
+        except Exception as e:
+            print(f"[WARNING] Failed to load categories from {fallback_config_path}: {e}")
+
+    # Hardcoded fallback
+    print("[WARNING] Could not load categories from config, using hardcoded defaults")
+    return [
+        "LLMs for Algorithm Design",
+        "Generative AI for OR",
+        "OR for Generative AI",
+    ]
+
+CATEGORY_ORDER = _load_category_order()
 
 # ── Status emoji mapping (L2 research front status) ──────────────────────────
 
@@ -520,7 +551,8 @@ def generate_readme(json_path: Path, out_path: Path, to_web: bool = False):
     if to_web:
         header = "---\nlayout: default\n---\n\n" + header
 
-    body = header + toc + "\n".join(sections)
+    # Add blank line after TOC before first section heading (required for proper markdown rendering)
+    body = header + toc + "\n" + "\n".join(sections)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:

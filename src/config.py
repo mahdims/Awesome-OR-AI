@@ -5,6 +5,8 @@ Configure models, API keys, and settings for all agents.
 """
 
 import os
+import yaml
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
@@ -112,25 +114,11 @@ def get_api_key(provider: str) -> Optional[str]:
     return os.getenv(env_var)
 
 # ============================================================================
-# COST ESTIMATES (per 1M tokens)
+# COST ESTIMATES (loaded from research_config/model_config.yaml)
 # ============================================================================
 
-COST_PER_MILLION_TOKENS = {
-    # Gemini (2026-02-11)
-    "gemini-3-flash-preview": {"input": 0.5, "output": 3.0},  
-    "gemini-2.5-flash": {"input": 0.3, "output": 2.5},
-    "gemini-2.5-flash-lite": {"input": 0.1, "output": 0.40},
-    "gemini-2.5-pro": {"input": 1.25, "output": 10.00},
-    "gemini-3-pro-preview" : {"input": 2.0, "output": 12.00},
-    
-    # Anthropic Claude
-    "claude-sonnet-4-5-20250929": {"input": 3.00, "output": 15.00},
-    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
-
-    # OpenAI
-    "gpt-4o": {"input": 2.50, "output": 10.00},
-    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-}
+# Will be populated by _load_model_config_from_yaml()
+COST_PER_MILLION_TOKENS = {}
 
 def estimate_cost(model_name: str, input_tokens: int, output_tokens: int) -> float:
     """Estimate cost for a model call."""
@@ -143,11 +131,77 @@ def estimate_cost(model_name: str, input_tokens: int, output_tokens: int) -> flo
     return cost
 
 # ============================================================================
+# LOAD MODELS FROM YAML CONFIGURATION
+# ============================================================================
+
+def _load_model_config_from_yaml():
+    """Load model configuration from research_config/model_config.yaml."""
+    PROJECT_ROOT = Path(__file__).parent.parent
+    model_config_path = PROJECT_ROOT / "research_config" / "model_config.yaml"
+
+    if not model_config_path.exists():
+        print(f"[WARNING] Model config not found at {model_config_path}, using hardcoded defaults")
+        return DEFAULT_AGENT_MODELS
+
+    try:
+        with open(str(model_config_path), 'r', encoding='utf-8') as f:
+            config = yaml.load(f, Loader=yaml.FullLoader)
+
+        def parse_model_config(layer_config: dict) -> ModelConfig:
+            """Parse YAML model config dict into ModelConfig object."""
+            return ModelConfig(
+                provider=layer_config.get('provider', 'gemini'),
+                model_name=layer_config.get('model_name', 'gemini-2.5-flash'),
+                temperature=layer_config.get('temperature', 0.0),
+                max_tokens=layer_config.get('max_tokens', 0)
+            )
+
+        # Parse Layer 1 configs
+        layer1 = config.get('layer1', {})
+        reader = parse_model_config(layer1.get('reader', {}))
+        methods = parse_model_config(layer1.get('methods_extractor', {}))
+        positioning = parse_model_config(layer1.get('positioning', {}))
+
+        # Parse Layer 2 config
+        layer2 = config.get('layer2', {})
+        front_summarizer = parse_model_config(layer2.get('front_summarizer', {}))
+
+        # Parse Layer 3 configs
+        layer3 = config.get('layer3', {})
+        daily_updater = parse_model_config(layer3.get('daily_updater', {}))
+        weekly_revisor = parse_model_config(layer3.get('weekly_revisor', {}))
+        monthly_rewriter = parse_model_config(layer3.get('monthly_rewriter', {}))
+        email_generator = parse_model_config(layer3.get('email_generator', {}))
+
+        # Load cost estimates from YAML
+        global COST_PER_MILLION_TOKENS
+        COST_PER_MILLION_TOKENS = config.get('cost_per_million_tokens', {})
+        if COST_PER_MILLION_TOKENS:
+            print(f"[CONFIG] Loaded cost estimates for {len(COST_PER_MILLION_TOKENS)} models")
+
+        print(f"[CONFIG] Loaded model configuration from {model_config_path}")
+        return AgentModels(
+            reader=reader,
+            methods_extractor=methods,
+            positioning=positioning,
+            front_summarizer=front_summarizer,
+            daily_updater=daily_updater,
+            weekly_revisor=weekly_revisor,
+            monthly_rewriter=monthly_rewriter,
+            email_generator=email_generator
+        )
+
+    except Exception as e:
+        print(f"[ERROR] Failed to load model config from {model_config_path}: {e}")
+        print(f"[WARNING] Using hardcoded defaults")
+        return DEFAULT_AGENT_MODELS
+
+# ============================================================================
 # RUNTIME CONFIGURATION
 # ============================================================================
 
-# Can be overridden by environment variables or runtime settings
-AGENT_MODELS = DEFAULT_AGENT_MODELS
+# Load models from YAML, fallback to defaults if not available
+AGENT_MODELS = _load_model_config_from_yaml()
 
 def override_model(agent_name: str, model_config: ModelConfig):
     """Override model for a specific agent at runtime."""

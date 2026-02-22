@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import yaml
 import sys
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -48,12 +49,40 @@ try:
 except ImportError:
     _HAS_AFFILIATIONS = False
 
-CATEGORIES = [
-    "LLMs for Algorithm Design",
-    "Generative AI for OR",
-    "OR for Generative AI",
-]
+def _load_categories():
+    """Load categories from research_config/research_domain.yaml with fallback."""
+    config_path = REPO_ROOT / "research_config" / "research_domain.yaml"
+    fallback_config_path = REPO_ROOT / "config.yaml"
 
+    # Try new config location first
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.load(f, Loader=yaml.FullLoader)
+                categories = config.get('categories', {})
+                return list(categories.keys())
+        except Exception as e:
+            print(f"[WARNING] Failed to load categories from {config_path}: {e}")
+
+    # Fallback to legacy config.yaml
+    if fallback_config_path.exists():
+        try:
+            with open(fallback_config_path, 'r', encoding='utf-8') as f:
+                config = yaml.load(f, Loader=yaml.FullLoader)
+                keywords = config.get('keywords', {})
+                return list(keywords.keys())
+        except Exception as e:
+            print(f"[WARNING] Failed to load categories from {fallback_config_path}: {e}")
+
+    # Hardcoded fallback
+    print("[WARNING] Could not load categories from config, using hardcoded defaults")
+    return [
+        "LLMs for Algorithm Design",
+        "Generative AI for OR",
+        "OR for Generative AI",
+    ]
+
+CATEGORIES = _load_categories()
 OUTPUT_PATH = PROJECT_ROOT / "docs" / "dashboard_data.json"
 
 

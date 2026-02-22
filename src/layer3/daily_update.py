@@ -6,6 +6,7 @@ Each category has its own markdown file in docs/living_reviews/.
 """
 
 import json
+import yaml
 from datetime import date, timedelta
 from pathlib import Path
 from typing import List, Optional
@@ -18,16 +19,37 @@ from layer3.data_collector import collect_daily_data, _json
 
 LIVING_REVIEWS_DIR = Path(__file__).parent.parent.parent / "docs" / "living_reviews"
 
-CATEGORY_SLUGS = {
-    "LLMs for Algorithm Design": "llm_for_algo",
-    "Generative AI for OR": "genai_for_or",
-    "OR for Generative AI": "or_for_genai",
-}
+# Category slugs are now generated dynamically, with optional overrides from config
+def _load_category_slug_overrides():
+    """Load custom category slug mappings from config if they exist."""
+    REPO_ROOT = Path(__file__).parent.parent.parent
+    config_path = REPO_ROOT / "research_config" / "research_domain.yaml"
+
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.load(f, Loader=yaml.FullLoader)
+                categories = config.get('categories', {})
+                # Allow optional 'slug' field per category
+                slugs = {}
+                for cat_name, cat_config in categories.items():
+                    if isinstance(cat_config, dict) and 'slug' in cat_config:
+                        slugs[cat_name] = cat_config['slug']
+                return slugs
+        except Exception:
+            pass
+    return {}
+
+_CATEGORY_SLUG_OVERRIDES = _load_category_slug_overrides()
 
 
 def _category_slug(category: str) -> str:
-    return CATEGORY_SLUGS.get(category,
-                              category.lower().replace(' ', '_').replace('/', '_')[:30])
+    """Generate a filesystem-safe slug for a category name."""
+    # Check for explicit override first
+    if category in _CATEGORY_SLUG_OVERRIDES:
+        return _CATEGORY_SLUG_OVERRIDES[category]
+    # Otherwise generate automatically
+    return category.lower().replace(' ', '_').replace('/', '_')[:30]
 
 
 def _create_review_scaffold(category: str) -> str:

@@ -92,16 +92,16 @@ python src/config.py
 
 ### Change Models
 
-Edit `src/config.py`:
+Edit `research_config/model_config.yaml`:
 
-```python
+```yaml
 # Use different model for specific agent
-positioning=ModelConfig(
-    provider="gemini",
-    model_name="gemini-2.5-pro",  # Upgrade to Pro
-    temperature=0.0,
-    max_tokens=4096
-),
+layer1:
+  positioning:
+    provider: "gemini"
+    model_name: "gemini-2.5-pro"  # Upgrade to Pro
+    temperature: 0.0
+    max_tokens: 4096
 ```
 
 ### Supported Models
@@ -253,8 +253,8 @@ time.sleep(2)  # Wait 2 seconds between papers
 After Layer 1 is working:
 
 1. **Customize Research Profile**
-   - Edit: `src/layer1/prompts/researcher_profile.md`
-   - Add your actual research interests
+   - Edit: `research_config/researcher_profile.md`
+   - Add your actual research interests per category
 
 2. **Implement Layer 2** (Citation graphs, fronts)
    - Run: `python src/scripts/layer2_detect_fronts.py`

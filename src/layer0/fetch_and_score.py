@@ -30,23 +30,123 @@ except ImportError:
     except ImportError:
         _Database = None
 
+# Import unified LLM client for multi-provider support
+try:
+    from src.llm_client import LLMClient
+    from src.config import ModelConfig, get_api_key
+except ImportError:
+    try:
+        from llm_client import LLMClient
+        from config import ModelConfig, get_api_key
+    except ImportError:
+        LLMClient = None
+        ModelConfig = None
+        get_api_key = None
+
 logging.basicConfig(format='[%(asctime)s %(levelname)s] %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
 
-huggingface_papers_url = "https://huggingface.co/api/papers/"
-github_url = "https://api.github.com/search/repositories"
-arxiv_url = "http://arxiv.org/"
-semantic_scholar_url = "https://api.semanticscholar.org/graph/v1/paper/"
+# Load constants from research_config/constants.yaml with fallback to hardcoded defaults
+def _load_constants():
+    """Load constants from research_config/constants.yaml, with fallback to defaults."""
+    constants_path = PROJECT_ROOT / 'research_config' / 'constants.yaml'
 
-MIN_YEAR = 2024
-RELEVANCE_THRESHOLD = 6
-SCORE_CACHE_PATH = './docs/relevance_cache.json'
-ARXIV_API_URL = "http://export.arxiv.org/api/query"
+    # Defaults (if constants.yaml doesn't exist)
+    defaults = {
+        'min_year': 2024,
+        'relevance_threshold': 6,
+        'score_cache_path': './docs/relevance_cache.json',
+        'arxiv_api_url': 'http://export.arxiv.org/api/query',
+        'arxiv_base_url': 'http://arxiv.org/',
+        'semantic_scholar_url': 'https://api.semanticscholar.org/graph/v1/paper/',
+        'huggingface_papers_url': 'https://huggingface.co/api/papers/',
+        'github_search_url': 'https://api.github.com/search/repositories',
+        'arxiv': {
+            'max_retries': 3,
+            'retry_delay': 3,
+            'timeout': 30,
+            'max_query_clauses': 8
+        },
+        'semantic_scholar': {
+            'rate_limit_pause': 5,
+            'pagination_delay': 1,
+            'seed_paper_delay': 2,
+            'batch_size': 500
+        }
+    }
+
+    if constants_path.exists():
+        try:
+            with open(str(constants_path), 'r', encoding='utf-8') as f:
+                loaded = yaml.load(f, Loader=yaml.FullLoader)
+                # Merge loaded constants with defaults (loaded takes precedence)
+                constants = {**defaults, **loaded}
+                logging.info(f"Loaded constants from {constants_path}")
+                return constants
+        except Exception as e:
+            logging.warning(f"Failed to load constants from {constants_path}: {e}, using defaults")
+            return defaults
+    else:
+        logging.warning(f"Constants file not found at {constants_path}, using hardcoded defaults")
+        return defaults
+
+# Load constants at module level
+_CONSTANTS = _load_constants()
+
+# Extract constants for backward compatibility
+huggingface_papers_url = _CONSTANTS['huggingface_papers_url']
+github_url = _CONSTANTS['github_search_url']
+arxiv_url = _CONSTANTS['arxiv_base_url']
+semantic_scholar_url = _CONSTANTS['semantic_scholar_url']
+
+MIN_YEAR = _CONSTANTS['min_year']
+RELEVANCE_THRESHOLD = _CONSTANTS['relevance_threshold']
+SCORE_CACHE_PATH = _CONSTANTS['score_cache_path']
+ARXIV_API_URL = _CONSTANTS['arxiv_api_url']
 ARXIV_NS = {
     "atom": "http://www.w3.org/2005/Atom",
     "arxiv": "http://arxiv.org/schemas/atom",
 }
+
+# Load relevance scorer model configuration
+def _load_relevance_scorer_config():
+    """
+    Load relevance scorer configuration from model_config.yaml.
+    Returns a dict with 'provider', 'model_name', 'temperature', 'max_tokens'.
+    """
+    model_config_path = PROJECT_ROOT / 'research_config' / 'model_config.yaml'
+    default_config = {
+        'provider': 'openai',
+        'model_name': 'gpt-5-nano',
+        'temperature': 0.0,
+        'max_tokens': 0
+    }
+
+    if model_config_path.exists():
+        try:
+            with open(str(model_config_path), 'r', encoding='utf-8') as f:
+                config = yaml.load(f, Loader=yaml.FullLoader)
+                layer0_config = config.get('layer0', {})
+                scorer_config = layer0_config.get('relevance_scorer', {})
+
+                result = {
+                    'provider': scorer_config.get('provider', default_config['provider']),
+                    'model_name': scorer_config.get('model_name', default_config['model_name']),
+                    'temperature': scorer_config.get('temperature', default_config['temperature']),
+                    'max_tokens': scorer_config.get('max_tokens', default_config['max_tokens'])
+                }
+
+                logging.info(f"Loaded relevance scorer config: {result['provider']}/{result['model_name']}")
+                return result
+        except Exception as e:
+            logging.warning(f"Failed to load relevance scorer config: {e}, using defaults")
+            return default_config
+    else:
+        logging.warning(f"Model config not found, using default relevance scorer config")
+        return default_config
+
+RELEVANCE_SCORER_CONFIG = _load_relevance_scorer_config()
 
 def _parse_arxiv_entries(xml_text):
     """Parse arxiv API XML response into a list of paper dicts."""
@@ -241,6 +341,26 @@ def load_config(config_file:str = None) -> dict:
         # Migrate old config structure to new structure for consistency
         if 'keywords' in config and 'categories' not in config:
             config['categories'] = config['keywords']
+
+        # Flatten nested new schema to old flat format for backward compatibility
+        if 'github' in config:
+            config['user_name'] = config['github'].get('user_name', config.get('user_name'))
+            config['repo_name'] = config['github'].get('repo_name', config.get('repo_name'))
+
+        if 'display' in config:
+            config['show_authors'] = config['display'].get('show_authors', config.get('show_authors', True))
+            config['show_links'] = config['display'].get('show_links', config.get('show_links', True))
+            config['max_results'] = config['display'].get('max_results', config.get('max_results', 500))
+
+        if 'output' in config:
+            if 'readme' in config['output']:
+                config['publish_readme'] = config['output']['readme'].get('enabled', True)
+                config['json_readme_path'] = config['output']['readme'].get('json_path', './docs/or-llm-daily.json')
+                config['md_readme_path'] = config['output']['readme'].get('md_path', 'README.md')
+            if 'gitpage' in config['output']:
+                config['publish_gitpage'] = config['output']['gitpage'].get('enabled', True)
+                config['json_gitpage_path'] = config['output']['gitpage'].get('json_path', './docs/or-llm-daily-web.json')
+                config['md_gitpage_path'] = config['output']['gitpage'].get('md_path', './docs/index.md')
 
         logging.info(f'config = {config}')
     return config
@@ -588,23 +708,33 @@ def get_relevance_score(paper_id, title, abstract, category, category_descriptio
     Use lightweight LLM to score paper relevance to category (0-10).
     Checks cache first (keyed by paper_id + category) to avoid repeat API calls.
     Returns 10 (include) if no client available.
+
+    Special value -1 indicates failed scoring attempt (will be retried on next run).
+
+    Args:
+        client: LLMClient instance (unified client supporting multiple providers)
     """
     # Build a cache key: paper_id + category ensures same paper scored once per category
     cache_key = f"{paper_id}::{category}"
 
-    # Check cache first
+    # Check cache first, but RETRY if previous attempt failed (score == -1)
     if score_cache is not None and cache_key in score_cache:
         cached = score_cache[cache_key]
-        logging.info(f"Cache hit for {paper_id} in '{category}': score={cached}")
-        return cached
+        if cached == -1:
+            logging.info(f"Retrying previously failed score for {paper_id} in '{category}'")
+            # Fall through to re-attempt scoring
+        else:
+            logging.info(f"Cache hit for {paper_id} in '{category}': score={cached}")
+            return cached
 
     # Fallback to DB cache if JSON cache misses (e.g., file lost/corrupted).
-    db_cached = _load_score_from_db(paper_id, category)
-    if db_cached is not None:
-        logging.info(f"DB cache hit for {paper_id} in '{category}': score={db_cached}")
-        if score_cache is not None:
-            score_cache[cache_key] = db_cached
-        return db_cached
+    if cache_key not in score_cache or score_cache.get(cache_key) == -1:
+        db_cached = _load_score_from_db(paper_id, category)
+        if db_cached is not None and db_cached != -1:
+            logging.info(f"DB cache hit for {paper_id} in '{category}': score={db_cached}")
+            if score_cache is not None:
+                score_cache[cache_key] = db_cached
+            return db_cached
 
     if client is None:
         return 10
@@ -612,7 +742,7 @@ def get_relevance_score(paper_id, title, abstract, category, category_descriptio
     desc = category_description if category_description else category
     researcher_context = _PROFILE_SECTIONS.get(category, "")
 
-    prompt = f"""Rate how relevant this paper is to the research category "{category}" on a scale of 0 to 10.
+    user_prompt = f"""Rate how relevant this paper is to the research category "{category}" on a scale of 0 to 10.
 
 Category description: {desc}
 
@@ -629,20 +759,22 @@ Title: {title}
 Abstract: {abstract}"""
 
     try:
-        response = client.chat.completions.parse(
-            model="gpt-5-nano",
-            messages=[{"role": "user", "content": prompt}],
-            response_format=RelevanceScore
+        # Use unified client's generate_json method for structured output
+        result = client.generate_json(
+            system_prompt="You are an expert research paper evaluator.",
+            user_prompt=user_prompt,
+            output_schema=RelevanceScore
         )
-        result = response.choices[0].message.parsed
-        if result is None:
-            logging.warning(f"Empty LLM response for '{title}', defaulting to 10")
-            score = 10
+
+        if result is None or not hasattr(result, 'score'):
+            logging.warning(f"Empty/invalid LLM response for '{title}', marking for retry (score=-1)")
+            score = -1  # Mark as failed, will retry next run
         else:
             score = min(max(result.score, 0), 10)
     except Exception as e:
         logging.warning(f"Relevance scoring failed for '{title}': {e}")
-        score = 10  # include paper if scoring fails
+        logging.warning(f"Marking paper for retry on next run (score=-1)")
+        score = -1  # Mark as failed, will retry next run
 
     # Store in JSON cache
     if score_cache is not None:
@@ -722,7 +854,10 @@ def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, catego
         t0 = time.time()
         score = get_relevance_score(paper_key, paper_title, paper_abstract, topic, category_description, llm_client, score_cache)
         elapsed = time.time() - t0
-        if score < RELEVANCE_THRESHOLD:
+        if score == -1:
+            print(f"SCORING FAILED (will retry next run, {elapsed:.1f}s): {paper_title[:50]}", flush=True)
+            continue
+        elif score < RELEVANCE_THRESHOLD:
             print(f"FILTERED (score={score}, {elapsed:.1f}s): {paper_title[:50]}", flush=True)
             continue
         print(f"PASS (score={score}, {elapsed:.1f}s): {paper_title[:50]}", flush=True)
@@ -851,7 +986,10 @@ def get_citation_papers(topic, seed_papers, llm_client=None, category_descriptio
                 t0 = time.time()
                 score = get_relevance_score(paper_key, paper_title, paper_abstract, topic, category_description, llm_client, score_cache)
                 elapsed = time.time() - t0
-                if score < RELEVANCE_THRESHOLD:
+                if score == -1:
+                    print(f"SCORING FAILED (will retry next run, {elapsed:.1f}s): {paper_title[:50]}", flush=True)
+                    continue
+                elif score < RELEVANCE_THRESHOLD:
                     print(f"FILTERED (score={score}, {elapsed:.1f}s): {paper_title[:50]}", flush=True)
                     continue
                 print(f"PASS (score={score}, {elapsed:.1f}s): {paper_title[:50]}", flush=True)
@@ -1305,14 +1443,30 @@ def demo(**config):
         keywords = {k: v for k, v in keywords.items() if k == filter_category}
         print(f"[--category] Restricting fetch to: '{filter_category}'", flush=True)
 
-    # Initialize OpenAI client for relevance filtering
+    # Initialize LLM client for relevance filtering (supports multiple providers)
     llm_client = None
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if api_key and OpenAI is not None:
-        llm_client = OpenAI(api_key=api_key)
-        print("[1/6] OpenAI client initialized (LLM filtering ON)", flush=True)
+    if LLMClient is not None and ModelConfig is not None:
+        try:
+            # Create ModelConfig from loaded configuration
+            scorer_config = ModelConfig(
+                provider=RELEVANCE_SCORER_CONFIG['provider'],
+                model_name=RELEVANCE_SCORER_CONFIG['model_name'],
+                temperature=RELEVANCE_SCORER_CONFIG['temperature'],
+                max_tokens=RELEVANCE_SCORER_CONFIG['max_tokens']
+            )
+
+            # Check if API key is available for the configured provider
+            api_key = get_api_key(RELEVANCE_SCORER_CONFIG['provider'])
+            if api_key:
+                llm_client = LLMClient(scorer_config)
+                print(f"[1/6] LLM client initialized ({RELEVANCE_SCORER_CONFIG['provider']}/{RELEVANCE_SCORER_CONFIG['model_name']}) - filtering ON", flush=True)
+            else:
+                provider_upper = RELEVANCE_SCORER_CONFIG['provider'].upper()
+                print(f"[1/6] No {provider_upper}_API_KEY set - LLM filtering OFF (all papers pass through)", flush=True)
+        except Exception as e:
+            print(f"[1/6] Failed to initialize LLM client: {e} - LLM filtering OFF", flush=True)
     else:
-        print("[1/6] No OPENAI_API_KEY set - LLM filtering OFF (all papers pass through)", flush=True)
+        print("[1/6] LLM client library not available - LLM filtering OFF (all papers pass through)", flush=True)
 
     # Load persistent relevance score cache
     score_cache = load_score_cache()
@@ -1320,7 +1474,8 @@ def demo(**config):
 
     # Build category descriptions lookup
     category_descriptions = {}
-    for topic, cfg in config['keywords'].items():
+    categories_dict = config.get('categories', config.get('keywords', {}))
+    for topic, cfg in categories_dict.items():
         category_descriptions[topic] = cfg.get('description', topic)
 
     b_update = config['update_paper_links']
@@ -1338,42 +1493,76 @@ def demo(**config):
         total_found = 0
         cache_before = len(score_cache)
 
-        # keyword-based search
-        for i, (topic, keyword) in enumerate(keywords.items(), 1):
-            cat_max = config['keywords'].get(topic, {}).get('max_results', max_results)
-            print(f"\n  [{i}/{len(keywords)}] Keyword search: '{topic}' (max {cat_max}) ...", flush=True)
-            t0 = time.time()
-            data, data_web = get_daily_papers(topic, query=keyword,
-                                            max_results=cat_max,
-                                            llm_client=llm_client,
-                                            category_description=category_descriptions.get(topic, topic),
-                                            score_cache=score_cache,
-                                            existing_ids=existing_ids)
-            count = len(data.get(topic, {}))
-            total_found += count
-            elapsed = time.time() - t0
-            print(f"  [{i}/{len(keywords)}] '{topic}' done: {count} papers kept ({elapsed:.1f}s)", flush=True)
-            data_collector.append(data)
-            data_collector_web.append(data_web)
+        # Process each category with its specified search strategy
+        categories = config.get('categories', config.get('keywords', {}))
 
-        # citation-based search
-        citation_topics = [(t, c) for t, c in config['keywords'].items()
-                           if 'seed_papers' in c and (not filter_category or t == filter_category)]
-        for i, (topic, cfg) in enumerate(citation_topics, 1):
-            seed_count = len(cfg['seed_papers'])
-            print(f"\n  [Citation {i}/{len(citation_topics)}] '{topic}' ({seed_count} seed papers) ...", flush=True)
-            t0 = time.time()
-            data, data_web = get_citation_papers(topic, cfg['seed_papers'],
-                                                 llm_client=llm_client,
-                                                 category_description=category_descriptions.get(topic, topic),
-                                                 score_cache=score_cache,
-                                                 existing_ids=existing_ids)
-            count = len(data.get(topic, {}))
-            total_found += count
-            elapsed = time.time() - t0
-            print(f"  [Citation {i}/{len(citation_topics)}] '{topic}' done: {count} papers kept ({elapsed:.1f}s)", flush=True)
-            data_collector.append(data)
-            data_collector_web.append(data_web)
+        for i, (topic, topic_config) in enumerate(categories.items(), 1):
+            # Skip if filtering by category and this isn't the target
+            if filter_category and topic != filter_category:
+                continue
+
+            # Determine search strategy: explicit 'search_strategy' field takes precedence,
+            # otherwise infer from presence of 'filters' or 'seed_papers'
+            search_strategy = topic_config.get('search_strategy')
+
+            if search_strategy is None:
+                # Backward compatibility: infer strategy from content
+                if 'seed_papers' in topic_config:
+                    search_strategy = 'citation'
+                elif 'filters' in topic_config or topic in keywords:
+                    search_strategy = 'keyword'
+                else:
+                    logging.warning(f"Category '{topic}' has no search_strategy, filters, or seed_papers - skipping")
+                    continue
+
+            cat_max = topic_config.get('max_results', max_results)
+
+            if search_strategy == 'keyword':
+                # Keyword-based search
+                keyword_query = keywords.get(topic)
+                if not keyword_query:
+                    logging.warning(f"Category '{topic}' has search_strategy='keyword' but no filters - skipping")
+                    continue
+
+                print(f"\n  [{i}/{len(categories)}] Keyword search: '{topic}' (max {cat_max}) ...", flush=True)
+                t0 = time.time()
+                data, data_web = get_daily_papers(topic, query=keyword_query,
+                                                max_results=cat_max,
+                                                llm_client=llm_client,
+                                                category_description=category_descriptions.get(topic, topic),
+                                                score_cache=score_cache,
+                                                existing_ids=existing_ids)
+                count = len(data.get(topic, {}))
+                total_found += count
+                elapsed = time.time() - t0
+                print(f"  [{i}/{len(categories)}] '{topic}' done: {count} papers kept ({elapsed:.1f}s)", flush=True)
+                data_collector.append(data)
+                data_collector_web.append(data_web)
+
+            elif search_strategy == 'citation':
+                # Citation-based search
+                seed_papers = topic_config.get('seed_papers', [])
+                if not seed_papers:
+                    logging.warning(f"Category '{topic}' has search_strategy='citation' but no seed_papers - skipping")
+                    continue
+
+                seed_count = len(seed_papers)
+                print(f"\n  [{i}/{len(categories)}] Citation search: '{topic}' ({seed_count} seed papers) ...", flush=True)
+                t0 = time.time()
+                data, data_web = get_citation_papers(topic, seed_papers,
+                                                     llm_client=llm_client,
+                                                     category_description=category_descriptions.get(topic, topic),
+                                                     score_cache=score_cache,
+                                                     existing_ids=existing_ids)
+                count = len(data.get(topic, {}))
+                total_found += count
+                elapsed = time.time() - t0
+                print(f"  [{i}/{len(categories)}] '{topic}' done: {count} papers kept ({elapsed:.1f}s)", flush=True)
+                data_collector.append(data)
+                data_collector_web.append(data_web)
+
+            else:
+                logging.warning(f"Unknown search_strategy '{search_strategy}' for category '{topic}' - skipping")
 
         new_scores = len(score_cache) - cache_before
         print(f"\n[4/6] Retrieval done: {total_found} total papers, {new_scores} new LLM scores (cached: {cache_before})", flush=True)
@@ -1469,7 +1658,8 @@ def redo_category(category_name, **config):
     start_time = time.time()
 
     # Validate category exists
-    all_categories = list(config['keywords'].keys())
+    categories_dict = config.get('categories', config.get('keywords', {}))
+    all_categories = list(categories_dict.keys())
     if category_name not in all_categories:
         print(f"ERROR: Category '{category_name}' not found.", flush=True)
         print(f"Available categories: {all_categories}", flush=True)
@@ -1483,7 +1673,7 @@ def redo_category(category_name, **config):
     max_results = config['max_results']
     publish_readme = config['publish_readme']
     publish_gitpage = config['publish_gitpage']
-    cfg = config['keywords'][category_name]
+    cfg = categories_dict[category_name]
     category_description = cfg.get('description', category_name)
     cat_max = cfg.get('max_results', max_results)
 
@@ -1498,14 +1688,28 @@ def redo_category(category_name, **config):
     n = clear_category_from_cache(category_name)
     print(f"  Removed {n} entries from score cache", flush=True)
 
-    # Step 2: Init LLM client
+    # Step 2: Init LLM client (unified client supporting multiple providers)
     llm_client = None
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if api_key and OpenAI is not None:
-        llm_client = OpenAI(api_key=api_key)
-        print("[2/5] OpenAI client initialized (LLM filtering ON)", flush=True)
+    if LLMClient is not None and ModelConfig is not None:
+        try:
+            scorer_config = ModelConfig(
+                provider=RELEVANCE_SCORER_CONFIG['provider'],
+                model_name=RELEVANCE_SCORER_CONFIG['model_name'],
+                temperature=RELEVANCE_SCORER_CONFIG['temperature'],
+                max_tokens=RELEVANCE_SCORER_CONFIG['max_tokens']
+            )
+
+            api_key = get_api_key(RELEVANCE_SCORER_CONFIG['provider'])
+            if api_key:
+                llm_client = LLMClient(scorer_config)
+                print(f"[2/5] LLM client initialized ({RELEVANCE_SCORER_CONFIG['provider']}/{RELEVANCE_SCORER_CONFIG['model_name']}) - filtering ON", flush=True)
+            else:
+                provider_upper = RELEVANCE_SCORER_CONFIG['provider'].upper()
+                print(f"[2/5] No {provider_upper}_API_KEY set - LLM filtering OFF", flush=True)
+        except Exception as e:
+            print(f"[2/5] Failed to initialize LLM client: {e} - LLM filtering OFF", flush=True)
     else:
-        print("[2/5] No OPENAI_API_KEY set - LLM filtering OFF", flush=True)
+        print("[2/5] LLM client library not available - LLM filtering OFF", flush=True)
 
     score_cache = load_score_cache()
 
@@ -1573,8 +1777,8 @@ def redo_category(category_name, **config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config_path',type=str, default='config.yaml',
-                            help='configuration file path')
+    parser.add_argument('--config_path',type=str, default=None,
+                            help='configuration file path (defaults to research_config/research_domain.yaml, falls back to config.yaml)')
     parser.add_argument('--update_paper_links', default=False,
                         action="store_true",help='whether to update paper links etc.')
     parser.add_argument('--redo_category', type=str, default=None,
