@@ -1,0 +1,1618 @@
+--- Page 1 ---
+VARIATIONAL TRAJECTORY OPTIMIZATION OF ANISOTROPIC
+DIFFUSION SCHEDULES
+Pengxi Liu∗
+Department of Electrical and Computer Engineering
+Duke University
+pengxi.liu@duke.edu
+Zeyu Michael Li∗
+Department of Electrical and Computer Engineering
+Duke University
+zeyu.li030@duke.edu
+Xiang Cheng
+Department of Electrical and Computer Engineering
+Duke University
+xiang.cheng@duke.edu
+ABSTRACT
+We introduce a variational framework for diffusion models with anisotropic noise schedules pa-
+rameterized by a matrix-valued path Mt(θ) that allocates noise across subspaces. Central to our
+framework is a trajectory-level objective that jointly trains the score network and learns Mt(θ), which
+encompasses general parameterization classes of matrix-valued noise schedules. We further derive an
+estimator for ∂θ∇log pt that enables efficient optimization of the Mt(θ) schedule. For inference, we
+develop an efficiently-implementable reverse-ODE solver that is an anisotropic generalization of the
+second-order Heun discretization algorithm. Across CIFAR-10, AFHQv2, FFHQ, and ImageNet-64,
+our method consistently improves upon the baseline EDM model in all NFE regimes. Code is
+available at https://github.com/lizeyu090312/anisotropic-diffusion-paper.
+Keywords Diffusion Model · Anisotropic Diffusion
+1
+Introduction
+Diffusion models generate samples by reversing a gradual Gaussian noising process. Starting from data x0 ∼p0, a
+forward process produces a family of noisy variables (xt)t≥0 with density pt that smoothly interpolates between the
+data distribution and a tractable Gaussian. A neural score model (parameters ϕ) is trained to approximate the score
+∇x log pt(x); given this score, sampling integrates a reverse-time SDE/ODE that transports pT back to p0 [1, 2, 3].
+Nearly all modern diffusion pipelines assume isotropic forward noise, meaning that at time t, the covariance of total
+injected Gaussian noise is a scalar multiple of identity.
+Matrix-valued (anisotropic) schedules. In this paper, we replace the scalar noise level by a matrix-valued covariance
+trajectory Mt and study how to learn it. Concretely, in the standard variance-exploding (VE) / Brownian formulation,
+the isotropic process adds noise with covariance tI,
+x0 ∼p0,
+dxt = dBt ⇔
+dxt = −1
+2∇log pt(xt)dt,
+(1)
+where Bt is standard Brownian motion and ∗denotes convolution. We generalize this to anisotropic diffusion by instead
+considering a forward diffusion driven by a matrix-valued diffusion coefficient:
+x0 ∼p0,
+dxt = (∂tMt)1/2dBt ⇔
+dxt = −1
+2∂tMt∇log pt(xt)dt,
+(2)
+where Mt(θ) is a matrix-valued noise-schedule, with arbitrary parameterization θ, satisfying
+M0 = 0,
+∂tMt ≻0
+for all t.
+(3)
+∗Equal contribution.
+arXiv:2602.19512v1  [cs.LG]  23 Feb 2026
+
+
+--- Page 2 ---
+Isotropic 
+Denoising
+Anisotropic 
+Denoising
+𝜎2 𝑡:
+𝑡:
+𝑔1 𝑡:
+𝑔2 𝑡:
+5600             4800            4000            3200             2400            1600             800         
+5600             4800            4000            3200             2400            1600             800         
+4900             3600            2500            1600              900              400              100         
+5600             4800            4000            3200             2400            1600             800         
+(6400,6400)
+Figure 1: Illustration of isotropic vs. anisotropic denoising. Top: a standard isotropic sampler denoises all directions
+uniformly. Bottom: an anisotropic sampler with two DCT subspaces, V1 (low frequency) and V2 (high frequency)
+(Section 6). Columns show intermediate reconstructions as t decreases. The plot (right) displays learned subspace
+schedules g1(t) and g2(t); the former is denoised more aggressively, so low-frequency structure from V1 emerges
+earlier, while high-frequency details from V2 emerge later. Illustration only: in practice anisotropic and isotropic
+reconstruct different images, and the gap between g1 and g2 is typically smaller (see Fig. 2–5).
+The power of anisotropy. Replacing a scalar schedule by a matrix path allows noise (and thus denoising effort)
+to be allocated differently across directions and time, better matching data geometry. Natural images concentrate
+energy in low spatial frequencies [4]; latent diffusion effectively separates coarse structure from fine detail [5]; video
+models benefit from temporally structured priors or decomposed noise [6, 7]; and multi-resolution generation often
+proceeds coarse-to-fine [8]. Figure 1 illustrates one such effect: low-frequency content can be denoised earlier than
+high-frequency details when the schedule is allowed to differ across subspaces.
+A variational formulation of matrix trajectory is necessary. The flexibility of Mt comes with a price: the design
+space is enormous—instead of choosing a single scalar function, we must choose a trajectory in the cone of PSD
+matrices. In the isotropic VE case, the family of marginals is essentially one-dimensional: pt = p0 ∗N(0, σ(t)2I)
+depends on t only through the scalar variance σ(t)2, so changing the schedule mainly reparameterizes time along
+the same curve of distributions. In contrast, different anisotropic paths Mt(θ) generally produce genuinely different
+marginals pt(·; θ) (even up to time reparameterization), and hence different score targets and reverse-time dynamics.
+This makes hand-crafted anisotropy brittle and motivates a principled, data-driven approach.
+1.1
+Main contributions
+We develop a variational framework for learning anisotropic diffusion trajectories Mt(θ) jointly with a score model
+(parameters ϕ), rather than prescribing Mt by hand. We summarize our technical and empirical contributions below
+(1) A general variational framework for learning anisotropic diffusion models.
+1. We introduce a variational framework for anisotropic diffusion with matrix-valued noise path Mt(θ). Our framework
+is fully general and supports broad classes of Mt(θ), including interpretable frequency-band schedules and data-
+adaptive (class-conditional) PCA schedules (Section 6).
+2. We propose a trajectory-level score-matching objective L(θ, ϕ) (Section 3) that jointly trains the score network and
+learns Mt(θ) by minimizing mismatch between ideal and learned denoising dynamics along the reverse trajectory
+(with a pathwise change-of-measure interpretation).
+3. We derive anisotropic reverse-ODE solvers by generalizing Euler and second-order Heun updates to matrix trajecto-
+ries (Section 5), yielding closed-form steps expressed through increments of M 1/2
+t
+and implementable efficiently
+via structured matrix operations.
+(2) An efficient schedule-gradient estimator for matrix-valued trajectories.
+Optimizing Mt(θ) is challenging
+because changing θ changes the entire forward family pt(·; θ), and thus requires ∂θ∇log pt(x; θ), which is not
+available from a network trained at a single θ. We derive a plug-in estimator of ∂θ∇log pt(x; θ) using only higher-
+2
+
+
+--- Page 3 ---
+order x-directional derivatives of the network, implementable in three backward passes and independent of dim(θ)
+(Theorem 4.1). We further introduce a flow parameterization that stabilizes scale across noise levels and reduces
+estimator variance (Section 4.2).
+(3) Empirical validation of anisotropic trajectory learning.
+Across CIFAR-10, AFHQv2, FFHQ, and ImageNet-64
+(Section 7), learned anisotropic trajectories are competitive with (and often improve upon) the EDM baseline under the
+standard evaluation protocol. The gains persist across solver budgets and schedule families, supporting the view that
+learning the matrix trajectory improves score-matching and the resulting generative model.
+1.2
+Related Work
+Structured noising and anisotropy.
+Prior work introduces non-isotropic structure via edge-aware perturbations
+[9], correlated/blue-noise masks [10], subspace/frequency restrictions [11], and temporally structured priors for video
+[7, 6, 12]. In contrast, we learn a global, monotone PSD matrix trajectory Mt(θ) (e.g., DCT/PCA-parameterized)
+and optimize it jointly with the score network via a trajectory loss, allocating noise (and denoising effort) across
+directions/subspaces.
+ELBO views and schedule learning.
+VDM [13] and the ELBO reinterpretation of common diffusion losses [14]
+relate scalar schedule learning to reweighting noise levels. MuLAN [15] learns (possibly input-conditional) per-pixel
+noise rates to tighten an ELBO for density estimation. Our formulation differs in that (i) Mt(θ) is anisotropic (reweights
+directions, not just levels), (ii) we derive a practical schedule-gradient estimator that accounts for the schedule-dependent
+score target, and (iii) we optimize the schedule to improve sample quality, yielding consistent FID gains.
+2
+Preliminaries
+2.1
+Anisotropic Diffusion: Process, Score, and Parameterizations
+Recall the anisotropic diffusion process in (2). Let Mt(θ) denote the noise covariance at time t, parameterized by θ. pt
+as defined in (2) has score given by
+∇log pt(x; θ) = M −1
+t
+(θ)Ex0|xt=x [x0 −xt] ,
+(4)
+where (x0, xt) are defined by the joint distribution x0 ∼p0 and xt = x0 + N(0, Mt). We provide a short proof in
+Lemma A.1 in Appendix A. In case of time-uniform isotropic diffusion (i.e. standard Brownian Motion), Mt(θ) = tI,
+and the formula in (4) reduces to the standard score expression.
+We parameterize a neural network net(x, t, ϕ) to approximate the score, we also define flow, a transformation of net
+whose norm is approximately time-invariant:
+net(x, t, ϕ) ≈∇log pt(x; θ)
+(5)
+flow(x, t, ϕ) := M 1/2
+t
+net(x, t, ϕ)
+(6)
+Continuous and discrete reverse ODE for anisotropic denoising.
+Recall the forward ODE dynamics as defined in
+(2): dxt = −1
+2∂tMt∇log pt(xt)dt. Given net in (5), the learned denoising ODE is given by the time-reversal of
+d¯xt = −1
+2∂tMt(θ)net(¯xt.t, ϕ)dt,
+(7)
+Variance-preserving anisotropic diffusion.
+It is often more useful to consider the variance preserving anisotropic
+diffusion, which is simply a time-dependent linear-transformation of (2). Define
+xV P
+t
+:= (I + Mt(θ))−1/2xt.
+(8)
+The choice of I above is based on the assumption that Cov(x0) ≈I, which implies that Cov(xV P
+t
+) ≈I for all t.
+Combining (8) with (2) gives the following dynamic:
+dxV P
+t
+= v(xt, t; θ)dt,
+where
+v(x, t; θ) := −1
+2(I + Mt(θ))−1/2∂tMt(θ)∇log pt(x; θ) −1
+2(I + Mt(θ))−3/2∂tMt(θ)x,
+(9)
+3
+
+
+--- Page 4 ---
+where v(x, t; θ) is the ideal velocity field. Analogously, we define the learned velocity field
+d¯xV P
+t
+= ¯v(xt, t; θ)dt,
+where
+¯v(x, t; θ, ϕ) := −1
+2(I + Mt(θ))−1/2∂tMt(θ)net(x, t, ϕ) −1
+2(I + Mt(θ))−3/2∂tMt(θ)x,
+(10)
+3
+Trajectory-Level Score Matching Loss
+This section introduces our central training objective (11), which enables us to jointly learn a matrix-valued noise path
+{Mt(θ)}t∈[0,T ] together with a score network net(x, t, ϕ). At a high level, the loss measures a trajectory-weighted
+score error induced by the schedule Mt(θ), and it is designed so that (for any fixed θ) the optimal network recovers the
+true score (Lemma 3.1).
+3.1
+Defining the Trajectory Loss
+Loss definition.
+We define our trajectory-level training objective as
+L(θ, ϕ) := Et∼Unif[0,T ], x0∼p0, ϵ∼N(0,I)
+Wt(θ)
+
+Mt(θ)1/2net
+
+x0 + Mt(θ)1/2ϵ, t, ϕ
+
++ ϵ
+
+2
+2
+
+where
+Wt(θ) := (I + Mt(θ))−1/2(∂tMt(θ))Mt(θ)1/2.
+(11)
+In words: we draw a noise level t, perturb data by xt := x0 + Mt(θ)1/2ϵ, evaluate the score network at (xt, t), and
+penalize its deviation from the noise target −ϵ, under a matrix-valued weight Wt(θ) determined by the trajectory
+Mt(θ). Since xt = x0 + Mt(θ)1/2ϵ, we have Mt(θ)−1/2ϵ = −Mt(θ)−1(x0 −xt), so the network term inside (11) is
+trained to match the conditional denoising direction. The operator Wt(θ) serves as a matrix-valued weighting schedule
+that can emphasize different subspaces at different times, and it is exactly this dependence on Mt(θ) that allows us to
+optimize the trajectory θ.
+Equivalence of loss to velocity mismatch norm.
+Recall from Section 2 that under the variance-preserving (VP)
+reparameterization (8), the ideal and learned VP velocity fields are v(·, t; θ) and ¯v(·, t; θ, ϕ) as defined in (9) and (10).
+A natural trajectory-level principle is to choose (θ, ϕ) so that the learned denoising dynamics match the ideal ones along
+the reverse trajectory. The continuous-time form of this principle is the path integral
+Z T
+0
+Ex0∼p0, ϵ∼N(0,I)
+h
+∥¯v(xt, t; θ, ϕ) −˜v(xt, x0, t; θ)∥2
+2
+i
+dt,
+xt = x0 + Mt(θ)1/2ϵ,
+(12)
+where ˜v(·, x0, t; θ) is obtained from the ideal velocity v(·, t; θ) by replacing the intractable score ∇log pt(·; θ) with the
+single-sample proxy Mt(θ)−1(x0 −xt) (see the score identity (4)):
+˜v(xt, x0, t; θ) := −1
+2(I + Mt(θ))−1/2∂tMt(θ) Mt(θ)−1(x0 −xt) −1
+2(I + Mt(θ))−3/2∂tMt(θ) xt.
+(13)
+Expanding ¯v and ˜v, the common contraction term −1
+2(I + Mt)−3/2∂tMt xt cancels, and (12) reduces to the compact
+matrix-weighted score-matching form (11) (up to an overall constant factor and the standard Monte Carlo approximation
+of the time integral by sampling t).
+3.2
+Key Properties and Interpretation
+Exact score at optimality.
+As standard in the literature [16, 2], we show that for any fixed schedule Mt(θ) satisfying
+(3), the optimal network for L(θ, ϕ) recovers the true score in the infinite-data/infinite-capacity limit:
+Lemma 3.1 (Exact score at optimality). Fix any schedule Mt(θ) satisfying (3). In the limit of infinite data and model
+capacity, the minimizer ϕ∗(θ) = arg minϕ L(θ, ϕ) satisfies
+net(x, t, ϕ∗(θ)) = ∇x log pt(x; θ).
+(14)
+We defer the proof of Lemma 3.1 to Appendix B.1.
+Connection to path-wise change-of-measure (Girsanov).
+The objective (12) is a path-wise integral of a velocity
+mismatch, aligning with the classical change-of-measure control suggested by Girsanov’s theorem. Concretely, for
+two processes dxt = v(xt, t) dt + dBt and d¯xt = ¯v(¯xt, t) dt + dBt, the path-space KL is bounded by a constant times
+R T
+0 E
+
+∥¯v(xt, t) −v(xt, t)∥2
+2
+
+dt (under standard regularity, e.g. Novikov’s condition). Related bounds have been used
+to control reverse SDE discretization error [17]. Our loss can be viewed as a tractable surrogate in this spirit: it replaces
+the intractable score-dependent v with the proxy velocity ˜v in (13).
+4
+
+
+--- Page 5 ---
+Consistency check: isotropic trajectory loss reduces to weighted score matching.
+When Mt(θ) = g(t; θ)I for a
+scalar function g, the weighting operator Wt(θ) becomes the scalar function
+∂tg(t;θ)
+√
+1+g(t;θ). In Lemma A.2 (Appendix A),
+we formally prove the equivalence to a standard weighted score-matching objective. Thus, in the isotropic case,
+choosing g(t; θ) is essentially choosing a weighting over noise levels. Our main focus, however, is that (11) enables
+optimization over matrix-valued trajectories.
+4
+Optimization of the Trajectory Loss
+This section explains how we learn the matrix-valued trajectory Mt(θ). We first emphasize the subtle but crucial
+relationship between θ and the learned network: the parametric model net(x, t, ϕ) has no explicit dependence on θ, but
+the optimal network for a given schedule does depend on θ, because it approximates the score of the schedule-dependent
+marginal pt(·; θ) = p0 ∗N(0, Mt(θ)). We therefore present schedule learning as the following bilevel problem:
+Let L(θ, ϕ) be as defined in (11). Define
+ϕ∗(θ) ∈arg min
+ϕ L(θ, ϕ),
+⇔
+H(θ)
+:= L(θ, ϕ∗(θ)) = min
+ϕ L(θ, ϕ).
+(15)
+From (15), the joint minimization over (θ, ϕ) is equivalent to
+min
+θ,ϕ L(θ, ϕ) = min
+θ
+H(θ).
+Lemma 3.1 implies that, in the infinite-data/capacity limit, net(x, t, ϕ∗(θ)) = ∇x log pt(x; θ) for any θ.
+The challenge of computing ∂θH(θ):
+When optimizing θ in (15), we need ∂θH(θ). Because H(θ) evaluates the loss
+at the θ-dependent optimum ϕ∗(θ), differentiating H involves computing the derivative of the optimum score field wrt
+θ, i.e. ∂θnet(x, t, ϕ∗(θ)) ≈∂θ∇log pt(x, θ). Even though net(x, t, ϕ) does not depend on θ, an implicit dependency
+on θ is introduced via ϕ∗(θ).
+The difficulty arises because at any point during training, we only observe the current value of ϕ. There is no
+simple way to directly compute ∂θnet(x, t, ϕ∗(θ)) or even ∂θϕ∗(θ). However, there is remarkable structure in
+pt(x, θ) = p0 ∗N(0, Mt(θ)). By exploiting this fact, we show that ∂θ∇log pt(x, θ) can be written using only
+derivatives wrt x, without explicit derivatives wrt θ. In turn, this enables us to approximate ∂θnet(x, t, ϕ∗(θ)) using
+only x-derivatives of the network.
+4.1
+A Plug-in Approximation for ∂θ∇log pt via Stochastic Calculus
+Below we provide an identity for expressing the θ-derivative of the true score ∂θ∇log pt(x, θ) using terms that only
+depend on entries of ∇2 log pt(x, θ).
+Theorem 4.1. Let θ ∈Rc and let j ∈{1, . . . , c} be any coordinate. Then for all x ∈Rd,
+∂θj∇log pt(x; θ) = 1
+2
+d
+X
+i=1
+∂r∂s ∇log pt
+
+x + rei + s ∂θjMt(θ) ei; θ
+
+r=s=0
++ ∂s ∇log pt
+
+x + s ∂θjMt(θ) ∇log pt(x; θ); θ
+
+s=0.
+(16)
+Let ϕ∗(θ) be defined as in (15). Under sufficient model capacity and data,
+∂θjnet(x, t, ϕ∗(θ)) = 1
+2
+d
+X
+i=1
+∂r∂s net
+
+x + rei + s ∂θjMt(θ) ei, t, ϕ∗(θ)
+
+r=s=0
++ ∂s net
+
+x + s ∂θjMt(θ) net(x, t, ϕ∗(θ)), t, ϕ∗(θ)
+
+s=0.
+(17)
+We defer the proof to Appendix B.2.
+4.2
+Flow Parameterization and Variance Reduction
+A practical concern is that ∥net(x, t, ϕ)∥2 typically scales like ∥Mt(θ)−1/2∥2, which can vary significantly across noise
+levels and inflate gradient variance. We therefore work with the normalized vector field
+flow(x, t, ϕ) := Mt(θ)1/2 net(x, t, ϕ),
+(18)
+5
+
+
+--- Page 6 ---
+whose scale is approximately time-invariant. Using Theorem 4.1, we can also express ∂θflow in terms of x-directional
+derivatives:
+Corollary 4.2. Under the same setup as Theorem 4.1,
+∂θflow(x, t, ϕ∗(θ)) = 1
+2
+d
+X
+i=1
+∂r∂s flow
+
+x + rei + s ∂θMt(θ) ei, t, ϕ∗(θ)
+
+r=s=0
++ ∂s flow
+
+x + s Mt(θ)−1/2 ∂θMt(θ) flow(x, t, ϕ∗(θ)), t, ϕ∗(θ)
+
+s=0
++ 1
+2 Mt(θ)−1 ∂θMt(θ)
+
+flow(x, t, ϕ∗(θ)).
+We defer the proof of Corollary 4.2 to Appendix B.3.
+4.3
+Final Optimization Formulation for H(θ) = minϕ L(θ, ϕ)
+We now clarify how the schedule gradient uses (17) (or equivalently Corollary 4.2). We emphasize that the additional
+∂θnet(x, t, ϕ∗(θ)) term appears when differentiating the outer value function H(θ) = minϕ L(θ, ϕ), not when
+differentiating L(θ, ϕ) with ϕ held fixed.
+For notational clarity we treat θ as a scalar below; the vector case follows by applying the same derivation to each
+coordinate θj. Let x0 ∼p0, ϵ ∼N(0, I), sample t as in Section 3, and set xt := x0 + Mt(θ)1/2ϵ. Using the flow form
+of the loss, we verify that L(θ, ϕ) of (11) is equivalent to
+L(θ, ϕ) = Ex0,ϵ,t
+Wt(θ)
+ flow(xt, t, ϕ) + ϵ
+
+2
+2
+
+Wt(θ) := (I + Mt(θ))−1/2 ∂tMt(θ) Mt(θ)−1/2.
+(19)
+We define the convenient notation ℓ(v, ϵ, W) := ∥W(θ)(v+ϵ)∥2
+2, so that L(θ, ϕ) = Ex0,ϵ,t [ℓ(flow(xt, t, ϕ), ϵ, Wt(θ))].
+Chain rule for the outer objective.
+Define flow∗
+θ(x, t) := flow(x, t, ϕ∗(θ)) and recall H(θ) = L(θ, ϕ∗(θ)). Differ-
+entiating gives
+∂θH(θ) =
+∂θL(θ, ϕ)
+
+ϕ=ϕ∗(θ)
+|
+{z
+}
+explicit dependence through Mt(θ)
++ Ex0,ϵ,t
+hD
+∇vℓ(flow(xt, t, ϕ∗(θ)), ϵ, Wt(θ)), ∂θflow(xt, t, ϕ∗(θ))
+Ei
+|
+{z
+}
+implicit dependence through the optimal score/flow field
+,
+(20)
+The second term on the RHS above uses the (per-sample) gradient of ℓ(v, ϵ, t) with respect to v given by ∇flowℓt =
+2 ˆWt(θ)⊤ˆWt(θ)
+ v + ϵ
+
+, this term isolates the dependence of H(θ) on ϕ∗(θ). We estimate ∂θflow∗
+θ(xt, t) using
+Corollary 4.2 (equivalently, estimate ∂θnet∗
+θ using (17)). In practice, the expectation in (20) is approximated by
+minibatch averages over samples (x(j)
+0 , ϵ(j), t(j)), for j = 1...BatchSize.
+5
+Denoising Algorithms for Matrix Trajectories
+This section describes sampling (denoising) given (i) a learned PSD matrix trajectory Mt(θ) and (ii) a trained network
+flow(x, t, ϕ), where
+flow(x, t, ϕ) ≈Mt(θ)1/2 ∇x log pt(x; θ).
+We focus on reverse-time ODE sampling, which is the inference method used throughout our experiments. We remark
+that our method generalizes easily to the reverse-time SDE setting.
+5.1
+Reverse-time ODE in flow form and initialization
+Using net(x, t, ϕ) = Mt(θ)−1/2flow(x, t, ϕ), and the learned ODE from (7), the reverse-time ODE is equivalent to the
+time-reversal of the following:
+d¯xt = −1
+2 ∂tMt(θ) Mt(θ)−1/2 flow(¯xt, t, ϕ) dt,
+(21)
+For initialization we sample ξ ∼N(0, I) and set
+¯xT := MT (θ)1/2ξ,
+(22)
+with T chosen large enough that pT is close to a centered Gaussian.
+6
+
+
+--- Page 7 ---
+Why the solver uses increments of M 1/2
+t
+.
+In this section, we will assume that the matrices Mt(θ) share eigenvectors
+and therefore commute with ∂tMt(θ). This assumption is not necessary, but helps significantly simplify the algebra. In
+Section 6, we discuss numerous examples of families of Mt(θ) which satisfy this assumption. Under this commutation,
+1
+2 ∂tMt(θ) Mt(θ)−1/2 = ∂t
+ Mt(θ)1/2
+,
+so (21) becomes
+d¯xt = −∂t
+ Mt(θ)1/2
+flow(¯xt, t, ϕ) dt.
+(23)
+This reveals that the natural step size for anisotropic denoising is the matrix increment ∆M 1/2
+t
+, directly generalizing
+the scalar EDM viewpoint where Mt = σ(t)2I and ∆M 1/2
+k
+= (σk−1 −σk)I.
+5.2
+Reverse Euler discretization
+Let K be the number of solver steps and choose a discretization grid
+0 = t0 < t1 < · · · < tK = T.
+(24)
+Reverse-time integration proceeds from tK down to t0. For convenience, define
+Uk := Mtk(θ)1/2,
+∆Uk := Uk −Uk−1
+(k = 1, . . . , K).
+(25)
+A first-order explicit Euler discretization of the time-reversal of (23) yields
+¯xtk−1 = ¯xtk + ∆Uk flow(¯xtk, tk, ϕ),
+k = 1, . . . , K.
+(26)
+We present the above Euler-Discretization scheme (26) mainly as a baseline derivation; in our experiments, second-order
+Heun consistently dominates Euler in FID per NFE.
+5.3
+Heun’s second-order method for matrix trajectories
+We now present the matrix-valued generalization of Heun’s second-order algorithm. We inherit the notation from
+Section 5.2 above. Fix a secondary evaluation time ˆtk ∈[tk−1, tk] and denote ˆUk := Mˆtk(θ)1/2. Let
+uk := −flow(¯xtk, tk, ϕ).
+We form a predictor at ˆtk by
+ˆxˆtk = ¯xtk + ( ˆUk −Uk) uk,
+ˆuk := −flow(ˆxˆtk, ˆtk, ϕ).
+(27)
+At any time s ∈[tk−1, tk], we approximate the intermediate flow field at s by the affine model
+˜u(s) := uk + (U(s) −Uk) ( ˆUk −Uk)−1 (ˆuk −uk),
+U(s) := Ms(θ)1/2.
+Substituting this approximation into (23) and integrating yields the closed-form second-order update
+¯xtk−1 = ¯xtk + ∆Uk uk + 1
+2 (∆Uk)2 ( ˆUk −Uk)−1 (ˆuk −uk).
+(28)
+We defer the proof to Lemma A.3 in the appendix. When ˆtk = tk−1 (endpoint choice), we have ˆUk = Uk−1 and (28)
+reduces to the familiar Heun form
+¯xtk−1 = ¯xtk + ∆Uk
+uk + ˆuk
+2
+,
+which matches the standard scalar EDM/Heun update when Mt = σ(t)2I. In experiments we consider two choices of
+ˆtk, i.e. ˆtk = tk−1 (endpoint) and ˆtk = (tk−1 + tk)/2 (midpoint).
+The solver grid {tk}K
+k=0 is treated as an orthogonal design choice. In our experiments, for given total step K, we take
+t1...tK to be a uniform grid over [0...T].
+Efficient implementation under structured parameterizations.
+All updates require only (i) matrix–vector products
+with Mt(θ)1/2 and (ii) product of ( ˆUk −Uk)−1 with vectors. Under the projector-based families in Section 6, these
+operations reduce to inexpensive subspace-wise scalings (and subspace-wise pseudoinverses), avoiding explicit d × d
+matrix square roots or dense linear algebra.
+7
+
+
+--- Page 8 ---
+6
+Practical Choices of Matrix Schedule Mt(θ)
+The framework in Sections 3–5 applies to arbitrary monotone PSD matrix trajectories Mt(θ). Below, we demonstrate
+a number of specific parametric families of Mt(θ). In each case, we verify that the parameterization satisfies: (i)
+monotonicity (∂tMt(θ) ≻0), (ii) efficient evaluation of matrix functions appearing in the loss and sampler (e.g.
+M ±1/2
+t
+and (I + Mt)−1/2), and (iii) commutation of ∂tMt(θ) and Mt(θ).
+6.1
+A subspace-schedule framework
+We use a broad family based on an orthogonal decomposition of Rd into subspaces. Let {Pj}J
+j=1 be orthogonal
+projection matrices such that Pj = P ⊤
+j ⪰0, P 2
+j = Pj, PjPk = 0 for j ̸= k, and PJ
+j=1 Pj = I. Let {gj(·; θ)}J
+j=1 be
+nonnegative, nondecreasing scalar functions with gj(0; θ) = 0 and gj(T; θ) = T. In our experiments, each gj(·; θ) is
+parameterized by a monotone knot-based family (Appendix C), which ensures gj is nondecreasing and differentiable in
+θ. We define the matrix-valued schedule
+Mt(θ) :=
+J
+X
+j=1
+gj(t; θ) Pj,
+(24)
+so that ∂tMt(θ) = PJ
+j=1 ˙gj(t; θ)Pj ⪰0 whenever each gj is nondecreasing. This construction therefore satisfies the
+monotonicity constraint (3) automatically. Because the Pj are mutually orthogonal projectors, any (scalar) matrix
+function f acts subspace-wise:
+f(Mt(θ)) =
+J
+X
+j=1
+f(gj(t; θ)) Pj.
+(25)
+In particular, the quantities needed by our loss and sampler—M ±1/2
+t
+, M −1
+t
+, and (I + Mt)−1/2—reduce to inexpensive
+scalings on each subspace. This also matches the solver structure in Section 5, where updates depend on increments of
+M 1/2
+t
+; under (24), these increments are simply subspace-wise scalar increments.
+The form of (24) separates:
+• Directions / subspaces (the projectors {Pj}, determined by a basis choice and a grouping), and
+• Time allocation (the scalar schedules {gj(·; θ)}).
+This separation lets us trade off interpretability and expressivity while keeping training and sampling efficient.
+6.2
+Schedule families used in experiments
+We now list the concrete instances of (24) used in our experiments in Section 7.
+(a) Isotropic schedule (warm-up / special case).
+Standard isotropic diffusion corresponds to J = 1 with P1 = I, so
+Mt(θ) = g(t; θ)I. This serves as a sanity check and warm-up baseline; it also emphasizes that our framework strictly
+generalizes scalar schedule learning.
+(b) Fixed structured basis (DCT subspaces).
+For images, we often choose a fixed orthonormal transform U ∈Rd×d
+exposing interpretable directions (e.g. a 2D-DCT basis; see Appendix F.2). Partition the basis indices into J groups
+defining subspaces S1, . . . , SJ (ordered by decreasing frequency), and let Pj be the projector onto Sj. A particularly
+simple instance is J = 2: S1 is a low-frequency subspace and S2 = S⊥
+1 its complement, giving
+Mt(θ) = gDCT
+1
+(t; θ)P1 + gDCT
+2
+(t; θ)P2.
+This parameterization yields an interpretable notion of anisotropy (coarse-to-fine denoising) while remaining cheap.
+(c) Class-conditional PCA bases (data-dependent subspaces, shared schedules).
+To incorporate data geometry, we
+can make the basis depend on a class label y ∈{1, . . . , C} (in the case of ImageNet and CIFAR10). For each class
+y, compute a PCA basis from training samples in that class and form mutually orthogonal subspaces {S(y)
+j
+}J
+j=1 that
+partition Rd (e.g. S(y)
+1
+spans the top-k PCs and the remaining subspaces capture residual directions). Let P (y)
+j
+be the
+projector onto S(y)
+j
+. We then define
+Mt(θ; y) =
+J
+X
+j=1
+gPCA
+j
+(t; θ) P (y)
+j
+.
+8
+
+
+--- Page 9 ---
+Here the subspaces vary with y while the scalar schedules are shared across classes, isolating the effect of a class-
+dependent geometry.
+(d) Shared structured basis + class-conditional schedules.
+For class-conditional generation with a score network
+net(x, t, y; ϕ), we can instead keep the projectors fixed (e.g. DCT projectors {Pj}) and make the schedules class-
+specific:
+Mt(θ; y) =
+J
+X
+j=1
+gDCT
+j,y
+(t; θ) Pj.
+Even in the simple J = 2 case this yields 2C coupled scalar trajectories, making black-box search over θ impractical
+and motivating our gradient-based optimization of θ.
+(e) Class-conditional PCA bases + class-conditional schedules (most expressive).
+Finally, we can let both the
+subspaces and schedules depend on class:
+Mt(θ; y) =
+J
+X
+j=1
+gPCA
+j,y
+(t; θ) P (y)
+j
+.
+This is the largest design space we consider. It can align anisotropic diffusion dynamics with class-dependent data
+geometry, but it also highlights why an efficient variational optimization scheme is needed.
+Discussion: expressivity vs. efficiency.
+Across (a)–(e), the template (24) ensures that all matrix operations required
+by the trajectory loss and the anisotropic solvers reduce to subspace-wise scalings via (25). Increasing expressivity
+corresponds to increasing J, allowing class dependence, or making the basis data-dependent (PCA), while retaining
+tractable computation.
+7
+Experiments
+We evaluate learned anisotropic diffusion schedules on four standard image generation benchmarks: CIFAR-10
+(32 × 32) [18], AFHQv2 (64 × 64) [19], FFHQ (64 × 64) [20], and ImageNet-64 (64 × 64) [21]. All comparisons are
+against the EDM baseline [3], using the official EDM implementation and its recommended hyperparameter settings for
+each dataset/configuration.
+Training protocol.
+Our models are initialized from the corresponding pretrained EDM networks and then fine-tuned
+while learning the schedule parameters θ (and continuing to update network parameters ϕ) as in (19). Across all datasets,
+fine-tuning consumes the equivalent of 1.2M image passes (as measured by total images processed). See Appendix D
+for full training details.
+Evaluation protocol.
+We generate 50k samples and compute Fréchet Inception Distance (FID↓). For both EDM
+and our method, we repeat sampling three times (independent random seeds) and report the minimum FID across the
+three runs, matching the EDM evaluation protocol [3]. We report results across a range of solver budgets measured by
+number of function evaluations (NFE), where one function evaluation corresponds to one forward pass of the score/flow
+network during sampling. For Heun’s second-order solver, each step uses two network evaluations, and when the
+secondary time is chosen as an endpoint (ˆtk = tk−1) the final evaluation at tk−1 is reused as the first evaluation of
+the next step. This yields the familiar odd NFE counts (approximately 2K −1 for K solver steps), consistent with
+EDM [3]. Unless otherwise noted, we use the Heun solver described in Section 5.
+7.1
+Schedule variants evaluated
+We compare the following schedule families (see Section 6 for the corresponding parameterizations):
+1. EDM. The original EDM baseline with isotropic schedule.
+2. Learned isotropic schedule g. A single learned scalar schedule with Mt = g(t; θ)I.
+3. Class-conditional isotropic schedules {gy}C
+y=1. One scalar schedule per class: Mt(y) = gy(t; θ)I.
+4. DCT anisotropic schedule (gDCT
+1
+, gDCT
+2
+). A two-subspace matrix schedule with J = 2 in a fixed 2D-DCT basis
+(Appendix E), where the “low-frequency” subspace consists of the (H/2)×(H/2) lowest-frequency DCT modes (i.e.,
+H2/4 basis vectors) and the second subspace is its orthogonal complement: Mt = gDCT
+1
+(t; θ)P1 + gDCT
+2
+(t; θ)P2.
+9
+
+
+--- Page 10 ---
+5. PCA anisotropic schedule (gPCA
+1
+, gPCA
+2
+). A two-subspace matrix schedule with J = 2 using class-conditional
+PCA bases (subspaces depend on class, schedules are shared), as described in Section 6.
+6. Class-conditional DCT anisotropic schedules {(gDCT
+1,y , gDCT
+2,y )}C
+y=1. Fixed DCT subspaces but class-specific scalar
+schedules.
+7. Class-conditional PCA anisotropic schedules {(gPCA
+1,y , gPCA
+2,y )}C
+y=1. The most expressive conditional variant we
+consider: both PCA subspaces and schedules depend on class.
+Conditional vs. unconditional datasets.
+We consider CIFAR-10 and ImageNet-64 as class-conditional datasets. For
+CIFAR-10, which is relatively simple, we first train isotropic schedules, including both a global isotropic schedule and
+class-conditional isotropic schedules, as warm-up ablations. Building on this, we separately study the effects of class-
+conditional schedules and class-conditional bases. For ImageNet-64, due to its higher visual complexity, we directly
+adopt class-conditional isotropic schedules during warm-up. We then evaluate more expressive variants, including
+class-conditional schedules, class-conditional bases, and their combination. For AFHQv2 and FFHQ, which do not
+provide class labels, we primarily train structured-basis anisotropic schedules based on a fixed DCT decomposition
+with a global isotropic schedule g as an ablation for warm-up.
+CIFAR-10
+Method
+nfe 9
+nfe 11
+nfe 13
+nfe 15
+nfe 17
+nfe 35
+nfe 59
+nfe 79
+Best FID
+EDM
+35.52
+14.37
+6.694
+4.231
+3.027
+1.829
+1.868
+1.890
+1.829
+g
+4.241
+3.087
+2.650
+2.431
+2.328
+1.815
+1.820
+1.835
+1.815
+{gy}C
+y=1
+3.691
+3.090
+2.735
+2.582
+2.480
+1.831
+1.829
+1.841
+1.829
+{(gDCT
+1,y , gDCT
+2,y )}C
+y=1
+3.618
+3.056
+2.681
+2.535
+2.431
+1.829
+1.810
+1.818
+1.810
+(gPCA
+1
+, gPCA
+2
+)
+3.839
+2.900
+2.538
+2.332
+2.213
+1.851
+1.803
+1.803
+1.803
+AFHQv2
+Method
+nfe 9
+nfe 11
+nfe 13
+nfe 15
+nfe 19
+nfe 39
+nfe 79
+nfe 119
+Best FID
+EDM
+27.98
+13.66
+7.587
+4.746
+2.986
+2.075
+2.042
+2.046
+2.042
+g
+4.657
+3.085
+2.584
+2.463
+2.332
+2.091
+2.041
+2.042
+2.041
+(gDCT
+1
+, gDCT
+2
+)
+4.524
+2.977
+2.513
+2.401
+2.265
+2.070
+2.015
+2.010
+2.010
+FFHQ
+Method
+nfe 9
+nfe 11
+nfe 13
+nfe 15
+nfe 19
+nfe 39
+nfe 79
+nfe 119
+Best FID
+EDM
+57.14
+29.39
+15.81
+9.769
+5.169
+2.575
+2.391
+2.374
+2.374
+g
+68.35
+27.92
+13.44
+8.097
+3.958
+2.265
+2.242
+2.281
+2.242
+(gDCT
+1
+, gDCT
+2
+)
+45.43
+17.21
+8.263
+5.129
+3.001
+2.327
+2.313
+2.354
+2.313
+ImageNet-64
+Method
+nfe 9
+nfe 11
+nfe 13
+nfe 15
+nfe 19
+nfe 39
+nfe 79
+nfe 119
+Best FID
+EDM
+35.32
+15.19
+8.160
+5.458
+3.586
+2.428
+2.294
+2.276
+2.276
+{gy}C
+y=1
+8.416
+5.907
+4.749
+4.079
+3.366
+2.455
+2.314
+2.296
+2.296
+(gPCA
+1
+, gPCA
+2
+)
+29.47
+15.55
+8.558
+5.666
+3.409
+2.362
+2.263
+2.240
+2.240
+{(gPCA
+1,y , gPCA
+2,y )}C
+y=1
+8.366
+5.823
+4.626
+3.992
+3.282
+2.378
+2.259
+2.239
+2.239
+{(gDCT
+1,y , gDCT
+2,y )}C
+y=1
+8.340
+5.808
+4.615
+3.983
+3.275
+2.377
+2.259
+2.238
+2.238
+Table 1: FID ↓vs. NFE across datasets (50k samples). See section 7 for description of each method. For each method
+(both EDM and ours), we perform 3 independent random generations of 50k images and report the minimum FID
+across the three runs. Bold = per-NFE best. Blue = Best FID lower than EDM.
+7.2
+Discussion of results
+Table 1 reports FID across solver budgets (NFE). Figures 2–5 (Appendix E) visualize the learned schedules and
+anisotropy ratios.
+(i) Consistent FID improvement over EDM baseline.
+At the best-performing NFE in Table 1, we observe consistent
+improvements over EDM: CIFAR-10 improves from 1.829 (EDM) to 1.803 (PCA schedule); AFHQv2 improves
+10
+
+
+--- Page 11 ---
+from 2.042 to 2.010 (DCT anisotropic); FFHQ improves from 2.374 to 2.242 (learned isotropic g); and ImageNet-64
+improves from 2.276 to 2.238 (class-conditional DCT anisotropic). These gains persist across multiple NFE settings.
+(iii) Matrix-valued anisotropy demonstrates benefits.
+Beyond the isotropic warm-up, matrix-valued schedules are
+often beneficial. On CIFAR-10 and AFHQv2, anisotropic variants improve upon EDM baseline or learned isotropic
+schedules across a wide range of NFEs. On ImageNet-64, class-conditional anisotropic variants are the strongest, with
+{(gDCT
+1,y , gDCT
+2,y )}C
+y=1 achieving the best FID (2.238).
+(iv) Class-conditional variants matter most on complex conditional data.
+On both CIFAR-10 and ImageNet-64,
+class-conditional variants outperform their global counterparts. On CIFAR-10, class-conditional bases (gPCA
+1
+, gPCA
+2
+)
+achieve the best FID of 1.803. On ImageNet-64, class-conditional schedules {(gDCT
+1,y , gDCT
+2,y )}C
+y=1 yield the best FID of
+2.238. These results indicate that class-dependent schedule parameterizations are beneficial in practice.
+8
+Conclusion
+We introduced a variational framework for learning anisotropic diffusion models by replacing the scalar noise schedule
+with a monotone PSD, matrix-valued trajectory Mt(θ) that allocates noise (and denoising effort) across directions
+and subspaces. Central to the framework is a trajectory-level score-matching objective that jointly trains the score
+network and optimizes the schedule, and admits a natural pathwise change-of-measure interpretation: the loss controls
+a tractable surrogate of the discrepancy between ideal and learned dynamics integrated along full trajectories. In the
+isotropic special case, the formulation reduces to standard weighted score matching—a useful consistency check—but
+its main purpose is to enable principled optimization over general matrix-valued schedules.
+To make trajectory optimization practical, we derived an efficient plug-in estimator for schedule gradients using
+higher-order directional derivatives of the network, together with a flow parameterization that stabilizes scale across
+noise levels and reduces variance. For inference, we developed anisotropic reverse-time ODE solvers by generalizing
+Euler and second-order Heun updates to matrix trajectories, yielding closed-form steps expressed through increments of
+M 1/2
+t
+that can be implemented efficiently under structured parameterizations.
+Empirically, we observe consistent improvements over the baseline across a wide range of datasets and settings;
+strongest performance was observed for complex class-conditional matrix schedules, underscoring the importance of a
+efficient variational approach to selecting anisotropic trajectories.
+Looking forward, it is promising to expand the space of efficiently-computable matrix trajectories beyond orthogonal
+projector decompositions and to explore richer conditioning, as well as other modalities.
+References
+[1] Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. Advances in neural
+information processing systems, 33:6840–6851, 2020.
+[2] Yang Song, Jascha Sohl-Dickstein, Diederik P. Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. Score-
+based generative modeling through stochastic differential equations. In International Conference on Learning
+Representations (ICLR), 2021.
+[3] Tero Karras, Miika Aittala, Timo Aila, and Samuli Laine. Elucidating the design space of diffusion-based
+generative models. Advances in neural information processing systems, 35:26565–26577, 2022.
+[4] Daniel Ruderman and William Bialek. Statistics of natural images: Scaling in the woods. Advances in neural
+information processing systems, 6, 1993.
+[5] Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Björn Ommer. High-resolution image
+synthesis with latent diffusion models. In Proceedings of the IEEE/CVF conference on computer vision and
+pattern recognition, pages 10684–10695, 2022.
+[6] Songwei Ge, Seungjun Nah, Guilin Liu, Tyler Poon, Andrew Tao, Bryan Catanzaro, David Jacobs, Jia-Bin Huang,
+Ming-Yu Liu, and Yogesh Balaji. Preserve your own correlation: A noise prior for video diffusion models. In
+Proceedings of the IEEE/CVF International Conference on Computer Vision, pages 22930–22941, 2023.
+[7] Zhengxiong Luo, Dayou Chen, Yingya Zhang, Yan Huang, Liang Wang, Yujun Shen, Deli Zhao, Jingren Zhou,
+and Tieniu Tan. Videofusion: Decomposed diffusion models for high-quality video generation. arXiv preprint
+arXiv:2303.08320, 2023.
+11
+
+
+--- Page 12 ---
+[8] Keyu Tian, Yi Jiang, Zehuan Yuan, Bingyue Peng, and Liwei Wang. Visual autoregressive modeling: Scalable
+image generation via next-scale prediction. Advances in neural information processing systems, 37:84839–84865,
+2024.
+[9] Jente Vandersanden, Sascha Holl, Xingchang Huang, and Gurprit Singh. Edge-preserving noise for diffusion
+models. 2024.
+[10] Xingchang Huang, Corentin Salaun, Cristina Vasconcelos, Christian Theobalt, Cengiz Oztireli, and Gurprit Singh.
+Blue noise for diffusion models. In ACM SIGGRAPH 2024 conference papers, pages 1–11, 2024.
+[11] Bowen Jing, Gabriele Corso, Renato Berlinghieri, and Tommi Jaakkola. Subspace diffusion generative models. In
+European conference on computer vision, pages 274–289. Springer, 2022.
+[12] Pascal Chang, Jingwei Tang, Markus Gross, and Vinicius C Azevedo. How i warped your noise: a temporally-
+correlated noise prior for diffusion models. arXiv preprint arXiv:2504.03072, 2025.
+[13] Diederik Kingma, Tim Salimans, Ben Poole, and Jonathan Ho. Variational diffusion models. Advances in neural
+information processing systems, 34:21696–21707, 2021.
+[14] Diederik Kingma and Ruiqi Gao. Understanding diffusion objectives as the elbo with simple data augmentation.
+Advances in Neural Information Processing Systems, 36:65484–65516, 2023.
+[15] Subham Sahoo, Aaron Gokaslan, Christopher M De Sa, and Volodymyr Kuleshov. Diffusion models with learned
+adaptive noise. Advances in Neural Information Processing Systems, 37:105730–105779, 2024.
+[16] Yang Song and Stefano Ermon. Generative modeling by estimating gradients of the data distribution. Advances in
+neural information processing systems, 32, 2019.
+[17] Sitan Chen, Sinho Chewi, Jerry Li, Yuanzhi Li, Adil Salim, and Anru R Zhang. Sampling is as easy as learning
+the score: theory for diffusion models with minimal data assumptions. arXiv preprint arXiv:2209.11215, 2022.
+[18] Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple layers of features from tiny images. 2009.
+[19] Yunjey Choi, Youngjung Uh, Jaejun Yoo, and Jung-Woo Ha. Stargan v2: Diverse image synthesis for multiple
+domains. In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition, pages
+8188–8197, 2020.
+[20] Tero Karras, Samuli Laine, and Timo Aila. A style-based generator architecture for generative adversarial networks.
+In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition, pages 4401–4410, 2019.
+[21] Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-scale hierarchical image
+database. In 2009 IEEE conference on computer vision and pattern recognition, pages 248–255. Ieee, 2009.
+12
+
+
+--- Page 13 ---
+A
+Additional Lemmas
+Lemma A.1. If xt evolves as either one of the two processes:
+1. (xt −x0) ∼N(0, Mt(θ))
+2. dxt = −1
+2∂tMt(θ)∇log pt(xt; θ)dt,
+where pt(x; θ) := p0 ∗N(0, Mt(θ)), then the score above is the conditional expectation
+∇log pt(x; θ) = M −1
+t
+(θ)Ex0|xt=x [x0 −xt] ,
+where (x0, xt) are defined by the joint distribution x0 ∼p0 and xt = x0 + N(0, Mt).
+Proof of Lemma A.1. Fix t and θ, and write Σ := Mt(θ). For notational simplicity we suppress the dependence on
+(t, θ) when clear. The marginal pt(·; θ) is the Gaussian convolution
+pt(x; θ) =
+Z
+Rd p0(x0) φΣ(x −x0) dx0,
+φΣ(z) := (2π)−d/2|Σ|−1/2 exp
+
+−1
+2z⊤Σ−1z
+
+.
+Assuming Σ ≻0, we may differentiate under the integral sign to obtain
+∇xpt(x; θ) =
+Z
+p0(x0) ∇xφΣ(x −x0) dx0.
+Since ∇xφΣ(x −x0) = Σ−1(x0 −x) φΣ(x −x0), we get
+∇xpt(x; θ) = Σ−1
+Z
+p0(x0) (x0 −x) φΣ(x −x0) dx0.
+Dividing by pt(x; θ) yields
+∇x log pt(x; θ) = Σ−1
+R
+p0(x0) (x0 −x) φΣ(x −x0) dx0
+R
+p0(x0) φΣ(x −x0) dx0
+= Σ−1 E [x0 −x | xt = x] ,
+where the conditional distribution is p(x0 | xt = x) ∝p0(x0)φΣ(x −x0). Finally, since xt = x on the conditioning
+event, x0 −x = x0 −xt, giving the stated identity.
+Lemma A.2. For any w(t), there exists a gt(θ) and constant c, such that for any h(t)
+Z T
+0
+(∂tgt(θ))2
+1 + gt(θ) h(gt(θ))dt = c
+Z T
+0
+w(t)h(t)dt.
+Proof of Lemma A.2. Let w : [0, T] →(0, ∞) be measurable and define
+Φ(x) :=
+Z x
+0
+ds
+(1 + s)w(s) < ∞.
+Then, to prove this Lemma, it is sufficient to show there exist a c = Φ(T )
+T
+> 0 and a strictly increasing continuous
+function g : [0, T] →[0, T] with g(0) = 0, g(T) = T such that
+g′ g−1(t)
+
+1 + t
+= cw(t) for all t.
+where c = Φ(T)/T.
+Define g implicitly by Φ
+ g(t)
+
+= ct for (0 ≤t ≤T), i.e. g(t) = Φ−1(ct). Differentiating Φ(g(t)) = ct with respect
+to t yields the separable ODE g′(t) = (1 + g(t))cw(g(t)), and with r = g(t) this is g′(g−1(r))
+1+r
+= cw(r). Hence, we
+derive an expression for g involving a constant c and any w. Monotonicity of g(t) follows since w > 0 and c > 0 imply
+g′(t) > 0.
+Substituting into c
+R T
+0 w(t)h(t)dt, we get
+c
+Z T
+0
+w(r)h(r)dr =
+Z T
+0
+g′(t)
+1 + g(t)h(g(t))g′(t)dt.
+13
+
+
+--- Page 14 ---
+Lemma A.3. Assume M¯t commutes with ∂¯tM¯t. Let ˜u be as defined in Section 5. Then
+Z tk−1
+tk
+(∂sM 1/2
+s
+)˜u(s) ds
+= (M 1/2
+tk
+−M 1/2
+tk−1)(flow(˜xtk, tk)) −1
+2(M 1/2
+tk−1 −M 1/2
+tk )2 M 1/2
+ˆtk
+−M 1/2
+tk
+−1 ·
+ flow(ˆxˆtk, ˆtk) −flow(˜xtk, tk)
+
+.
+Proof. Recall our notation that
+uk := flow(¯xtk, tk, ϕ),
+ˆuk := −flow(ˆxˆtk, ˆtk, ϕ).
+Z tk−1
+tk
+(∂sM 1/2
+s
+(θ))˜u(s) ds
+=
+Z tk−1
+tk
+(∂sM 1/2
+s
+(θ))
+
+uk + (M 1/2
+s
+(θ) −M 1/2
+tk (θ)) (M 1/2
+ˆtk (θ) −M 1/2
+tk (θ))−1 (ˆuk −uk)
+
+ds
+=
+
+M 1/2
+tk−1(θ) −M 1/2
+tk (θ)
+
+uk +
+Z tk−1
+tk
+(∂sM 1/2
+s
+(θ))(M 1/2
+s
+(θ) −M 1/2
+tk (θ)) ds (M 1/2
+ˆtk (θ) −M 1/2
+tk (θ))−1(ˆuk −uk)
+=
+
+M 1/2
+tk−1(θ) −M 1/2
+tk (θ)
+
+uk + 1
+2(M 1/2
+tk−1(θ) −M 1/2
+tk (θ))2(M 1/2
+ˆtk (θ) −M 1/2
+tk (θ))−1(ˆuk −uk).
+B
+Proofs
+B.1
+Proof of Lemma 3.1
+We simplify the term inside the Euclidean norm in (12):
+¯v(xt, t; θ, ϕ) −˜v(xt, x0, t; θ)
+= (I + Mt(θ))−1/2∂tMt(θ)(M −1
+t
+(θ)(x0 −xt) −net(xt, t, ϕ)).
+Let Mall denote (I + Mt(θ))−1/2∂tMt(θ). Let V : Rd →Rd be an arbitrary vector field.
+We can minimize the expectation pointwise at each xt. We can rewrite the expectation
+Ex0,ϵ
+hMall(net(xt, t, ϕ) −M −1
+t
+(θ)(x0 −xt))
+2
+2
+i
+as
+Ex0,ϵ
+hMall(V (xt) −M −1
+t
+(θ)(x0 −xt))
+2
+2
+i
+= Ext
+h
+Ex0,ϵ|xt
+hMall(V (xt) −M −1
+t
+(θ)(x0 −xt))
+2
+2
+ii
+by the law of iterated expectation.
+arg min
+v∈Rd Ex0,ϵ|xt
+h
+(v −M −1
+t
+(θ)(x0 −xt))⊤
+Mall(v −M −1
+t
+(θ)(x0 −xt))
+i
+= M −1
+t
+(θ)Ex0,ϵ|xt [x0 −xt] = ∇log pt(x; θ).
+The above equality follows from (4). The penultimate equality follows from the fact that arg mina∈Rd(b−a)⊤Q(b−a) =
+b for any PSD matrix Q. Note that ∂tMt = A2
+t is PSD, and Mt being the covariance in the diffusion process is also
+PSD. Hence, assuming that ∂tMt commutes with Mt, Mall is PSD.
+14
+
+
+--- Page 15 ---
+B.2
+Proof of Theorem 4.1
+To simplify notation, we will drop the index j and treat θ as a scalar. The general proof for θ ∈Rc follows by repeating
+the proof for each θj, while holding all other θ′
+ks fixed. Recall that pt(·; θ) = p0 ∗N(0, Mt(θ)). By the the heat
+equation (applied to ∂θMt(θ) instead of ∂tMt(θ)),
+∂θpt(x; θ)
+=1
+2div(pt(x; θ)∂θMt(θ)∇log pt(x; θ))
+=1
+2pt(x; θ)div(∂θMt(θ)∇log pt(x; θ))
++ 1
+2pt(x; θ) ⟨∇log pt(x; θ), ∂θMt(θ)∇log pt(x; θ)⟩.
+Dividing both sides by pt(x; θ) gives
+∂θ log pt(x; θ)
+=1
+2div(∂θMt(θ)∇log pt(x; θ))
++ 1
+2 ⟨∇log pt(x; θ), ∂θMt(θ)∇log pt(x; θ)⟩
+=1
+2
+X
+i
+
+∂θMt(θ)ei, ∇2 log pt(x; θ)ei
+
++ 1
+2 ⟨∇log pt(x; θ), ∂θMt(θ)∇log pt(x; θ)⟩
+=1
+2
+X
+i
+⟨∂θMt(θ)ei, ∂c∇log pt(x + cei; θ)⟩
++ 1
+2 ⟨∇log pt(x; θ), ∂θMt(θ)∇log pt(x; θ)⟩.
+Taking a derivative wrt x gives
+∂θ∇log pt(x; θ)
+=1
+2
+X
+i
+
+∂θMt(θ)ei, ∂c∇2 log pt(x + cei; θ)
+
++
+
+∂θMt(θ)∇log pt(x; θ), ∇2 log pt(x; θ)
+
+=1
+2
+X
+i
+∂r∂s∇log pt(x + rei + s∂θMt(θ)ei; θ)
++ ∂s∇log pt(x + s∂θMt(θ)∇log pt(x; θ); θ).
+This concludes the proof of (17). To prove (17), we combine (17) with the guarantee that net(x, t, ϕ∗(θ)) =
+∇log pt(x; θ) from Lemma 3.1.
+B.3
+Proof of Corollary 4.2
+Recall that
+flow(x; θ) = Mt(θ)1/2net(x; θ) = Mt(θ)1/2∇log pt(x; θ).
+Recall also from (17) that
+∂θnet(x, t, ϕ∗(θ))
+=1
+2
+d
+X
+i=1
+∂r∂snet(x + rei + s∂θMt(θ)ei, t, ϕ∗(θ))
++ ∂snet(x + s∂θMt(θ)net(x, t, ϕ∗(θ)), t, ϕ∗(θ)).
+15
+
+
+--- Page 16 ---
+Combining the two equations above:
+∂θflow(x; ϕ∗(θ))
+=Mt(θ)1/2∂θnet(x; ϕ∗(θ)) + 1
+2Mt(θ)−1/2(∂θMt(θ))net(x; ϕ∗(θ))
+=1
+2
+X
+i
+Mt(θ)1/2∂r∂snet(x + rei + s∂θMt(θ)ei; ϕ∗(θ))
++ Mt(θ)1/2∂snet(x + s∂θMt(θ)net(x; ϕ∗(θ)); ϕ∗(θ)) + 1
+2Mt(θ)−1/2(∂θMt(θ))net(x; ϕ∗(θ))
+=1
+2
+X
+i
+∂r∂sflow(x + rei + s∂θMt(θ)ei; ϕ∗(θ))
++ ∂sflow(x + sMt(θ)−1/2∂θMt(θ)flow(x; ϕ∗(θ)); ϕ∗(θ)) + 1
+2Mt(θ)−1(∂θMt(θ))flow(x; ϕ∗(θ)).
+C
+Implementation Details of gi
+For a fixed set of node locations 0 = τ0 < τ1 < · · · < τK−1 = T, the subspace noise schedule is defined in
+log–space between the smallest and largest variance values g(0) = g0 and g(T) = T. The trainable parameters
+θ = (θ1, . . . , θK−1) define a collection of strictly positive increments
+si = softplus(θi),
+i = 1, . . . , K −1,
+These increments are then rescaled by α so that their sum exactly matches the total log–gap between the endpoints,
+α = log T −log g0
+PK−1
+i=1 si
+.
+The log–values at the nodes are constructed by cumulative summation,
+ℓ0 = log g0,
+ℓj = ℓ0 +
+j
+X
+i=1
+αsi,
+j = 1, . . . , K −1,
+so that ℓK−1 = log T.
+Given a time t ∈[0, T], one locates the enclosing interval [τj−1, τj] and computes the normalized position
+p(t) = t −τj−1
+τj −τj−1
+.
+The value of g(t) is then obtained by linearly interpolating between successive log–nodes and exponentiating:
+log g(t) = (1 −p(t))ℓj−1 + p(t)ℓj,
+g(t) = exp
+ log g(t)
+
+.
+Within each interval the derivative takes the simple form
+g′(t) = g(t)ℓj −ℓj−1
+τj −τj−1
+.
+D
+Detailed Training Setup
+Initialization.
+All experiments are initialized from the corresponding pretrained EDM checkpoints. We load both raw
+network weights and their exponential moving average (EMA) counterparts. When learning diffusion schedules, we
+initialize schedule parameters from a pretrained isotropic schedule model. For conditional variants, schedule parameters
+are instantiated per class. If class-wise isotropic schedules are available, they are used for initialization; otherwise, a
+shared global schedule is copied across classes.
+Joint optimization of network and schedule.
+We jointly optimize network parameters ϕ and schedule parameters
+θ using Adam (β1 = 0.9, β2 = 0.999, ϵ = 10−8). Network and schedule parameters use separate learning rates.
+Gradients are accumulated over multiple micro-batches to achieve the target effective batch size. After backpropagation,
+gradients are explicitly sanitized by replacing NaNs and infinities with finite values to ensure numerical stability.
+For class-conditional schedules, schedule updates are applied only to classes present in the current batch; in distributed
+settings, we synchronize the set of active classes across workers before applying optimizer steps to maintain consistent
+parameter updates.
+16
+
+
+--- Page 17 ---
+Learning-rate schedule.
+We employ a linear warm-up for the first Kramp kimg. After warm-up, the learning rate
+follows a mild decay schedule, with a decay factor applied after the midpoint of training. The learning rate of schedule
+parameters scales proportionally to the network learning rate.
+EMA update.
+We maintain an exponential moving average of network parameters throughout training. The EMA
+half-life is specified in kimg units. Optionally, we apply an EMA ramp-up, where the effective half-life is bounded by
+the number of images seen so far during early training. EMA parameters are synchronized across workers in distributed
+settings.
+Distributed training.
+For large-scale experiments (e.g., ImageNet-64), we use PyTorch Distributed Data Parallel
+(DDP) with NCCL backend. The global batch is evenly partitioned across workers. All parameters are broadcast from
+rank 0 at initialization. Gradients of network parameters are synchronized via DDP. Schedule parameters are explicitly
+all-reduced across workers, including zero-filled gradients for classes absent on a given worker, to guarantee consistent
+updates across GPUs.
+Training budget and checkpoints.
+Across all datasets, fine-tuning processes approximately 1.2M images in total. We
+periodically save raw network weights, EMA weights, and schedule parameters. Unless otherwise specified, evaluation
+is performed using the final EMA checkpoint.
+E
+Additional Experimental Analysis
+Figures 2–5 visualize the learned schedules across datasets, subspace parameterizations, and conditioning schemes.
+First, across all datasets (Figures 2–4), the learned anisotropic ratios deviate systematically from one over a substantial
+portion of the diffusion horizon, confirming that the two subspaces are not treated symmetrically by the learned schedule.
+However, the magnitude and shape of this deviation depend strongly on the dataset. For CIFAR-10 (Figure 2(b)) and
+AFHQv2 (Figure 3), the anisotropy ratio exhibits a smooth mid-horizon amplification before returning to one near the
+endpoints, suggesting that anisotropy is primarily active during intermediate diffusion times. In contrast, for FFHQ
+(Figure 4) the ratio shows a more pronounced early amplification followed by a gradual decay, indicating stronger
+low-frequency emphasis at early noise levels.
+Second, on the class-conditional datasets (CIFAR-10 and ImageNet-64; Figures 2 and 5), class-conditional training
+induces clear inter-class variability in both isotropic and anisotropic schedules. In CIFAR-10 (Figure 2(c,d)), the
+class-conditional isotropic schedules display substantial dispersion around the geometric mean, and the anisotropic
+schedules further amplify these differences. On ImageNet-64 (Figure 5(a–f)), this effect becomes more structured:
+while class-conditional isotropic schedules vary moderately, the anisotropic variants reveal consistent class-dependent
+shifts in both geometric means and anisotropy ratios. Notably, the PCA-based conditional schedules in Figure 5(d–f)
+exhibit tighter concentration than their DCT counterparts (Figure 5(b,c)), suggesting that class-adaptive subspaces
+reduce unnecessary variability.
+F
+Geometric Structure of Learned Subspaces
+F.1
+PCA Visualization
+To analyze the geometry of the learned PCA subspaces, we first visualize the leading principal components for
+representative classes (cat, dog, airplane) in Figure 6. Each row shows the top principal directions reshaped into spatial
+patterns. We observe that semantically related classes (e.g., cat and dog) exhibit qualitatively similar dominant spatial
+structures, whereas structurally distinct classes (e.g., airplane) show noticeably different patterns.
+To quantify cross-class similarity, we compute pairwise distances between subspaces using the Frobenius norm of
+projector differences, i.e.,
+d (Q1, Q2) =
+Q1Q⊤
+1 −Q2Q⊤
+2
+
+F
+√
+2k
+,
+where Q1, Q2 are orthonormal bases. We then apply classical multidimensional scaling (MDS) to embed this distance
+matrix into two dimensions for visualization. MDS constructs a low-dimensional embedding whose pairwise Euclidean
+distances best approximate the original subspace distances. Figure 7 reveals clear semantic clustering, with animal
+classes grouped together and separated from vehicle classes.
+These observations suggest that the learned PCA subspaces capture semantically meaningful geometric structure.
+17
+
+
+--- Page 18 ---
+Figure 2: CIFAR-10 learned schedule analysis. (a) PCA-based geometric mean
+p
+gPCA
+1
+(t)gPCA
+2
+(t) with a log-linear
+reference (gray dashed; log y-axis). (b) PCA anisotropy ratio gPCA
+1
+(t)/gPCA
+2
+(t). (c) Class-conditional isotropic
+schedules gy(t)/¯g(t), where ¯g(t) =
+  QC
+y=1 gy(t)
+1/C with C = #class = 10. (d) Class-conditional anisotropic
+schedules over DCT subspaces: gDCT
+k,y (t)/¯gk(t) for k ∈{1, 2} (solid/dashed), where i indexes classes and ¯gk(t) is the
+geometric mean across classes.
+Figure 3: AFHQv2 learned schedule analysis. Ratio between the two learned DCT-based schedules gDCT
+1
+(t) and
+gDCT
+2
+(t) over time.
+F.2
+2D-DCT Transform Visualization
+Let H be the image side length and d = H2. The two-dimensional DCT (type-II) basis over RH×H is defined as
+follows. For each pair (p, q) ∈{0, . . . , H −1}2, the basis is
+Φp,q(x, y) = γpγq cos
+
+(2x+1)pπ
+2H
+
+cos
+
+(2y+1)qπ
+2H
+
+,
+x, y = 0, . . . , H −1.
+18
+
+
+--- Page 19 ---
+Figure 4: FFHQ learned schedule analysis. Ratio between the two learned DCT-based schedules gDCT
+1
+(t) and
+gDCT
+2
+(t) over time.
+Figure 5: ImageNet-64 learned schedule analysis. (a) Class-conditional isotropic schedules shown as gy(t)/¯g(t),
+where ¯g(t) denotes the geometric mean across classes. (b) Class-conditional anisotropic schedules summarized
+by the geometric mean
+q
+gDCT
+1,y (t)gDCT
+2,y (t) and normalized by its class-wise geometric mean. (c) Class-conditional
+anisotropy ratios gDCT
+1,y /gDCT
+2,y . (d) PCA-based (class-conditional basis) anisotropic schedule ratio gPCA
+1,y (t)/gPCA
+2,y (t). (e)
+PCA-based (class-conditional basis) class-conditional anisotropic schedules shown as
+q
+gPCA
+1,y (t)gPCA
+2,y (t) normalized
+by the geometric mean across classes. (f) PCA-based (class-conditional basis) class-conditional anisotropy ratios
+gPCA
+1,y (t)/gPCA
+2,y (t). All ratios are plotted on a logarithmic y-axis, and dashed horizontal lines indicate the reference
+value 1.
+with normalization factors
+γp =
+(H−1/2,
+p = 0,
+√
+2H−1/2,
+p > 0,
+γq =
+(H−1/2,
+q = 0,
+√
+2H−1/2,
+q > 0.
+Vectorizing each Φp,q into Rd and enumerating them yields the orthonormal basis {v1, . . . , vH2}, which are the
+2D-DCT basis of Rd. Please refer to Figure 8 for example 2D-DCT bases.
+19
+
+
+--- Page 20 ---
+Figure 6: Class-specific PCA subspaces. Leading principal components for representative CIFAR-10 classes (cat,
+dog, airplane), reshaped as spatial patterns. Semantically related classes (e.g., cat and dog) exhibit qualitatively similar
+dominant structures, whereas visually distinct classes (e.g., airplane) display different principal directions.
+Figure 7: Subspace distance embedding via classical MDS. Pairwise distances between class-specific PCA subspaces
+are computed using the Frobenius norm between orthogonal projectors. Classical multidimensional scaling (MDS)
+embeds the resulting distance matrix into two dimensions. Animal classes cluster together and are separated from
+vehicle classes, indicating that the learned subspaces capture semantically structured geometry.
+20
+
+
+--- Page 21 ---
+u=0, v=0
+u=0, v=1
+u=1, v=0
+u=1, v=1
+u=0, v=2
+u=1, v=2
+u=2, v=0
+u=2, v=1
+u=2, v=2
+Figure 8: The first nine 2D-DCT bases ordered by increasing frequency.
+21
