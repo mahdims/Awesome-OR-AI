@@ -1,10 +1,21 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-02-24
+**Last Updated:** 2026-02-26
 
 ---
 
 ## Recent Papers
+
+#### 2026-02-26 (1 papers)
+
+### [OptiRepair: Closed-Loop Diagnosis and Repair of Supply Chain Optimization Models with LLM Agents](https://arxiv.org/abs/2602.19439)
+
+**2026-02-23** | Massachusetts Institute of Technology, Alibaba Group | M=8 P=7 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Two-phase closed-loop LLM agent with IIS-guided diagnosis, domain-specific rationality oracle, iterative STaR, and GRPO refinement | *LLM role:* diagnosis_and_repair
+
+> Ao et al. introduce OptiRepair, a closed-loop framework that repairs infeasible LPs using solver IIS feedback (Phase 1) and validates them with a 'Rationality Oracle' based on domain theory (Phase 2). Results are exceptionally strong: fine-tuned 8B models trained via iterative STaR and GRPO achieve 81.7% success, outperforming GPT-5.2 (42.2%) by a massive margin. **Key Takeaway:** We should steal the 'Rationality Oracle' concept—evaluating solution *properties* (e.g., monotonicity, variance bounds) rather than just raw fitness—to serve as a dense signal for our Process Reward Models in AlgoEvo. Additionally, their success with solver-verified GRPO confirms we should prioritize training specialized operators over prompting general LLMs.
+
 
 #### 2026-02-24 (1 papers)
 

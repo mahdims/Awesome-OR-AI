@@ -1,10 +1,77 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-02-24
+**Last Updated:** 2026-02-26
 
 ---
 
 ## Recent Papers
+
+#### 2026-02-26 (8 papers)
+
+### [DualPath: Breaking the Storage Bandwidth Bottleneck in Agentic LLM Inference](https://arxiv.org/abs/2602.21548)
+
+**2026-02-25** | DeepSeek-AI, Peking University, Tsinghua University | M=6 P=9 I=7 **MUST-READ** *discuss*
+
+*Method:* Dual-path KV-Cache loading architecture with CNIC-centric traffic management and adaptive request scheduling | *LLM role:* none
+
+> Wu et al. introduce DualPath, a system that breaks the storage I/O bottleneck in agentic inference by utilizing idle decode-node bandwidth to load KV-cache and transferring it to prefill nodes via RDMA. The results are highly credible (1.87x throughput increase on DeepSeek-V3) and directly target the long-context, short-append patterns typical of our evolutionary search rollouts. The most valuable technical takeaway is the 'CNIC-centric' traffic management strategy, which isolates bulk KV transfer from latency-sensitive model collectives—a technique we should immediately steal for our own serving infrastructure. While their scheduling logic is a simple heuristic, the architectural change defines a new, more flexible state space for our OR-based resource allocation research.
+
+### [Training Generalizable Collaborative Agents via Strategic Risk Aversion](https://arxiv.org/abs/2602.21515)
+
+**2026-02-25** | Caltech | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Strategically Risk-Averse Policy Optimization (SRPO) based on Risk-Averse Quantal Response Equilibria (RQE) | *LLM role:* collaborative_agent
+
+> Qu et al. introduce Strategically Risk-Averse Policy Optimization (SRPO), which trains agents against a 'constrained adversary' that minimizes their reward within a KL-divergence bound of the partner's current policy. Theoretical results prove this objective eliminates free-riding equilibria, and experiments on GSM8K multi-agent debate show it prevents 'lazy' agreement, improving joint accuracy by up to 19% when pairing heterogeneous LLMs (e.g., 0.6B with 4B). The key takeaway is that robustness to partner deviation—enforced via this specific adversarial objective—is a more principled way to fix lazy agent behavior than prompt engineering or simple dropout. We should immediately test this objective in our HERMES debate framework to improve the contribution quality of smaller models.
+
+### [How to Allocate, How to Learn? Dynamic Rollout Allocation and Advantage Modulation for Policy Optimization](https://arxiv.org/abs/2602.19208)
+
+**2026-02-22** | Meituan, Tsinghua University, Fudan University, Peking University | M=8 P=7 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Dual-pronged optimization framework (DynaMO) combining variance-minimizing dynamic rollout allocation and gradient-aware advantage modulation for GRPO-based policy optimization | *LLM role:* policy_model
+
+> DynaMO introduces a dual-pronged optimization for RLVR: a dynamic rollout allocation strategy that prioritizes problems with high gradient variance (proxied by Bernoulli variance of success/failure), and a gradient modulation technique to stabilize updates. The results are strong (+11.8% Pass@1 over GRPO on Qwen-7B) and backed by clear ablations. **The critical takeaway for us is the allocation logic:** we should immediately replace uniform sampling in AlgoEvo with variance-based allocation ($n_i \propto \sqrt{p(1-p)}$). This ensures compute is spent on instances/components that are currently 'learnable' (high variance) rather than wasted on the trivial or impossible, directly optimizing our search budget.
+
+### [AgentConductor: Topology Evolution for Multi-Agent Competition-Level Code Generation](https://arxiv.org/abs/2602.17100)
+
+**2026-02-19** | Shanghai Jiao Tong University, Meituan | M=8 P=7 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Reinforcement learning (GRPO) optimized multi-agent system with LLM-based orchestrator agent for dynamic layered DAG topology generation | *LLM role:* orchestrator
+
+> AgentConductor trains an LLM orchestrator via GRPO to dynamically generate and refine layered DAG interaction topologies (output as YAML) for code generation, optimizing for both correctness and token efficiency. The key innovation is a multi-objective reward that combines execution correctness with a 'difficulty-aware density penalty,' forcing the model to learn a policy that scales graph complexity with task hardness. Results are strong, showing ~14% gains on APPS while reducing token costs. We should immediately steal the **YAML-based topology action space** and the **density-aware reward formulation** to implement RL-driven structure optimization in AlgoEvo and MASPRM, replacing our static or hand-tuned interaction graphs.
+
+### [ARLArena: A Unified Framework for Stable Agentic Reinforcement Learning](https://arxiv.org/abs/2602.21534)
+
+**2026-02-25** | University of California, Los Angeles, University of Wisconsin–Madison | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Stable Agentic Multi-turn Policy Optimization (SAMPO) integrating sequence-level clipping, fine-grained advantage estimation, and dynamic filtering | *LLM role:* policy
+
+> The authors dissect why standard RL (GRPO/PPO) fails in multi-turn agentic tasks, identifying that token-level importance sampling (IS) clipping allows negative-advantage outliers to destabilize training. They propose SAMPO, which enforces sequence-level clipping and integrates fine-grained step-level advantages (similar to process rewards) to stabilize learning. The results are rigorous, showing a jump from ~50% to 92% success on ALFWorld by fixing the gradient update mechanics rather than just prompt engineering. **Key Takeaway:** We must audit our RL implementations; if we are using token-level clipping for multi-step evolutionary agents, we are likely suffering from silent gradient instability—switching to sequence-level clipping and masking negative-advantage outliers is an immediate, code-level improvement we should adopt.
+
+### [Reasoning-Driven Design of Single Atom Catalysts via a Multi-Agent Large Language Model Framework](https://arxiv.org/abs/2602.21533)
+
+**2026-02-25** | Georgia Institute of Technology, Korea University, Sogang University, Ewha Womans University | M=7 P=3 I=8 *discuss*
+
+*Method:* Multi-Agent-based Electrocatalyst Search Through Reasoning and Optimization (MAESTRO) framework using LLM agents and a Machine Learning Force Field (MLFF) surrogate model | *LLM role:* evolutionary_search
+
+> Mok et al. propose MAESTRO, a multi-agent LLM framework for optimizing single-atom catalysts that explicitly separates search into exploration and exploitation phases, bridged by a textual 'Exploration Report.' Results are validated against high-fidelity DFT calculations, showing the system learns to break theoretical scaling relations via in-context learning, outperforming memory-less baselines. The key takeaway for us is the **Exploration Report Agent**: instead of just passing the best candidates to the exploitation phase, the system pauses to write a natural language strategy guide summarizing 'what worked and what didn't' from the exploration phase. We should steal this mechanism for AlgoEvo to let the search agent 'learn' from the initial population generation rather than just selecting from it.
+
+### [GauS: Differentiable Scheduling Optimization via Gaussian Reparameterization](https://arxiv.org/abs/2602.20427)
+
+**2026-02-23** | Cornell University, University of Maryland, College Park | M=7 P=5 I=7 *discuss*
+
+*Method:* Differentiable Scheduling Optimization via Gaussian Reparameterization with Augmented Lagrangian Method | *LLM role:* none
+
+> GauS replaces the standard categorical (Gumbel-Softmax) relaxation in differentiable scheduling with Gaussian variables defined by mean and variance, reducing parameter space from O(N*D) to O(N). Results are strong: it scales to 57k nodes where previous differentiable methods OOM and exact solvers timeout, while maintaining near-100% GPU utilization. The key takeaway is a specific modeling technique: using Gaussian distributions to represent discrete ordinal values (like time steps) naturally captures temporal proximity and provides smoother gradients than categorical buckets. We should test this representation in our continuous latent-space optimization work to replace categorical relaxations for ordered parameters.
+
+### [Alignment in Time: Peak-Aware Orchestration for Long-Horizon Agentic Systems](https://arxiv.org/abs/2602.17910)
+
+**2026-02-20** | Lehigh University | M=7 P=5 I=7 *discuss*
+
+*Method:* APEMO (Affect-aware Peak-End Modulation for Orchestration), a runtime scheduling layer that reallocates reasoning effort and repair across a trajectory under fixed computational budgets by operationalizing temporal-affective signals. | *LLM role:* agents_being_orchestrated
+
+> Shi et al. introduce APEMO, a runtime orchestration layer that monitors agent trajectories for behavioral instability (e.g., repetition, drift) and dynamically reallocates a fixed compute budget to 'repair' these segments rather than spreading compute uniformly. The results are statistically rigorous, using bootstrap CIs to demonstrate significant improvements in trajectory robustness and completion rates without model retraining. **Key Takeaway:** We should steal the 'precision repair' logic: instead of uniform sampling in AlgoEvo, we can implement a 'stagnation detector' that triggers deeper inference or multi-agent debate only when the search gets stuck in local optima. This directly addresses our sample efficiency and resource allocation goals.
+
 
 #### 2026-02-24 (4 papers)
 
