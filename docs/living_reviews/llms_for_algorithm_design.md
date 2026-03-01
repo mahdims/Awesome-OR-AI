@@ -1,10 +1,21 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-02-26
+**Last Updated:** 2026-03-01
 
 ---
 
 ## Recent Papers
+
+#### 2026-03-01 (1 papers)
+
+### [AdaEvolve: Adaptive LLM Driven Zeroth-Order Optimization](https://arxiv.org/abs/2602.20133)
+
+**2026-02-23** | University of California, Berkeley, Bespoke Labs | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* LLM-driven evolutionary algorithm with hierarchical adaptive optimization using an accumulated improvement signal to dynamically modulate local exploration intensity, global resource allocation via multi-armed bandit, and meta-level solution tactics generation | *LLM role:* semantic_mutation_operator
+
+> AdaEvolve replaces static evolutionary schedules with a three-tier adaptive controller: local exploration intensity based on an 'accumulated improvement signal' (pseudo-gradient), global compute allocation via a normalized bandit, and meta-level 'tactic' generation when stagnation occurs. Results are highly convincing, showing SOTA on Circle Packing (beating AlphaEvolve) and 185 other tasks while using the same LLM backbone as baselines, proving the gains are algorithmic. The most stealable insight is the $G_t$ signal metric—an exponential moving average of squared normalized improvements—which allows auto-tuning exploration rates without manual intervention. This is a direct upgrade for our AlgoEvo architecture, specifically addressing our sample efficiency and stagnation bottlenecks.
+
 
 #### 2026-02-26 (1 papers)
 
