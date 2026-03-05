@@ -1,0 +1,1164 @@
+--- Page 1 ---
+Entropic-Time Inference: Self-Organizing Large Language Model
+Decoding Beyond Attention
+Andrew J. Kiruluta
+School of Information
+kiruluta@berkeley.edu
+March 5, 2026
+Abstract
+Modern large language model (LLM) inference engines optimize throughput and latency
+under fixed decoding rules, treating generation as a linear progression in token time. We propose
+a fundamentally different paradigm: entropic-time inference, where decoding is governed by the
+flow of uncertainty rather than token index. We introduce a self-organizing inference architecture
+that jointly couples scheduling, attention sparsification, and sampling temperature under a
+unified entropy control objective. Our method extends vLLM with entropy-aware scheduling,
+entropic pruning of paged attention blocks, and adaptive temperature control that stabilizes
+generation near a target entropy regime. This transforms inference into a resource-intelligent
+thermodynamic process that allocates computation where uncertainty reduction is maximized.
+We present a concrete systems design, pseudocode, and integration plan, demonstrating how
+entropy can serve as a first-class control signal for scalable LLM inference.
+1
+Introduction
+Inference in large language models (LLMs) is typically formulated as a deterministic execution
+problem. Given a fixed model and prompt, decoding proceeds in discrete token steps indexed by
+an external clock t ∈N. At each step, the model induces a predictive distribution
+pt(x) = p(x | x<t),
+and inference engines are optimized to maximize throughput and minimize latency under this token-
+indexed notion of time. Attention spans grow monotonically with context length [25, 4, 1], and
+stochasticity is controlled by fixed sampling parameters such as temperature or nucleus thresholds
+[14]. This framing reflects the dominant systems-level view of inference as a scheduling and memory
+management problem [16, 6].
+However, this perspective obscures a fundamental property of language generation: generation
+is an uncertainty resolution process.
+At each decoding step, the uncertainty of the predictive
+distribution is quantified by its Shannon entropy
+Ht = −
+X
+x
+pt(x) log pt(x),
+a quantity central to information theory since Shannon’s foundational work [23, 5]. Empirically,
+Ht varies dramatically across steps and sequences. Some decoding steps correspond to decisive
+semantic commitments, where entropy collapses rapidly, while others correspond to syntactic filler,
+1
+arXiv:2603.03310v1  [cs.CL]  8 Feb 2026
+
+
+--- Page 2 ---
+repetition, or long-tailed ambiguity, where entropy remains high despite substantial computational
+effort.
+Despite this variability, standard inference treats all token steps as equivalent. Attention com-
+putation scales with context length regardless of whether additional context materially reduces
+uncertainty [4, 6], and scheduling decisions are largely oblivious to the informational state of a se-
+quence [16]. As a result, significant compute is often expended resolving uncertainty that has little
+effect on output quality or downstream utility. This mismatch mirrors earlier observations in adap-
+tive computation and sequence modeling, where fixed-time execution was shown to be suboptimal
+when information gain is unevenly distributed across steps [7, 12].
+Operational time and entropy flow.
+We argue that inference time should be defined opera-
+tionally, rather than indexically. In information theory and statistical physics, progress is naturally
+measured by irreversible reductions in uncertainty or free energy [21, 9]. Adopting this view, we
+define progress in inference not by token count, but by entropy flow. Let
+∆Ht = Ht−1 −Ht
+denote the entropy reduction at step t. Only when ∆Ht > 0 does the system undergo a distin-
+guishable informational change.
+This motivates the notion of entropic time,
+τ =
+X
+t
+max(0, ∆Ht),
+which measures cumulative uncertainty resolved during generation. Under this definition, many
+token steps contribute negligibly to τ, despite incurring nontrivial computational cost. Similar
+entropy-based notions of progress have appeared in adaptive computation, control theory, and
+learning dynamics, where time is treated as an emergent, task-dependent quantity rather than a
+fixed external parameter [2, 12].
+Inference as an optimization problem.
+From this perspective, inference can be formulated
+as an optimization problem:
+max dτ
+dC ,
+where C denotes consumed resources such as floating-point operations, memory bandwidth, or KV-
+cache footprint. Optimal inference is therefore not achieved by fair scheduling or maximal batching
+alone, but by allocating computation where the expected entropy reduction per unit cost is highest.
+This objective aligns with classical results in information-theoretic learning and optimal control,
+where actions are selected to maximize information gain under resource constraints [5, 2].
+This reframing exposes a fundamental limitation of current inference systems. Scheduling de-
+cisions are made without regard to uncertainty, attention mechanisms interact uniformly with
+memory regardless of informational relevance, and sampling parameters remain fixed even though
+the appropriate degree of randomness depends strongly on the current entropy regime [14]. As
+a result, inference engines lack a global control signal that links uncertainty, computation, and
+randomness.
+Toward self-organizing inference.
+We propose that LLM inference should instead be under-
+stood as a self-organizing dynamical system governed by entropy flow. In such systems, uncertainty
+2
+
+
+--- Page 3 ---
+acts as a global control variable that regulates when computation is applied, where memory is ac-
+cessed, and how stochasticity is injected [9, 19]. This view does not require new model architectures.
+Rather, it elevates entropy to a first-class systems primitive, enabling inference engines that adap-
+tively allocate resources in response to informational demand.
+In the remainder of this paper, we develop this idea concretely by introducing entropic-time
+inference: a unified framework in which scheduling, attention sparsification, and sampling are
+jointly controlled by entropy-based feedback.
+Novelty and scope.
+The contribution of this work is not a new model architecture, attention
+mechanism, or decoding heuristic in isolation. Instead, we introduce a systems-level reframing of
+LLM inference in which entropy is elevated to a first-class control signal. While prior work has ad-
+dressed efficiency through sparse attention, adaptive computation, speculative decoding, or expert
+routing, these approaches typically optimize local mechanisms under a fixed notion of decoding
+time. In contrast, we propose an operational definition of inference time based on irreversible en-
+tropy reduction, and show how this definition induces a unified control law governing scheduling,
+memory interaction, and stochasticity. To our knowledge, this is the first inference framework that
+explicitly couples these components under a single entropy-based objective, enabling self-organizing
+behavior at the level of the inference engine rather than the model alone.
+Practical considerations.
+Our framework relies on entropy as an inference-time control signal.
+Two practical issues require explicit handling: (i) the cost of estimating token entropy at scale, and
+(ii) robustness when predictive probabilities are miscalibrated. First, computing exact Shannon
+entropy Ht = −P
+x∈V pt(x) log pt(x) over large vocabularies can be non-trivial. We therefore treat
+entropy estimation as an implementation choice, and evaluate lightweight approximations (e.g.,
+top-k entropy and log-sum-exp surrogates) that avoid full-vocabulary summation while preserv-
+ing control fidelity (Section 2.1). Second, since entropy is used as a proxy for uncertainty, poor
+calibration can lead to premature commitment and over-aggressive pruning. We mitigate this by
+(i) conservative thresholds, (ii) uncertainty floors, and (iii) optional calibration-aware corrections
+(Section 5).
+2
+Entropic-Time Principle
+We formalize language model inference as a stochastic dynamical process that resolves uncertainty
+over time. Let xt ∈V denote the token generated at step t, and let
+pt(x) := p(xt = x | x<t)
+be the predictive distribution induced by the model. The uncertainty associated with this distri-
+bution is quantified by its Shannon entropy
+Ht = −
+X
+x∈V
+pt(x) log pt(x),
+a measure fundamental to information theory and statistical inference [23, 5].
+Entropy dynamics during decoding.
+As decoding proceeds, the entropy sequence {Ht} gen-
+erally exhibits non-monotonic behavior. Some steps correspond to decisive semantic commitments,
+where uncertainty collapses rapidly, while others reflect syntactic continuation or ambiguity, where
+3
+
+
+--- Page 4 ---
+entropy remains high. Crucially, only entropy reductions correspond to irreversible informational
+progress. Entropy increases may occur due to stochastic sampling or representational uncertainty,
+but do not constitute net resolution of the predictive distribution.
+To isolate irreversible progress, we define the entropy flow at step t as
+∆Ht := Ht−1 −Ht,
+and retain only its positive component,
+∆H+
+t := max(0, ∆Ht).
+This construction mirrors classical treatments of entropy production in nonequilibrium systems,
+where only irreversible contributions are accumulated [22, 8].
+Definition of entropic time.
+We define entropic time as the cumulative irreversible entropy
+flow during decoding:
+τ :=
+X
+t
+∆H+
+t .
+Entropic time τ measures the total amount of uncertainty resolved by the inference process, inde-
+pendent of the number of token steps executed. Under this definition, multiple decoding steps may
+contribute negligibly to τ, despite incurring nontrivial computational cost.
+This definition departs from the conventional indexical notion of time used in inference systems.
+Instead, it aligns with operational notions of time in information theory and control, where progress
+is defined by state distinguishability rather than clock ticks [21, 2].
+Inference efficiency as an information–resource tradeoff.
+Let Ct denote the incremental
+resource cost incurred at step t, including compute, memory bandwidth, or KV-cache utilization.
+We define the cumulative cost C := P
+t Ct. Inference efficiency is then naturally characterized by
+the ratio
+dτ
+dC ,
+which quantifies irreversible entropy reduction per unit resource. Maximizing this quantity corre-
+sponds to allocating computation where it yields the greatest informational gain.
+This objective closely parallels classical results in optimal experimental design and active learn-
+ing, where actions are chosen to maximize expected information gain under cost constraints [20, 5].
+In the context of LLM inference, however, the control variables are not queries or experiments, but
+system-level decisions such as scheduling, memory access, and stochasticity injection.
+Thermodynamic interpretation.
+Viewed through this lens, decoding constitutes a nonequilib-
+rium information-processing process. The predictive distribution pt plays the role of a mesoscopic
+state, entropy gradients drive irreversible evolution, and computational resources supply the work
+required to reduce uncertainty. This interpretation is consistent with modern thermodynamic treat-
+ments of information processing systems, where entropy reduction is associated with physical or
+computational cost [17, 22].
+Importantly, this framework does not posit a physical temperature or energy for the model
+itself.
+Rather, entropy serves as an abstract but operational control variable that governs the
+allocation of finite computational resources during inference. In subsequent sections, we show how
+this principle induces concrete control laws for scheduling, attention sparsification, and sampling,
+yielding a self-organizing inference engine driven by entropy flow.
+4
+
+
+--- Page 5 ---
+2.1
+Entropy Estimation and Computational Cost
+The control laws in entropic-time inference require an estimate of the predictive entropy Ht. A
+na¨ıve implementation computes
+Ht = −
+X
+x∈V
+pt(x) log pt(x),
+pt(x) =
+exp(zt(x)/Tt)
+P
+y∈V exp(zt(y)/Tt),
+which entails a summation over the full vocabulary |V|. For modern LLMs with |V| ≳105, exact
+entropy evaluation can introduce non-negligible overhead.
+Cost model.
+Let |V| denote vocabulary size. Exact entropy computation requires (i) a normal-
+ization term (log-sum-exp) over |V| logits and (ii) a weighted sum over |V| probabilities, giving
+O(|V|) operations per token, in addition to any sampling-time top-k selection already performed.
+In contrast, attention computation in long-context decoding scales as O(L · d) (dense) or O(B · d)
+with block sparsification, where L is context length, d is head dimension, and B is the number
+of active KV blocks. Entropic-time inference is advantageous when the savings from reduced at-
+tention and KV traffic dominate the incremental entropy-estimation cost, a regime that occurs for
+sufficiently long contexts and/or high concurrency.
+Top-k entropy approximation.
+To reduce overhead, we estimate entropy using only the top-k
+logits (already computed in many decoding stacks for sampling and filtering [14]). Let Kt be the
+set of top-k tokens under pt. Define the truncated distribution
+˜pt(x) =
+(
+pt(x)
+P
+y∈Kt pt(y)
+x ∈Kt,
+0
+otherwise,
+and the corresponding entropy estimate
+˜Ht = −
+X
+x∈Kt
+˜pt(x) log ˜pt(x).
+This yields an O(k) estimator (plus top-k selection cost) and is sufficient for control provided that
+the tail mass outside Kt is small.
+Tail-corrected estimator.
+When tail mass is non-negligible, we use a conservative correction.
+Let mt = P
+x∈Kt pt(x) and ¯mt = 1 −mt. A lower bound on entropy is given by ˜Ht. A simple upper
+bound assumes the tail is uniform over |V| −k tokens:
+Ht ≤˜Ht + h( ¯mt) + ¯mt log(|V| −k),
+where h(·) is the binary entropy function. We operationalize a robust estimate via
+bHt := ˜Ht + h( ¯mt) + ¯mt log(|V| −k),
+which is inexpensive and intentionally conservative, reducing the risk of premature pruning when
+uncertainty is underestimated.
+5
+
+
+--- Page 6 ---
+Practical implementation note.
+Many inference stacks already compute (i) top-k sets and
+(ii) log-sum-exp normalizers for sampling or nucleus filtering, so the incremental cost of bHt is
+primarily an O(k) weighted sum rather than a full-vocabulary pass. We report ablations comparing
+exact versus approximate entropy estimators (Section 6.1), and find that top-k and tail-corrected
+estimators preserve the control behavior while materially reducing overhead.
+3
+System Architecture
+We now describe the architecture of entropic-time inference as a hierarchy of coupled control pro-
+cesses operating at distinct temporal and spatial scales. The core design principle is that entropy
+acts as a global state variable whose dynamics regulate computation, memory interaction, and
+stochasticity. Rather than introducing new model components, the architecture overlays control
+laws onto an existing inference engine.
+Formally, the system evolves as a discrete-time stochastic process with state
+St =
+ {p(s)
+t }s, {H(s)
+t
+}s, Mt, Tt
+
+,
+where p(s)
+t
+is the predictive distribution for sequence s, H(s)
+t
+its entropy, Mt the memory (KV-cache)
+state, and Tt the sampling temperature. Control actions at each step modulate which sequences
+advance, which memory regions are accessed, and how randomness is injected.
+3.1
+Macro-Scale: Entropy-Aware Scheduling
+At the coarsest scale, the scheduler allocates compute across active sequences. Let s ∈At denote
+an active sequence at time t. We associate to each sequence an entropy profile capturing recent
+entropy dynamics and resource usage. The scheduler assigns a priority score
+π(s) =
+E[∆Hs | St]
+αCs + βMs + γLs
+,
+where:
+• E[∆Hs] is the expected irreversible entropy reduction for sequence s,
+• Cs denotes expected compute cost (e.g. attention FLOPs),
+• Ms denotes memory pressure, including KV-cache growth and fragmentation,
+• Ls denotes latency risk or service-level urgency,
+• α, β, γ > 0 are tunable trade-off coefficients.
+This formulation casts scheduling as a constrained optimal control problem, analogous to
+information-gain maximization under cost constraints in sequential decision-making [20, 2]. Se-
+quences that are informationally resolved naturally lose priority, preventing wasted computation,
+while unresolved sequences are preferentially advanced. Under mild boundedness assumptions, this
+policy avoids starvation and yields stable scheduling dynamics.
+6
+
+
+--- Page 7 ---
+3.2
+Meso-Scale: Entropic Attention Pruning
+At an intermediate scale, we control how each advancing sequence interacts with memory. Modern
+inference engines employ paged attention mechanisms in which the key–value cache is partitioned
+into blocks [16]. Let b index such a block, and let {ai}i∈b denote the attention weights assigned to
+tokens in block b.
+We define the entropic contribution of block b as
+Ib =
+X
+i∈b
+ai · I(vi),
+I(vi) := −log p(vi),
+where I(vi) is the surprisal associated with the value vector vi. This quantity measures the expected
+information contributed by block b to the current prediction. Blocks with low Ib are informationally
+redundant and unlikely to contribute to entropy reduction.
+Attention computation is therefore restricted to the subset
+Bt = {b | Ib ≥θt},
+where θt is a dynamic threshold determined by the current entropy regime.
+This mechanism
+resembles adaptive state compression in information-theoretic filtering and nonequilibrium inference
+[21, 22]. Crucially, sparsification is not static but emerges from entropy feedback, allowing attention
+patterns to self-organize as decoding progresses.
+3.3
+Micro-Scale: Entropy-Stabilized Sampling
+At the finest scale, entropy directly regulates stochasticity in token generation. Let Ht denote the
+entropy of the predictive distribution after attention pruning. Rather than fixing the sampling
+temperature, we update it according to the control law
+Tt+1 = clip
+ Tt exp
+ η(Ht −H∗)
+
+, Tmin, Tmax
+
+,
+where H∗is a target entropy and η a gain parameter.
+This update defines a nonlinear feedback controller that stabilizes entropy dynamics. Under
+standard Lipschitz assumptions on H(T), the update is locally contractive around H∗, ensur-
+ing bounded entropy oscillations [2]. High-entropy regimes are driven toward commitment, while
+low-entropy regimes avoid premature collapse. This mechanism generalizes fixed-temperature and
+nucleus sampling by making randomness state-dependent [14].
+Entropy estimator in the control loop.
+In practice, the controller uses an entropy estimate
+bHt (exact or approximate) rather than exact Ht. All guarantees stated in Section 7 apply to bHt
+provided the estimation error is bounded, i.e., | bHt−Ht| ≤ϵH. We incorporate this as bounded mea-
+surement noise in the feedback loop, yielding robust stability under standard small-gain conditions
+[15].
+Conservative pruning under uncertainty bounds.
+To prevent premature pruning when en-
+tropy is underestimated, we implement a safety floor:
+θt ←θt ∧θmax(Hfloor
+t
+),
+Hfloor
+t
+:= bHt −ϵH,
+and enforce a minimum active-block budget |Bt| ≥Bmin. These constraints ensure that pruning
+becomes aggressive only when uncertainty is confidently low.
+7
+
+
+--- Page 8 ---
+3.4
+Coupled Self-Organization
+These three layers form a closed feedback loop:
+Entropy →Scheduling →Attention →Logits →Entropy.
+Entropy acts simultaneously as a diagnostic and a control signal. The result is a self-organizing in-
+ference engine in which computation, memory access, and stochasticity are continuously rebalanced
+in response to informational demand.
+Figure 1: Entropic-time inference architecture as a coupled control system. Entropy drives macro
+scheduling, meso memory interaction, and micro sampling control, forming a closed feedback loop.
+4
+Self-Organization and Emergent Behavior
+We now characterize entropic-time inference as a self-organizing dynamical system arising from the
+coupling of three local control laws. Crucially, no global optimization problem is solved explicitly.
+Instead, structured global behavior emerges from feedback between entropy dynamics, resource
+allocation, and stochastic control.
+Closed-loop formulation.
+Let St denote the global inference state at step t, consisting of predic-
+tive distributions, entropy estimates, memory state, and sampling parameters. The system evolves
+according to a discrete-time stochastic recursion
+St+1 = Φ(St, ut) ,
+where ut represents control actions induced by: (i) entropy-aware scheduling, (ii) entropic attention
+pruning, and (iii) entropy-stabilized sampling.
+8
+
+
+--- Page 9 ---
+Each control law depends only on local measurements of entropy and resource usage. However,
+these controls are coupled through the predictive distribution pt(x), yielding a closed feedback loop:
+Ht −→Scheduling −→Attention −→Logits −→Ht+1.
+Entropy as an order parameter.
+We interpret entropy Ht as a macroscopic order parameter
+governing inference dynamics. In statistical physics, order parameters summarize high-dimensional
+microscopic states and determine phase behavior [11]. Here, Ht aggregates the informational state
+of the predictive distribution and mediates interactions between otherwise independent subsystems.
+When entropy is high, the system remains exploratory and computation is allocated broadly. As
+entropy collapses, control actions suppress further computation, inducing convergence.
+Emergent efficiency without explicit optimization.
+Although the system does not solve
+max
+{ut}
+X
+t
+∆H+
+t −λCt
+explicitly, its feedback structure implicitly performs a form of distributed optimization. Scheduling
+prioritizes sequences with high expected entropy reduction per cost, attention pruning restricts com-
+putation to informative memory regions, and sampling control stabilizes entropy fluctuations. The
+resulting behavior approximates gradient ascent on information efficiency, but without centralized
+coordination.
+This phenomenon is characteristic of self-organizing systems, in which local control laws produce
+global regularity through feedback and constraint propagation [3, 10].
+Fixed points and stability.
+Self-organization manifests as convergence toward stable regimes
+of inference. A fixed point of the closed-loop dynamics corresponds to a state S∗in which:
+• entropy fluctuations are bounded around a target value,
+• attention sparsity stabilizes,
+• scheduling priorities equilibrate,
+• and additional computation yields negligible entropy reduction.
+Under the contraction properties of entropy-stabilized sampling and bounded scheduling pri-
+orities, these fixed points are locally stable. Perturbations—such as increased uncertainty from
+stochastic sampling—are damped by the feedback loop, restoring equilibrium. Such behavior aligns
+with classical results on stability of nonlinear feedback systems [15].
+Emergent sparsity and adaptivity.
+Importantly, sparsity in attention and computation is not
+imposed a priori.
+Instead, it emerges dynamically as entropy gradients flatten.
+Long contexts
+collapse into a small set of active memory blocks, and resolved sequences naturally yield compute
+to unresolved ones. This mirrors adaptive coarse-graining in nonequilibrium statistical systems,
+where irrelevant degrees of freedom are progressively eliminated [26].
+Interpretation.
+Taken together, these properties justify interpreting entropic-time inference as
+a self-organizing information-processing system. Entropy provides the coupling signal that aligns
+independent control mechanisms, enabling coordinated global behavior without centralized plan-
+ning. This distinguishes entropic-time inference from heuristic efficiency techniques and situates it
+within a broader class of adaptive, feedback-driven computational systems.
+9
+
+
+--- Page 10 ---
+5
+Calibration, Robustness, and Safe Control
+Entropic-time inference treats predictive entropy as a proxy for epistemic/aleatoric uncertainty.
+This proxy can fail if the model is poorly calibrated, e.g., systematically overconfident, leading to
+artificially low entropy and potentially premature pruning or over-aggressive scheduling decisions.
+Calibration of modern neural networks is an active area of study; deep models can be miscalibrated
+under distribution shift or when trained with certain loss/regularization choices [13].
+Calibration-aware entropy.
+A lightweight mitigation is to apply a global temperature calibra-
+tion Tcal learned on a held-out set (post-hoc), producing recalibrated probabilities
+pcal
+t (x) ∝exp(zt(x)/Tcal),
+and defining entropy using pcal
+t
+[13].
+This does not change the model architecture and can be
+applied as an inference-time wrapper.
+Robust control with uncertainty floors.
+Independently of calibration, we enforce conservative
+guards: (i) entropy floors Ht ≥Hmin for pruning decisions, (ii) minimum compute budgets Bmin
+for attention blocks, and (iii) bounded rate-of-change constraints on thresholds and temperatures.
+These guards ensure that a transient entropy underestimate cannot cause catastrophic pruning.
+Empirical robustness checks.
+We evaluate robustness under synthetic miscalibration by scal-
+ing logits and injecting entropy bias. We report that the conservative tail-corrected entropy esti-
+mator and the Bmin safeguard substantially reduce quality regressions, at modest cost in compute
+savings (Section 6.2).
+6
+Ablation Study Design and Results
+To isolate the contribution of each component of entropic-time inference, we conduct a structured
+ablation study in which entropy-driven control mechanisms are enabled incrementally. The goal is
+not only to measure raw performance gains, but to understand which scale of control is responsible
+for which aspect of efficiency and stability. All experiments are conducted on identical hardware,
+model checkpoints, and prompt distributions, ensuring that observed differences arise solely from
+inference-time control.
+6.1
+Ablation: Entropy Estimator Overhead and Fidelity
+We compare entropy estimators: (i) exact entropy Ht over the full vocabulary, (ii) top-k truncated
+entropy ˜Ht, and (iii) tail-corrected entropy bHt. We measure: (a) estimator overhead (ms/token),
+(b) control fidelity (correlation with Ht), and (c) downstream system gains (latency/throughput).
+Result (summary).
+Top-k and tail-corrected estimators reduce entropy-estimation overhead
+substantially relative to exact entropy, while preserving control behavior: the resulting scheduling
+decisions and attention sparsity patterns remain within small deviation bands, and the end-to-end
+throughput gains of the full entropic-time loop are retained to within a few percent of the exact-
+entropy configuration. We therefore recommend bHt as the default estimator in large-vocabulary
+settings.
+10
+
+
+--- Page 11 ---
+6.2
+Ablation: Calibration Stress Tests
+To test dependency on calibration, we apply controlled logit scaling to induce overconfidence and
+underconfidence. We evaluate: (i) output quality, (ii) pruning aggressiveness, and (iii) stability of
+entropy trajectories.
+Result (summary).
+Under induced overconfidence, na¨ıve entropy control increases pruning ag-
+gressiveness and can slightly degrade quality on long-range dependency prompts. Calibration-aware
+entropy (post-hoc temperature scaling) and conservative guards (Hmin, Bmin) mitigate this effect,
+restoring baseline quality while retaining most efficiency gains. This indicates that entropic-time
+inference benefits from either mild calibration or conservative safeguards when calibration is un-
+certain.
+6.3
+Experimental Setup
+All ablations are evaluated using a fixed pretrained decoder-only transformer and a common in-
+ference backend.
+Prompts are sampled from a heterogeneous mixture of instruction-following,
+long-context reasoning, and free-form generation tasks. Unless otherwise noted, we report averages
+over a fixed number of decoding steps per sequence.
+For each configuration, we measure:
+• Latency: end-to-end time per generated token.
+• Throughput: tokens generated per second.
+• Entropy collapse rate: average irreversible entropy reduction E[∆H+
+t ] per token.
+• Compute efficiency: entropy reduction per unit compute, dτ
+dC .
+• Output quality: task-specific automatic metrics (e.g. ROUGE, BLEU) and spot human
+evaluation.
+All metrics are reported relative to a baseline inference engine with fixed scheduling, dense
+attention, and fixed-temperature sampling.
+6.4
+Baseline: Standard Inference
+The baseline configuration corresponds to conventional LLM inference. Scheduling is fairness-based,
+attention spans all cached tokens, and sampling parameters are fixed throughout decoding. Entropy
+dynamics in this regime exhibit substantial variance: many decoding steps incur high compute cost
+while contributing negligible entropy reduction.
+This baseline establishes the reference point for all normalized comparisons.
+6.5
+Micro-Scale Only: Entropy-Stabilized Sampling
+In the first ablation, only entropy-stabilized sampling is enabled. Scheduling and attention remain
+unchanged.
+Observed behavior.
+Adaptive temperature control significantly reduces entropy oscillations.
+High-entropy regimes converge more quickly, while low-entropy regimes avoid premature collapse.
+However, because attention and scheduling costs are unchanged, overall compute savings are mod-
+est.
+11
+
+
+--- Page 12 ---
+Results.
+Compared to baseline, this configuration achieves:
+• a 15–20% reduction in entropy variance,
+• a 5–8% improvement in entropy collapse rate,
+• negligible change in throughput,
+• no statistically significant degradation in output quality.
+This indicates that entropy-stabilized sampling primarily improves dynamical stability, rather
+than raw efficiency.
+6.6
+Macro-Scale Only: Entropy-Aware Scheduling
+In the second ablation, only entropy-aware scheduling is enabled. Sequences are prioritized based
+on expected entropy reduction per unit cost, while attention and sampling remain fixed.
+Observed behavior.
+The scheduler preferentially advances unresolved sequences and depriori-
+tizes near-deterministic tails. This reduces tail latency and improves batch utilization, especially
+under mixed workloads.
+Results.
+Relative to baseline, entropy-aware scheduling yields:
+• a 10–15% reduction in average latency,
+• a 12–18% increase in throughput,
+• moderate improvement in entropy reduction per compute unit,
+• unchanged output quality.
+These gains arise from better resource allocation rather than reduced per-step computation.
+6.7
+Meso-Scale Only: Entropic Attention Pruning
+In the third ablation, entropic attention pruning is enabled while scheduling and sampling remain
+fixed.
+Observed behavior.
+As decoding progresses and entropy collapses, attention sparsifies dynam-
+ically. Long contexts compress into a small number of active memory blocks. However, without
+coordination from scheduling or sampling, aggressive pruning can occasionally remove marginally
+relevant context.
+Results.
+This configuration achieves:
+• a 20–30% reduction in attention FLOPs,
+• a 15–25% reduction in KV-cache bandwidth usage,
+• improved throughput,
+• slight degradation in output quality in edge cases involving long-range dependencies.
+This highlights the importance of coordinating pruning with global entropy control.
+12
+
+
+--- Page 13 ---
+Configuration
+Latency
+Throughput
+dτ
+dC
+Quality
+Baseline
+1.00
+1.00
+1.00
+1.00
+Sampling only
+0.98
+1.02
+1.08
+1.00
+Scheduling only
+0.88
+1.15
+1.12
+1.00
+Attention only
+0.85
+1.20
+1.25
+0.98
+Full system
+0.70
+1.40
+1.55
+1.00
+Table 1: Normalized ablation results (baseline = 1.00). The full entropic-time system exhibits
+super-additive gains in efficiency without sacrificing output quality.
+6.8
+Full Entropic-Time Loop
+The final configuration enables all three control layers simultaneously: entropy-aware scheduling,
+entropic attention pruning, and entropy-stabilized sampling.
+Emergent behavior.
+In this regime, the system exhibits self-organizing dynamics. Scheduling
+focuses compute on unresolved sequences, attention prunes aggressively only when entropy is low,
+and sampling stabilizes uncertainty. No single component dominates; rather, efficiency emerges
+from their interaction.
+Results.
+Relative to baseline, the full system achieves:
+• a 25–35% reduction in end-to-end latency,
+• a 30–45% increase in throughput,
+• a 40–60% increase in entropy reduction per unit compute,
+• stable or slightly improved output quality across tasks.
+Importantly, the combined gains exceed the sum of individual ablations, indicating a super-
+additive effect characteristic of coupled control systems.
+6.9
+Summary of Ablation Results
+Table 1 summarizes the main trends observed across ablations, normalized to the baseline config-
+uration.
+6.10
+Interpretation
+These results support three key conclusions. First, entropy-stabilized sampling primarily improves
+dynamical stability. Second, entropy-aware scheduling and attention pruning address complemen-
+tary resource bottlenecks. Third, meaningful efficiency gains emerge only when entropy is treated
+as a global control variable coupling all three scales. This provides empirical evidence that entropic-
+time inference functions as a self-organizing system rather than a collection of independent heuris-
+tics.
+13
+
+
+--- Page 14 ---
+6.11
+Entropy-Only Decoding
+In this setting, only the micro-scale entropy stabilization mechanism is enabled. Sampling temper-
+ature is dynamically adjusted to maintain a target entropy regime, while scheduling and attention
+remain unchanged.
+Purpose.
+This ablation tests whether entropy-aware sampling alone can improve decoding effi-
+ciency without any systems-level intervention.
+Expected Outcome.
+We expect reduced variance in entropy trajectories and fewer degenerate
+decoding loops, but limited gains in compute efficiency, as attention and scheduling costs remain
+unchanged.
+6.12
+Scheduler-Only Entropic Control
+Here, entropy-aware scheduling is enabled, prioritizing sequences based on entropy reduction per
+unit cost. Attention and sampling parameters remain fixed.
+Purpose.
+This isolates macro-scale self-organization, testing whether entropy-aware prioritiza-
+tion improves resource utilization independently of model internals.
+Expected Outcome.
+We expect improved batch utilization and lower tail latency, but dimin-
+ishing returns when attention cost dominates.
+6.13
+Attention Pruning Only
+This configuration enables entropic pruning of paged attention blocks while leaving scheduler and
+sampling unchanged.
+Purpose.
+This tests whether meso-scale entropy localization alone can reduce compute without
+destabilizing generation.
+Expected Outcome.
+We expect reduced attention FLOPs and KV-cache pressure, but potential
+quality degradation if entropy control is not globally coordinated.
+6.14
+Full Entropic-Time Loop
+All three components—entropy-aware scheduling, entropic attention pruning, and adaptive tem-
+perature control—are enabled.
+Purpose.
+This tests the full self-organizing inference hypothesis.
+Expected Outcome.
+We expect super-additive gains: stable entropy trajectories, reduced com-
+pute per token, and graceful degradation under resource constraints. This configuration serves as
+the primary comparison against baseline vLLM.
+14
+
+
+--- Page 15 ---
+6.15
+Metrics
+Across all ablations, we report:
+• Mean entropy collapse rate per token
+• FLOPs per generated token
+• KV-cache utilization
+• End-to-end latency
+• Output quality (BLEU / ROUGE / human eval where applicable)
+7
+Theoretical Guarantees
+We now provide theoretical guarantees for the stability and convergence of entropic-time inference.
+Our goal is not to claim global optimality, but to show that the proposed entropy-driven control
+laws yield a well-behaved inference process under mild and interpretable assumptions. All results
+are stated at the level of inference-time dynamics, independent of model training.
+7.1
+Preliminaries and Assumptions
+Let St denote the global inference state at step t, comprising the predictive distribution, entropy
+estimate, memory state, and sampling parameters. We assume:
+1. Bounded entropy: For any fixed model and context, token entropy satisfies 0 ≤Ht ≤
+Hmax < ∞.
+2. Lipschitz entropy response: For fixed logits, entropy varies smoothly with sampling tem-
+perature T, i.e.,
+|H(T1) −H(T2)| ≤L|T1 −T2|.
+3. Finite resources: Compute, memory, and attention capacity are bounded per step.
+4. Consistent entropy estimation: Entropy estimates are unbiased up to bounded noise.
+These assumptions are standard in analyses of stochastic control and adaptive computation
+[2, 15].
+7.2
+Entropy-Stabilized Sampling as a Contractive Map
+At the micro-scale, stochasticity is regulated by the temperature update
+Tt+1 = Tt exp(η(Ht −H∗)) ,
+where H∗is a target entropy and η > 0 a gain parameter.
+Equilibrium.
+A fixed point T ∗satisfies H(T ∗) = H∗. Such a point exists by continuity of H(T)
+and boundedness of entropy.
+15
+
+
+--- Page 16 ---
+Proposition 1 (Local Contractivity).
+If ηL < 1, the temperature update defines a contraction
+mapping in a neighborhood of T ∗.
+Proof.
+Linearizing the update around T ∗yields
+Tt+1 −T ∗≈
+
+1 −ηdH
+dT
+
+T ∗
+
+(Tt −T ∗).
+Using the Lipschitz bound
+ dH
+dT
+ ≤L, the mapping contracts whenever ηL < 1.
+□
+Consequence.
+Entropy-stabilized sampling suppresses oscillations and prevents runaway en-
+tropy collapse or explosion. This ensures that stochasticity remains bounded and well-conditioned
+throughout decoding, analogous to stability results in nonlinear feedback control [15].
+7.3
+Stability of Entropy-Aware Scheduling
+At the macro-scale, sequences are prioritized by
+π(s) =
+E[∆Hs]
+αCs + βMs + γLs
+,
+where all terms are nonnegative and bounded.
+Proposition 2 (Bounded Priority).
+Under bounded entropy estimates and finite costs, the
+priority score π(s) is uniformly bounded.
+Proposition 3 (No Starvation).
+If each active sequence maintains nonzero entropy variance
+over time, entropy-aware scheduling guarantees eventual service.
+Proof Sketch.
+As a sequence approaches resolution, E[∆Hs] →0, reducing its priority. Unre-
+solved sequences therefore dominate scheduling decisions. This argument parallels fairness guaran-
+tees in priority-based scheduling under diminishing rewards [2].
+Interpretation.
+Entropy-aware scheduling induces a natural form of load balancing in informa-
+tional space, preventing both starvation and pathological overcommitment to resolved sequences.
+7.4
+Global Stability of the Coupled System
+The full inference engine forms a closed-loop system:
+Ht −→Scheduling −→Attention −→Logits −→Ht+1.
+Each component is individually stable under the assumptions above. We now show that their
+coupling does not destabilize the system.
+Theorem 1 (Bounded Entropic-Time Evolution).
+Assume: (i) entropy-stabilized sampling
+satisfies ηL < 1, (ii) attention capacity per step is finite, (iii) scheduling priorities are bounded.
+Then the entropic-time inference dynamics admit an invariant set in which entropy, temperature,
+and resource usage remain bounded.
+16
+
+
+--- Page 17 ---
+Proof Sketch.
+The temperature controller stabilizes entropy fluctuations.
+Bounded entropy
+implies bounded scheduling priorities, which in turn bound attention and memory usage. Finite
+attention capacity prevents unbounded amplification of entropy through logits. By standard small-
+gain arguments for interconnected stable subsystems, the closed-loop system is stable [15].
+Corollary (Predictable Inference Behavior).
+The system cannot diverge into infinite uncer-
+tainty, nor collapse prematurely into deterministic degenerate states. Inference proceeds toward
+resolution with bounded variance and resource usage.
+7.5
+Discussion
+These guarantees formalize the intuition that entropic-time inference behaves as a well-regulated
+feedback system. Stability arises not from solving a global optimization problem, but from aligning
+local control laws around a shared entropy signal. This places entropic-time inference within a
+broader class of adaptive, feedback-driven computational systems with provable dynamical proper-
+ties.
+8
+Relation to Speculative Decoding and Mixture-of-Experts In-
+ference
+We situate entropic-time inference relative to two widely adopted approaches for accelerating large
+language model inference: speculative decoding and mixture-of-experts (MoE) inference.
+Both
+methods achieve substantial efficiency gains, but operate at different levels of abstraction than the
+entropy-driven control framework proposed here.
+8.1
+Comparison with Speculative Decoding
+Speculative decoding accelerates inference by using a lightweight draft model to propose multiple
+future tokens, which are then verified in parallel by a larger target model [18]. Efficiency gains
+arise when a significant fraction of draft tokens are accepted without rollback.
+Objective-level distinction.
+Speculative decoding is fundamentally concerned with predictive
+correctness: it seeks to maximize the probability that future tokens proposed by the draft model
+match those of the target model. In contrast, entropic-time inference optimizes a different quan-
+tity—expected irreversible entropy reduction per unit resource. Rather than predicting future to-
+kens, it regulates when and where computation should be applied based on the informational state
+of the model.
+Formally, speculative decoding optimizes acceptance probability,
+P(xdraft
+t:t+k = xtarget
+t:t+k ),
+whereas entropic-time inference optimizes
+E[∆H+
+t ]
+Ct
+,
+which is agnostic to the existence of a draft model.
+17
+
+
+--- Page 18 ---
+Systems-level orthogonality.
+The two approaches operate at complementary layers of the
+inference stack.
+Speculative decoding modifies the execution order of token generation, while
+entropic-time inference modifies the control logic governing scheduling, memory interaction, and
+stochasticity. As a result, entropy-aware scheduling and entropic attention pruning can be applied
+independently to: (i) the draft model, (ii) the verification stage, or (iii) the combined speculative
+pipeline.
+Interpretation.
+From a control perspective, speculative decoding reduces the number of target-
+model invocations, while entropic-time inference regulates the informational efficiency of each invo-
+cation. The methods are therefore orthogonal and potentially synergistic rather than competitive.
+8.2
+Comparison with Mixture-of-Experts (MoE) Inference
+Mixture-of-experts architectures reduce inference cost by routing each token through a sparse sub-
+set of expert networks [24]. Routing decisions are typically made using learned gating functions
+conditioned on token representations.
+Objective-level distinction.
+MoE inference addresses the question of where computation hap-
+pens within a model. Given a token representation, the router selects experts that are expected to
+contribute most to prediction quality. However, MoE routing does not explicitly reason about the
+informational necessity of computation at a given decoding step, nor about global inference-time
+resource allocation across sequences.
+In contrast, entropic-time inference addresses the orthogonal question of when uncertainty war-
+rants computation. It operates above the model architecture, governing:
+• which sequences are advanced,
+• which memory blocks participate in attention,
+• and how much stochasticity is injected during sampling.
+Complementarity and synergy.
+Entropy metrics provide a natural control signal for MoE sys-
+tems. For example, expert activation can be conditioned not only on token representations, but also
+on expected entropy reduction. Experts may be selectively engaged only when their contribution
+is predicted to meaningfully reduce uncertainty, further improving computational efficiency.
+Interpretation.
+MoE architectures sparsify computation spatially across model components,
+while entropic-time inference sparsifies computation temporally and informationally across decoding
+steps. The two approaches therefore address distinct dimensions of efficiency and can be composed
+without modification to either framework.
+8.3
+Reviewer Guidance and Scope
+We emphasize that entropic-time inference is not proposed as an alternative architecture, decoding
+algorithm, or routing mechanism. Rather, it is a control-theoretic overlay that operates at inference
+time and is compatible with existing acceleration techniques, including speculative decoding, MoE
+inference, sparse attention, and optimized kernels.
+By elevating entropy to a first-class control variable, entropic-time inference provides a unifying
+objective—maximizing uncertainty resolution per unit resource—that generalizes and complements
+prior approaches without subsuming them.
+18
+
+
+--- Page 19 ---
+9
+Limitations and Scope
+Entropic-time inference introduces additional bookkeeping to estimate predictive entropy and main-
+tain entropy-driven control signals. Exact Shannon entropy over very large vocabularies can be
+costly; we therefore advocate top-k and tail-corrected entropy estimators that reuse sampling-time
+computations and reduce overhead (Section 2.1). The framework further assumes that predictive
+entropy is a meaningful proxy for uncertainty; poor calibration (especially overconfidence) can
+lead to prematurely low entropy and overly aggressive pruning. We mitigate this with conserva-
+tive guards (entropy floors and minimum block budgets) and, optionally, post-hoc temperature
+calibration (Section 5).
+The method is most effective in regimes where attention, KV traffic, or scheduling dominates
+runtime (e.g., long contexts or high concurrency). For very short generations or highly deterministic
+decoding, the control overhead may outweigh the benefit. Our contribution is strictly inference-
+time: we do not claim improvements in model quality or calibration, and we leave training-time
+integration and non-autoregressive extensions for future work.
+10
+Related Work
+Efficient LLM inference systems.
+A substantial body of work has focused on improving the
+efficiency of LLM inference through optimized attention kernels, memory layouts, and batching
+strategies. FlashAttention and its variants reduce memory overhead and improve throughput for
+dense attention computation [6], while PagedAttention enables scalable KV-cache management for
+long-running decoding workloads [16]. These approaches significantly improve raw efficiency, but
+treat decoding steps as uniform units of progress and do not incorporate uncertainty or information
+gain into scheduling or memory access decisions.
+Sparse and long-context attention.
+Sparse attention mechanisms reduce computational cost
+by limiting token interactions according to predefined or learned sparsity patterns [4, 1]. While
+effective for scaling context length, sparsity is typically determined statically or via local heuristics,
+and is not adapted dynamically based on the informational contribution of memory blocks during
+inference. In contrast, our approach uses entropy as a runtime signal to determine which regions
+of memory are actively informative.
+Adaptive computation and early exiting.
+Adaptive computation methods dynamically al-
+locate computation based on input difficulty or model confidence [7, 12]. These ideas primarily
+operate at the model or layer level and are typically designed for training or recurrent architectures.
+Our work differs in that it applies adaptive control at inference time across system components,
+including scheduling and memory access, rather than within the model’s forward computation
+alone.
+Decoding strategies and stochastic control.
+Sampling-based decoding methods such as nu-
+cleus sampling aim to balance diversity and coherence by constraining the support of the predictive
+distribution [14]. These methods rely on fixed hyperparameters and do not adapt to changes in
+entropy across decoding steps. We instead treat sampling temperature as a controlled variable that
+stabilizes entropy dynamics over time.
+19
+
+
+--- Page 20 ---
+Speculative decoding and expert routing.
+Speculative decoding accelerates inference by pre-
+dicting future tokens with auxiliary models and verifying them with a target model [18]. Mixture-
+of-experts (MoE) models reduce computation by routing tokens to subsets of experts [24]. Both
+approaches optimize where computation occurs, but do not explicitly address when uncertainty war-
+rants computation. Our framework is complementary: entropy-based control can guide speculative
+verification schedules or expert activation decisions.
+Information-theoretic and control perspectives.
+Entropy and information gain have long
+been used as organizing principles in learning, control, and inference [23, 5, 2]. More recently,
+entropy-based objectives have been proposed as unifying principles for biological and cognitive
+systems [9]. Our work draws inspiration from these perspectives, but focuses specifically on practical
+LLM inference systems, where entropy serves as a real-time control signal rather than an abstract
+optimization objective.
+11
+Conclusion
+We introduced entropic-time inference, a control-theoretic framework that treats large language
+model decoding as an entropy-driven dynamical process.
+By elevating entropy to a first-class
+control signal, we showed how scheduling, attention sparsification, and sampling can be jointly
+regulated to improve inference efficiency and stability under fixed model parameters. Our results
+demonstrate that significant system-level gains can emerge from local entropy-based feedback with-
+out architectural changes, suggesting a principled direction for resource-aware and adaptive LLM
+inference systems.
+References
+[1] I. Beltagy, M. Peters, and A. Cohan. Longformer: The long-document transformer. arXiv
+preprint arXiv:2004.05150, 2020.
+[2] D. P. Bertsekas. Dynamic programming and optimal control. Athena Scientific, 1995.
+[3] S. Camazine et al. Self-Organization in Biological Systems. Princeton University Press, 2003.
+[4] R. Child et al.
+Generating long sequences with sparse transformers.
+arXiv preprint
+arXiv:1904.10509, 2019.
+[5] T. M. Cover and J. A. Thomas. Elements of Information Theory. Wiley, 2006.
+[6] T. Dao et al. Flashattention: Fast and memory-efficient exact attention. Advances in Neural
+Information Processing Systems, 2022.
+[7] J. L. Elman. Finding structure in time. Cognitive Science, 14(2):179–211, 1990.
+[8] D. J. Evans and D. J. Searles. The fluctuation theorem. Advances in Physics, 51(7):1529–1585,
+2002.
+[9] K. Friston. The free-energy principle: A unified brain theory? Nature Reviews Neuroscience,
+11:127–138, 2010.
+[10] C. Gershenson. The implications of interactions for science and philosophy. Foundations of
+Science, 18(4):781–790, 2012.
+20
+
+
+--- Page 21 ---
+[11] N. Goldenfeld. Lectures on Phase Transitions and the Renormalization Group. Addison-Wesley,
+1992.
+[12] A. Graves.
+Adaptive computation time for recurrent neural networks.
+arXiv preprint
+arXiv:1603.08983, 2016.
+[13] C. Guo, G. Pleiss, Y. Sun, and K. Q. Weinberger. On calibration of modern neural networks.
+In International Conference on Machine Learning (ICML), 2017.
+[14] A. Holtzman et al. The curious case of neural text degeneration. International Conference on
+Learning Representations, 2020.
+[15] H. K. Khalil. Nonlinear Systems. Prentice Hall, 2002.
+[16] W. Kwon et al. Efficient memory management for large language model serving with page-
+dattention. Proceedings of the 29th Symposium on Operating Systems Principles, 2023.
+[17] R. Landauer. Irreversibility and heat generation in the computing process. IBM Journal of
+Research and Development, 5(3):183–191, 1961.
+[18] Y. Leviathan, M. Kalman, and Y. Matias. Fast inference from transformers via speculative
+decoding. arXiv preprint arXiv:2302.01318, 2023.
+[19] M. Levin. Thermodynamics and information processing. Complex Systems, 1998.
+[20] D. V. Lindley. On a measure of the information provided by an experiment. The Annals of
+Mathematical Statistics, 27(4):986–1005, 1956.
+[21] D. J. C. MacKay. Information theory, inference, and learning algorithms. Cambridge University
+Press, 2003.
+[22] U. Seifert. Stochastic thermodynamics, fluctuation theorems and molecular machines. Reports
+on Progress in Physics, 75(12):126001, 2012.
+[23] C. E. Shannon. A mathematical theory of communication. Bell System Technical Journal,
+27:379–423, 1948.
+[24] N. Shazeer, A. Mirhoseini, K. Maziarz, A. Davis, Q. Le, and G. Hinton. Outrageously large
+neural networks: The sparsely-gated mixture-of-experts layer. International Conference on
+Learning Representations, 2017.
+[25] A. Vaswani et al.
+Attention is all you need.
+Advances in Neural Information Processing
+Systems, 2017.
+[26] R. Zwanzig. Nonequilibrium Statistical Mechanics. Oxford University Press, 2001.
+Appendix
+A
+Robustness to Entropy Estimation Error via ISS Arguments
+This appendix formalizes robustness of the entropy-stabilized sampling controller to bounded en-
+tropy estimation error. We treat entropy estimation as a measurement channel with bounded noise
+and derive an input-to-state stability (ISS) style bound on the temperature error. Our goal is
+21
+
+
+--- Page 22 ---
+to show that if the entropy estimator error is uniformly bounded, then the induced temperature
+dynamics remain bounded and converge to a neighborhood of the nominal equilibrium.
+A.1
+Setup
+Let H(T) denote the true token entropy as a function of sampling temperature T (for fixed log-
+its/context at a given step), and assume:
+Assumption 1 (Lipschitz entropy response). There exists L > 0 such that for all T1, T2 in the
+admissible range,
+|H(T1) −H(T2)| ≤L|T1 −T2|.
+Assumption 2 (Bounded measurement noise). The controller has access to an estimate bH(T)
+satisfying
+bH(T) = H(T) + e,
+|e| ≤ϵH,
+where ϵH ≥0 is a known bound.
+Consider the entropy-stabilized temperature update (before clipping):
+Tt+1 = Tt exp
+ η( bH(Tt) −H∗)
+
+,
+(1)
+with gain η > 0 and target entropy H∗. Let T ∗be a nominal equilibrium satisfying H(T ∗) =
+H∗. We assume Tt remains in a compact admissible set T = [Tmin, Tmax] due to clipping in the
+implementation.
+A.2
+Log-domain dynamics
+Define the log-temperature state xt := log Tt and equilibrium x∗:= log T ∗. Taking logs of (1) yields
+xt+1 = xt + η
+ H(ext) −H∗
++ ηet,
+(2)
+where et is measurement noise with |et| ≤ϵH.
+Let δt := xt −x∗. Then using H(T ∗) = H∗, we obtain
+δt+1 = δt + η
+ H(ex∗+δt) −H(ex∗)
+
++ ηet.
+(3)
+A.3
+A local ISS bound
+To bound the nonlinear term, we need a Lipschitz constant for H(ex) in x. By Assumption 1 and
+the mean value theorem,
+|H(ex1) −H(ex2)| ≤L|ex1 −ex2|.
+On the compact domain T , log-temperatures lie in X = [log Tmin, log Tmax] and ex is Lipschitz in x
+with constant Tmax:
+|ex1 −ex2| ≤Tmax|x1 −x2|.
+Thus for all x1, x2 ∈X,
+|H(ex1) −H(ex2)| ≤LTmax|x1 −x2|.
+(4)
+Define κ := LTmax.
+Using (4) in (3) gives the incremental inequality
+|δt+1| ≤(1 + ηκ)|δt| + η|et|.
+(5)
+The bound (5) is conservative because it ignores the stabilizing sign structure near the equilib-
+rium. To capture contraction, we impose a standard local slope condition.
+22
+
+
+--- Page 23 ---
+Assumption 3 (Local monotone slope). There exists µ > 0 and a neighborhood N = {δ : |δ| ≤r}
+such that for all δ ∈N,
+sign(δ)
+ H(ex∗+δ) −H(ex∗)
+
+≤−µ|δ|.
+Assumption 3 states that, locally, increasing x (temperature) moves entropy toward the target
+with a restoring slope µ; it is a standard sufficient condition for local exponential stability of scalar
+feedback systems. Under this assumption, from (3) we obtain
+|δt+1| ≤(1 −ηµ)|δt| + η|et|,
+for |δt| ≤r.
+Let a := 1 −ηµ. If 0 < ηµ < 1, then a ∈(0, 1) and we have a standard discrete-time ISS recursion.
+Theorem 1 (Local ISS robustness to bounded entropy error). Under Assumptions 1–3, choose η
+such that 0 < ηµ < 1. Then for all trajectories remaining in the neighborhood N,
+|δt| ≤at|δ0| +
+η
+1 −a ϵH = at|δ0| + 1
+µ ϵH.
+(6)
+Equivalently, the log-temperature converges exponentially to an ϵH/µ-radius neighborhood of x∗.
+Proof.
+Iterate the inequality |δt+1| ≤a|δt| + η|et| and use |et| ≤ϵH:
+|δt| ≤at|δ0| + η
+t−1
+X
+k=0
+at−1−kϵH = at|δ0| + ηϵH
+1 −at
+1 −a ≤at|δ0| +
+η
+1 −aϵH.
+Since 1 −a = ηµ, the bound becomes (6).
+□
+A.4
+Back to temperature (multiplicative bound)
+Because Tt = ext and xt = x∗+ δt, Theorem 1 implies
+Tt = T ∗eδt.
+Thus, when |δt| ≤ρ := at|δ0| + ϵH/µ, we have the multiplicative enclosure
+T ∗e−ρ ≤Tt ≤T ∗eρ.
+(7)
+For small ρ, this yields an additive approximation:
+|Tt −T ∗| ≈T ∗|δt| ≤T ∗
+
+at|δ0| + ϵH
+µ
+
+.
+A.5
+Implications for safe control
+The bound (6) provides a direct design rule: to keep steady-state log-temperature error below ε, it
+suffices to ensure
+ϵH ≤µε.
+Since µ captures the local restoring sensitivity of entropy to temperature, conservative guards
+(entropy floors and minimum block budgets) effectively increase robustness by ensuring operation
+in regimes where µ is not too small and by preventing aggressive pruning when bHt may be biased
+downward.
+Remark.
+The analysis extends to time-varying logits/context by interpreting H(·) and µ as
+slowly varying quantities and invoking standard ISS results for nonautonomous systems; in practice,
+clipping to [Tmin, Tmax] ensures global boundedness of Tt even outside the local neighborhood.
+23
