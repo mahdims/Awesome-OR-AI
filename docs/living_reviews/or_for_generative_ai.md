@@ -6,6 +6,73 @@
 
 ## Recent Papers
 
+#### 2026-03-05 (8 papers)
+
+### [AI-for-Science Low-code Platform with Bayesian Adversarial Multi-Agent Framework](https://arxiv.org/abs/2603.03233)
+
+**2026-03-03** | Fudan University, Shanghai Innovation Institute, Shanghai Academy of AI for Science | M=8 P=7 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Bayesian Adversarial Multi-agent Framework for AI4S (BAMF-AI4S) with recursive co-optimization of generated code, test cases, and prompts, guided by a non-LLM-based Bayesian updating rule and Bayesian Optimization for code performance estimation. | *LLM role:* code_writer, decomposition_guide, prompt_optimizer, test_case_generator, solution_generator
+
+> The authors propose a multi-agent framework for scientific code generation that couples an adversarial 'Challenger' (generating difficult test cases) with a 'Solver', governed by a Bayesian update rule. Crucially, they employ Bayesian Optimization with a kernel based on code embeddings (AST + text) to estimate solution quality *before* running expensive tests, effectively acting as a learned surrogate model. Results on SciCode and ScienceAgentBench are strong, showing small models (Qwen-32B) outperforming GPT-4o when using this loop. **The killer feature for us is the surrogate modeling pipeline:** we should immediately steal the idea of using GP surrogates on code embeddings to filter candidates in our evolutionary search, potentially reducing our evaluation costs by orders of magnitude.
+
+### [VisionCreator: A Native Visual-Generation Agentic Model with Understanding, Thinking, Planning and Creation](https://arxiv.org/abs/2603.02681)
+
+**2026-03-03** | Tencent Hunyuan, Hong Kong University of Science and Technology | M=8 P=2 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Native visual-generation agentic model (VisionCreator) unifying Understanding, Thinking, Planning, and Creation (UTPC) capabilities, optimized via Progressive Specialization Training (PST) and Virtual Reinforcement Learning (VRL) with LtrReward in VisGenEnv. | *LLM role:* agentic_model
+
+> This paper introduces VisionCreator, an agent trained via 'Virtual Reinforcement Learning' (VRL) where tool outputs and logic are simulated to train long-horizon planning policies without incurring expensive real-world execution costs. They employ a 'Plan-Driven Reward' model (combining LLM-based plan verification with rule-based execution checks) and prove theoretical bounds for the sim-to-real transfer, achieving performance superior to GPT-5 on visual tasks. **Key Takeaway:** We should steal the VRL architecture for AlgoEvo. By constructing a 'Virtual OR Environment' that simulates code validity and approximate heuristic performance, we can train our evolutionary search policies (RL-infused evolution) at a fraction of the current compute cost, bypassing the bottleneck of running full benchmarks during the search policy optimization phase.
+
+### [StitchCUDA: An Automated Multi-Agents End-to-End GPU Programing Framework with Rubric-based Agentic Reinforcement Learning](https://arxiv.org/abs/2603.02637)
+
+**2026-03-03** | University of Minnesota-Twin Cities | M=8 P=6 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Multi-agent framework with rubric-based agentic reinforcement learning (GRPO) | *LLM role:* decomposition_guide, code_writer, evaluator
+
+> StitchCUDA automates end-to-end GPU program generation using a multi-agent framework, but its core contribution is a training recipe that solves reward hacking in code optimization. They decompose expensive multi-turn agentic RL into single-turn 'atomic skills' (generation vs. refinement) and use GRPO with an LLM-evaluated 'Rubric Reward' (e.g., 'Did you use tiling?') rather than just sparse outcome metrics. This prevents the model from gaming the system (e.g., wrapping PyTorch code) and forces actual optimization behavior. We should steal the atomic skill decomposition to drastically reduce training costs for AlgoEvo and implement Rubric Rewards to fix our process reward models.
+
+### [Enhancing CVRP Solver through LLM-driven Automatic Heuristic Design](https://arxiv.org/abs/2602.23092)
+
+**2026-02-26** | City University of Hong Kong, Southern University of Science and Technology | M=7 P=9 I=8 **MUST-READ** *discuss*
+
+*Method:* Adaptive Iterated Local Search (AILS) with LLM-driven Evolutionary Computation for Automatic Heuristic Design (AHD) of ruin heuristics | *LLM role:* heuristic_generator
+
+> This paper integrates LLM-driven evolutionary search into the AILS framework to evolve 'ruin' heuristics for CVRP, employing a Chain-of-Thought 'voting' mechanism to filter out poor heuristics before expensive evaluation. The results are empirically strong: they claim 8 new Best-Known Solutions on the CVRPLib large-scale benchmark, outperforming HGS and AILS-II. **Key Takeaway:** We should steal the 'acceleration mechanism'—using the LLM to predict heuristic quality via CoT prior to execution—to address the sample efficiency bottleneck in our own evolutionary search loops. This is a direct proof-of-concept that LLM-evolved components can beat hand-crafted SOTA on hard OR instances.
+
+### [AI4S-SDS: A Neuro-Symbolic Solvent Design System via Sparse MCTS and Differentiable Physics Alignment](https://arxiv.org/abs/2603.03686)
+
+**2026-03-04** | Nanjing University, Suzhou Laboratory, Shanghai Artificial Intelligence Laboratory | M=8 P=4 I=8 **MUST-READ** *discuss*
+
+*Method:* Neuro-symbolic framework integrating Sparse Monte Carlo Tree Search (MCTS) with Sibling-Aware Expansion, Memory-Driven Global Planning, and a Differentiable Physics Engine for continuous ratio optimization. | *LLM role:* semantic_generator
+
+> Chen et al. introduce a neuro-symbolic MCTS framework for mixed discrete-continuous optimization, applying it to solvent design. They solve the LLM context bottleneck via 'Sparse State Storage' (storing only state abstractions and reconstructing paths on-demand) and fix mode collapse using 'Sibling-Aware Expansion' (conditioning the generator on sibling nodes to force orthogonality). While the chemical application is niche, the search architecture is highly relevant: we should steal the sibling-aware conditioning to improve diversity in our evolutionary code generation and adopt their sparse storage pattern to scale our search horizons.
+
+### [Build, Judge, Optimize: A Blueprint for Continuous Improvement of Multi-Agent Consumer Assistants](https://arxiv.org/abs/2603.03565)
+
+**2026-03-03** | DoorDash, WithMetis.ai | M=8 P=6 I=8 **MUST-READ** *discuss*
+
+*Method:* Prompt-level optimization using GEPA and MAMUT GEPA | *LLM role:* evaluator, evolutionary_search, decomposition_guide, user_simulator
+
+> This paper presents a production-grade framework for optimizing multi-agent systems by jointly evolving prompt bundles (MAMUT) rather than optimizing agents in isolation. They validate this on a grocery assistant, showing that system-level optimization outperforms local sub-agent optimization by ~7% because it captures coordination dynamics (e.g., context passing) that local metrics miss. The most stealable insight is their 'Judge Calibration' loop: they use evolutionary search (GEPA) to optimize the *evaluator's* prompt to match human labels (91.4% agreement) before using that judge to optimize the agents. This is a rigorous solution to the noisy fitness function problem we face in LLM evolutionary search.
+
+### [AgentDropoutV2: Optimizing Information Flow in Multi-Agent Systems via Test-Time Rectify-or-Reject Pruning](https://arxiv.org/abs/2602.23258)
+
+**2026-02-26** | Alibaba Group, Harbin Institute of Technology, Shenzhen | M=6 P=7 I=8 *discuss*
+
+*Method:* Test-time rectify-or-reject pruning framework with retrieval-augmented rectifier, failure-driven indicator pool, and dual-stage deduplication | *LLM role:* rectifier, teacher, deduplicator, reasoning_engine
+
+> Wang et al. propose a test-time 'firewall' for multi-agent systems that intercepts messages and validates them against a retrieved set of error patterns (mined from offline failure trajectories). They achieve ~6% accuracy gains on math benchmarks by iteratively rectifying or pruning erroneous outputs before they propagate. The critical takeaway for our AlgoEvo work is the **Failure-Driven Indicator Pool**: we should implement a similar module that mines failed code generations to build a repository of 'forbidden patterns,' allowing a lightweight verifier to prune bad mutations before expensive execution. This effectively turns the 'graveyard' of failed runs into a persistent memory that improves sample efficiency.
+
+### [MuxTune: Efficient Multi-Task LLM Fine-Tuning in Multi-Tenant Datacenters via Spatial-Temporal Backbone Multiplexing](https://arxiv.org/abs/2603.02885)
+
+**2026-03-03** | Shanghai Jiao Tong University, National University of Singapore | M=6 P=7 I=7 *discuss*
+
+*Method:* Hierarchical spatial-temporal backbone multiplexing with unified PEFT representations, dynamic programming for task fusion, priority-based subgraph scheduling, and chunk-based data alignment | *LLM role:* subject_of_optimization
+
+> MuxTune introduces a hierarchical scheduler for multi-tenant PEFT that uses Dynamic Programming to optimally fuse tasks (spatial batching) or interleave them (temporal multiplexing) based on a pipeline cost model. Empirical results on H100s show up to 5x throughput gains over NeMo and S-LoRA, validated by ablation studies. The most stealable insight is their **chunk-based data alignment**: instead of standard padding or naive packing, they split packed sequences into fixed-size chunks to balance compute efficiency with memory waste—a trick we should immediately implement for batch evaluation in AlgoEvo and our serving optimization models.
+
+
 #### 2026-03-01 (6 papers)
 
 ### [DualPath: Breaking the Storage Bandwidth Bottleneck in Agentic LLM Inference](https://arxiv.org/abs/2602.21548)
