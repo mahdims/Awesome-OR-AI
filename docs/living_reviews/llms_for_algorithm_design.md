@@ -1,10 +1,29 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-03-05
+**Last Updated:** 2026-03-08
 
 ---
 
 ## Recent Papers
+
+#### 2026-03-08 (2 papers)
+
+### [Rethinking Code Similarity for Automated Algorithm Design with LLMs](https://arxiv.org/abs/2603.02787)
+
+**2026-03-03** | City University of Hong Kong | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* BehaveSim, a method for measuring algorithmic similarity based on problem-solving trajectories (PSTrajs) quantified using Dynamic Time Warping (DTW) | *LLM role:* heuristic_generator
+
+> Zhang et al. propose BehaveSim, a metric that measures algorithmic similarity by applying Dynamic Time Warping (DTW) to the sequence of intermediate solutions (trajectories) generated during execution, rather than relying on static code analysis. By integrating this into FunSearch and EoH to enforce behavioral diversity, they achieve significant performance gains, notably reducing the optimality gap on TSP by ~7.8% compared to standard FunSearch. **Key Takeaway:** We must stop using code hashes or embedding cosine similarity for population diversity in AlgoEvo; instead, we should instrument generated heuristics to log intermediate states (e.g., partial VRP routes) and cluster them via DTW to prevent convergence to behaviorally identical local optima. This is a mandatory upgrade for our evolutionary search infrastructure.
+
+### [Learning to Evolve for Optimization via Stability-Inducing Neural Unrolling](https://arxiv.org/abs/2512.11453)
+
+**2026-03-03** | The Hong Kong Polytechnic University, The University of Hong Kong | M=5 P=7 I=7 *discuss*
+
+*Method:* Bilevel meta-optimization with stability-inducing neural unrolling, using a structured Mamba-based neural operator and a gradient-derived composite solver. | *LLM role:* none
+
+> Gao et al. propose L2E, a meta-learned neural optimizer that uses Mamba blocks to parameterize evolutionary operators within a stability-enforcing unrolled loop (Krasnosel'skii-Mann iteration). Results on BBOB and LSGO-1000D are strong, showing it outperforms Transformer-based L2O methods (GLHF) and classical heuristics (DE) in sample efficiency and zero-shot generalization. **Key Takeaway:** We should investigate replacing Transformer-based population encoders in AlgoEvo with Mamba blocks to reduce complexity from quadratic to linear ($O(N)$), enabling larger population sizes in our meta-heuristic search. The theoretical framing of evolution as a fixed-point iteration also offers a rigorous stability constraint we could inject into our RL-guided search policies.
+
 
 #### 2026-03-05 (2 papers)
 

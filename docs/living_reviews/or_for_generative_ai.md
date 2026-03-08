@@ -1,10 +1,85 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-03-05
+**Last Updated:** 2026-03-08
 
 ---
 
 ## Recent Papers
+
+#### 2026-03-08 (9 papers)
+
+### [SLO-Aware Compute Resource Allocation for Prefill-Decode Disaggregated LLM Inference](https://arxiv.org/abs/2603.04716)
+
+**2026-03-05** | Kingsoft Cloud | M=4 P=9 I=7 **MUST-READ** *discuss*
+
+*Method:* Hybrid theoretical modeling (M/M/1 queuing theory) and empirical benchmarking for P/D resource calculation | *LLM role:* none
+
+> This paper proposes a hybrid resource allocation method for disaggregated Prefill/Decode (P/D) inference, using M/M/1 queuing theory to model prefill throughput under TTFT constraints and empirical profiling for decode. The results are real and validated on NVIDIA H200 clusters running DeepSeek-V3.1. The key takeaway for us is the validated analytical relationship between TTFT, input length, and effective prefill throughput ($TP_{eff} = TP_{max} - \frac{L_{in}}{TTFT - T_{overhead}}$). We can steal this equation to serve as a cheap, differentiable constraint in our 'GPUSched' OR formulations or fitness functions, replacing expensive simulations.
+
+### [AI-for-Science Low-code Platform with Bayesian Adversarial Multi-Agent Framework](https://arxiv.org/abs/2603.03233)
+
+**2026-03-03** | Fudan University, Shanghai Innovation Institute, Shanghai Academy of AI for Science | M=8 P=7 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Bayesian Adversarial Multi-agent Framework for AI4S (BAMF-AI4S) with recursive co-optimization of generated code, test cases, and prompts, guided by a non-LLM-based Bayesian updating rule and Bayesian Optimization for code performance estimation. | *LLM role:* code_writer, decomposition_guide, prompt_optimizer, test_case_generator, solution_generator
+
+> The authors propose a multi-agent framework for scientific code generation that couples an adversarial 'Challenger' (generating difficult test cases) with a 'Solver', governed by a Bayesian update rule. Crucially, they employ Bayesian Optimization with a kernel based on code embeddings (AST + text) to estimate solution quality *before* running expensive tests, effectively acting as a learned surrogate model. Results on SciCode and ScienceAgentBench are strong, showing small models (Qwen-32B) outperforming GPT-4o when using this loop. **The killer feature for us is the surrogate modeling pipeline:** we should immediately steal the idea of using GP surrogates on code embeddings to filter candidates in our evolutionary search, potentially reducing our evaluation costs by orders of magnitude.
+
+### [VisionCreator: A Native Visual-Generation Agentic Model with Understanding, Thinking, Planning and Creation](https://arxiv.org/abs/2603.02681)
+
+**2026-03-03** | Tencent Hunyuan, Hong Kong University of Science and Technology | M=8 P=2 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Native visual-generation agentic model (VisionCreator) unifying Understanding, Thinking, Planning, and Creation (UTPC) capabilities, optimized via Progressive Specialization Training (PST) and Virtual Reinforcement Learning (VRL) with LtrReward in VisGenEnv. | *LLM role:* agentic_model
+
+> This paper introduces VisionCreator, an agent trained via 'Virtual Reinforcement Learning' (VRL) where tool outputs and logic are simulated to train long-horizon planning policies without incurring expensive real-world execution costs. They employ a 'Plan-Driven Reward' model (combining LLM-based plan verification with rule-based execution checks) and prove theoretical bounds for the sim-to-real transfer, achieving performance superior to GPT-5 on visual tasks. **Key Takeaway:** We should steal the VRL architecture for AlgoEvo. By constructing a 'Virtual OR Environment' that simulates code validity and approximate heuristic performance, we can train our evolutionary search policies (RL-infused evolution) at a fraction of the current compute cost, bypassing the bottleneck of running full benchmarks during the search policy optimization phase.
+
+### [StitchCUDA: An Automated Multi-Agents End-to-End GPU Programing Framework with Rubric-based Agentic Reinforcement Learning](https://arxiv.org/abs/2603.02637)
+
+**2026-03-03** | University of Minnesota-Twin Cities | M=8 P=6 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Multi-agent framework with rubric-based agentic reinforcement learning (GRPO) | *LLM role:* decomposition_guide, code_writer, evaluator
+
+> StitchCUDA automates end-to-end GPU program generation using a multi-agent framework, but its core contribution is a training recipe that solves reward hacking in code optimization. They decompose expensive multi-turn agentic RL into single-turn 'atomic skills' (generation vs. refinement) and use GRPO with an LLM-evaluated 'Rubric Reward' (e.g., 'Did you use tiling?') rather than just sparse outcome metrics. This prevents the model from gaming the system (e.g., wrapping PyTorch code) and forces actual optimization behavior. We should steal the atomic skill decomposition to drastically reduce training costs for AlgoEvo and implement Rubric Rewards to fix our process reward models.
+
+### [PromptTuner: SLO-Aware Elastic System for LLM Prompt Tuning](https://arxiv.org/abs/2603.05087)
+
+**2026-03-05** | Nanyang Technological University, Unaffiliated | M=5 P=8 I=7 *discuss*
+
+*Method:* SLO-aware elastic system combining a two-layer Prompt Bank for initial prompt selection and a Workload Scheduler for dynamic multi-GPU allocation | *LLM role:* feature_extractor
+
+> PromptTuner is a cluster management system for LLM prompt tuning that combines a 'Prompt Bank' (retrieving similar past prompts to speed up convergence) with a hierarchical scheduler (warm/cold GPU pools) to meet latency SLOs. The authors demonstrate real-world efficacy on 32-96 GPU clusters, showing 4-8x reductions in SLO violations compared to INFless and ElasticFlow. The key takeaway for us is the 'Prompt Bank' mechanism: using K-medoids clustering on activation features to retrieve high-quality initial prompts. We should steal this initialization strategy for AlgoEvo to reduce the number of generations needed for convergence, and use the scheduling logic as a baseline for our GPUSched project.
+
+### [BandPO: Bridging Trust Regions and Ratio Clipping via Probability-Aware Bounds for LLM Reinforcement Learning](https://arxiv.org/abs/2603.04918)
+
+**2026-03-05** | Fudan University, Shanghai Innovation Institute | M=8 P=7 I=7 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Band-constrained Policy Optimization (BandPO) using a Band operator to project f-divergence trust regions into dynamic, probability-aware clipping intervals | *LLM role:* policy_agent
+
+> BandPO replaces the standard static clipping in PPO/GRPO with dynamic bounds derived from projecting f-divergence trust regions, specifically addressing a bottleneck where allowable updates vanish for low-probability tokens. Empirical results are rigorous, showing consistent gains (2-10%) on math benchmarks and, crucially, maintaining policy entropy where baselines collapse. The key takeaway is that standard clipping scales update margins linearly with probability, effectively freezing rare tokens; BandPO decouples this, allowing the model to actually reinforce novel, high-advantage tail strategies. We should implement the closed-form TV or Chi-squared variants immediately in our RL optimizers to improve exploration efficiency.
+
+### [AI4S-SDS: A Neuro-Symbolic Solvent Design System via Sparse MCTS and Differentiable Physics Alignment](https://arxiv.org/abs/2603.03686)
+
+**2026-03-04** | Nanjing University, Suzhou Laboratory, Shanghai Artificial Intelligence Laboratory | M=8 P=4 I=8 **MUST-READ** *discuss*
+
+*Method:* Neuro-symbolic framework integrating Sparse Monte Carlo Tree Search (MCTS) with Sibling-Aware Expansion, Memory-Driven Global Planning, and a Differentiable Physics Engine for continuous ratio optimization. | *LLM role:* semantic_generator
+
+> Chen et al. introduce a neuro-symbolic MCTS framework for mixed discrete-continuous optimization, applying it to solvent design. They solve the LLM context bottleneck via 'Sparse State Storage' (storing only state abstractions and reconstructing paths on-demand) and fix mode collapse using 'Sibling-Aware Expansion' (conditioning the generator on sibling nodes to force orthogonality). While the chemical application is niche, the search architecture is highly relevant: we should steal the sibling-aware conditioning to improve diversity in our evolutionary code generation and adopt their sparse storage pattern to scale our search horizons.
+
+### [Build, Judge, Optimize: A Blueprint for Continuous Improvement of Multi-Agent Consumer Assistants](https://arxiv.org/abs/2603.03565)
+
+**2026-03-03** | DoorDash, WithMetis.ai | M=8 P=6 I=8 **MUST-READ** *discuss*
+
+*Method:* Prompt-level optimization using GEPA and MAMUT GEPA | *LLM role:* evaluator, evolutionary_search, decomposition_guide, user_simulator
+
+> This paper presents a production-grade framework for optimizing multi-agent systems by jointly evolving prompt bundles (MAMUT) rather than optimizing agents in isolation. They validate this on a grocery assistant, showing that system-level optimization outperforms local sub-agent optimization by ~7% because it captures coordination dynamics (e.g., context passing) that local metrics miss. The most stealable insight is their 'Judge Calibration' loop: they use evolutionary search (GEPA) to optimize the *evaluator's* prompt to match human labels (91.4% agreement) before using that judge to optimize the agents. This is a rigorous solution to the noisy fitness function problem we face in LLM evolutionary search.
+
+### [MuxTune: Efficient Multi-Task LLM Fine-Tuning in Multi-Tenant Datacenters via Spatial-Temporal Backbone Multiplexing](https://arxiv.org/abs/2603.02885)
+
+**2026-03-03** | Shanghai Jiao Tong University, National University of Singapore | M=6 P=7 I=7 *discuss*
+
+*Method:* Hierarchical spatial-temporal backbone multiplexing with unified PEFT representations, dynamic programming for task fusion, priority-based subgraph scheduling, and chunk-based data alignment | *LLM role:* subject_of_optimization
+
+> MuxTune introduces a hierarchical scheduler for multi-tenant PEFT that uses Dynamic Programming to optimally fuse tasks (spatial batching) or interleave them (temporal multiplexing) based on a pipeline cost model. Empirical results on H100s show up to 5x throughput gains over NeMo and S-LoRA, validated by ablation studies. The most stealable insight is their **chunk-based data alignment**: instead of standard padding or naive packing, they split packed sequences into fixed-size chunks to balance compute efficiency with memory waste—a trick we should immediately implement for batch evaluation in AlgoEvo and our serving optimization models.
+
 
 #### 2026-03-05 (8 papers)
 
