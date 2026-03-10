@@ -1,0 +1,1424 @@
+--- Page 1 ---
+Trident: Adaptive Scheduling for Heterogeneous
+Multimodal Data Pipelines
+Ding Pan1, Zhuangzhuang Zhou2, Long Qian2, Binhang Yuan1
+1HKUST, 2Huawei
+Abstract
+The rapid adoption of large language models and multimodal foundation models has created unprece-
+dented demand for high-quality training data, making multimodal data preparation pipelines a critical
+AI infrastructure. These pipelines interleave CPU-heavy preprocessing with AI accelerator-backed
+(e.g., GPU/NPU/TPU) inference operators and process massive intermediate artifacts. Achieving
+high throughput is difficult for such a computation paradigm, where the multimodal workloads are
+highly non-stationary: workload regime shifts and input-dependent inference behavior cause rapid
+performance fluctuations, while transient memory spikes can trigger out-of-memory (OOM) failures.
+Existing schedulers often rely on threshold-based autoscaling or assume synchronous, homogeneous
+operators, leading to severe inefficiency.
+To overcome these essential challenges, we introduce Trident, an adaptive scheduling framework for
+heterogeneous multimodal data pipelines on fixed-resource clusters, integrating three tightly coupled
+layers in a closed loop: (i) an observation layer that provides noise-resilient capacity estimates for
+asynchronous operators using Gaussian Process regression with two-stage anomaly filtering; (ii) an
+adaptation layer that tracks workload regime shifts via online clustering and uses memory-constrained
+Bayesian optimization to tune operator configurations sample-efficiently, reducing OOM risk; (iii) a
+scheduling layer formulates a mixed-integer linear program (MILP) that jointly optimizes operator
+parallelism, placement, and configuration transitions under heterogeneous compute and bandwidth
+constraints, trading off throughput gains against cold-start overhead via rolling updates. The three
+layers form a closed control loop: capacity estimates and configuration recommendations flow into
+the MILP, whose decisions in turn trigger sample invalidation and model updates, ensuring system-
+wide consistency. We evaluate Trident on production-representative document and video curation
+pipelines. Trident improves end-to-end throughput by up to 2.01× (PDF pipeline) and 1.88× (video
+pipeline) over a static baseline, substantially outperforming existing schedulers, with low overhead
+suitable for online re-optimization.
+1
+Introduction
+The rapid advancement of large language models (LLMs) and multimodal foundation models (MFMs) has
+created an unprecedented demand for high-quality training data [1–3]. Multimodal data preparation pipelines
+that process petabytes of documents [2, 4], images [5], and videos [6] have become a critical infrastructure for
+modern generative AI development. These pipelines contain various operators with heterogeneous resource
+utilization, such as video decoding, filtering operators using CPUs, alongside LLM-based assessment operators
+running on AI accelerators such as GPUs, TPUs, or NPUs, where a large volume of intermediate multimodal
+data flows through the pipelines.
+1
+arXiv:2603.02075v1  [cs.DC]  2 Mar 2026
+
+
+--- Page 2 ---
+We believe that stream processing architectures [7–10] should be able to offer compelling advantages for such
+workloads—unlike batch processing, which executes stage-by-stage and materializes all intermediate results
+between stages, stream processing divides data into dynamically sized batches that continuously flow between
+CPU preprocessing and GPU inference operators, and enables memory-efficient pipelining with concurrent
+utilization of heterogeneous resources. Emerging streaming data processing systems for AI and multimodal
+workloads (e.g., Ray Data [10]) have demonstrated substantial throughput improvements over batch processing
+systems such as Spark [11].
+However, achieving high end-to-end throughput in production multimodal data pipelines remains challeng-
+ing: First, multimodal workloads are highly non-stationary: dataset skew and input dependent inference
+behavior [12, 13] can cause large and rapid fluctuations in both performance and resource utilization during
+pipeline execution, including transient spikes in accelerator memory footprint that may trigger out-of-memory
+(OOM) failures. This requires the scheduler to model pipeline performance and make resource allocation
+decisions based on real-time performance metrics, while also accounting for memory safety. Second, accurately
+characterizing the performance of multimodal data pipelines composed of complex asynchronous operators
+is essentially difficult. Operators often encapsulate LLM inference and batched vision models that execute
+asynchronously with complex internal scheduling logic, a vast configuration space, and shifting performance.
+Configuration changes that improve throughput (e.g., larger batches or longer sequences) can also push
+memory usage over the device limit and cause OOM-induced restarts. Third, the search space for the potential
+optimal configuration is exponential—each operator has a distinct parallelism configuration that should
+be dynamically adjusted during pipeline execution, and the cluster placement of each operator’s parallel
+executors further affects pipeline performance by introducing cross-server multimodal data transfer overhead
+and synchronization costs.
+As a result, existing stream processing systems may suffer severe performance degradation in multimodal data
+processing pipelines without including specific optimization to address the above challenges. For example,
+the schedulers in such systems either perform threshold-based auto-scaling on individual operators without
+considering end-to-end pipeline performance, or make mismatched assumptions: operators are synchronous
+and share homogeneous resource usage, and inter-operator data transfer overhead is negligible [10, 14–17].
+We present Trident, a scheduling framework that addresses these challenges through three integrated
+innovative components.
+• An observation layer that provides a noise-resilient performance model for heterogeneous multimodal
+pipelines. For each complex asynchronous operator in the pipeline, rather than relying on synchronous
+useful-time estimators that break under overlapping execution and dynamic batching, we learn a direct
+mapping from workload descriptors to achievable throughput using Gaussian Process regression [18]. To
+ensure the model reflects sustainable capacity rather than transient underutilization, we incorporate anomaly
+detection to filter observations that are dominated by upstream starvation or backpressure artifacts. This
+layer provides reliable capacity estimates that enable both effective scheduling and meaningful evaluation of
+candidate configurations during online tuning.
+• An adaptation layer that performs online workload clustering and memory-constrained configuration
+tuning. Streaming clustering identifies distinct workload patterns without offline preprocessing. To safely
+optimize operator parameters under accelerator memory limits, the layer uses memory-constrained Bayesian
+optimization [19–21], treating peak accelerator memory as a black-box constraint to enable sample-efficient
+search while reducing OOM risk during exploration. The layer outputs candidate configurations to the
+scheduling layer, which decides whether and when to apply them.
+• A scheduling layer that formulates a mixed-integer linear program (MILP) for joint parallelism, placement,
+and configuration transition under heterogeneous resource constraints. Unlike traditional autoscalers that
+treat workers as interchangeable, our formulation models GPUs/NPUs and CPUs as distinct resource pools
+with separate capacity limits. The effective source rate becomes a decision variable coupled to downstream
+capacity, enabling throughput maximization rather than reactive scaling. The formulation captures cluster
+topology and bandwidth constraints, co-locating bandwidth-intensive adjacent stages to avoid cross-node
+transfer bottlenecks. The MILP incorporates integer decision variables that govern rolling updates for
+2
+
+
+--- Page 3 ---
+configuration transitions, weighing the projected throughput improvement against the cold-start overhead
+incurred during instance restart. A migration penalty term discourages unnecessary placement changes
+across re-optimization rounds.
+Note that these three layers form a closed control loop rather than operating independently. The capacity
+estimations produced by the observation layer parameterize both the MILP in the scheduling layer and
+the surrogate models in the adaptation layer. When the adaptation layer detects a workload regime shift
+and proposes a new operator configuration, the scheduling layer decides whether to adopt it by weighing
+the projected throughput gain against the cold-start overhead of a rolling update. Upon committing a
+configuration transition, the scheduling layer invalidates the observation layer’s historical samples for the
+affected operator, triggering model re-initialization so that capacity estimates remain consistent with the
+active system state. This bidirectional coupling—where scheduling decisions feed back into the observation
+layer and adaptation layer, and vice versa—is essential for maintaining system-wide consistency: without it,
+stale capacity models or uncoordinated configuration switches would erode the very throughput gains that
+each layer individually provides.
+We implement Trident atop Ray Data and evaluate it on two production-representative pipelines: a document
+processing pipeline combining PDF parsing, layout detection, and LLM-based OCR, and a video cleaning
+pipeline with decoding, scene detection, quality filtering, and captioning stages. Experiments show that
+Trident (i) provides robust, workload-aware capacity estimates for complex asynchronous operators, (ii) adapts
+operator configurations under workload regime shifts while mitigating OOM-induced disruption, and (iii)
+improves end-to-end scheduling decisions by jointly optimizing parallelism, placement, and configuration
+transitions under fixed heterogeneous resources. Overall, Trident improves end-to-end throughput by up to
+2.01× (PDF pipeline) and 1.88× (video pipeline) over a static baseline, with low overhead suitable for online
+re-optimization.
+2
+Background and Motivation
+Modern data preparation pipelines increasingly process multimodal datasets that combine text documents,
+images, and videos, and are executed repeatedly to produce training and evaluation corpora for downstream
+foundation models [2, 6, 22]. These pipelines typically consist of multiple stages—e.g., parsing, decoding,
+filtering, transformation, and model-based inference—and are often deployed using stream execution models [7–
+10], where data items flow through a directed acyclic graph (DAG) of operators and intermediate results are
+materialized only when necessary. While streaming improves resource efficiency and reduces materialization
+overhead, streaming also exposes scheduling challenges that are less pronounced in traditional synchronous,
+record-at-a-time settings.
+2.1
+Multimodal Pipeline Characteristics
+Multimodal operators exhibit highly input-dependent and non-stationary behavior. Even within a single
+stage, execution time and achievable throughput can vary substantially with request characteristics such as
+document length and layout, image resolution, or video duration and scene complexity. Many vision and
+video operators rely on accelerators and process data in batches; moreover, accelerator-backed inference is
+frequently asynchronous and uses internal dynamic/continuous batching to amortize overhead [12, 13]. As a
+result, observed throughput can be non-linear and time-varying, and short-window measurements are often
+confounded by transient upstream starvation, downstream backpressure, and batching artifacts rather than
+reflecting sustainable operator capacity. Finally, configuration choices that improve throughput (e.g., larger
+batch sizes or longer sequence limits) can also increase peak device memory sharply and trigger out-of-memory
+failures, turning configuration selection into an online performance–safety trade-off under changing input
+distributions.
+2.2
+Offline Resource Constraints
+In practice, multimodal data preparation pipelines are commonly executed in an offline paradigm on fixed-
+resource clusters of heterogeneous devices (i.e., a large number of CPUs, along with a fixed number of GPUs,
+3
+
+
+--- Page 4 ---
+Figure 1 Trident system architecture. The metrics collector gathers runtime statistics from operator instances and
+feeds them to two parallel paths: the observation layer filters anomalies and estimates operator throughput via Gaussian
+Process regression, while the adaptation layer performs workload clustering and maintains memory-aware configuration
+recommendations via memory-constrained Bayesian optimization. The scheduling layer integrates capacity estimates
+and configuration recommendations to solve an MILP that jointly optimizes parallelism, placement, and configuration
+transitions. Upon committing a configuration transition, the scheduling layer signals the observation layer to invalidate
+stale samples (path ➈), ensuring capacity estimates remain consistent with the active configuration.
+NPUs, or TPUs) and under non-negligible network constraints. Operators have distinct resource affinities:
+some are CPU-bound, others require accelerators, and bandwidth-intensive stages can be bottlenecked by
+cross-node transfers of large intermediate data (e.g., frames, crops, or embeddings). Consequently, end-to-end
+throughput depends not only on per-operator parallelism but also on placement decisions and communication
+patterns. Unlike elastic cloud settings, where autoscaling can mask inefficiencies, fixed clusters require careful
+coordination of operator parallelism, placement, and configuration choices under hard resource budgets, while
+maintaining stability in the presence of workload shifts and costly operator restarts.
+3
+System Overview
+This section presents the overall architecture of Trident and describes how its components interact to achieve
+adaptive scheduling for multimodal data preparation pipelines.
+3.1
+System Architecture
+Figure 1 illustrates the architecture of Trident, which consists of three integrated layers built atop a Ray
+cluster.
+Pipeline Executor. The pipeline executor manages the dataflow graph, instantiating operators, routing data
+between them, and applying parallelism updates from the scheduling layer.
+Metrics Collector. The metrics collector gathers runtime statistics from all operator instances—including
+observed throughput, resource utilization, queue lengths, per-request characteristics, and peak device memory
+usage—and feeds them into both the observation layer and the adaptation layer.
+Observation Layer. The observation layer estimates the sustainable throughput of each operator by combining
+4
+
+
+--- Page 5 ---
+anomaly filtering with Gaussian Process regression [18] over workload descriptors. The resulting capacity
+estimates feed into both the scheduling layer and the adaptation layer. Details are presented in Section 4.
+Adaptation Layer. The adaptation layer tracks workload distribution shifts through online clustering and
+discovers optimal operator configurations via memory-constrained Bayesian optimization, which serves as a
+workload-aware advisor: configuration recommendations are forwarded to the scheduling layer, which decides
+whether and when to apply them. Details are presented in Section 5.
+Scheduling Layer. The scheduling layer formulates a mixed-integer linear program (MILP) that jointly opti-
+mizes operator parallelism, placement, and configuration transitions under heterogeneous resource constraints.
+Upon committing a configuration change, the scheduling layer notifies the observation layer to invalidate stale
+samples, ensuring capacity estimates remain consistent with the active system state. Details are presented in
+Section 6.
+3.2
+Control Flow
+The three layers form a closed-loop control system. The metrics collector gathers observations from operators
+(path ➁) and feeds them into two parallel paths.
+The observation layer filters samples and produces
+capacity estimations (➂→➃), while the adaptation layer performs clustering and maintains configuration
+recommendations (➄→➅→➆). The scheduling layer integrates both inputs to solve the MILP, which jointly
+determines parallelism, placement, and configuration transitions. Scheduling decisions are propagated back to
+the pipeline executor (➇). When the MILP selects a configuration change for an operator, the scheduling layer
+coordinates a rolling update through the pipeline executor and signals the observation layer to invalidate stale
+samples (➈), maintaining consistency between capacity estimates and the active system state.
+4
+Observation Layer
+The observation layer estimates the sustainable throughput of each operator, providing capacity inputs for the
+scheduling layer. This section describes the challenges of throughput estimation for asynchronous operators
+and presents our approach combining Gaussian Process regression with anomaly detection.
+4.1
+Problem Description
+For synchronous operators with deterministic execution, dividing processed records by useful time yields reliable
+capacity metrics [15]. However, asynchronous operators prevalent in multimodal pipelines—such as LLM
+inference engines with continuous batching [12] and batch-oriented vision models—violate this assumption:
+overlapping execution obscures the mapping between elapsed time and completed work, while dynamic batching
+makes throughput dependent on request arrival patterns rather than a fixed per-record cost. Furthermore,
+when an operator is starved of input or temporarily backlogged, raw measurements confound transient pipeline
+effects with intrinsic capacity. The observation layer, therefore, requires a throughput estimator that: (i)
+conditions on workload characteristics to capture input-dependent performance variation, (ii) quantifies
+prediction uncertainty for downstream decision-making, and (iii) filters non-steady-state observations before
+they corrupt the model. We address these requirements using Gaussian Process regression [18] in combination
+with a two-stage anomaly filtering pipeline.
+4.2
+Throughput Modeling by Gaussian Process
+We model the relationship between workload characteristics and operator throughput using Gaussian Process
+(GP) regression [18]. GP is well suited to this setting for two reasons: (i) flexible nonlinear modeling without
+a fixed functional form, and (ii) explicit uncertainty quantification, which is valuable for both extrapolation
+to unseen workload regions and model-based anomaly detection.
+Feature Representation. For each asynchronous operator, we define a feature vector x capturing workload
+characteristics relevant to its throughput. For LLM inference operators, features include the mean and
+standard deviation of input token lengths (µin, σin) and output token lengths (µout, σout). Specifically,
+x = (µin, σin, µout, σout). For vision operators, features include image resolution and batch size. The specific
+features are operator-dependent and configured at pipeline definition time.
+5
+
+
+--- Page 6 ---
+Model Formulation. We model throughput y as a function of workload features formulated below:
+y = f(x) + ϵ,
+f ∼GP(m(x), k(x, x′))
+(1)
+where m(x) is the mean function, k(x, x′) is the covariance kernel, and ϵ ∼N(0, σ2
+n) represents observation
+noise. We use a constant mean function and the Mat´ern 5/2 kernel, which provides smoothness appropriate
+for physical throughput relationships while remaining robust to local variations.
+Incremental Updates. As new filtered observations arrive, we update the GP model incrementally. To
+bound computational cost, we maintain a fixed-size inducing point set using a sliding window over recent
+observations. When the observation buffer exceeds capacity, we remove the oldest samples while preserving
+coverage across the observed feature space.
+Throughput Prediction. Given the current workload characteristics x∗, the GP provides a predictive
+distribution:
+p(y∗|x∗, D) = N(µ∗, σ∗2)
+(2)
+where D denotes the training set of filtered observations. We report the predictive mean µ∗as the capacity
+estimate to the scheduling layer. The predictive variance σ∗2 quantifies estimation confidence and supports
+two use cases: (i) identifying predictions in unexplored workload regions that require caution and (ii) enabling
+model-based anomaly detection (Section 4.3).
+4.3
+Anomaly Detection
+Not all throughput observations reflect sustainable operator capacity. We apply a two-stage filtering pipeline
+to identify and discard anomalous samples before they are included in the GP training set.
+Stage 1: Signal-based Filtering. The first stage uses lightweight, readily available runtime signals to detect
+and discard observations collected under non-steady-state conditions.
+• Utilization-based filtering. We monitor GPU/NPU/TPU utilization for accelerated operators and CPU
+utilization for compute-bound stages. Observations collected when utilization falls below a threshold τu are
+excluded, preventing underestimation caused by upstream starvation.
+• Queue-based filtering. We track queue length over sliding windows and detect two anomalous patterns:
+draining queues indicate the operator is outpacing its input supply, while rapidly growing queues suggest a
+temporary backlog that inflates apparent throughput. Thus, observations during these transient phases will
+be excluded.
+Stage 2: Model-based Filtering. Samples passing the first stage may still contain outliers due to transient
+system effects (e.g., garbage collection pauses or resource contention). For each candidate observation (x, y),
+we query the current GP model for a predictive distribution at x:
+p(y∗|x, D) = N(µ, σ2)
+(3)
+We compute the standardized residual z = (y −µ)/σ and reject observations where |z| > τz, preventing
+outliers from corrupting subsequent updates.
+We want to emphasize that the two stages are complementary: the signal-based filtering catches systematic
+issues detectable from runtime metrics, while model-based filtering catches sporadic anomalies that escape
+the first stage.
+4.4
+Cold Start and Sample Invalidation
+During system startup or after a configuration change, insufficient valid samples may be available for reliable
+GP prediction. When the number of filtered observations falls below a threshold nmin, we bypass the GP
+model and report an exponential moving average (EMA) of recent throughput observations as the capacity
+estimate, with only signal-based filtering (Stage 1) active. Once the observation count exceeds nmin, we
+transition to GP-based prediction with the full two-stage filtering pipeline. When the scheduling layer commits
+6
+
+
+--- Page 7 ---
+Algorithm 1 Adaptation Layer Control Flow
+Require: Feature vector x for incoming request
+Ensure: Updated cluster state and configuration recommendations
+1: // Phase 1: Workload Categorization
+2: c ←AssignCluster(x)
+3: UpdateClusterStats(c, x)
+4: // Phase 2: Trigger Condition Check
+5: if ShouldTriggerTuning(c) then
+6:
+EnqueueTuningJob(c)
+7: end if
+8: // Phase 3: Forward Recommendations
+9: UpdateMatchHistory(c)
+10: cdom ←GetDominantCluster()
+11: if cdom.s = Tuned then
+12:
+ForwardRecommendation(cdom.config, cdom.UT cand)
+13: end if
+a configuration transition for an operator, historical samples collected under the previous configuration no
+longer reflect the operator’s behavior. Upon receiving the transition notification, the observation layer clears
+its observation buffer and resets the GP model for the affected operator, triggering a return to EMA-based
+estimation until sufficient new samples accumulate.
+5
+Adaptation Layer
+The adaptation layer detects workload distribution shifts and identifies near-optimal operator configurations
+for each workload pattern. As a workload-aware advisor, the adaptation layer performs online workload
+categorization and configuration tuning and forwards recommendations to the scheduling layer, which decides
+whether and when to apply configuration transitions as part of its unified MILP optimization. Algorithm 1
+presents the overall control flow.
+5.1
+Problem Description
+Operator configurations such as batch size, maximum sequence length, and tiling strategy significantly affect
+both throughput and peak accelerator memory. Optimal settings are workload-dependent: shorter inputs favor
+larger batches to improve device utilization, whereas longer inputs require smaller batches to avoid memory
+exhaustion. The exact memory footprint depends on framework allocators, kernel fusion, and caching behavior
+and therefore behaves as a black-box function of the configuration and input distribution. Naively exploring
+the configuration space risks frequent out-of-memory (OOM) failures that cause worker restarts and prolonged
+throughput drops. The adaptation layer must therefore (i) detect when the workload distribution has shifted
+sufficiently to warrant re-tuning, and (ii) search for high-throughput configurations sample-efficiently while
+bounding OOM risk. We achieve this through online workload clustering coupled with memory-constrained
+Bayesian optimization.
+5.2
+Workload Categorization
+We maintain a set of workload categories using an online clustering algorithm that updates incrementally as
+new samples arrive.
+Cluster Representation. Each cluster Ci is represented as a tuple (µi, Ni, si, θ∗
+i ), where µi denotes the cen-
+troid, Ni the sample count, si ∈{Pending, Tuning, Tuned} the tuning status, and θ∗
+i the optimal configuration
+if available. We limit the number of clusters to Lmax to bound memory usage.
+Feature Extraction. For each processed request, we extract a low-dimensional feature vector x characterizing
+the workload. Features are operator-specific: for LLM operators, we use input token length and output token
+7
+
+
+--- Page 8 ---
+length; for vision operators, we use image resolution and aspect ratio.
+Cluster Assignment and Update. When a new sample arrives, we compute its distance to each existing
+centroid. If the minimum distance falls below the threshold τd, we assign the sample to the nearest cluster
+and update the centroid incrementally via µnearest ←µnearest +
+1
+Nnearest+1(x −µnearest). Otherwise, we create
+a new cluster with the sample as its centroid. If the number of clusters reaches the limit Lmax, the two closest
+clusters are merged before the new one is added.
+Cluster Maintenance. To adapt to shifting distributions, we periodically apply exponential decay to sample
+counts: Ni ←γ ·Ni where γ < 1. Clusters whose counts fall below a minimum threshold are removed, allowing
+the system to forget obsolete patterns.
+5.3
+Configuration Optimization
+Trident optimizes operator-level runtime configurations online to maximize sustainable throughput under the
+current dominant workload cluster. For accelerator-backed operators, aggressive exploration of configuration
+parameters (e.g., batch size, maximum sequence length, tile size) can easily trigger device out-of-memory
+(OOM) failures, causing worker restarts and prolonged throughput drops. Peak device memory is difficult
+to model analytically because peak memory depends on framework allocators, kernel fusion, and caching
+behavior. Trident therefore treats device memory as a black-box constraint and uses memory-constrained
+Bayesian optimization during tuning so that recommended configurations are both high-throughput and
+OOM-safe, without requiring additional mechanisms in the scheduling layer.
+Formally, for a tunable operator i and dominant workload cluster c described by a feature vector xc, Trident
+chooses a configuration θ ∈Θi by solving:
+max
+θ∈Θi UTi(θ; xc)
+s.t.
+Memi(θ; xc) ≤M cap
+i
+−∆i,
+(4)
+where UTi(θ; xc) is sustainable throughput, Memi(θ; xc) is peak device memory during execution, M cap
+i
+is
+the available device memory capacity for the operator instance, and ∆i is a safety margin that accounts for
+allocator fragmentation, runtime caching, and measurement noise. Because both throughput and peak memory
+are expensive to evaluate and do not admit closed-form expressions, Trident maintains two probabilistic
+surrogate models learned from online measurements (Gaussian Processes in our implementation):
+UTi(θ; xc) ∼N
+ µUT (θ; xc), σ2
+UT (θ; xc)
+
+,
+(5)
+Memi(θ; xc) ∼N
+ µM(θ; xc), σ2
+M(θ; xc)
+
+.
+(6)
+Each tuning evaluation records (UTi(θ; xc), Memi(θ; xc)). If an evaluation triggers OOM, Trident marks θ
+as infeasible so subsequent proposals avoid repeatedly exploring unsafe regions. From the memory surrogate
+in Eq. (6), Trident computes the probability that θ satisfies the memory constraint:
+PoF(θ) = Pr(Memi(θ; xc) ≤M cap
+i
+−∆i) = Φ
+M cap
+i
+−∆i −µM(θ; xc)
+σM(θ; xc)
+
+(7)
+where Φ(·) is the standard normal CDF.
+Let UT +
+i denote the best observed sustainable throughput among feasible (non-OOM) configurations. Trident
+uses expected improvement on throughput, denoted EIUT (θ), and combines EIUT (θ) with feasibility to define
+a constrained acquisition function:
+α(θ) = EIUT (θ) · PoF(θ).
+(8)
+The next configuration is selected by maximizing α(θ) while enforcing a minimum feasibility threshold:
+θt+1 = arg max
+θ∈Θi α(θ)
+s.t.
+PoF(θ) ≥η,
+(9)
+where η controls the exploration–safety trade-off. After exhausting the tuning budget, Trident recommends
+the best configuration candidate with the highest predicted throughput among candidates satisfying PoF(θ) ≥
+η, keeping the safety mechanism entirely within the tuning loop.
+8
+
+
+--- Page 9 ---
+6
+Scheduling Layer
+The scheduling layer determines operator parallelism and placement to maximize pipeline throughput under
+fixed resource constraints. This section formulates the scheduling problem as a mixed-integer linear program
+(MILP) and describes the solution approach.
+6.1
+Problem Description
+Given a pipeline of n operators processing data through a cluster of K heterogeneous nodes, the scheduling
+layer must decide how many instances of each operator to run and where to place them. This problem
+differs from traditional stream processing autoscaling in three respects. First, resources are fixed rather
+than elastic. Offline data preparation runs on dedicated clusters where CPU cores, memory, and accelerator
+devices cannot be provisioned on demand. Unlike online streaming settings where the source rate is externally
+imposed by incoming data streams, in offline batch processing, the source rate is itself a decision variable:
+we seek to maximize end-to-end throughput subject to hard capacity limits on each node. Second, operator
+placement matters. When adjacent operators reside on different nodes, intermediate data must traverse the
+network. For bandwidth-intensive stages—such as those following decompression or frame extraction—network
+capacity can become the binding constraint. Placement-unaware scheduling misses opportunities to co-locate
+communicating operators and reduce cross-node traffic. Third, operator configuration selection interacts
+with parallelism and placement. Switching to a better-matched configuration promises higher steady-state
+throughput, but each transition incurs cold-start overhead from instance restarts and observation warm-up.
+The scheduling layer must therefore weigh the projected gain against the transition cost and decide both
+whether and how fast to apply configuration changes via rolling updates. Our scheduling layer addresses these
+challenges through an MILP formulation that jointly optimizes parallelism, placement, and configuration
+transitions while modeling heterogeneous resources, data amplification, network bandwidth, and cold-start
+overhead.
+6.2
+System Model
+Cluster Resources. The cluster consists of K nodes, each with heterogeneous resource capacities. Node
+k provides Ccpu
+k
+CPU cores, Cmem
+k
+GB of memory, and Cgpu
+k
+GPU devices. These capacities are fixed and
+known at scheduling time.
+Pipeline Structure. The pipeline comprises n operators arranged in a linear dataflow: operator 1 receives
+raw input, each operator i passes its output to operator i + 1, and operator n produces final results. Each
+operator i has the following characteristics, obtained from the observation layer and adaptation layer:
+• Unit throughput UTi: the processing rate of a single instance, in records per second. This value is provided
+by the observation layer’s Gaussian Process model based on current workload characteristics.
+• Resource requirements: CPU cores ui, memory mi GB, and GPU devices gi consumed by each instance.
+• Output data size dout
+i
+: the size in MB of each record produced by operator i.
+• Data amplification factor Di: the ratio of operator i’s input volume to the original pipeline input. This
+captures how data expands or contracts through the pipeline. For example, if operator 1 splits each input
+document into 10 pages, then D2 = 10; if operator 2 filters half, then D3 = 5.
+Let Do denote the amplification factor at the pipeline output. The relationship between operator i’s local
+throughput and the equivalent pipeline input rate is governed by Di: processing Di records at operator i
+corresponds to one record of original input.
+Current Deployment State. For online rescheduling, we track the current deployment: ¯xi,k denotes the
+number of instances of operator i currently running on node k. At initial startup, ¯xi,k = 0 for all i, k. Each
+operator also has associated migration costs: hstart
+i
+seconds to launch a new instance and hstop
+i
+seconds to
+terminate an existing one.
+9
+
+
+--- Page 10 ---
+Configuration State. For each tunable operator i, the system maintains the current rolling update state:
+nold
+i
+instances running the current configuration and nnew
+i
+instances already transitioned to the candidate
+configuration from previous scheduling rounds. At initial startup or when no rolling update is in progress,
+nold
+i
+= pi and nnew
+i
+= 0.
+The adaptation layer provides the candidate configuration’s estimated unit throughput UT cand
+i
+, while the
+observation layer provides the current configuration’s measured unit throughput UT cur
+i
+. The cold-start
+overhead per instance is hcold
+i
+, encompassing both the instance restart time and the observation warm-up
+period during which the GP model is unavailable.
+6.3
+Decision Variables
+The MILP formulation employs the following decision variables:
+• pi ∈Z+: total number of instances (parallelism) for operator i.
+• xi,k ∈Z≥0: number of instances of operator i placed on node k.
+• bi ∈Z≥0: number of instances of operator i to transition from current to candidate configuration in this
+scheduling round (rolling update batch size). For non-tunable operators or those without a ready candidate
+configuration (si ̸= Tuned), bi = 0.
+• wi,k,l ∈Z≥0: data flow units from operator i on node k to operator i + 1 on node l. Each unit represents
+one instance’s worth of output capacity.
+• δ+
+i,k, δ−
+i,k ∈Z≥0: instances of operator i added to or removed from node k relative to current deployment.
+• T ≥0: pipeline throughput in original input records per second.
+• Emax ≥0: maximum egress traffic (MB/s) across all nodes.
+• Jmig ≥0: total migration cost in seconds.
+6.4
+Optimization Objective
+The primary goal is maximizing throughput T. Secondary objectives include minimizing peak network load
+to avoid bandwidth bottlenecks and minimizing migration cost to maintain deployment stability. We combine
+these through weighted summation:
+max
+T −λ1 · Emax −λ2 · Jmig
+(10)
+The coefficients λ1 and λ2 are small positive values that establish a priority ordering: throughput dominates,
+with network balance and migration cost serving as tiebreakers. In practice, we set λ1 = 10−4 and λ2 = 10−6
+to ensure that the secondary objectives influence the solution only when throughput is equal.
+6.5
+Constraints
+Throughput Constraints. System throughput cannot exceed any operator’s processing capacity. When
+an operator undergoes a rolling update (bi > 0), its instances contribute at different rates depending on
+their configuration state. At the start of a scheduling round, operator i has nnew
+i
+instances already on the
+candidate configuration and nold
+i
+on the current configuration. The MILP decides total parallelism pi and
+rolling batch size bi. Since already-transitioned instances are never rolled back, pi ≥nnew
+i
+holds by design. Of
+the pi instances in the new deployment:
+• nnew
+i
+instances continue on the candidate configuration at rate UT cand
+i
+;
+• bi instances are transitioning: each is restarted and incurs cold-start overhead hcold
+i
+, yielding effective rate
+ˆ
+UT i (Eq. (11));
+• the remaining pi −nnew
+i
+−bi instances stay on the current configuration at rate UT cur
+i
+.
+10
+
+
+--- Page 11 ---
+The effective throughput of a transitioning instance accounts for the cold-start overhead within the scheduling
+window:
+ˆ
+UT i = UT cand
+i
+· max
+
+0, 1 −hcold
+i
+Tsched
+
+(11)
+Since hcold
+i
+and Tsched are known constants,
+ˆ
+UT i is precomputed before MILP construction. Therefore,
+ˆ
+UT i
+does not introduce nonlinearity. We define:
+pstay
+i
+= pi −nnew
+i
+−bi
+(12)
+For the i-th operator, the throughput constraint becomes:
+T ≤Do
+Di
+·
+h
+pstay
+i
+· UT cur
+i
++ nnew
+i
+· UT cand
+i
++ bi · ˆ
+UT i
+i
+(13)
+Since nnew
+i
+is a constant (determined by the previous round’s state), all terms are linear in the decision
+variables pi and bi. When no configuration transition is active or scheduled (bi = 0 and nnew
+i
+= 0), this
+reduces to the standard constraint T ≤Do
+Di · pi · UT cur
+i
+.
+Placement Consistency. The sum of instances across all nodes must equal total parallelism:
+K
+X
+k=1
+xi,k = pi,
+∀i ∈{1, . . . , n}
+(14)
+Resource Capacity Constraints. Each node’s resource consumption must not exceed its capacity:
+n
+X
+i=1
+ui · xi,k ≤Ccpu
+k
+,
+∀k ∈{1, . . . , K}
+(15)
+n
+X
+i=1
+mi · xi,k ≤Cmem
+k
+,
+∀k ∈{1, . . . , K}
+(16)
+n
+X
+i=1
+gi · xi,k ≤Cgpu
+k
+,
+∀k ∈{1, . . . , K}
+(17)
+These constraints model heterogeneous resources as distinct pools, unlike traditional autoscalers that treat all
+workers as interchangeable, uniform capacity.
+Data Flow Conservation. Data produced by operator i on node k must be consumed by operator i + 1
+instances somewhere in the cluster. The flow variables wi,k,l model this routing:
+K
+X
+l=1
+wi,k,l = xi,k,
+∀i ∈{1, . . . , n −1}, ∀k
+(18)
+K
+X
+k=1
+wi,k,l = xi+1,l,
+∀i ∈{1, . . . , n −1}, ∀l
+(19)
+The first constraint ensures each instance of operator i on node k sends its output somewhere; the second
+ensures each instance of operator i + 1 on node l receives input from somewhere. Together, these enforce flow
+balance across the operator boundary.
+11
+
+
+--- Page 12 ---
+Network Bandwidth Constraints. Cross-node data transfer consumes network bandwidth. For operator i
+on node k, the egress traffic to other nodes is (xi,k −wi,k,k) · UTi · dout
+i
+MB/s, where wi,k,k represents local
+transfers that bypass the network. Total egress from node k is bounded by Emax:
+n−1
+X
+i=1
+(xi,k −wi,k,k) · UTi · dout
+i
+≤Emax,
+∀k ∈{1, . . . , K}
+(20)
+Minimizing Emax in the objective encourages co-location of adjacent operators, reducing cross-node traffic.
+Migration Accounting. The difference between the new and current deployment determines migration:
+xi,k = ¯xi,k + δ+
+i,k −δ−
+i,k,
+∀i, k
+(21)
+Total migration cost aggregates startup and shutdown overhead:
+Jmig =
+n
+X
+i=1
+K
+X
+k=1
+
+hstart
+i
+· δ+
+i,k + hstop
+i
+· δ−
+i,k
+
+(22)
+Including Jmig in the objective with coefficient λ2 encourages the solver to prefer solutions close to the current
+deployment when throughput is similar, reducing unnecessary churn.
+Rolling Update Constraints. The rolling update process is governed by four constraints:
+pi ≥nnew
+i
+,
+∀i
+(23)
+bi ≤nold
+i
+,
+∀i
+(24)
+bi ≤Bmax
+i
+,
+∀i
+(25)
+pstay
+i
+= pi −nnew
+i
+−bi ≥0,
+∀i
+(26)
+Constraint (23) encodes the no-rollback semantics discussed above: since already-transitioned instances
+remain on the candidate configuration, the solver must allocate at least nnew
+i
+instances. This simultaneously
+eliminates the min(nnew
+i
+, pi) nonlinearity from the throughput constraint. The second and third bound
+the batch size by the number of remaining old instances and a configurable maximum, respectively. The
+fourth ensures non-negativity of the staying instances. The MILP selects bi > 0 only when
+ˆ
+UT i > UT cur
+i
+,
+i.e., when the candidate configuration’s throughput, discounted by cold-start overhead, exceeds the current
+configuration’s throughput. When UT cand
+i
+is only marginally better or the cold-start penalty is large relative
+to Tsched, the solver defers the transition, avoiding unnecessary disruption. To avoid configuration thrashing,
+the scheduling layer enforces a single-transition invariant: each operator may have at most one pending
+configuration transition at any time. If operator i is mid-transition (nold
+i
+> 0), new recommendations from
+the adaptation layer are buffered but not acted upon until the current transition completes (nold
+i
+= 0). This
+ensures the formulation only needs to track two configuration states per operator (current and candidate),
+keeping the MILP tractable. Combining the objective (Eq. (10)) with constraints (Eqs. (12)–(26)) yields the
+complete MILP formulation, which we solve as described next.
+6.6
+Periodic Rescheduling
+Algorithm 2 describes the periodic rescheduling loop. Before each round, the scheduling layer queries the
+observation layer for current capacity estimates {UT cur
+i
+} and the adaptation layer for candidate configurations
+and their tuning status. For each tunable operator with a ready candidate (si = Tuned), the cold-start
+discounted throughput
+ˆ
+UT i is precomputed via Eq. (11). These values parameterize the MILP, which is
+solved by a dedicated Ray actor running asynchronously; the scheduler continues operating under the most
+recent feasible solution until an updated plan is returned.
+12
+
+
+--- Page 13 ---
+Algorithm 2 Periodic Rescheduling
+Require: Rescheduling interval Tsched, MILP solver, current state {¯xi,k}, rolling update state {nold
+i
+, nnew
+i
+}
+1: loop
+2:
+{UT cur
+i
+} ←query Observation Layer
+3:
+{UT cand
+i
+, si} ←query Adaptation Layer
+4:
+for each tunable operator i with si = Tuned do
+5:
+ˆ
+UT i ←UT cand
+i
+· max(0, 1 −hcold
+i
+/Tsched)
+6:
+end for
+7:
+Construct and solve MILP →(p∗, x∗, b∗, w∗)
+8:
+Apply placement and configuration changes
+9:
+¯xi,k ←x∗
+i,k for all i, k
+10:
+sleep Tsched
+11: end loop
+The solver output is applied incrementally: only the delta between the current and target placements is
+executed, launching or terminating instances gracefully as needed to minimize disruption to in-flight processing.
+For operators with b∗
+i > 0, the designated instances are restarted with the candidate configuration via rolling
+update, and the rolling update state is updated accordingly (nnew
+i
++= b∗
+i , nold
+i
+−= b∗
+i ). Upon committing a
+configuration transition, the scheduling layer signals the observation layer to invalidate historical samples for
+the affected operator, triggering a return to EMA-based estimation (Section 4.4) until new samples accumulate
+under the updated configuration.
+7
+Implementation
+We implement Trident as an extension to Ray Data v2.46.0 [10], a distributed data processing library built
+on the Ray framework [23].
+For the observation layer, we extend Ray Data’s metrics infrastructure to capture per-operator timestamps,
+record counts, and queue statistics. Workers maintain local buffers that flush to a central coordinator at
+configurable intervals. The coordinator maintains sliding-window statistics and tracks data amplification
+factors using exponential smoothing. The GP regression module is embedded in the scheduler process using a
+lightweight implementation that updates incrementally.
+The adaptation layer maintains per-operator Bayesian optimization state, including surrogate models for both
+throughput and peak device memory. Peak device memory is collected from device telemetry (e.g., NVML on
+GPUs or vendor runtime APIs on NPUs), and OOM events are detected from worker exceptions and restart
+reasons; these signals update the feasibility model used by the constrained acquisition function.
+For the scheduling layer, we extend Ray Data’s abstract autoscaler interface with MILP-based optimization. To
+avoid blocking the scheduling loop, MILP solving is delegated to a dedicated Ray actor; the autoscaler continues
+operating under the most recent feasible solution until an updated plan is returned. A key modification is
+the scale-down policy: Ray Data’s default policy terminates only idle instances, whereas our implementation
+marks busy instances for termination when reduced parallelism is indicated. Marked instances complete
+current tasks before releasing resources, enabling prompt scaling without task preemption.
+8
+EVALUATION
+We evaluate Trident to answer the following research questions:
+• RQ1: How does Trident perform compared to existing scheduling approaches in end-to-end throughput?
+• RQ2: How does Trident’s scheduling layer perform compared to existing schedulers under identical
+observation/adaptation support (i.e., a controlled comparison)?
+• RQ3: How accurate is the throughput estimation in the observation layer?
+13
+
+
+--- Page 14 ---
+PDF Pipeline
+Video Pipeline
+0.0
+0.5
+1.0
+1.5
+2.0
+Throughput Speedup (over Static)
+1.00×
+1.00×
+0.87×
+0.79×
+1.04×
+0.96×
+1.12×
+1.18×
+1.21×
+1.17×
+2.01×
+1.88×
+Static
+DS2
+ContTune
+Ray Data
+SCOOT
+Trident
+Figure 2 End-to-end throughput comparison on the PDF processing and video curation pipelines. Methods differ in
+their system-level coverage of capacity estimation, configuration tuning, and resource scheduling (Table 1). Trident
+integrates all three layers in a closed loop. Speedup is reported relative to the Static baseline.
+• RQ4: Can the adaptation layer effectively detect workload shifts, discover high-throughput configurations,
+and maintain memory safety during online exploration?
+• RQ5: How does each component contribute to overall performance?
+• RQ6: Is the system overhead acceptable?
+8.1
+Experimental Setup
+Cluster Configuration. We conduct experiments on a cluster of 8 servers, each equipped with 8 Huawei
+Ascend 910B NPUs, 256 CPU cores, and 1 TB memory, interconnected via 100 Gbps network.
+Datasets. We use two datasets spanning distinct modalities. The PDF dataset contains ∼200k documents of
+three types—academic papers, annual reports, and financial reports—processed sequentially by type. The
+video dataset contains ∼410k clips in two categories: short-form (10–30 s, ≤720p) and long-form (5–10 min,
+1080p–4K), likewise processed sequentially by category.
+Pipeline Configurations. The PDF curation pipeline comprises 17 operators across five stages (file I/O,
+parsing and layout detection, block segmentation, modality-specific OCR, and aggregation), expanding each
+document into ∼120 content blocks. Three LLM-based OCR operators each require 1 NPU; the remaining
+operators are CPU-bound. The video curation pipeline comprises 9 operators across four stages (scene-based
+splitting, aesthetic filtering, OCR-based text filtering, and LLM-based captioning). Three NPU operators—
+CLIP-based scoring, CRAFT text detection, and Qwen2.5-VL-7B captioning—each require 1 NPU, with the
+remaining six being CPU-bound.
+Baselines. We compare Trident with Static, Ray Data’s default autoscaler [10], DS2 [15], ContTune [16],
+and SCOOT [24]; baseline details and adaptations are described in Section 8.2 and Section 8.3.
+8.2
+End-to-End System Comparison (RQ1)
+We evaluate Trident as a complete system against baselines under realistic deployment conditions. Each
+baseline covers only a subset of the three subproblems—capacity estimation, configuration tuning, and resource
+scheduling—while Trident addresses all three through its integrated architecture, enabling coordinated
+decisions across components. Table 1 summarizes each approach’s coverage.
+Setup. Static uses a manually tuned fixed allocation with no runtime adaptation. Ray Data [10] uses its default
+autoscaling policy, which scales each operator independently based on in-flight tasks and utilization thresholds.
+DS2 [15] estimates per-operator processing rates via useful-time instrumentation and derives parallelism from
+dataflow topology, assuming synchronous execution. ContTune [16] extends DS2 with Conservative Bayesian
+14
+
+
+--- Page 15 ---
+Table 1 Subproblem coverage of evaluated approaches.
+Observation
+Adaptation
+Scheduling
+Static
+Ray Data
+✓
+DS2
+✓
+✓
+ContTune
+✓
+✓
+SCOOT
+✓
+Trident
+✓
+✓
+✓
+Optimization to learn non-linear parallelism–throughput relationships, but inherits the same useful-time
+instrumentation and per-operator optimization without global resource awareness. SCOOT [24] applies
+Bayesian optimization to tune inference engine parameters for each LLM-based operator offline; we run a
+separate tuning session per operator and deploy the resulting configurations statically with the same resource
+allocation as Static. Trident uses the full three-layer architecture described in Sections 4–6.
+Results. In Figure 2, Trident achieves 2.01× and 1.88× throughput over Static on the PDF and video
+pipelines, respectively, outperforming all baselines. DS2 (0.87× / 0.79×) and ContTune (1.04× / 0.96×) rely
+on useful-time instrumentation that misestimates capacity for asynchronous LLM operators with continuous
+batching. The resulting scheduling decisions actively misallocate resources, causing both to underperform or
+barely match Static. Ray Data (1.12× / 1.18×) outperforms both by avoiding capacity modeling entirely—its
+threshold-based reactive scaling cannot be misled by inaccurate estimates, and thus tracks actual demand
+more reliably. SCOOT (1.21× / 1.17×) is the strongest baseline on both pipelines, confirming that operator
+configuration tuning materially contributes to end-to-end throughput. However, SCOOT tunes each operator
+offline in isolation without accounting for inter-operator interactions, produces fixed configurations that cannot
+adapt to runtime workload shifts, and performs no cross-operator resource scheduling. These limitations
+explain Trident’s remaining 1.66× and 1.61× advantage over SCOOT: Trident’s observation layer provides
+accurate runtime capacity estimates, its adaptation layer continuously re-tunes configurations to track workload
+drift, and its scheduling layer jointly optimizes parallelism, placement, and configuration transitions across all
+operators under global resource constraints.
+8.3
+Scheduling Layer Comparison (RQ2)
+We isolate the scheduling layer by holding observation and adaptation constant for all methods; throughput
+differences are thus due only to scheduling.
+Controlled Setup. All methods share (i) Trident’s observation layer capacity estimates and (ii) Trident’s
+adaptation layer, which detects workload regime shifts and outputs per-operator configuration recommenda-
+tions. Since baselines do not natively support configuration-transition planning, we equip all baselines with
+the same minimal mechanism to apply recommendations: an all-at-once switch that restarts all instances of
+an affected operator simultaneously (restart overhead included in throughput).
+Fairness Ablation. To separate the benefit of rolling updates from Trident’s global optimization, we add
+Trident (all-at-once), which is identical to Trident except it also applies configuration changes via the
+same all-at-once restart.
+Key Findings. As shown in Table 2, Trident achieves the highest throughput, even when all methods share
+identical observation and configuration inputs. The fairness ablation reveals that rolling updates contribute a
+moderate improvement of approximately 5% over all-at-once switching on both pipelines, confirming that
+controlled transitions reduce disruption during regime changes. However, the dominant source of Trident’s
+advantage is its globally coordinated, placement-aware scheduling. Even under the same all-at-once switching
+semantics as baselines, Trident (all-at-once) outperforms the best baseline ContTune by 1.35× on the
+PDF pipeline and 1.32× on the video pipeline, demonstrating that joint optimization of parallelism and
+placement under cluster-wide constraints—rather than a privileged transition mechanism—accounts for most
+of the throughput gain.
+15
+
+
+--- Page 16 ---
+Table 2 Scheduling comparison under identical Observation+Adaptation inputs. Throughput normalized to Static.
+Method
+PDF
+Video
+Static
+1.00×
+1.00×
+Ray Data
+1.22×
+1.30×
+DS2
+1.38×
+1.25×
+ContTune
+1.42×
+1.36×
+Trident (all-at-once)
+1.92×
+1.79×
+Trident
+2.01×
+1.88×
+Table 3 Processing capacity estimation accuracy (MAPE %).
+Method
+PDF
+Video
+True Processing Rate
+62.7
+54.3
+EMA
+28.3
+25.7
+GP w/o filtering
+24.3
+21.8
+GP + signal filtering
+8.4
+7.1
+GP + two-stage filtering (Trident)
+5.6
+4.8
+8.4
+Observation Layer Accuracy (RQ3)
+We evaluate how accurately the observation layer estimates each operator’s sustainable throughput during end-
+to-end pipeline execution, where measurements are subject to upstream starvation, downstream backpressure,
+and transient imbalance.
+Setup. We execute both pipelines under representative workloads and continuously collect per-operator
+observations. Identical samples are fed to each compared estimator so that accuracy differences are attributable
+solely to methodology. Ground-truth capacity is obtained by profiling every operator in isolation under
+sustained full-load conditions with the same configuration as in the pipeline. Table 3 reports Mean Absolute
+Percentage Error (MAPE).
+Key Findings. Table 3 shows the true processing rate estimator exhibits the highest error (62.7%/54.3%),
+confirming that synchronous useful-time assumptions are violated by asynchronous operators with continuous
+batching. EMA and unfiltered GP progressively reduce error by smoothing variance and conditioning on
+workload features, respectively, but both remain sensitive to transient pipeline effects. Signal-based filtering
+sharply reduces MAPE by removing non-steady-state samples, and Trident’s full two-stage filtering achieves
+the best accuracy (5.6%/4.8%) by further rejecting GP-residual outliers. These results confirm that accurate
+capacity estimation for asynchronous multimodal operators requires both workload-aware modeling and robust
+anomaly filtering.
+8.5
+Adaptation Layer Effectiveness (RQ4)
+We evaluate the adaptation layer along three dimensions: (i) workload clustering accuracy, (ii) configuration
+optimization efficiency, and (iii) OOM protection during online exploration.
+Clustering Accuracy. On the PDF pipeline (three document types processed sequentially to create regime
+shifts) and the video pipeline (short-form clips vs. long-form videos), we compare our online clustering against
+offline K-means [25] and DBSCAN [26] that have access to the complete dataset. As shown in Table 4, our
+online algorithm correctly discovers the expected number of clusters on both pipelines without requiring
+the cluster count as input, achieving purity and ARI is only marginally below the offline baselines despite
+operating incrementally.
+Configuration Optimization. We evaluate memory-constrained Bayesian optimization on two representative
+tunable operators: TextOCR (LLM-based, PDF pipeline) and Captioning (Qwen2.5-VL-7B, Video pipeline).
+16
+
+
+--- Page 17 ---
+Table 4 Workload clustering accuracy.
+Method
+Pipeline
+Clusters
+Purity
+ARI
+K-means (offline)
+PDF
+3
+0.97
+0.94
+DBSCAN (offline)
+PDF
+3
+0.95
+0.92
+Trident (online)
+PDF
+3
+0.95
+0.89
+K-means (offline)
+Video
+2
+0.98
+0.96
+DBSCAN (offline)
+Video
+2
+0.97
+0.95
+Trident (online)
+Video
+2
+0.97
+0.93
+Table 5 Configuration optimization comparison. Throughput normalized to default (1.0×). † indicates the method
+selected an OOM-triggering configuration as its best.
+Method
+TextOCR (PDF)
+Captioning (Video)
+Default Config
+1.00×
+1.00×
+Random Search
+1.18×
+1.14×
+Grid Search
+1.22×
+1.19×
+Unconstrained BO
+1.38×†
+1.35×†
+Constrained BO (Trident)
+1.36×
+1.33×
+The configuration space includes inference engine parameters such as max-num-seqs, max-num-batched-tokens,
+block-size, scheduler-delay-factor, enable-chunked-prefill, and enable-prefix-caching, forming a large mixed-type
+search space. Each method is given 30 evaluations under sustained full-load conditions. We compare against
+Random Search (Sobol-based [27]), Grid Search, and Unconstrained BO (standard Expected Improvement
+without memory constraint). All BO variants use the Mat´ern 5/2 kernel and are initialized with 5 random
+evaluations. As shown in Table 5, Constrained BO achieves throughput within 1–2% of Unconstrained BO
+while substantially outperforming random and grid search, confirming that the memory feasibility constraint
+introduces only a marginal throughput trade-off. Notably, Unconstrained BO’s best configurations (marked
+with †) trigger OOM during sustained pipeline execution, negating their nominal advantage.
+OOM Protection. To quantify the end-to-end impact, we run both pipelines, comparing Constrained BO
+(η = 0.6, ∆i = 2048 MB) against Unconstrained BO with identical hyperparameters and tuning budgets. As
+shown in Table 6, Constrained BO reduces OOM events by 79–82%, with cumulative downtime dropping from
+462 s to 102 s (PDF) and 352 s to 68 s (Video). The remaining events occur during the initial random exploration
+phase before the memory surrogate has sufficient observations. Despite selecting nominally conservative
+configurations, Constrained BO achieves 5.5% (PDF) and 4.5% (Video) higher effective throughput than
+Unconstrained BO due to avoided restart overhead, with only a ∼3% gap relative to an OOM-free oracle.
+8.6
+Ablation Study (RQ5)
+We quantify the end-to-end contribution of Trident’s components.
+Setup. We run both the PDF and Video pipelines under the same workload traces and cluster setting as
+Section 8.1. We report normalized throughput where full Trident = 100%.
+Variants. We evaluate five variants: (i) Trident (Full); (ii) w/o Observation Layer, which replaces Trident’s
+GP-based sustainable-throughput estimation with the true-processing-rate estimator based on useful time; (iii)
+w/o Adaptation Layer, which disables online workload clustering and configuration tuning so operators use
+fixed initial configurations; (iv) w/o Placement-Aware Scheduling, which makes the scheduling optimization
+network-agnostic by removing network/ communication modeling and co-location incentives while keeping
+global parallelism and configuration-transition optimization unchanged; and (v) w/o Rolling Update, which
+applies each configuration change by restarting all instances of the affected operator simultaneously.
+Results. Figure 3 shows that the observation layer is the most critical component: removing the observation
+layer reduces throughput to 66.5% (PDF) and 60.9% (Video), indicating that accurate sustainable-capacity
+17
+
+
+--- Page 18 ---
+Table 6 OOM events and throughput impact during end-to-end pipeline execution.
+PDF Pipeline
+Video Pipeline
+Metric
+Unconstr.
+Constr.
+Unconstr.
+Constr.
+OOM events
+14
+3
+11
+2
+Cumulative downtime (s)
+462
+102
+352
+68
+Throughput loss vs. oracle
+8.7%
+3.2%
+7.2%
+2.7%
+PDF Pipeline
+Video Pipeline
+0
+25
+50
+75
+100
+125
+Throughput (% of Full)
+100.0%
+66.5%
+79.6%
+90.5%
+95.5%
+100.0%
+60.9%
+78.1%
+84.0%
+95.2%
+Trident (Full)
+w/o Observation Layer
+w/o Adaptation Layer
+w/o Placement-Aware Scheduling
+w/o Rolling Update
+Figure 3 Ablation study. Throughput is normalized to the full Trident system (100%). Removing either layer
+degrades performance on both pipelines, with the observation layer contributing more in both cases.
+estimation is essential for correct end-to-end resource allocation in pipelines with asynchronous and dynamically
+batched operators. Disabling the adaptation layer decreases throughput to 79.6% (PDF) and 78.1% (Video),
+showing that online workload-aware configuration tuning provides substantial gains beyond scheduling alone.
+Removing placement awareness leads to a smaller but consistent drop—to 90.5% (PDF) and 84.0% (Video)—
+highlighting the importance of co-locating communication-intensive stages, particularly for the Video pipeline.
+Finally, replacing rolling updates with all-at-once restarts reduces throughput to 95.5% (PDF) and 95.2%
+(Video), confirming that controlled transitions mitigate cold-start disruption during configuration switches.
+8.7
+System Overhead (RQ6)
+The observation layer and adaptation layer execute synchronously within Ray Data’s scheduler loop, adding
+only 2 ms and 4 ms per invocation respectively—negligible compared to the scheduler’s own approximately
+∼400 ms execution time. The scheduling layer’s MILP is solved asynchronously by a dedicated Ray actor, so
+the pipeline continues under the most recent feasible solution while a new one is computed. On our production
+cluster of 8 nodes, the mean MILP solve time is 206 ms (PDF pipeline) and 62 ms (video pipeline). When
+scaling the cluster to 16 nodes, solve time grows to 1,521 ms and 259 ms respectively, still well within the
+multi-minute rescheduling interval and entirely off the critical path.
+9
+Related Work
+Dataflow Scheduling and Stream Processing Autoscaling. Dataflow systems such as Flink [9], Spark
+Streaming [7], and Ray Data [10] regulate execution via backpressure or utilization thresholds. Autoscaling
+strategies range from rule-based policies [7, 14, 17, 28–32], to model-based methods like DS2 [15] and
+Turbine [33] that derive parallelism from useful-time measurements, to learning-based techniques such as
+Dragster [34] and ContTune [16] that apply Bayesian optimization. These approaches uniformly assume
+elastic resources, synchronous operators, and negligible transfer costs. Notably, useful-time instrumentation
+systematically misestimates the capacity of asynchronous operators under continuous batching (Section 8.4).
+Trident addresses these gaps by jointly optimizing operator parallelism, device placement, and configuration
+18
+
+
+--- Page 19 ---
+transitions under a fixed heterogeneous resource budget via a unified MILP formulation.
+Performance Modeling with Gaussian Processes. GP regression is widely adopted for black-box performance
+modeling: OtterTune [35] learns DBMS performance surfaces for knob tuning, CherryPick [36] applies GP-
+based BO to cloud VM selection, and Fu et al. [37] show that inherent performance variability dominates
+prediction error, motivating robust observation filtering. Online extensions including SkyGP [38] and DAO-
+GP [39] handle non-stationarity through local expert maintenance and drift detection, though neither targets
+data pipelines with asynchronous operators. Trident’s observation layer builds on this line by coupling
+GP regression with a two-stage anomaly filter that removes starvation and backpressure artifacts, yielding
+sustainable capacity estimates that update incrementally as workloads evolve.
+Constrained Configuration Tuning and Safe Exploration. Constrained Bayesian optimization has been
+applied extensively to database tuning: ResTune [40] models both objectives and SLA constraints with separate
+GPs, OnlineTune [41] restricts exploration to a GP-derived safety region for live databases, LlamaTune [42]
+reduces dimensionality via randomized embeddings, and QTune [43] introduces query-aware encodings for
+robustness under workload drift. In the LLM inference domain, SCOOT [24] tunes serving parameters per
+operator using BO with learned hidden constraints. Trident’s adaptation layer shares the constrained BO
+formulation but targets peak accelerator memory—whose violation triggers OOM failures and prolonged
+restarts—and couples configuration search with online workload regime discovery, forwarding per-regime
+recommendations to the scheduling layer’s MILP solver for transition-aware commitment decisions.
+10
+Conclusion
+In this paper, we presented Trident, an adaptive scheduling framework for heterogeneous multimodal data
+preparation pipelines running on fixed-resource clusters. Trident addresses key limitations of existing
+stream processing schedulers when applied to modern multimodal workloads, including inaccurate throughput
+estimation for asynchronous operators, static operator configurations under workload heterogeneity, and the
+lack of placement-aware resource allocation. Trident integrates three tightly coupled components: (i) a
+noise-resilient observation layer to estimate sustainable operator throughput, (ii) an adaptation layer that
+performs online workload clustering and memory-constrained configuration tuning, and (iii) a scheduling layer
+that jointly optimizes operator parallelism, placement, and configuration transitions using a mixed-integer
+linear program, where rolling updates are selectively applied only when the projected throughput gain
+outweighs the cold-start overhead. We implemented Trident on top of Ray Data and evaluated Trident on
+production-representative document and video processing pipelines. Experimental results show that Trident
+improves end-to-end throughput by up to 2.01× compared to state-of-the-art approaches, while maintaining
+low overhead and stable behavior under workload regime shifts.
+19
+
+
+--- Page 20 ---
+References
+[1] Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza Rutherford, Diego
+de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, Tom Hennigan, Eric Noland, Katie Millican,
+George van den Driessche, Bogdan Damoc, Aurelia Guy, Simon Osindero, Karen Simonyan, Erich Elsen, Oriol
+Vinyals, Jack W. Rae, and Laurent Sifre. Training compute-optimal large language models. In Proceedings of the
+36th International Conference on Neural Information Processing Systems, NIPS ’22, Red Hook, NY, USA, 2022.
+Curran Associates Inc.
+[2] Shuai Bai, Yuxuan Cai, Ruizhe Chen, Keqin Chen, Xionghui Chen, Zesen Cheng, Lianghao Deng, Wei Ding,
+Chang Gao, Chunjiang Ge, Wenbin Ge, Zhifang Guo, Qidong Huang, Jie Huang, Fei Huang, Binyuan Hui,
+Shutong Jiang, Zhaohai Li, Mingsheng Li, Mei Li, Kaixin Li, Zicheng Lin, Junyang Lin, Xuejing Liu, Jiawei Liu,
+Chenglong Liu, Yang Liu, Dayiheng Liu, Shixuan Liu, Dunjie Lu, Ruilin Luo, Chenxu Lv, Rui Men, Lingchen
+Meng, Xuancheng Ren, Xingzhang Ren, Sibo Song, Yuchong Sun, Jun Tang, Jianhong Tu, Jianqiang Wan, Peng
+Wang, Pengfei Wang, Qiuyue Wang, Yuxuan Wang, Tianbao Xie, Yiheng Xu, Haiyang Xu, Jin Xu, Zhibo Yang,
+Mingkun Yang, Jianxin Yang, An Yang, Bowen Yu, Fei Zhang, Hang Zhang, Xi Zhang, Bo Zheng, Humen Zhong,
+Jingren Zhou, Fan Zhou, Jing Zhou, Yuanzhi Zhu, and Ke Zhu. Qwen3-vl technical report, 2025.
+[3] Pablo Villalobos, Anson Ho, Jaime Sevilla, Tamay Besiroglu, Lennart Heim, and Marius Hobbhahn. Position: Will
+we run out of data? limits of llm scaling based on human-generated data. In Forty-first International Conference
+on Machine Learning, 2024.
+[4] Maurice Weber, Daniel Fu, Quentin Anthony, Yonatan Oren, Shane Adams, Anton Alexandrov, Xiaozhong Lyu,
+Huu Nguyen, Xiaozhe Yao, Virginia Adams, Ben Athiwaratkun, Rahul Chalamala, Kezhen Chen, Max Ryabinin,
+Tri Dao, Percy Liang, Christopher R´e, Irina Rish, and Ce Zhang. Redpajama: an open dataset for training large
+language models, 2024.
+[5] Christoph Schuhmann, Romain Beaumont, Richard Vencu, Cade Gordon, Ross Wightman, Mehdi Cherti, Theo
+Coombes, Aarush Katta, Clayton Mullis, Mitchell Wortsman, et al. Laion-5b: An open large-scale dataset for
+training next generation image-text models. Advances in neural information processing systems, 35:25278–25294,
+2022.
+[6] Zangwei Zheng, Xiangyu Peng, Tianji Yang, Chenhui Shen, Shenggui Li, Hongxin Liu, Yukun Zhou, Tianyi Li,
+and Yang You. Open-sora: Democratizing efficient video production for all, 2024.
+[7] Matei Zaharia, Tathagata Das, Haoyuan Li, Timothy Hunter, Scott Shenker, and Ion Stoica. Discretized streams:
+Fault-tolerant streaming computation at scale. In Proceedings of the twenty-fourth ACM symposium on operating
+systems principles, pages 423–438, 2013.
+[8] Tyler Akidau, Robert Bradshaw, Craig Chambers, Slava Chernyak, Rafael J Fern´andez-Moctezuma, Reuven Lax,
+Sam McVeety, Daniel Mills, Frances Perry, Eric Schmidt, et al. The dataflow model: a practical approach to
+balancing correctness, latency, and cost in massive-scale, unbounded, out-of-order data processing. Proceedings of
+the VLDB Endowment, 8(12):1792–1803, 2015.
+[9] Paris Carbone, Asterios Katsifodimos, Stephan Ewen, Volker Markl, Seif Haridi, and Kostas Tzoumas. Apache
+flink: Stream and batch processing in a single engine. The Bulletin of the Technical Committee on Data Engineering,
+38(4), 2015.
+[10] Frank Sifei Luan, Ron Yifeng Wang, Yile Gu, Ziming Mao, Charlotte Lin, Amog Kamsetty, Hao Chen, Cheng
+Su, Balaji Veeramani, Scott Lee, et al. The streaming batch model for efficient and fault-tolerant heterogeneous
+execution. arXiv preprint arXiv:2501.12407, 2025.
+[11] Matei Zaharia, Mosharaf Chowdhury, Tathagata Das, Ankur Dave, Justin Ma, Murphy McCauly, Michael J
+Franklin, Scott Shenker, and Ion Stoica. Resilient distributed datasets: A {Fault-Tolerant} abstraction for
+{In-Memory} cluster computing. In 9th USENIX symposium on networked systems design and implementation
+(NSDI 12), pages 15–28, 2012.
+[12] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. Orca: A distributed
+serving system for {Transformer-Based} generative models. In 16th USENIX Symposium on Operating Systems
+Design and Implementation (OSDI 22), pages 521–538, 2022.
+[13] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez, Hao
+Zhang, and Ion Stoica. Efficient memory management for large language model serving with pagedattention. In
+Proceedings of the 29th symposium on operating systems principles, pages 611–626, 2023.
+20
+
+
+--- Page 21 ---
+[14] Avrilia Floratou, Ashvin Agrawal, Bill Graham, Sriram Rao, and Karthik Ramasamy. Dhalion: self-regulating
+stream processing in heron. Proc. VLDB Endow., 10(12):1825–1836, August 2017.
+[15] Vasiliki Kalavri, John Liagouris, Moritz Hoffmann, Desislava Dimitrova, Matthew Forshaw, and Timothy Roscoe.
+Three steps is all you need: fast, accurate, automatic scaling decisions for distributed streaming dataflows. In
+13th USENIX Symposium on Operating Systems Design and Implementation (OSDI 18), pages 783–798, 2018.
+[16] Jinqing Lian, Xinyi Zhang, Yingxia Shao, Zenglin Pu, Qingfeng Xiang, Yawen Li, and Bin Cui. Conttune: Con-
+tinuous tuning by conservative bayesian optimization for distributed stream data processing systems. Proceedings
+of the VLDB Endowment, 16(13):4282–4295, 2023.
+[17] Bu˘gra Gedik, Scott Schneider, Martin Hirzel, and Kun-Lung Wu. Elastic scaling for data stream processing.
+IEEE Transactions on Parallel and Distributed Systems, 25(6):1447–1463, 2014.
+[18] Matthias Seeger. Gaussian processes for machine learning. International journal of neural systems, 14(02):69–106,
+2004.
+[19] Jasper Snoek, Hugo Larochelle, and Ryan P. Adams.
+Practical bayesian optimization of machine learning
+algorithms. In Proceedings of the 26th International Conference on Neural Information Processing Systems -
+Volume 2, NIPS’12, page 2951–2959, Red Hook, NY, USA, 2012. Curran Associates Inc.
+[20] Lorenz Fischer, Shen Gao, and Abraham Bernstein. Machines tuning machines: Configuring distributed stream
+processors with bayesian optimization. In 2015 IEEE International Conference on Cluster Computing, pages
+22–31, 2015.
+[21] Michael A. Gelbart, Jasper Snoek, and Ryan P. Adams. Bayesian optimization with unknown constraints. In
+Proceedings of the Thirtieth Conference on Uncertainty in Artificial Intelligence (UAI), 2014.
+[22] Daoyuan Chen, Yilun Huang, Zhijian Ma, Hesen Chen, Xuchen Pan, Ce Ge, Dawei Gao, Yuexiang Xie, Zhaoyang
+Liu, Jinyang Gao, Yaliang Li, Bolin Ding, and Jingren Zhou. Data-juicer: A one-stop data processing system for
+large language models. In SIGMOD, 2024.
+[23] Philipp Moritz, Robert Nishihara, Stephanie Wang, Alexey Tumanov, Richard Liaw, Eric Liang, Melih Elibol,
+Zongheng Yang, William Paul, Michael I. Jordan, and Ion Stoica. Ray: a distributed framework for emerging ai
+applications. In Proceedings of the 13th USENIX Conference on Operating Systems Design and Implementation,
+OSDI’18, page 561–577, USA, 2018. USENIX Association.
+[24] Ke Cheng, Zhi Wang, Wen Hu, Tiannuo Yang, Jianguo Li, and Sheng Zhang. Scoot: Slo-oriented performance
+tuning for llm inference engines. In Proceedings of the ACM on Web Conference 2025, WWW ’25, page 829–839,
+New York, NY, USA, 2025. Association for Computing Machinery.
+[25] James B McQueen. Some methods of classification and analysis of multivariate observations. In Proc. of 5th
+Berkeley Symposium on Math. Stat. and Prob., pages 281–297, 1967.
+[26] Martin Ester, Hans-Peter Kriegel, J¨org Sander, and Xiaowei Xu. A density-based algorithm for discovering
+clusters in large spatial databases with noise. In Proceedings of the Second International Conference on Knowledge
+Discovery and Data Mining, KDD’96, page 226–231. AAAI Press, 1996.
+[27] James Bergstra and Yoshua Bengio. Random search for hyper-parameter optimization. Journal of machine
+learning research, 13(2), 2012.
+[28] Yanif Ahmad, Bradley Berg, Uˇgur Cetintemel, Mark Humphrey, Jeong-Hyon Hwang, Anjali Jhingran, Anurag
+Maskey, Olga Papaemmanouil, Alexander Rasin, Nesime Tatbul, et al. Distributed operation in the borealis
+stream processing engine. In Proceedings of the 2005 ACM SIGMOD international conference on Management of
+data, pages 882–884, 2005.
+[29] Raul Castro Fernandez, Matteo Migliavacca, Evangelia Kalyvianaki, and Peter Pietzuch. Integrating scale out
+and fault tolerance in stream processing using operator state management. In Proceedings of the 2013 ACM
+SIGMOD International Conference on Management of Data, SIGMOD ’13, page 725–736, New York, NY, USA,
+2013. Association for Computing Machinery.
+[30] Vincenzo Gulisano, Ricardo Jimenez-Peris, Marta Patino-Martinez, Claudio Soriente, and Patrick Valduriez.
+Streamcloud: An elastic and scalable data streaming system. IEEE Trans. Parallel Distrib. Syst., 23(12):2351–2365,
+December 2012.
+21
+
+
+--- Page 22 ---
+[31] Thomas Heinze, Zbigniew Jerzak, Gregor Hackenbroich, and Christof Fetzer. Latency-aware elastic scaling
+for distributed data stream processing systems. In Proceedings of the 8th ACM International Conference on
+Distributed Event-Based Systems, DEBS ’14, page 13–22, New York, NY, USA, 2014. Association for Computing
+Machinery.
+[32] Le Xu, Boyang Peng, and Indranil Gupta. Stela: Enabling stream processing systems to scale-in and scale-out
+on-demand. In 2016 IEEE International Conference on Cloud Engineering (IC2E), pages 22–31, 2016.
+[33] Yuan Mei, Luwei Cheng, Vanish Talwar, Michael Y. Levin, Gabriela Jacques-Silva, Nikhil Simha, Anirban
+Banerjee, Brian Smith, Tim Williamson, Serhat Yilmaz, Weitao Chen, and Guoqiang Jerry Chen. Turbine:
+Facebook’s service management platform for stream processing. In 2020 IEEE 36th International Conference on
+Data Engineering (ICDE), pages 1591–1602, 2020.
+[34] Yang Liu, Huanle Xu, and Wing Cheong Lau. Online resource optimization for elastic stream processing with
+regret guarantee. In Proceedings of the 51st International Conference on Parallel Processing, ICPP ’22, New York,
+NY, USA, 2023. Association for Computing Machinery.
+[35] Dana Van Aken, Andrew Pavlo, Geoffrey J Gordon, and Bohan Zhang. Automatic database management
+system tuning through large-scale machine learning. In Proceedings of the 2017 ACM international conference on
+management of data, pages 1009–1024, 2017.
+[36] Omid Alipourfard, Hongqiang Harry Liu, Jianshu Chen, Shivaram Venkataraman, Minlan Yu, and Ming Zhang.
+{CherryPick}: Adaptively unearthing the best cloud configurations for big data analytics. In 14th USENIX
+Symposium on Networked Systems Design and Implementation (NSDI 17), pages 469–482, 2017.
+[37] Silvery Fu, Saurabh Gupta, Radhika Mittal, and Sylvia Ratnasamy. On the use of {ML} for blackbox system
+performance prediction. In 18th USENIX Symposium on Networked Systems Design and Implementation (NSDI
+21), pages 763–784, 2021.
+[38] Zewen Yang, Dongfa Zhang, Xiaobing Dai, Fengyi Yu, Chi Zhang, Bingkun Huang, Hamid Sadeghian, and Sami
+Haddadin. Streaming generated gaussian process experts for online learning and control: Extended version. arXiv
+preprint arXiv:2508.03679, 2025.
+[39] Mohammad Abu-Shaira, Ajita Rattani, and Weishi Shi. Dao-gp drift aware online non-linear regression gaussian-
+process. arXiv preprint arXiv:2512.08879, 2025.
+[40] Xinyi Zhang, Hong Wu, Zhuo Chang, Shuowei Jin, Jian Tan, Feifei Li, Tieying Zhang, and Bin Cui. Restune:
+Resource oriented tuning boosted by meta-learning for cloud databases. In Proceedings of the 2021 international
+conference on management of data, pages 2102–2114, 2021.
+[41] Xinyi Zhang, Hong Wu, Yang Li, Jian Tan, Feifei Li, and Bin Cui. Towards dynamic and safe configuration
+tuning for cloud databases. In Proceedings of the 2022 International Conference on Management of Data, pages
+631–645, 2022.
+[42] Konstantinos Kanellis, Cong Ding, Brian Kroth, Andreas M¨uller, Carlo Curino, and Shivaram Venkataraman.
+Llamatune: sample-efficient dbms configuration tuning. arXiv preprint arXiv:2203.05128, 2022.
+[43] Guoliang Li, Xuanhe Zhou, Shifu Li, and Bo Gao. Qtune: A query-aware database tuning system with deep
+reinforcement learning. Proceedings of the VLDB Endowment, 12(12):2118–2130, 2019.
+22
