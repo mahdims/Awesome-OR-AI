@@ -96,6 +96,30 @@ class Database:
         )
         return dict(row) if row else None
 
+    def get_embedding(self, arxiv_id: str) -> Optional[bytes]:
+        """Return raw embedding BLOB, or None if not yet generated."""
+        row = self.fetchone(
+            "SELECT embedding FROM paper_analyses WHERE arxiv_id = ?",
+            (arxiv_id,)
+        )
+        return row['embedding'] if row else None
+
+    def store_embedding(self, arxiv_id: str, blob: bytes) -> None:
+        """Persist serialized float32 embedding into the paper_analyses row."""
+        self.execute(
+            "UPDATE paper_analyses SET embedding = ? WHERE arxiv_id = ?",
+            (blob, arxiv_id)
+        )
+        self.commit()
+
+    def store_abstract(self, arxiv_id: str, abstract: str) -> None:
+        """Backfill abstract into paper_analyses (only if currently NULL/empty)."""
+        self.execute(
+            "UPDATE paper_analyses SET abstract = ? WHERE arxiv_id = ? AND (abstract IS NULL OR abstract = '')",
+            (abstract, arxiv_id)
+        )
+        self.commit()
+
     @staticmethod
     def _compute_is_relevant(relevance, significance) -> int:
         """Return 1 if paper passes the positioning filter, 0 otherwise.

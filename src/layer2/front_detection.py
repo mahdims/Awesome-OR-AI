@@ -6,21 +6,28 @@ Louvain community detection to identify research fronts.
 """
 
 import json
+import statistics
 from collections import Counter, defaultdict
 from datetime import date
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import sys
 
+try:
+    import numpy as np
+    _NUMPY_AVAILABLE = True
+except ImportError:
+    _NUMPY_AVAILABLE = False
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import networkx as nx
 
 try:
-    import community as community_louvain  # python-louvain
+    import pycombo
 except ImportError:
-    community_louvain = None
-    print("[WARN] python-louvain not installed. Install with: pip install python-louvain")
+    pycombo = None
+    print("[WARN] pycombo not installed. Install with: pip install pycombo")
 
 from db.database import Database
 
@@ -109,8 +116,8 @@ def build_semantic_edges(corpus_ids: set, db, semantic_weight: float,
             continue
         analyses[pid] = _parse_analysis_fields(row)
 
-    print(f"  Semantic edges: {len(analyses)}/{len(corpus_list)} papers have Layer 1 data "
-          f"({missing} skipped)")
+    print(f"  Layer 1 data: {len(analyses)}/{len(corpus_list)} papers found "
+          f"({missing} skipped — no analysis row)")
     if not analyses:
         print("  [WARN] No Layer 1 analyses found. Semantic edges skipped.")
         return
@@ -161,14 +168,49 @@ def build_semantic_edges(corpus_ids: set, db, semantic_weight: float,
         den = sum(idf(df_map[t]) for t in union)
         return num / den if den > 0 else 0.0
 
-    # Anchor scale to mean existing citation weight
-    mean_w = (sum(d['weight'] for _, _, d in G.edges(data=True)) / G.number_of_edges()
-              if G.number_of_edges() > 0 else 1.0)
+    # citation_scale: mean co-citation edge weight before semantic edges are added.
+    # A co-citation edge weight = number of external papers that cited both papers together.
+    # This anchors semantic edge weights to the same numerical scale as citation edges,
+    # so Louvain treats them proportionally.
+    # semantic_weight (caller param) then scales all semantic edges up/down relative
+    # to citation evidence (default 1.0 = equal footing with average citation pair).
+    citation_scale = (sum(d['weight'] for _, _, d in G.edges(data=True)) / G.number_of_edges()
+                      if G.number_of_edges() > 0 else 1.0)
+
+    # --- Load / generate OpenAI embeddings ---
+    # Lazy: generates only for papers with embedding IS NULL in DB (stores result).
+    # Returns {} silently if OPENAI_API_KEY not set — embedding score degrades to 0.
+    # Fallback constants used when embedding_utils cannot be imported.
+    SIM_THRESHOLD = 0.70
+    EMB_WEIGHT    = 0.70
+    emb_vecs: dict = {}
+    if _NUMPY_AVAILABLE:
+        try:
+            from layer2.embedding_utils import load_or_generate_embeddings, SIM_THRESHOLD, EMB_WEIGHT
+            emb_vecs = load_or_generate_embeddings(corpus_list, db)
+        except Exception as e:
+            print(f"  [WARN] Embedding signal unavailable: {e}")
+
+    # log_N: normalizer for categorical IDF scores → maps idf(df) ∈ [0, log(N)] to [0, 1]
+    log_N = _log(N) if N > 1 else 1.0
+
+    # Print the active configuration so the user can see exactly what is driving edges
+    emb_status = (f"{len(emb_vecs)} embeddings loaded"
+                  if emb_vecs else "disabled (OPENAI_API_KEY not set or unavailable)")
+    print(f"  Embedding signal: {emb_status}")
+    print(f"  Config: cosine_threshold={SIM_THRESHOLD}, embedding_weight={EMB_WEIGHT}, "
+          f"min_score={min_similarity}, semantic_edge_weight={semantic_weight:.2g}, "
+          f"citation_scale={citation_scale:.2f}")
 
     ids = sorted(analyses.keys())
     tag_new = lineage_new = 0
+    emb_driven = 0    # new edges where embedding was the primary driver (has_emb=True)
+    tag_only_new = 0  # new edges created without embeddings (tag-only path)
+    n_emb_pairs = 0   # total pairs where both papers have embeddings
+    all_scores: List[float] = []     # all pairwise scores for distribution reporting
+    all_cosines: List[float] = []    # raw cosine values for all emb pairs (before threshold)
+    all_tag_scores: List[float] = [] # tag scores for all pairs
 
-    # Signals 1–8: IDF-weighted pairwise similarity
     for i in range(len(ids)):
         pid_a = ids[i]
         m_a, p_a, cls_a, role_a, stype_a, bench_a, _p, _anc_a, lin_a, dom_a, cpl_a = analyses[pid_a]
@@ -179,53 +221,80 @@ def build_semantic_edges(corpus_ids: set, db, semantic_weight: float,
             m_b, p_b, cls_b, role_b, stype_b, bench_b, _p, _anc_b, lin_b, dom_b, cpl_b = analyses[pid_b]
             tags_b = m_b | p_b
 
-            # Signal 1: IDF-weighted tag Jaccard (methods + problems)
-            idf_tag = idf_jaccard(tags_a, tags_b, tag_df)
+            # --- All signals normalized to [0, 1] ---
 
-            # Signal 2: IDF-scaled class homophily
-            # Near-zero when all papers share the same class (pure noise)
-            class_bonus = (idf(class_df[cls_a]) * 0.30
-                           if (cls_a and cls_a == cls_b) else 0.0)
+            # Tag signal: IDF-weighted Jaccard over methods + problems  [0, 1] naturally
+            s_tags = idf_jaccard(tags_a, tags_b, tag_df)
 
-            # Signal 3: IDF-scaled LLM role match
-            role_bonus = (idf(role_df[role_a]) * 0.25
-                          if (role_a and role_a == role_b) else 0.0)
+            # Benchmark signal: IDF-weighted Jaccard over benchmark names  [0, 1] naturally
+            s_bench = idf_jaccard(bench_a, bench_b, bench_df)
 
-            # Signal 4: IDF-scaled search type match
-            stype_bonus = (idf(stype_df[stype_a]) * 0.15
-                           if (stype_a and stype_a == stype_b) else 0.0)
+            # Categorical signals: each normalized by log(N) so idf ∈ [0, log(N)] → [0, 1]
+            # Returns 0 when unmatched or when all papers share the same value (IDF≈0)
+            def _nc(val_a, val_b, df_map):
+                if not val_a or val_a != val_b:
+                    return 0.0
+                return idf(df_map[val_a]) / log_N
 
-            # Signal 5: IDF-weighted benchmark Jaccard (benchmark names are specific)
-            idf_bench = idf_jaccard(bench_a, bench_b, bench_df)
+            s_cat = (0.25 * _nc(cls_a,   cls_b,   class_df)    # problem class
+                   + 0.20 * _nc(role_a,  role_b,  role_df)     # LLM role
+                   + 0.15 * _nc(stype_a, stype_b, stype_df)    # search type
+                   + 0.20 * _nc(lin_a,   lin_b,   lineage_df)  # framework lineage
+                   + 0.15 * _nc(dom_a,   dom_b,   domain_df)   # specific domain
+                   + 0.05 * _nc(cpl_a,   cpl_b,   coupling_df) # LLM coupling
+                   )  # s_cat ∈ [0, 1] since weights sum to 1.0
 
-            # Signal 6: IDF-scaled framework lineage match (e.g. both "alphaevolve")
-            # Zero when all papers share the same lineage — IDF noise-proofs this
-            lineage_bonus = (idf(lineage_df[lin_a]) * 0.40
-                             if (lin_a and lin_a == lin_b) else 0.0)
+            # Tag score: weighted combination of three tag sub-signals  [0, 1]
+            tag_score = min(1.0,
+                0.50 * s_tags    # methods/problems: most informative
+              + 0.30 * s_cat     # categorical structure: refinement
+              + 0.20 * s_bench   # benchmark overlap: specific but sparse
+            )
 
-            # Signal 7: IDF-scaled specific domain match (e.g. "combinatorial_routing")
-            domain_bonus = (idf(domain_df[dom_a]) * 0.40
-                            if (dom_a and dom_a == dom_b) else 0.0)
+            # Embedding score: normalized cosine  [0, 1]
+            # 0 when cos ≤ SIM_THRESHOLD, 1 when cos = 1.0
+            # SIM_THRESHOLD removes the ~0.65 domain baseline of text-embedding-3-large
+            emb_score = 0.0
+            all_tag_scores.append(tag_score)
+            vec_a = emb_vecs.get(pid_a) if emb_vecs else None
+            vec_b = emb_vecs.get(pid_b) if emb_vecs else None
+            has_emb = vec_a is not None and vec_b is not None
+            if has_emb:
+                cos = float(np.dot(vec_a, vec_b))
+                all_cosines.append(cos)        # raw cosine before threshold (for diagnostics)
+                if cos > SIM_THRESHOLD:
+                    emb_score = (cos - SIM_THRESHOLD) / (1.0 - SIM_THRESHOLD)
 
-            # Signal 8: IDF-scaled LLM coupling match (e.g. "rl_trained")
-            coupling_bonus = (idf(coupling_df[cpl_a]) * 0.20
-                              if (cpl_a and cpl_a == cpl_b) else 0.0)
+            # Final score [0, 1]:
+            # With embeddings: EMB_WEIGHT fraction from embedding, rest from tags
+            # Without embeddings for this pair: tag-only (graceful degradation)
+            if has_emb:
+                n_emb_pairs += 1
+                score = EMB_WEIGHT * emb_score + (1.0 - EMB_WEIGHT) * tag_score
+            else:
+                score = tag_score
 
-            raw = (idf_tag + class_bonus + role_bonus + stype_bonus + idf_bench
-                   + lineage_bonus + domain_bonus + coupling_bonus)
+            # Collect ALL scores for distribution reporting (before threshold filter)
+            all_scores.append(score)
 
-            # Threshold: skip weak / noise connections
-            if raw < min_similarity:
+            if score < min_similarity:
                 continue
 
-            w = raw * mean_w * semantic_weight
+            # Edge weight: score × citation_scale × semantic_weight
+            # citation_scale keeps semantic edges on the same numerical scale as citation edges
+            # semantic_weight is the user's trust factor (--semantic-weight CLI arg)
+            w = score * citation_scale * semantic_weight
             if G.has_edge(pid_a, pid_b):
                 G[pid_a][pid_b]['weight'] += w
             else:
                 G.add_edge(pid_a, pid_b, weight=w)
                 tag_new += 1
+                if has_emb:
+                    emb_driven += 1
+                else:
+                    tag_only_new += 1
 
-    # Signal 9: Lineage edges (only exact arxiv_id matches in corpus)
+    # Lineage edges (only exact arxiv_id matches in corpus)
     # ancestors is index 7 in the 11-field tuple
     for pid_a, (_m, _p, _cls, _role, _stype, _bench, _props,
                 ancestors, _lin, _dom, _cpl) in analyses.items():
@@ -233,15 +302,46 @@ def build_semantic_edges(corpus_ids: set, db, semantic_weight: float,
             anc = entry.get('paper', '')
             if anc not in corpus_ids:
                 continue  # title-only refs or out-of-corpus papers: skip silently
-            w = mean_w * semantic_weight
+            w = citation_scale * semantic_weight
             if G.has_edge(pid_a, anc):
                 G[pid_a][anc]['weight'] += w
             else:
                 G.add_edge(pid_a, anc, weight=w)
                 lineage_new += 1
 
-    print(f"  Semantic edges: {tag_new} pairwise (threshold={min_similarity}), "
-          f"{lineage_new} lineage edges added")
+    total_pairs = len(all_scores)
+    above = [s for s in all_scores if s >= min_similarity]
+    print(f"  Pairwise scoring: {total_pairs} pairs evaluated "
+          f"({n_emb_pairs} with embeddings, {total_pairs - n_emb_pairs} tag-only)")
+    print(f"  Pairwise edges added: {tag_new} "
+          f"({emb_driven} embedding-driven, {tag_only_new} tag-only) | "
+          f"{lineage_new} lineage edges")
+    if all_scores:
+        std_str = f"{statistics.stdev(all_scores):.3f}" if len(all_scores) > 1 else "n/a"
+        print(f"  Score distribution (ALL {total_pairs} pairs): "
+              f"min={min(all_scores):.3f}, max={max(all_scores):.3f}, "
+              f"mean={statistics.mean(all_scores):.3f}, "
+              f"median={statistics.median(all_scores):.3f}, "
+              f"std={std_str} | "
+              f"above threshold ({min_similarity}): {len(above)}/{total_pairs}")
+    if all_cosines:
+        thresholds = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
+        thresh_str = " | ".join(
+            f"≥{t}: {sum(1 for c in all_cosines if c >= t)}/{len(all_cosines)}"
+            for t in thresholds
+        )
+        cos_std = f"{statistics.stdev(all_cosines):.3f}" if len(all_cosines) > 1 else "n/a"
+        print(f"  Raw cosine ({len(all_cosines)} emb pairs): "
+              f"min={min(all_cosines):.3f}, max={max(all_cosines):.3f}, "
+              f"mean={statistics.mean(all_cosines):.3f}, "
+              f"median={statistics.median(all_cosines):.3f}, "
+              f"std={cos_std}")
+        print(f"  Cosine coverage: {thresh_str}")
+    if all_tag_scores:
+        print(f"  Tag score ({len(all_tag_scores)} pairs): "
+              f"min={min(all_tag_scores):.3f}, max={max(all_tag_scores):.3f}, "
+              f"mean={statistics.mean(all_tag_scores):.3f}, "
+              f"median={statistics.median(all_tag_scores):.3f}")
 
 
 def build_cocitation_network(citation_graph: nx.DiGraph,
@@ -295,7 +395,17 @@ def build_cocitation_network(citation_graph: nx.DiGraph,
         G.add_edge(p1, p2, weight=count)
 
     cocit_edge_count = G.number_of_edges()
-    print(f"  Co-citation edges: {cocit_edge_count}")
+    if cocitation_counts:
+        cc_vals = list(cocitation_counts.values())
+        cc_std = f"{statistics.stdev(cc_vals):.2f}" if len(cc_vals) > 1 else "n/a"
+        print(f"  Co-citation edges: {cocit_edge_count} "
+              f"(count range: {min(cc_vals)}–{max(cc_vals)}, "
+              f"mean={statistics.mean(cc_vals):.2f}, "
+              f"median={statistics.median(cc_vals):.1f}, "
+              f"std={cc_std}, "
+              f"cited ≥2x by same paper: {sum(1 for v in cc_vals if v >= 2)})")
+    else:
+        print(f"  Co-citation edges: {cocit_edge_count}")
 
     # --- Step 2: Bibliographic coupling edges (skip if factor=0.0) ---
     # Two corpus papers are coupled if they share at least one reference.
@@ -365,8 +475,8 @@ def detect_fronts(cocitation_graph: nx.Graph,
     Returns:
         List of front dicts ready for database insertion
     """
-    if community_louvain is None:
-        raise ImportError("python-louvain required: pip install python-louvain")
+    if pycombo is None:
+        raise ImportError("pycombo required: pip install pycombo")
 
     if snapshot_date is None:
         snapshot_date = date.today().isoformat()
@@ -382,12 +492,12 @@ def detect_fronts(cocitation_graph: nx.Graph,
               "run layer2_detect_fronts.py with more analyzed papers.")
         return []
 
-    # Run Louvain community detection
-    partition = community_louvain.best_partition(
+    # Run Combo community detection
+    partition, _ = pycombo.execute(
         cocitation_graph,
         weight='weight',
-        resolution=resolution,
-        random_state=42
+        modularity_resolution=resolution,
+        random_seed=42
     )
 
     # Group papers by community
@@ -582,7 +692,7 @@ def run_front_detection(category: str,
         store_cocitation_edges(cocitation, category, snapshot_date, db)
 
     # Detect fronts
-    print(f"\n  Running Louvain community detection...")
+    print(f"\n  Running Combo community detection...")
     fronts = detect_fronts(cocitation, category, snapshot_date,
                            min_front_size, resolution)
 

@@ -39,6 +39,10 @@ from layer2.front_detection import (
 )
 from layer2.bridge_papers import detect_bridge_papers, store_bridge_papers
 from layer2.front_summarizer import summarize_all_fronts
+try:
+    from layer2.embedding_utils import SEMANTIC_WEIGHT as _yaml_semantic_weight
+except Exception:
+    _yaml_semantic_weight = 1.0
 
 
 def _parse_json_list(value):
@@ -215,7 +219,7 @@ def run_layer2_pipeline(category: str,
         store_cocitation_edges(cocitation, category, snapshot_date, db)
 
     # Step 3: Detect fronts
-    print(f"\n[STEP 3/5] Detecting research fronts (Louvain, resolution={resolution})...")
+    print(f"\n[STEP 3/5] Detecting research fronts (Combo, resolution={resolution})...")
     fronts = detect_fronts(cocitation, category, snapshot_date,
                            min_front_size, resolution)
 
@@ -315,18 +319,21 @@ def main():
     parser.add_argument('--min-front-size', type=int, default=2,
                         help='Minimum papers per front (default: 2)')
     parser.add_argument('--resolution', type=float, default=1.0,
-                        help='Louvain resolution (higher=more communities, default: 1.0)')
+                        help='Combo resolution (higher=more communities, default: 1.0)')
     parser.add_argument('--snapshot-date', help='Override snapshot date (YYYY-MM-DD)')
     parser.add_argument('--s2-api-key', help='Semantic Scholar API key (optional, for higher rate limits)')
     parser.add_argument('--min-bridge-score', type=float, default=0.5,
                         help='Min fraction of cross-front edge weight to qualify as bridge paper (default: 0.5)')
-    parser.add_argument('--semantic-weight', type=float, default=1.0,
-                        help='Weight for semantic similarity edges from Layer 1 data (default: 1.0, 0=citation-only)')
+    parser.add_argument('--semantic-weight', type=float, default=None,
+                        help='Scale of semantic edges vs citation edges (default: from model_config.yaml semantic_edge_weight, 0=citation-only)')
     parser.add_argument('--bib-coupling-factor', type=float, default=0.0,
                         help='Scale for bibliographic coupling edges (default: 0.0, 0=disable)')
-    parser.add_argument('--min-similarity', type=float, default=0.9,
-                        help='Min IDF-weighted similarity to create a semantic edge (default: 0.9)')
+    parser.add_argument('--min-similarity', type=float, default=0.15,
+                        help='Min combined score [0-1] to create a semantic edge (default: 0.15)')
     args = parser.parse_args()
+
+    # Resolve semantic_weight: CLI arg takes priority; fall back to YAML default
+    semantic_weight = args.semantic_weight if args.semantic_weight is not None else _yaml_semantic_weight
 
     # Check for Gemini API key if summaries are needed
     if not args.skip_summaries and not os.getenv("GEMINI_API_KEY"):
@@ -369,7 +376,7 @@ def main():
             s2_api_key=s2_api_key,
             snapshot_date=args.snapshot_date,
             min_bridge_score=args.min_bridge_score,
-            semantic_weight=args.semantic_weight,
+            semantic_weight=semantic_weight,
             bib_coupling_factor=args.bib_coupling_factor,
             min_similarity=args.min_similarity,
         )
