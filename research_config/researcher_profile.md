@@ -45,6 +45,15 @@ Active projects: OR-Bench
 
 ### [OR for Generative AI]
 
+**SCORING DIRECTION GUIDE:** This category covers OR/optimization methods applied **TO** AI
+infrastructure (OR → AI). A paper where an LLM or AI model is used to **solve** an optimization
+problem should score 0-2 here (it belongs in "Generative AI for OR").
+High-score signals: LP/MIP/queueing/scheduling math that optimizes GPU clusters, LLM serving
+latency, batch scheduling, or multi-agent AI coordination.
+Low-score signals: LLM generates optimization models, solves routing/scheduling, or formulates
+MIP constraints. Also low: LLM generates or evolves algorithms (AlphaEvolve-style, FunSearch,
+automated heuristic design) — those belong in "LLMs for Algorithm Design".
+
 **Applying formal OR methods to optimize AI and multi-agent systems**
 
 Optimization of multi-agent systems:
