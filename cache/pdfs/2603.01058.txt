@@ -1,0 +1,1129 @@
+--- Page 1 ---
+TriMoE: Augmenting GPU with AMX-Enabled CPU and
+DIMM-NDP for High-Throughput MoE Inference via Offloading
+Yudong Pan1,2, Yintao He1,2, Tianhua Han1,2, Lian Liu1,2, Shixin Zhao1,2, Zhirong Chen1,2, Mengdi
+Wang1,2, Cangyuan Li1,2, Yinhe Han1,2, Ying Wang1,2,†
+1SKLP, Institute of Computing Technology, Chinese Academy of Sciences, Beijing, China
+2University of Chinese Academy of Sciences, Beijing, China
+panyudong23@mails.ucas.ac.cn,heyintao19z@ict.ac.cn,wangying2009@ict.ac.cn
+Abstract
+To deploy large Mixture-of-Experts (MoE) models cost-effectively,
+offloading-based single-GPU heterogeneous inference is crucial.
+While GPU–CPU architectures that offload cold experts are con-
+strained by host memory bandwidth, emerging GPU-NDP archi-
+tectures utilize DIMM-NDP to offload non-hot experts. However,
+non-hot experts are not a homogeneous memory-bound group:
+a significant subset of warm experts exists is severely penalized
+by high GPU I/O latency yet can saturate NDP compute through-
+put, exposing a critical compute gap. We present TriMoE, a novel
+GPU–CPU–NDP architecture that fills this gap by synergistically
+leveraging AMX-enabled CPU to precisely map hot, warm, and cold
+experts onto their optimal compute units. We further introduce a
+bottleneck-aware expert scheduling policy and a prediction-driven
+dynamic relayout/rebalancing scheme. Experiments demonstrate
+that TriMoE achieves up to 2.83× speedup over state-of-the-art
+solutions.
+1
+Introduction
+Mixture-of-Experts (MoE) models improve the efficiency–quality
+trade-off of large language models (LLMs) by sparsely activating
+a small set of experts per token [13, 20]. Yet the total parameters
+across hundreds of experts far exceed the memory of a single high-
+end GPU [7, 29]. For example, serving DeepSeek-V2 requires at
+least seven 80GB H100 GPUs [9], costing about $200K. This makes
+offloading experts to host memory essential for single-GPU serving.
+In MoE offloading systems, end-to-end latency is often domi-
+nated by data movement to fetch off-GPU expert weights over PCIe
+rather than pure computation. As illustrated in Figure 1, prior work
+therefore evolved from GPU-only prefetching to heterogeneous
+designs [14]. Because GPU-CPU approaches are constrained by
+host memory bandwidth, current systems favor GPU-NDP [18],
+which exploits routing sparsity by keeping hot experts on the GPU
+and offloading low-load, memory-bound experts to NDP engines.
+Revisiting expert activations under high-throughput workloads
+(e.g., offline [29] or zigzag batching [9]), we find that the non-hot
+experts are not homogeneous. In addition to a small number of hot
+experts and a long tail of cold experts, 30% of experts are warm
+(a.k.a. mid-intensity). Mapping warm experts to the GPU yields
+insufficient tokens per expert for high utilization and fails to overlap
+PCIe transfers; mapping them to NDP exceeds the limited near-
+data compute budget, offsetting the gains from offloading cold
+experts. Therefore, the binary GPU-NDP partitioning paradigm,
+which lumps all non-hot experts into a single class, fails.
+† Corresponding author
+Time
+Expert 1
+Loading E2
+GPU
+Loading E3
+Expert 2
+E3
+Loading E4
+E4
+PCIe
+Expert 1
+A2
+GPU
+Expert 2
+Expert 3
+PCIe
+CPU
+Expert 4
+A3
+A4
+Expert 1
+GPU
+Expert 2
+E3
+PCIe
+NDP
+E4
+A2
+A3
+A4
+Expert 1
+GPU
+Expert 2
+E3
+PCIe
+CPU
+E4
+A2
+A3
+A4
+NDP
+cold experts
+warm experts
+cold experts
+(a) GPU-only offloading: I/O-bound & low utilization
+(b) GPU-CPU offloading: CPU bandwidth bottleneck for cold experts
+(c) GPU-NDP offloading: NDP compute bottleneck for warm experts
+(d) GPU-CPU-NDP offloading ( Ours ): balanced load & high utilization
+load weight 
+load activation
+ 
+Expected Speedup
+Expected Speedup
+Expected Speedup
+Figure 1: Execution timelines of baseline MoE offloading
+systems and our proposed architecture.
+This analysis prompts a re-examination of host-side compute
+options. Although GPU-CPU systems have historically been viewed
+as constrained, we argue that this was due to the misallocation
+of CPU to bandwidth-intensive cold experts. In contrast, modern
+server CPUs with matrix extensions (e.g., Intel AMX and ARM SME)
+offer tens of TFLOPS [2, 17], precisely matching the compute profile
+of warm experts. Meanwhile, DIMM-NDP remains the ideal choice
+for cold experts, leveraging high aggregate internal bandwidth that
+is 4–8× higher than that of the host memory system [22, 23].
+We therefore propose TriMoE, a single-GPU, high-throughput
+MoE inference architecture that uniquely orchestrates three hetero-
+geneous compute domains within one system. TriMoE retains hot
+experts (e.g., shared experts) on the GPU to exploit peak through-
+put; maps warm experts to AMX-enabled CPU to bypass PCIe
+bottlenecks and match compute demand; and offloads long-tail cold
+experts to DIMM-NDP engines to leverage high internal bandwidth.
+This hierarchical design effectively shields the GPU from PCIe con-
+gestion and the CPU from memory-bound tasks, ensuring each
+domain focuses on the workload it handles most efficiently.
+In a nutshell, our contributions are as follows:
+• Problem identification: We are the first to identify and
+formalize the overlooked class of warm experts in high-
+throughput MoE serving and show why the frontier GPU-
+NDP offloading is intrinsically inefficient.
+• TriMoE architecture & scheduler: We design TriMoE, the
+first offloading architecture to integrate GPU, AMX-enabled
+CPU, and DIMM-NDP, along with its scheduler that precisely
+arXiv:2603.01058v1  [cs.AR]  1 Mar 2026
+
+
+--- Page 2 ---
+MoE Layer
+E 1
+E 2
+E 3
+E 4
+...
+E N
+gate
+X
+Add & Normalize
+Add & Normalize
+Self Attention
+Token Embedding
+Positional 
+Encoding
+T2
+T3
+T4
+Transformer 
+Blocks
+T1
+T1
+T2
+T1
+T3
+T2
+T4
+T4
+T2
+T3
+T4
+T1
+T2
+T3
+T4
+T1
+LM head
+Output Tokens
+T3
+T1
+T4
+Routed Experts
+Shared Experts
++
+Figure 2: MoE architecture with shared and routed experts.
+matches experts to their most suitable compute units, thereby
+architecturally resolving fundamental scheduling conflicts.
+• Dynamic relayout and rebalancing: We design a prediction-
+driven policy that resolves the conflicting data layout prefer-
+ences (GPU/CPU vs. NDP) via dynamic expert relayout, and
+prevents NDP load skew via cold expert rebalancing.
+• End-to-end gains: Across multiple representative MoE
+models, TriMoE achieves 2.12–2.83× speedups in decode,
+yielding 2.09–2.78× end-to-end throughput improvement
+over state-of-the-art offloading systems.
+2
+Background
+2.1
+MoE Architecture & Inference
+Mixture-of-Experts (MoE) models scale their parameter count with-
+out a linear increase in computational cost by sparsely activating
+expert subsets [13, 20, 21, 31]. As shown in Figure 2, an MoE layer
+replaces the standard feed-forward layer with a gating function and
+N parallel experts. During inference, the gating function computes
+the assignment probability for each input token to every expert
+and selects top-k experts for processing. The outputs of these k
+experts are subsequently combined through a weighted sum to
+form the token’s final output, which is then passed to subsequent
+layers. In practice, the total number of experts (N) often ranges
+from tens to hundreds, while the number of activated experts (K) is
+typically a small integer. Furthermore, modern architectures such
+as DeepSeek [20] introduce both shared and routed experts. For
+instance, DeepSeek V2 utilizes 2 shared experts activated by all
+tokens, alongside 160 routed experts from which 6 are selected via
+a top-k gate. This hybrid design enables the model to achieve a
+good balance between parameter scale and computational cost.
+2.2
+Offloading in MoE Inference
+The large parameter scale of MoE models, due to their sparse ar-
+chitecture, typically necessitates costly multi-GPU deployments.
+Offloading-based inference systems have emerged as a cost-effective
+single-GPU solution [26, 30], utilizing host memory to store most
+(>90%) of expert weights. However, the PCIe bus (64 GB/s for
+PCIe 5.0) creates a severe I/O bottleneck, since its bandwidth lags
+experts
+tokens
+experts
+tokens
+experts
+tokens
+experts
+tokens
+experts
+tokens
+experts
+tokens
+experts
+tokens
+experts
+tokens
+bsz=256
+bsz=512
+bsz=256
+bsz=512
+bsz=256
+bsz=512
+bsz=256
+bsz=512
+lmsys dataset
+DeepSeek-V2
+CodeAlpaca dataset
+lmsys dataset
+Qwen3-235B-A22B
+CodeAlpaca dataset
+0
+100
+50
+Breakdown (%)
+routed tokens
+0-1
+2-3
+4-7
+8-15
+16-31
+32-63
+64-127
+127-255
+256+
+num of experts
+52
+39
+27
+10
+14
+5
+4
+5
+6
+num of tokens
+29
+94
+141
+112
+312
+194
+421
+744
+2017
+(b)
+(a)
+Figure 3: Expert Activation across Batch Sizes, Models and
+Datasets1. (a) Fine-grained activation for a specific configura-
+tion. (b) Summary of activation across all configurations.
+GPU compute. Consequently, SOTA offloading systems target high-
+throughput scenarios (offline or zigzag batching) to amortize I/O
+overhead [9, 29]. To minimize expert data movement during the
+decode phase with highly skewed expert activation, designs have
+evolved from prefetching to heterogeneous computing paradigms.
+Hot experts are kept resident on the GPU, while other non-hot
+experts are executed on the host using its available compute re-
+sources [14, 37]. As heterogeneous GPU-CPU systems are still con-
+strained by the host memory bandwidth, the growing trend is to
+utilize DIMM-NDP [18, 22]. For example, rank-level PUs leverage an
+aggregate internal bandwidth 4-8× higher than the host to process
+experts near-data [23], alleviating the I/O bottleneck and improving
+throughput. During the prefill phase, conversely, experts are widely
+activated, and GPU computation largely hides I/O overhead.
+3
+Motivation
+3.1
+The Scheduling Dilemma of Warm Experts
+SOTA GPU-NDP systems assume that all non-hot experts form
+a uniform, memory-bandwidth-bound subset suitable for DIMM-
+NDP processing [18, 28]. However, our analysis shows this is an
+oversimplification. As illustrated in Figure 3, an activation study
+across multiple representative MoE models and real-world datasets
+reveals substantial heterogeneity among non-hot experts: a long
+tail of cold experts constitutes over 70% of all experts but processes
+only 8% of tokens, while 20%–40% of warm experts handle up to
+70% of tokens. This heterogeneity creates a scheduling dilemma
+for GPU-NDP: (1) GPU-side I/O bottleneck. This bottleneck is
+two-fold. First, as shown in Figure 5(a), the H100 GPU requires
+at least 256 tokens per expert to reach 30% utilization, even when
+the expert is resident in HBM. Warm experts fall well below this
+threshold. More critically, these non-resident warm experts must be
+fetched via PCIe. Their low token count yields computation times
+too brief to overlap the significant I/O latency, forcing the GPU to
+stall. Consequently, overall GPU utilization drops below 8.6%. (2)
+NDP-side compute bottleneck. Scheduling warm experts on the
+NDP exceeds its compute budget, increasing NDP execution time
+by 7× and offsetting the benefits of cold-expert offloading.
+1“Batch size” here refers to offline large-batch inference or zigzag batching that aggre-
+gates multiple small batches.
+2
+
+
+--- Page 3 ---
+HBMs
+Tensor 
+Core
+Tensor 
+Core
+· · ·
+Shared Memory
+DIMM-NDP
+Host
+CPU
+AMX
+TMUL Engine
+PCIe
+Scheduler
+Expert Mapping Table
+Search
+E2
+E0
+E1
+···
+TP
+TP
+EP
+···
+DIMM 0
+Expert Load 
+Prediction
+E0
+E1
+···
+Cost Model
+Cached
+···
+Schedule
+Result
+GPU
+CPU
+NDP
+E0    E1    E2   ···
+     ✕      ✕    ···    
+✕           ✕    ···    
+✕     ✕     N1   ···    
+···
+18->6
+66->266
+···
+DIMM 0
+DIMM 1
+DRAM
+DRAM
+DRAM
+DRAM
+DIMM-Link CTL
+···
+DQ/CA Buffer
+Local CTL
+Buffer Chip
+GEMV & Act Unit
+Relayout Unit
+Buffer
+Multiplier
+Multiplier  ··· Multiplier
+Accumulator
+DL Bridge
+NDP
+Online Expert Scheduling
+Relayout
+Rebalancing
+Migration Decision
+E0
+E1
+···
+TP->EP : DIMM1
+Cache to GPU
+···
+Expert Load 
+E0
+E1
+···
+38
+276
+···
+E2
+7
+GPU
+(a)                                                                                                                                   (b)
+Figure 4: Overview of TriMoE. (a) DIMM-NDP architecture. (b) Online expert scheduling & Offline expert relayout-rebalancing.
+H100 (weight in DIMM)
+AMX-CPU
+NDP
+Number of tokens
+0                    200                   400        512    600                   800                 1000 
+30
+20
+10
+0
+60
+50
+40
+BF16 TFLOPS
+warm experts
+hot experts
+cold experts
+0                   5           8   10                         
+0
+2
+4
+6
+BF16 TFLOPS
+Number of tokens
+H100 (weight in DIMM)
+AMX-CPU
+H100 (weight in HBM)
+AMX-CPU peak 90.1TFLOPS
+H100 peak 820TFLOPS
+Number of tokens
+0                                    1000                                2000                                3000                                 4000
+800
+600
+400
+200
+0
+BF16 TFLOPS
+(a)
+(b)
+Figure 5: Compute Characterization. (a) Measured Through-
+put vs. Token Count. (b) Empirical GPU-CPU-NDP roofline.
+3.2
+Opportunity: AMX-CPU Bridging the
+GPU–NDP Compute Gap
+The scheduling dilemma in Section 3.1 arises from a significant
+compute gap between the high throughput of GPU and the limited
+compute of NDP. Warm experts fall squarely into this gap, which
+prompts a re-examination of CPU capability that NDP-based de-
+signs have largely overlooked. Although Section 2.2 notes that GPU-
+CPU systems are constrained by memory bandwidth, we argue that
+the root cause is the misallocation of CPU to bandwidth-intensive
+cold experts for which CPU is ill-suited. Server-class CPUs with ma-
+trix extensions, such as Intel AMX and ARM SME, can deliver 10–40
+TFLOPS when executing warm experts (processing tens to hun-
+dreds of tokens) [2], effectively outperforming both the PCIe-bound
+GPU and the compute-limited NDP as shown in Figure 5(b). This
+observation leads to a clear three-way co-design: AMX-enabled
+CPU handles warm experts to fill the compute gap; DIMM-NDP
+units process long-tail cold experts by exploiting their high internal
+bandwidth to avoid the CPU’s memory bottleneck; and the GPU
+continues to serve hot experts efficiently. This division assigns each
+resource to the task it executes most effectively.
+Challenges: However, realizing this co-design poses two cen-
+tral challenges: (1) Orchestration Complexity: How to design a light-
+weight scheduler that dynamically adapts to fluctuating expert loads
+and optimizes placement across three heterogeneous domains with
+distinct compute-I/O trade-offs. (2) Data Management Conflict: How
+to design an adaptive data placement policy that reconciles the
+structural conflict between layout preferences [23, 35] (striped for
+CPU/GPU vs. localized for NDP), while simultaneously mitigating
+the NDP load skew caused by uneven cold expert activations [17].
+4
+TriMoE
+This section details the design and implementation of TriMoE.
+We first present the overall architecture (Section 4.1), followed
+by two novel policies that address the challenges: the Bottleneck-
+Aware Greedy Makespan Expert Scheduling (Section 4.2) and the
+Prediction-Driven Expert Relayout and Rebalancing (Section 4.3).
+4.1
+TriMoE Architecture
+Figure 4 illustrates the overall TriMoE architecture, which aug-
+ments a server-grade single-GPU system with three heterogeneous
+compute resources: a high-performance GPU, an AMX-enabled
+CPU, and DIMM-NDP, to achieve high-throughput MoE offloading.
+High-Performance GPU: With hundreds of TFLOPS [3, 4], the
+GPU serves as the core compute unit for high-density tasks. During
+the prefill phase, it performs all inference computations. In the
+decode phase, it focuses on MLP, Attention, and the computation
+of hot experts prefetched into HBM. For storage, MLP and shared
+expert weights reside in GPU HBM, while the large KV Cache and
+all routed experts are offloaded to host DIMMs [29].
+AMX-enabled CPU: CPUs with matrix extensions provide con-
+siderable compute power. For example, an Intel Xeon Sapphire
+Rapids (90.1 TFLOPS theoretical) achieves 22% of a measured A100
+GEMM throughput [17]. Unlike the GPU which relies on remote
+PCIe transfers, the CPU operates directly on host-resident data.
+TriMoE exploits this property by designating the AMX-CPU as
+a dedicated compute domain for warm experts, maximizing the
+utility of host-side resources that would otherwise be bottlenecked
+by memory bandwidth if assigned to cold experts.
+DIMM-NDP: To process long-tail cold experts, we adopted a
+center buffer-based NDP instead of a high-area-overhead bank-level
+NDP [1, 5, 15, 25]. As shown in Figure 4(a), the NDP units are placed
+3
+
+
+--- Page 4 ---
+on the DIMM’s Buffer Chip. This design is an efficient trade-off: it
+leverages high aggregate internal bandwidth (8× host bandwidth)
+to efficiently process cold experts and remains fully compatible
+with regular memory access, without interfering with normal CPU
+or GPU access to DIMM data [1, 5].
+GEMV & Act Unit: Each DIMM-NDP is equipped with a dedicated
+GEMV unit. It contains 256 multipliers and a multi-level adder tree.
+Each 128-bit multiplier operates in a typical bit-serial manner [6],
+processing 8 FP16 values simultaneously, while a 256KB internal
+buffer is used to store intermediate activations. To support non-
+linear functions such as SiLU in MoE layers, the unit is further
+integrated with an activation module that primarily comprises 256
+FP16 exponentiation and multiplication units.
+Relayout Unit & DIMM-Link: A core architectural challenge is
+data layout preference conflict and the NDP load imbalance. To
+resolve both challenges, we need the ability to perform fast data
+relayout and migration between DIMMs, as detailed in Section 4.3.
+We therefore adopt DIMM-Link [38] and introduce a Relayout Unit.
+The DIMM-Link provides a 25 GB/s host-free, cross-DIMM transfer
+bus. The Relayout Unit acts as a control engine, leveraging the
+DIMM-Link to efficiently execute two key background tasks. (1)
+Relayout: enabling data conversion between striped and localized
+layouts, and (2) Rebalancing: enabling fast migration of localized
+cold experts between DIMMs. This host-free data operation is over
+62× more efficient than CPU-driven data movement.
+Scheduler: A scheduler orchestrates all the heterogeneous re-
+sources, performing online expert scheduling and dynamic expert
+relayout and rebalancing, detailed in subsequent sections.
+4.2
+Bottleneck-Aware Greedy Makespan Expert
+Scheduling
+Scheduling on TriMoE’s three-way heterogeneous platform is chal-
+lenging. While mapping experts to their best-suited device aims
+to maximize resource utilization, this simple theoretically optimal
+strategy can create global bottlenecks. The key is to balance the load
+across all three domains to minimize the global makespan. We pro-
+pose a two-phase scheduling policy: it first performs a greedy, cost-
+model-based initial assignment, followed by an iterative, bottleneck-
+aware refinement to optimize the final makespan.
+Expert Execution Cost Model: The first step is to estimate the
+execution cost of any expert 𝐸𝑖on all possible paths and select the
+most suitable one. This cost model relies on two runtime inputs,
+as shown in Figure 4(b): the expert load (token count) 𝐿𝑖from the
+gate function and the expert’s mapping and data layout, collectively
+represented by 𝑀𝑖. To accurately model compute latency, we offline-
+profile both the GPU and CPU for various token counts, building
+lookup tables [16] for 𝑓𝑐𝑎𝑙𝑐_𝑔𝑝𝑢(𝐿𝑖) and 𝑓𝑐𝑎𝑙𝑐_𝑐𝑝𝑢(𝐿𝑖).
+1) GPU Execution Cost: We evaluate two paths. Equation 1 models
+a cache hit, where the expert is resident in GPU HBM and the cost
+is dominated by computation. Equation 2 represents a cache miss,
+requiring on-demand loading from the host. its cost is determined
+by GPU computation, PCIe weight transfer, and host DIMM weight
+read (𝑇𝐷𝑅𝐴𝑀). The 𝑇𝐷𝑅𝐴𝑀time depends on the expert’s weight lay-
+out (𝑀𝑖), which is either striped, accessing total memory bandwidth,
+or localized, accessing only single-DIMM bandwidth.
+𝑇𝐺𝑃𝑈_𝐻𝑖𝑡(𝐸𝑖) = 𝑓𝑐𝑎𝑙𝑐_𝑔𝑝𝑢(𝐿𝑖)
+(1)
+𝑇𝐺𝑃𝑈_𝑀𝑖𝑠𝑠(𝐸𝑖) = max  𝑓𝑐𝑎𝑙𝑐_𝑔𝑝𝑢(𝐿𝑖),𝑇𝑃𝐶𝐼𝑒,𝑇𝐷𝑅𝐴𝑀(𝑊𝑖, 𝑀𝑖)
+(2)
+2) CPU Execution Cost: For the AMX-CPU, the cost is the max-
+imum of its computation time and the DIMM weight read time
+(𝑇𝐷𝑅𝐴𝑀), as 𝑇𝐷𝑅𝐴𝑀is similarly dependent on the expert’s layout.
+𝑇𝐶𝑃𝑈(𝐸𝑖) = max  𝑓𝑐𝑎𝑙𝑐_𝑐𝑝𝑢(𝐿𝑖),𝑇𝐷𝑅𝐴𝑀(𝑊𝑖, 𝑀𝑖)
+(3)
+3) NDP Execution Cost: Unlike the centralized GPU and CPU,
+DIMM-NDP units operate in parallel. We restrict this path strictly
+to experts with a localized layout to avoid high overhead from input
+broadcasting and result reduction across multiple DIMMs. Conse-
+quently, an expert 𝐸𝑖is only executable on the specific DIMM where
+its weights reside. Its cost is the maximum of NDP computation
+and the time to read weights using the internal DIMM bandwidth.
+𝑇𝑁𝐷𝑃(𝐸𝑖) = max  𝑓𝑐𝑎𝑙𝑐_𝑛𝑑𝑝(𝐿𝑖),𝑇𝐼𝑛𝑡𝑒𝑟𝑛𝑎𝑙(𝑊𝑖)
+(4)
+Overall Makespan Modeling: After the initial expert assign-
+ment, we formulate the global makespan by aggregating costs
+within each compute domain. Let S𝐺𝑃𝑈, S𝐶𝑃𝑈, and S𝑑
+𝑁𝐷𝑃denote
+the sets of experts assigned to the GPU, CPU, and the 𝑑-th DIMM-
+NDP unit, respectively.
+The GPU and CPU act as centralized serial processors. Their
+total execution times, 𝑇𝐺𝑃𝑈
+𝑡𝑜𝑡𝑎𝑙and 𝑇𝐶𝑃𝑈
+𝑡𝑜𝑡𝑎𝑙, are simply the cumulative
+sum of the execution costs of their assigned experts (derived from
+Eq. 1–3):
+𝑇𝐺𝑃𝑈/𝐶𝑃𝑈
+𝑡𝑜𝑡𝑎𝑙
+=
+∑︁
+𝐸𝑖∈S𝐺𝑃𝑈/𝐶𝑃𝑈
+𝑇𝐺𝑃𝑈/𝐶𝑃𝑈(𝐸𝑖)
+(5)
+In contrast, the DIMM-NDP units operate in parallel, so the NDP
+domain latency is dictated by the bottleneck DIMM. Crucially, our
+model accounts for memory access contention: a DIMM is busy
+not only when performing local NDP computation but also when
+serving weight fetch requests from the GPU or CPU. The total
+active time for a DIMM 𝑑is:
+𝑇𝐷𝐼𝑀𝑀(𝑑) =
+∑︁
+𝐸𝑖∈S𝑑
+𝑁𝐷𝑃
+𝑇𝑁𝐷𝑃(𝐸𝑖) +𝑇𝑑
+𝑐𝑜𝑛𝑡𝑒𝑛𝑡𝑖𝑜𝑛
+(6)
+where 𝑇𝑑
+𝑐𝑜𝑛𝑡𝑒𝑛𝑡𝑖𝑜𝑛represents the accumulated DRAM access latency
+caused by striped or localized weight reads from the host processors
+targeting DIMM 𝑑. The global makespan is ultimately determined
+by the slowest of the three domains:
+𝑇𝑀𝑎𝑘𝑒𝑠𝑝𝑎𝑛= max
+
+𝑇𝐺𝑃𝑈
+𝑡𝑜𝑡𝑎𝑙,𝑇𝐶𝑃𝑈
+𝑡𝑜𝑡𝑎𝑙, max
+𝑑∈D 𝑇𝐷𝐼𝑀𝑀(𝑑)
+
+(7)
+Bottleneck-Aware Refinement: The initial expert assignment
+may create a global load imbalance, so the algorithm enters an iter-
+ative bottleneck correction phase. In each iteration, the algorithm
+first identifies the bottleneck device (the one with the maximum
+total time) and selects the highest-cost expert on that bottleneck
+device as a migration candidate. It then evaluates re-assigning this
+expert to the other two devices and models the new global makespan
+for each potential move. The algorithm greedily selects the move
+that results in the minimum new global makespan. If both moves
+result in the same new makespan, the algorithm breaks the tie by
+choosing the move that causes the minimum time increase (delta)
+on the receiving device. This iterative refinement continues until
+4
+
+
+--- Page 5 ---
+no re-assignment can further reduce the global makespan, or a
+maximum iteration limit is reached.
+4.3
+Prediction-Driven Expert Relayout and
+Rebalancing
+The effectiveness of the online expert scheduling is constrained by
+expert weight placement. Although we set an optimized initial lay-
+out via offline trace analysis (e.g., localizing cold experts onto single
+DIMMs), this static placement becomes suboptimal at runtime due
+to dynamic expert activation [11, 32]. This leads to two core prob-
+lems. First, a Layout Preference Conflict arises as an expert’s
+identity can change. For instance, a cold expert may become warm,
+creating a mismatch with the CPU’s preference for a striped layout.
+Second, NDP Load Imbalance occurs when uneven activation of
+cold experts across DIMMs overloads certain DIMM-NDP, creating
+bottlenecks. To address these issues, we design a prediction-driven
+policy that leverages the temporal locality of expert activation to
+perform asynchronous relayout and rebalancing [8, 30].
+Expert Load Predictor: As shown in Figure 4(b), we introduce
+a lightweight Expert Load Predictor. The predictor maintains an
+Exponential Moving Average (EMA) for each expert’s load [10, 34],
+which is updated after every decode step:
+𝐸𝑀𝐴𝑒(𝑡) = 𝛼· 𝐹𝑒(𝑡) + (1 −𝛼) · 𝐸𝑀𝐴𝑒(𝑡−1)
+(8)
+where 𝐹𝑒(𝑡) is the expert’s actual load at step 𝑡and 𝛼= 0.3 is em-
+pirically tuned to predict the expert’s load trend while suppressing
+noise, yielding >78% accuracy.
+Expert Migration Decision: When one layer’s expert com-
+putation completes, the predictor estimates the next layer’s load
+trends and triggers three types of background actions. (1) Hot Expert
+Prefetching: If an expert is predicted as hot, the runtime triggers
+a high-priority task to prefetch its weights via PCIe to GPU HBM.
+(2) Dynamic Relayout: If an expert’s layout mismatches its optimal
+execution unit, the Relayout Unit uses the DIMM-Link to convert
+its data layout between localized and striped. (3) Cold Expert Re-
+balancing: To resolve NDP load imbalance, the system calculates
+the total predicted load of cold experts on each DIMM. If skew is
+detected, it greedily selects and migrates cold experts one by one
+from the busiest DIMM to the most idle DIMM via DIMM-Link. The
+overheads of these migrations are intended to be hidden within the
+overlap window provided by the current layer’s MLP and Attention
+computations on the GPU. Our policy ranks all feasible migration
+tasks by their predicted benefit and greedily executes them in pri-
+ority order until their cumulative estimated time fills this window
+budget. This ensures the limited DIMM-Link bandwidth is spent
+on the most critical tasks.
+Our evaluation shows that the predictor achieves 78% migration
+decision accuracy with only 38 KB of memory overhead to store
+necessary metadata, yielding a 1.16× end-to-end performance gain.
+5
+Evaluation
+5.1
+Experiment Setup
+5.1.1
+TriMoE System. To evaluate TriMoE, we built a heteroge-
+neous prototype system comprising an NVIDIA H100 PCIe GPU
+with 80GB HBM, an AMX-enabled Intel Xeon Platinum 8470 CPU
+(8-channel memory), and 16 DIMM-NDPs providing high inter-
+nal bandwidth. Detailed configurations are listed in Table 1. We
+utilize PCIe 5.0 to provide 64GB/s unidirectional bandwidth for
+host-to-GPU data transfer. On the software stack, we employ vLLM
+0.8.1 [19] and KTransformers [2] to implement efficient kernels
+for the GPU and AMX-CPU, respectively. We developed a cycle-
+accurate simulator based on Ramulator 2.0 [24] to evaluate DIMM-
+NDP performance. For NDP units, we implemented them using RTL
+and synthesized it using the Synopsys Design Compiler [27] with
+the TSMC 7nm technology.
+Table 1: System configurations.
+GPU
+H100 80GB: 819.6 TFLOPS (BF16), 2.04 TB/s Bandwidth, 64 GB/s PCIe bandwidth
+CPU
+Memory: 8 Channels × 2 DIMM, 2TB Capacity
+AMX: 90.1 TFLOPS (BF16), 307.2 GB/s Bandwidth
+DIMM-NDP
+DIMM Parameters
+DDR5-4800, 128GB/DIMM, 4 Ranks × 8 Bank Group × 4 Banks
+CCDL=12:CCDS=8:RRDS=8:RRDL=12:FAW=32:RP=34:BL=8:CL=40:WR=72
+NDP
+256 GFLOPS (BF16) & 153.6 GB/s Bandwidth, 1.13𝑚𝑚2 area overhead per NDP
+DIMM-Link Parameters
+25Gb/s/Lane, 8 × Lanes (25GB/s per Link)
+5.1.2
+Baselines. We compare TriMoE with three SOTA MoE of-
+floading systems. (1) Klotski [9]: GPU-Only. A baseline that max-
+imizes PCIe overlap by prefetching hot experts and loading cold
+expert weights during hot expert computation; (2) Enhanced Ktrans-
+former [2]: GPU-CPU. We added prefetching and on-demand load-
+ing of hot experts on top of its processing of all non-shared experts
+using AMX-CPU, making it the strongest baseline under this archi-
+tecture [37]; (3) MoNDE [18]: GPU-NDP. A system that balances
+load between GPU and NDP by modeling the cost trade-off between
+weight migration (to GPU) and activation migration (to NDP).
+5.1.3
+Workloads & Metrics. We select three representative modern
+MoE models with specifications detailed in Table 2 using LMSys [36]
+and CodeAlpaca [12] datasets to extract real expert activation traces
+to construct workloads. As offloading systems primarily target
+high-throughput demands [29], we focus on large batch sizes of
+256–768 aggregated via zigzag or offline batching, supplemented
+by robustness assessments on small batches. Given that the MoE
+decode phase dominates over 90% of inference time, we report MoE
+layer latency and end-to-end throughput as our core metrics.
+Table 2: MoE models configurations.
+Model
+params
+shared exp
+routed exp
+top-𝑘
+expert params
+DeepSeek-V2 [20]
+236B
+2
+160
+6
+422GB
+Qwen3-235B-A22B [31]
+235B
+0
+128
+8
+423GB
+GLM-4.5-Air [33]
+106B
+1
+128
+8
+190GB
+5.2
+TriMoE Performance
+5.2.1
+MoE Layer Decode Speedup. Our evaluation targets the MoE
+decode phase, the primary bottleneck in inference. As shown in
+Figure 6, TriMoE achieves an average 2.12–2.83× speedup over the
+best baseline across all models. To identify the source of these gains,
+we analyze resource utilization (Table 3). Klotski is constrained by
+5
+
+
+--- Page 6 ---
+0
+5
+10
+15
+20
+25
+bsz=256 bsz=512 bsz=768 bsz=256 bsz=512 bsz=768 bsz=256 bsz=512 bsz=768
+DeepSeek-V2
+Qwen3-235B-A22B
+GLM-4.5-Air
+Klotski
+En-Ktransformer
+MoNDE
+ours
+Normalized Speedup
+En-KTransformers
+Figure 6: MoE decode speedup over Klotski.
+0
+5
+10
+15
+20
+25
+Klotski
+En-Ktransformer
+MoNDE
+ours
+Normalized Throughput
+P256     P256      P256      P256     P256     P256      P256     P256      P256     P256     P256      P256
+D512     D1024    D512     D1024   D512     D1024    D512    D1024    D512     D1024   D512     D1024
+bsz=256              bsz=512               bsz=256              bsz=512            bsz=256              bsz=512   
+DeepSeek-V2                       Qwen3-235B-A22B                       GLM-4.5-Air
+s
+En-KTransformers
+Figure 7: End-to-End throughput over Klotski.
+severe PCIe bottlenecks, resulting in only 28.6% GPU utilization.
+En-KTransformers is limited by host bandwidth when serving cold
+experts on the CPU, capping CPU utilization at 42%. Meanwhile,
+MoNDE’s limited NDP compute capability forces the GPU to re-
+tain a large fraction of expert computation, failing to relieve PCIe
+congestion. In contrast, TriMoE offloads warm experts to AMX-
+enabled CPU and assigns cold experts to NDP, sustaining an average
+utilization of 76.2% across the three compute domains.
+Table 3: Resource utilization comparison
+Resource
+Klotski
+En-KTransformers
+MoNDE
+ours
+GPU Compute Utilization
+28.6%
+57.6%
+33.9%
+66.0%
+CPU Compute Utilization
+×
+42%
+×
+74.9%
+NDP Compute Utilization
+×
+×
+70.1%
+87.8%
+5.2.2
+End-to-End Performance. We further evaluate end-to-end
+performance. As shown in Figure 7, TriMoE achieves 2.78×, 2.22×,
+and 2.09× higher throughput over the strongest baseline across the
+three models. This confirms that the gains at the MoE decode layer
+translate effectively into system-level performance improvements,
+becoming notably more pronounced as output length increases.
+5.3
+Ablation Study
+As shown in Figure 8, we quantify component contributions via an
+ablation study starting from a GPU-NDP baseline. First, incorpo-
+rating AMX-CPU with greedy scheduling (+CPU) yields the most
+significant 1.75× speedup. This validates our hypothesis that AMX-
+CPU effectively processes warm experts, breaking the deadlock
+between GPU I/O and NDP compute bottlenecks. Next, enabling
+Bottleneck-Aware Refinement (+Refinement) contributes a further
+1.28× gain, confirming that the algorithm corrects greedy mapping
+imbalances to minimize the global makespan. Finally, Prediction-
+Driven Relayout and Rebalancing (+Relayout) adds another 1.16×
+0
+0.5
+1
+1.5
+2
+2.5
+3
+DeepSeek-V2
+Qwen3-235B-A22B
+GLM-4.5-Air
+GPU-NDP
++CPU
++Refinement
++Relayout
+1.87 X
+1.29 X
+1.17 X
+1.79 X
+1.30 X
+1.13 X
+1.57 X
+1.24 X
+1.17 X
+Normalized Speedup
+Figure 8: Ablation study of TriMoE with batch size 512.
+0
+2
+4
+6
+8
+DeepSeek-V2
+Qwen3-235B-A22B
+GLM-4.5-Air
+NDP=4
+NDP=8
+NDP=16
+NDP=32
+(a)
+0
+1
+2
+3
+4
+5
+DeepSeek-V2
+Qwen3-235B-A22B
+GLM-4.5-Air
+AMX/8(AVX)
+AMX/4
+AMX/2
+AMX
+AMX * 2
+(b)
+Latency (ms)
+Latency (ms)
+Figure 9: Sensitivity study of NDP count and CPU TFLOPS.
+improvement. With a predictor accuracy exceeding 78%, this mech-
+anism successfully resolves runtime layout conflicts and NDP load
+skew caused by dynamic activations, ensuring sustained system
+efficiency.
+5.4
+Sensitivity Analysis
+5.4.1
+Number of NDPs. Figure 9(a) varies the number of NDP-
+equipped DIMMs. Latency stabilizes after 16 units. This reflects a
+key workload characteristic: cold experts, though numerous, pos-
+sess low aggregate compute density. Thus, a full-NDP configuration
+provides sufficient bandwidth to process all cold experts.
+5.4.2
+CPU Compute Capability. Figure 9(b) sweeps CPU compute
+power from legacy AVX levels (≈0.125×) to 2.0× AMX. While AVX
+levels exhibit higher latency, the curve flattens significantly once ca-
+pacity reaches 0.5× of the AMX baseline. This confirms that modern
+AMX extensions offer sufficient computational capacity, allowing
+even mid-range CPUs to effectively bridge the warm expert gap.
+5.5
+Robustness & Overhead
+To evaluate robustness using the Qwen model at batch sizes 128,
+64, and 32, TriMoE maintains speedups of 2.72×, 2.18×, and 1.82×
+over the strongest baseline, confirming its efficacy across vary-
+ing throughput demands. We also analyzed the runtime overhead.
+Leveraging the DIMM-Link’s host-free, parallel inter-dimm trans-
+fer capability, we find that the ∼0.63 ms cost of migrating up to
+four experts is entirely masked by the ∼0.68 ms concurrent GPU
+computation. Given the predictor accuracy exceeding 78% (which
+makes such large transfers infrequent), the overall online migration
+overhead measured remains limited to below 3.3%.
+6
+
+
+--- Page 7 ---
+6
+Conclusion
+TriMoE revisits MoE offloading from the perspective of expert
+heterogeneity and exposes the fundamental inefficiency of binary
+GPU–NDP designs in handling warm experts. By jointly leveraging
+GPU for hot experts, AMX-enabled CPU for warm experts, and
+DIMM-NDP for cold experts, TriMoE matches each expert class to
+its most suitable compute domain. Combined with our bottleneck-
+aware scheduling and prediction-driven relayout and rebalancing,
+this tri-domain architecture achieves up to 2.83× speedup over
+state-of-the-art offloading systems.
+References
+[1] Mohammad Alian, Seung Won Min, Hadi Asgharimoghaddam, Ashutosh Dhar,
+Dong Kai Wang, Thomas Roewer, Adam McPadden, Oliver O’Halloran, Deming
+Chen, Jinjun Xiong, et al. 2018. Application-transparent near-memory processing
+architecture with memory channel network. In 2018 51st Annual IEEE/ACM
+International Symposium on Microarchitecture (MICRO). IEEE, 802–814.
+[2] Hongtao Chen, Weiyu Xie, Boxin Zhang, Jingqi Tang, Jiahao Wang, Jianwei Dong,
+Shaoyuan Chen, Ziwei Yuan, Chen Lin, Chengyu Qiu, et al. 2025. KTransformers:
+Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models. In
+Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles.
+1014–1029.
+[3] Jack Choquette. 2023. Nvidia hopper h100 gpu: Scaling performance. IEEE Micro
+43, 3 (2023), 9–17.
+[4] Jack Choquette, Wishwesh Gandhi, Olivier Giroux, Nick Stam, and Ronny
+Krashinsky. 2021. Nvidia a100 tensor core gpu: Performance and innovation.
+IEEE Micro 41, 2 (2021), 29–35.
+[5] Jason Cong, Zhenman Fang, Michael Gill, Farnoosh Javadi, and Glenn Rein-
+man. 2017. AIM: accelerating computational genomics through scalable and
+noninvasive accelerator-interposed memory. In Proceedings of the International
+Symposium on Memory Systems. 3–14.
+[6] Fabrice Devaux. 2019. The true processing in memory accelerator. In 2019 IEEE
+Hot Chips 31 Symposium (HCS). IEEE Computer Society, 1–24.
+[7] Artyom Eliseev and Denis Mazur. 2023. Fast inference of mixture-of-experts
+language models with offloading. arXiv preprint arXiv:2312.17238 (2023).
+[8] Zhiyuan Fang, Zicong Hong, Yuegui Huang, Yufeng Lyu, Wuhui Chen, Yue Yu,
+Fan Yu, and Zibin Zheng. 2025. Accurate Expert Predictions in MoE Inference
+via Cross-Layer Gate. arXiv e-prints (2025), arXiv–2502.
+[9] Zhiyuan Fang, Yuegui Huang, Zicong Hong, Yufeng Lyu, Wuhui Chen, Yue Yu,
+Fan Yu, and Zibin Zheng. 2025. Klotski: Efficient Mixture-of-Expert Inference via
+Expert-Aware Multi-Batch Pipeline. In Proceedings of the 30th ACM International
+Conference on Architectural Support for Programming Languages and Operating
+Systems, Volume 2. 574–588.
+[10] David Haynes, Steven Corns, and Ganesh Kumar Venayagamoorthy. 2012. An
+exponential moving average algorithm. In 2012 IEEE congress on evolutionary
+computation. IEEE, 1–8.
+[11] Siqi He, Haozhe Zhu, Jiapei Zheng, Lizhou Wu, Bo Jiao, Qi Liu, Xiaoyang Zeng,
+and Chixiao Chen. 2025. Hydra: Harnessing expert popularity for efficient
+mixture-of-expert inference on Chiplet system. In 2025 62nd ACM/IEEE Design
+Automation Conference (DAC). IEEE, 1–7.
+[12] Hugging Face H4. 2023. CodeAlpaca_20K. https://huggingface.co/datasets/
+HuggingFaceH4/CodeAlpaca_20K.
+[13] Albert Q Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Mensch, Blanche
+Savary, Chris Bamford, Devendra Singh Chaplot, Diego de las Casas, Emma Bou
+Hanna, Florian Bressand, et al. 2024.
+Mixtral of experts.
+arXiv preprint
+arXiv:2401.04088 (2024).
+[14] Keisuke Kamahori, Tian Tang, Yile Gu, Kan Zhu, and Baris Kasikci. 2024. Fiddler:
+Cpu-gpu orchestration for fast inference of mixture-of-experts models. arXiv
+preprint arXiv:2402.07033 (2024).
+[15] Liu Ke, Udit Gupta, Benjamin Youngjae Cho, David Brooks, Vikas Chandra, Utku
+Diril, Amin Firoozshahian, Kim Hazelwood, Bill Jia, Hsien-Hsin S Lee, et al.
+2020. Recnmp: Accelerating personalized recommendation with near-memory
+processing. In 2020 ACM/IEEE 47th Annual International Symposium on Computer
+Architecture (ISCA). IEEE, 790–803.
+[16] Liu Ke, Udit Gupta, Mark Hempstead, Carole-Jean Wu, Hsien-Hsin S Lee, and
+Xuan Zhang. 2022. Hercules: Heterogeneity-aware inference serving for at-
+scale personalized recommendation. In 2022 IEEE International Symposium on
+High-Performance Computer Architecture (HPCA). IEEE, 141–154.
+[17] Hyungyo Kim, Nachuan Wang, Qirong Xia, Jinghan Huang, Amir Yazdanbakhsh,
+and Nam Sung Kim. 2025. LIA: A Single-GPU LLM Inference Acceleration
+with Cooperative AMX-Enabled CPU-GPU Computation and CXL Offloading. In
+Proceedings of the 52nd Annual International Symposium on Computer Architecture.
+544–558.
+[18] Taehyun Kim, Kwanseok Choi, Youngmock Cho, Jaehoon Cho, Hyuk-Jae Lee,
+and Jaewoong Sim. 2024. Monde: Mixture of near-data experts for large-scale
+sparse models. In Proceedings of the 61st ACM/IEEE Design Automation Conference.
+1–6.
+[19] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng,
+Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient
+memory management for large language model serving with pagedattention. In
+Proceedings of the 29th symposium on operating systems principles. 611–626.
+[20] Aixin Liu, Bei Feng, Bin Wang, Bingxuan Wang, Bo Liu, Chenggang Zhao,
+Chengqi Dengr, Chong Ruan, Damai Dai, Daya Guo, et al. 2024. Deepseek-
+v2: A strong, economical, and efficient mixture-of-experts language model. arXiv
+preprint arXiv:2405.04434 (2024).
+[21] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Cheng-
+gang Zhao, Chengqi Deng, Chenyu Zhang, Chong Ruan, et al. 2024. Deepseek-v3
+technical report. arXiv preprint arXiv:2412.19437 (2024).
+[22] Lian Liu, Shixin Zhao, Bing Li, Haimeng Ren, Zhaohui Xu, Mengdi Wang, Xiaowei
+Li, Yinhe Han, and Ying Wang. 2025. Make llm inference affordable to everyone:
+Augmenting gpu memory with ndp-dimm. In 2025 IEEE International Symposium
+on High Performance Computer Architecture (HPCA). IEEE, 1751–1765.
+[23] Qingyuan Liu, Liyan Chen, Yanning Yang, Haocheng Wang, Dong Du, Zhigang
+Mao, Naifeng Jing, Yubin Xia, and Haibo Chen. 2025. L3: DIMM-PIM Integrated
+Architecture and Coordination for Scalable Long-Context LLM Inference. arXiv
+preprint arXiv:2504.17584 (2025).
+[24] Haocong Luo, Yahya Can Tuğrul, F Nisa Bostancı, Ataberk Olgun, A Giray
+Yağlıkçı, and Onur Mutlu. 2023. Ramulator 2.0: A modern, modular, and extensible
+dram simulator. IEEE Computer Architecture Letters 23, 1 (2023), 112–116.
+[25] Jaehyun Park, Jaewan Choi, Kwanhee Kyung, Michael Jaemin Kim, Yongsuk
+Kwon, Nam Sung Kim, and Jung Ho Ahn. 2024. Attacc! unleashing the power of
+pim for batched transformer-based generative model inference. In Proceedings of
+the 29th ACM International Conference on Architectural Support for Programming
+Languages and Operating Systems, Volume 2. 103–119.
+[26] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi
+Chen, Percy Liang, Christopher Ré, Ion Stoica, and Ce Zhang. 2023. Flexgen:
+High-throughput generative inference of large language models with a single
+gpu. In International Conference on Machine Learning. PMLR, 31094–31116.
+[27] Synopsys. 2025. Design compiler. https://www.synopsys.com/implementation-
+and-signoff/rtl-synthesis-test/design-compiler.html.
+[28] Lizhou Wu, Haozhe Zhu, Siqi He, Xuanda Lin, Xiaoyang Zeng, and Chixiao
+Chen. 2025. PIMoE: Towards efficient MoE transformer deployment on NPU-PIM
+system through throttle-aware task offloading. In 2025 62nd ACM/IEEE Design
+Automation Conference (DAC). IEEE, 1–7.
+[29] Tairan Xu, Leyang Xue, Zhan Lu, Adrian Jackson, and Luo Mai. 2025. MoE-Gen:
+High-Throughput MoE Inference on a Single GPU with Module-Based Batching.
+arXiv preprint arXiv:2503.09716 (2025).
+[30] Leyang Xue, Yao Fu, Zhan Lu, Luo Mai, and Mahesh Marina. 2024. Moe-infinity:
+Offloading-efficient moe model serving. arXiv preprint arXiv:2401.14361 (2024).
+[31] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng,
+Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, et al. 2025. Qwen3 technical
+report. arXiv preprint arXiv:2505.09388 (2025).
+[32] Hanfei Yu, Xingqi Cui, Hong Zhang, and Hao Wang. 2025.
+fMoE: Fine-
+Grained Expert Offloading for Large Mixture-of-Experts Serving. arXiv preprint
+arXiv:2502.05370 (2025).
+[33] Aohan Zeng, Xin Lv, Qinkai Zheng, Zhenyu Hou, Bin Chen, Chengxing Xie,
+Cunxiang Wang, Da Yin, Hao Zeng, Jiajie Zhang, et al. 2025. Glm-4.5: Agentic,
+reasoning, and coding (arc) foundation models. arXiv preprint arXiv:2508.06471
+(2025).
+[34] Yan Zeng, Chengchuang Huang, Yipeng Mei, Lifu Zhang, Teng Su, Wei Ye, Wenqi
+Shi, and Shengnan Wang. 2025. EfficientMoE: Optimizing Mixture-of-Experts
+Model Training With Adaptive Load Balance. IEEE Transactions on Parallel and
+Distributed Systems (2025).
+[35] Yilong Zhao, Mingyu Gao, Fangxin Liu, Yiwei Hu, Zongwu Wang, Han Lin, Ji
+Li, He Xian, Hanlin Dong, Tao Yang, et al. 2024. Um-pim: Dram-based pim with
+uniform & shared memory space. In 2024 ACM/IEEE 51st Annual International
+Symposium on Computer Architecture (ISCA). IEEE, 644–659.
+[36] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Tianle Li, Siyuan Zhuang, Zhang-
+hao Wu, Yonghao Zhuang, Zhuohan Li, Zi Lin, Eric P. Xing, Joseph E. Gonzalez,
+Ion Stoica, and Hao Zhang. 2023. Lmsys-chat-1m: A large-scale real-world llm
+conversation dataset. arXiv preprint arXiv:2309.11998 (2023).
+[37] Shuzhang Zhong, Yanfan Sun, Ling Liang, Runsheng Wang, Ru Huang, and Meng
+Li. 2025. HybriMoE: Hybrid CPU-GPU Scheduling and Cache Management for
+Efficient MoE Inference. arXiv preprint arXiv:2504.05897 (2025).
+[38] Zhe Zhou, Cong Li, Fan Yang, and Guangyu Sun. 2023. Dimm-link: Enabling
+efficient inter-dimm communication for near-memory processing. In 2023 IEEE
+International Symposium on High-Performance Computer Architecture (HPCA).
+IEEE, 302–316.
+7

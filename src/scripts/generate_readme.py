@@ -210,13 +210,15 @@ def _title_cell_html(title: str, brief: str) -> str:
 
 # ── DB queries ────────────────────────────────────────────────────────────────
 
-def _load_l1(db: Database, category: str) -> dict:
-    """Return {arxiv_id: {score, brief, affiliations, venue, code_url, is_relevant}} for all analyzed papers."""
+def _load_l1(db: Database, category: str = "") -> dict:
+    """Return {arxiv_id: {score, brief, affiliations, venue, code_url, is_relevant}} for all analyzed papers.
+
+    Note: category is unused — paper_analyses has arxiv_id as PRIMARY KEY so each paper has
+    exactly one analysis row. Loading all rows ensures cross-category papers are found correctly.
+    """
     rows = db.fetchall(
         """SELECT arxiv_id, relevance, significance, brief, affiliations, venue, artifacts, is_relevant
-           FROM paper_analyses
-           WHERE category = ?""",
-        (category,)
+           FROM paper_analyses"""
     )
     result = {}
     for row in rows:

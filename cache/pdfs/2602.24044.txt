@@ -1,0 +1,2610 @@
+--- Page 1 ---
+Data-Driven Optimization of GPU efficiency for Distributed LLM–Adapter Serving
+Ferran Agullóa,b,1,∗, Joan Oliverasa,b, Chen Wangc, Alberto Gutierrez-Torrea, Olivier Tardieuc, Alaa Youssefc, Jordi
+Torresa,b, Josep Ll. Berrala,b
+aBarcelona Supercomputing Center (BSC), Barcelona, Spain
+bUniversitat Politècnica de Catalunya - BarcelonaTech (UPC), Barcelona, Spain
+cIBM Research, New York, USA
+Abstract
+Large Language Model (LLM) adapters enable low-cost model specialization, but introduce complex caching and schedul-
+ing challenges in distributed serving systems where hundreds of adapters must be hosted concurrently. While prior work
+has largely focused on latency minimization, resource efficiency through throughput maximization remains underex-
+plored. This paper presents a data-driven pipeline that, for a given workload, computes an adapter placement that
+serves the workload with the minimum number of GPUs while avoiding request starvation and GPU memory errors.
+To that end, the approach identifies the maximum feasible throughput attainable on each GPU by leveraging accurate
+performance predictions learned from real serving behavior. The proposed pipeline integrates three components: (i)
+a Digital Twin (DT) tailored to LLM-adapter serving, (ii) a distilled machine learning (ML) model trained on DT-
+generated data, and (iii) a greedy placement algorithm that exploits ML-based performance estimates to maximize GPU
+efficiency. The DT emulates real system dynamics with high fidelity, achieving below 5% throughput estimation error
+while executing up to 90× faster than full LLM benchmarking across both predictable and unpredictable workloads.
+The learned ML models further accelerate performance estimation with marginal accuracy degradation, enabling scalable
+optimization. Experimental results demonstrate that the pipeline substantially improves GPU efficiency by reducing the
+number of GPUs required to sustain target workloads. Beyond GPU efficiency, the pipeline can be adapted to alternative
+objectives, such as latency minimization, highlighting its versatility for future large-scale LLM serving infrastructures.
+Keywords:
+Large language models (LLMs), Distributed system, LLM adapters, LoRA adapters, Digital twin, GPU
+optimization, Machine learning (ML), Performance modeling
+1. Introduction
+With the rapid advancement and widespread adoption
+of Large Language Models (LLMs), the demand for LLM-
+adapters has grown significantly. While LLMs are large-
+scale models trained to achieve strong performance across
+diverse language tasks, adapters specialize this general
+knowledge to concrete applications through lightweight pa-
+rameter additions [12, 11, 19, 10]. The use of adapters is
+far quicker than training-from-scratch or fine-tuning a new
+model, which is a tedious and long process that requires
+meticulous data curation and high computation capabili-
+ties. Moreover, adapters achieve comparable performance
+to other equivalent methods such as in-context learning [4]
+or prompt tuning [18, 24].
+∗Corresponding author
+Email addresses: ferran.agullo@bsc.es (Ferran Agulló),
+joan.oliveras@bsc.es (Joan Oliveras), chen.wang1@ibm.com (Chen
+Wang), alberto.gutierrez@bsc.es (Alberto Gutierrez-Torre),
+tardieu@ibm.com (Olivier Tardieu), asyousse@ibm.com (Alaa
+Youssef), jordi.torres@bsc.es (Jordi Torres),
+josep.ll.berral@upc.edu (Josep Ll. Berral)
+1Code
+will
+be
+available
+at:
+https://github.com/
+FerranAgulloLopez/DistributedEfficientAdapterLLMServing
+As adapters are increasingly used to specialize and
+deploy LLMs across diverse tasks [32], efficiently man-
+aging their inference execution has become a key sys-
+tems concern [34, 17, 13]. Although adapters were orig-
+inally designed to be merged into the backbone model to
+avoid additional computation and preserve latency [12],
+contemporary serving systems typically keep them un-
+merged. This design enables the serving of multiple task-
+specific adapters on top of a shared backbone without
+replicating its large parameter footprint in GPU mem-
+ory.
+Such an approach is particularly well suited for
+multi-tenant environments, where a system must serve
+multiple users, each requiring a distinct model special-
+ization [28]. Since adapters are compact, a single GPU
+can serve hundreds or even thousands of different special-
+izations of the same LLM [29, 5]. This consolidation in-
+creases per-GPU throughput by aggregating requests from
+the hosted adapters whose individual arrival rates are of-
+ten too low to saturate a GPU.
+However, excessive adapter packing can cross a criti-
+cal threshold where request starvation emerges.
+In this
+regime, the GPU lacks sufficient memory for intermedi-
+ate request states (i.e. KV cache), so requests accumu-
+arXiv:2602.24044v1  [cs.DC]  27 Feb 2026
+
+
+--- Page 2 ---
+late faster than they are processed and latency increases
+steadily. Determining an allocation that maximizes per-
+GPU throughput, and thus GPU utilization, without trig-
+gering starvation is non-trivial. This optimal point, de-
+noted as Maxpack, depends on the interplay between the
+sizes and request arrival rates of the adapters, which vary
+across deployments and over time. Adapter size constrains
+the GPU memory available for intermediate states and in-
+crease computation time, while arrival rate governs the
+load induced by each adapter.
+To mitigate the GPU footprint of adapter weights, serv-
+ing systems often employ dynamic mechanisms that swap
+adapters between CPU and GPU memory based on uti-
+lization. Adapters resident in GPU memory can execute
+requests in parallel with other resident adapters [6], while
+swapping enables interleaved execution among adapters
+that do not simultaneously coexist on the GPU. Some
+frameworks, such as vLLM [15], additionally enforce a
+static upper bound on the number of loaded adapters,
+Amax, and preallocate the corresponding GPU memory
+at initialization. This choice directly shapes Maxpack: in-
+creasing Amax reduces memory available for request pro-
+cessing, while decreasing it limits achievable parallelism.
+Improper tuning of Amax can therefore induce starvation
+and, in extreme cases, GPU memory errors.
+Building on these observations, this work addresses
+the following problem:
+given an expected future
+workload composed of adapters with heteroge-
+neous sizes and request arrival rates, determine
+a GPU allocation strategy that maximizes per-
+GPU throughput by achieving Maxpack, so that
+the workload is served using the minimum number
+of GPUs without incurring starvation or memory
+errors.
+The solution must also derive the correspond-
+ing Amax configuration for each GPU. By expected future
+workload, we focus on predictable workloads that can be
+estimated in advance, such as long-term patterns present
+in production traces that exhibit periodicity [34].
+This
+formulation enables distributed systems to provision the
+minimal GPU capacity required for a workload in advance,
+improving hardware efficiency. We refer to this optimiza-
+tion challenge as the adapter caching problem, whose
+output specifies adapter placement across GPUs together
+with per-GPU Amax values.
+While prior work has explored the optimization of
+LLM-adapter serving via kernel-level enhancements [6],
+memory management techniques [29], and scheduling
+strategies [13], the adapter caching problem remains
+largely underexplored.
+The closest related work is
+dLoRA [34], which, among its contributions, proposes a
+greedy, heuristic-based algorithm that proactively deter-
+mines a GPU allocation strategy based on long-term work-
+load patterns. Whereas dLoRA targets latency reduction
+by exploiting all available resources, our objective is to
+maximize GPU efficiency by optimizing per-GPU through-
+put. To this end, we propose a data-driven pipeline com-
+prising three phases: (i) a Digital Twin (DT) that emu-
+lates an online LLM-adapter serving system; (ii) a machine
+learning (ML) phase that employs data generated by the
+DT; and (iii) a greedy algorithm that computes the final
+adapter placement to solve the caching problem.
+Unlike purely heuristic approaches, our method bases
+allocation decisions on learned system behavior obtained
+under diverse workload and system conditions. The greedy
+algorithm exploits this performance knowledge captured
+by the ML models to approach the optimal packing point,
+Maxpack, for each GPU, while determining an appropriate
+Amax configuration. To train the ML models without in-
+curring the prohibitive cost of profiling a real LLM-adapter
+serving system, we introduce a Digital Twin that re-
+produces the system’s behavior with orders-of-magnitude
+faster execution and substantially lower resource consump-
+tion. Building this Digital Twin required an in-depth pro-
+filing and analysis of the dominant overheads in LLM-
+adapter serving, which we also report.
+We evaluate our approach using the widely adopted
+vLLM framework [15] with LoRA adapters [12].
+To il-
+lustrate the generality of the adapter caching problem be-
+yond a single framework, we additionally provide a brief
+analysis using S-LoRA [29] in Appendix A.
+In summary, this work makes the following contribu-
+tions:
+• A data-driven pipeline to solve the adapter
+caching problem, minimizing the number of
+GPUs required to serve an anticipated work-
+load by maximizing per-GPU utilization while avoid-
+ing request starvation and memory errors.
+The
+pipeline integrates a Digital Twin, an ML learning
+phase, and a greedy allocation algorithm.
+• To our knowledge, the first Digital Twin that em-
+ulates LLM-adapter serving.
+It runs orders of
+magnitude faster than the real system while accu-
+rately reproducing key performance metrics and effi-
+ciently generating synthetic training data for the ML
+learning phase.
+• A detailed analysis of the dominant overheads
+in LLM-adapter serving, quantifying their inter-
+actions under diverse workloads and providing action-
+able configuration guidelines.
+Paper structure: The remainder of this work is orga-
+nized as follows. Sections 2 and 3 present the necessary
+background and review prior work, with the former also
+showing the adapter caching problem in practice.
+Sec-
+tions 4, 5, 6, and 7 detail the components of the proposed
+pipeline. Section 8 reports the main experimental results,
+while Sections 9 and 10 provide discussion and concluding
+remarks.
+2
+
+
+--- Page 3 ---
+2. Background
+2.1. LLM serving
+An LLM serving system processes each request through
+two sequential phases: prefill and decode. During prefill,
+all input tokens are processed in parallel, producing inter-
+mediate attention states, commonly referred to as the KV
+cache, which are stored in GPU memory to avoid redun-
+dant computation during generation. In the decode phase,
+output tokens are generated autoregressively, one token at
+a time, while newly computed KV values are appended to
+memory. Generation terminates upon emission of an end-
+of-sequence token or when the maximum output length is
+reached.
+Because decoding is inherently sequential and there-
+fore not compute-intensive, serving systems improve hard-
+ware utilization by processing multiple requests in parallel
+through batching [25]. As static batching is inefficient un-
+der variable output lengths, modern systems instead adopt
+continuous batching [37, 15, 22, 21]. It allows requests to
+dynamically enter and exit the batch between decoding it-
+erations, significantly improving throughput and latency.
+At runtime, the number of active requests in the batch
+is primarily constrained by GPU memory, as each re-
+quest maintains a growing KV cache throughout decod-
+ing. Early frameworks conservatively preallocated mem-
+ory for the maximum possible output length, resulting in
+substantial overprovisioning. In contrast, systems such as
+vLLM [15] and S-LoRA [29] employ greedy KV-cache al-
+location strategies that reserve memory only for a limited
+window of upcoming tokens. While this design improves
+memory efficiency, it may lead to request preemption un-
+der high volumes of request arrivals.
+2.2. (vLLM) Adapter serving
+Multiple types of LLM-adapters have been proposed [11,
+19, 10, 30]. In this work, we focus on LoRA adapters [12],
+which remain the most widely adopted approach. LoRA
+introduces trainable weights into specific layers of the
+backbone LLM through two low-rank matrices. Their re-
+sulting activations are added to the corresponding back-
+bone layer outputs, allowing the adapter to learn only
+the residual difference between the pretrained and target
+tasks. The size of a LoRA adapter is defined by the di-
+mensionality of its low-rank latent space, known as rank.
+Modern serving systems support parallel execution of
+multiple adapters within the same batch through kernel-
+level optimizations [6].
+Nevertheless, a request can be
+processed only if both the backbone model and adapter
+weights reside in GPU memory. Adapter weights there-
+fore reduce the memory available for requests KV cache.
+To alleviate this limitation, adapters are dynamically swap
+between CPU and GPU depending on their current usage.
+In vLLM, GPU memory is statically partitioned at ini-
+tialization by reserving a fixed region for adapter weights.
+This design limits the maximum number of simultaneously
+loaded adapters, denoted as Amax.
+Although tunable,
+0
+100
+200
+300
+adapters (#)
+1000
+2000
+3000
+4000
+throughput (toks/s)
+Varying size (rank)
+8
+16
+32
+64
+0
+100
+200
+300
+adapters (#)
+Varying rate (reqs/s)
+0.0125
+0.025
+0.05
+0.1
+0.2
+0
+100
+200
+300
+adapters (#)
+Varying Amax
+12
+96
+120
+256
+320
+Not starvation
+Starvation
+Maxpack
+Memory error
+Figure 1: Throughput as a function of the number of served adapters
+under varying adapter sizes (left), arrival rates (center) and config-
+ured Amax (right). Each line corresponds to experiments in which
+all parameters are held constant except for the number of adapters.
+Results were obtained using vLLM with Llama-2-7B [31] and a public
+LoRA adapter [36].Unless otherwise specified, the default configura-
+tion is: adapter size 8 (rank), per-adapter arrival rate 0.05 req/s,
+250 input tokens per request, and 231 output tokens per request. In
+the two leftmost plots, Amax is set equal to the number of served
+adapters. Smax is configured to match the adapter size used in each
+experiment.
+there is no principled methodology to choose its optimal
+value. Furthermore, vLLM assigns a uniform maximum
+memory footprint per adapter, Smax, causing all adapters
+to occupy identical GPU memory space regardless of their
+actual size.
+S-LoRA [29] mitigates these limitations by
+jointly managing KV-cache and adapter-weight memory
+within a unified cache. However, given the archival sta-
+tus of its codebase and its limited adoption in practice, it
+is not used as the primary framework in this study. An
+exploratory analysis is provided in Appendix A.
+2.3. Illustrating the adapter caching problem
+Fig. 1 illustrates the adapter caching problem under ho-
+mogeneous workloads on a single GPU. Each curve shows
+the throughput as a function of the number of concurrently
+served adapters. Two distinct regimes are consistently ob-
+served in each line. Initially, throughput increases approx-
+imately linearly as additional adapters introduce more re-
+quest load that can be efficiently batched together. Be-
+yond a certain point, throughput saturates or degrades due
+to insufficient GPU memory for KV-cache allocation, re-
+sulting in request starvation. The transition between these
+two regimes marks the optimal packing point Maxpack
+targeted in this work, which maximizes throughput while
+avoiding starvation. In practice, we identify this point as
+the highest measured throughput that remains above 90%
+of the total incoming token rate.
+The location of Maxpack is highly sensitive to adapter
+size, arrival rate, and the configured value of Amax, as a
+consequence of the adapter-serving overheads analyzed in
+Section 5.1. Larger adapters reduce the available mem-
+ory for request processing and increase computation cost,
+yielding lower Maxpack points. Lower arrival rates sim-
+ilarly obtain lower peak points, as more adapters are
+required to saturate GPU memory, increasing adapter
+overheads.
+The choice of Amax introduces a trade-off
+between reserving excessive memory for adapters (e.g.,
+Amax = 320) and restricting achievable parallelism (e.g.,
+3
+
+
+--- Page 4 ---
+GPU 3
+GPU 2
+GPU 1
+GPU 0
+Greedy loop
+decide adapter 
+placement based on (a)
+ROUTER
+RESOURCE
+MANAGER
+run periodically
+  Expected
+  workload (a)
+  - Required adapters
+  - Adapter sizes
+  - Adapter request     
+    arrival rates
+FORECASTER
+User B
+predict future workload
+  Adapter
+  allocation (b)
+  - Adapter-to-GPU 
+    placement
+  - Per-GPU Amax   
+    configuration
+A
+Adapters
+request for adapter A
+request for adapter B
+PROPOSED DATA-DRIVEN PIPELINE
+Allocation maximizes
+GPU utilization,
+minimizing GPUs
+needed (maximizing
+efficiency)
+ML model
+Fast and
+interpretable
+model
+refined to a
+  - Expected         
+    workload (a)
+  - Candidate       
+    adapter             
+    allocation (b)
+  - Expected         
+    throughput
+  - Starvation       
+    risk
+DT generates training
+data, avoiding costly
+and time-intensive
+LLM benchmarking
+trained offline with
+created by a
+Dataset of LLM-
+adapter serving
+performance under
+heteregenous
+workloads
+Digital Twin (DT)
+Predictive 
+behaviour 
+simulation
+Code-based
+behavior 
+simulation
+mixing
+Complete simulation of an LLM-adapter
+serving system
+Small set of
+experiments in a
+single GPU system
+parametrized by
+Caching
+greedy
+algorithm
+PRODUCTION SYSTEM
+sends
+returns
+User A
+C
+F
+B
+Adapters
+D
+Adapters
+E
+GPU 4
+HARDWARE
+SPARED
+GPUS
+allocate
+1
+2
+3
+4
+6
+5
+Figure 2: Proposed data-driven pipeline to address the adapter caching problem (right), shown alongside its expected usage within a production
+system (left). The numbered red markers indicate the recommended reading order of the workflow.
+Amax = 96). While the results shown correspond to homo-
+geneous workloads, substantially higher variance arises un-
+der heterogeneous adapter sizes and arrival rates. Lastly,
+memory errors (marked as crosses) occur for large adapter
+sizes and low arrival rates as Amax is trivially set equal
+to the number of served adapters, resulting in the reser-
+vation of more GPU memory for adapter weights than is
+available.
+3. Related work
+3.1. LLM adapter optimization
+A growing body of work has focused on improving the
+efficiency of LLM-adapter serving systems. Existing ap-
+proaches can be broadly categorized into three levels:
+kernel-level optimizations, such as Punica [6], which en-
+ables batching requests across multiple adapters; memory-
+level optimizations, exemplified by S-LoRA [29], which
+extends vLLM by dynamically partitioning GPU mem-
+ory across both requests and adapters; and scheduler-level
+techniques, including CaraServe [17], Chameleon [13], and
+dLoRA [34].
+CaraServe reduces cold-start overheads and optimizes
+request scheduling for heterogeneous adapter sizes, while
+Chameleon improves adapter cache management and in-
+troduces an express-lane mechanism for short requests.
+Both systems present detailed performance analyses, with
+CaraServe focusing mainly on the computational overhead
+of mixing adapters and Chameleon emphasizing Time To
+First Token (TTFT) and adapter loading time.
+The work most closely related to ours is dLoRA [34],
+which proposes a distributed adapter-serving system that
+incorporates placement decisions based on both short-term
+and long-term workload patterns observed in production
+traces. For short-term dynamics—largely driven by unpre-
+dictable output lengths—dLoRA employs a reactive Inte-
+ger Linear Programming (ILP)-based optimization to up-
+date placement decisions at runtime. For longer-term and
+more predictable workload patterns, it adopts a heuristic-
+based algorithm that operates in a proactive manner. Both
+strategies aim to minimize request latency while utilizing
+all available resources.
+In contrast, our work focuses on long-term behavior and
+targets GPU resource efficiency, a largely unexplored di-
+mension in prior studies. We adopt a data-driven approach
+grounded in real system behavior and complement it with
+a detailed performance analysis of adapter-serving over-
+heads. In particular, we emphasize throughput and Inter-
+Token Latency (ITL), which form the foundation for the
+development of our proposed Digital Twin.
+3.2. LLM simulators or digital twins
+Several simulators have been proposed to model de-
+fault LLM serving behavior. Vidur [1] aims to simplify
+server configuration selection by training random forest
+4
+
+
+--- Page 5 ---
+models on benchmarking data to predict performance met-
+rics. LLMServingSim [7] emulates the continuous batching
+loop of LLM serving systems and is primarily intended for
+architecture exploration.
+Beyond simulators, more spe-
+cific analytical performance models have also been pro-
+posed.
+Latency is commonly approximated as a linear
+function of batch size, following earlier studies on generic
+AI models [38, 27].
+In the context of adapter serving,
+CaraServe [17] models adapter computation latency as a
+linear function of batch size and either the sum or the
+maximum adapter size within the current batch.
+To the best of our knowledge, no existing simulator
+or digital twin explicitly models the combined dynam-
+ics of adapter caching, KV-cache allocation, and contin-
+uous batching in multi-adapter LLM serving. Our Digital
+Twin combines code-based simulation with predictive be-
+havior modeling. The latter relies on performance models
+that reuse existing analytical formulations where applica-
+ble, while incorporating additional components and refine-
+ments to accurately capture adapter-serving behavior un-
+der heterogeneous workloads.
+3.3. Extension of prior workshop version
+A preliminary version of this work was presented at the
+NeurIPS ML for Systems Workshop (2025) [20], where
+throughput maximization was addressed in single-GPU
+settings via Maxpack estimation.
+This manuscript sub-
+stantially extends that work by generalizing the problem
+to distributed multi-GPU environments and introducing a
+greedy placement algorithm for adapter allocation. More-
+over, the ML component is reformulated as a distilled sur-
+rogate of the Digital Twin (DT), enabling efficient perfor-
+mance prediction to guide placement under heterogeneous
+workloads. Finally, the experimental evaluation is signifi-
+cantly expanded, including validation under unpredictable
+arrival patterns and distributed scenarios not considered
+in the workshop version.
+4. Pipeline overview
+Fig. 2 illustrates the proposed data-driven pipeline and
+its expected integration within a production system. In-
+spired by the long-term predictive strategy of dLoRA, the
+pipeline is designed to be periodically reinvoked based
+on an anticipated workload.
+A workload is character-
+ized by the required adapters, their sizes, and their re-
+quest arrival rates. Given this workload, the pipeline com-
+putes an adapter-to-GPU placement together with the op-
+timal Amax configuration per device. The resulting allo-
+cation maximizes per-GPU utilization by driving a subset
+of devices to their maximum feasible packing throughput
+(Maxpack), thereby minimizing the number of GPUs re-
+quired to serve the workload. The remaining devices can
+be reassigned to other workloads to improve overall system
+efficiency or powered down to reduce energy consumption.
+The pipeline consists of three components: (i) a Dig-
+ital Twin (DT), (ii) an ML learning phase, and (iii) a
+Send new arrivals from last
+step to scheduler
+Retrieve active batch from
+scheduler
+Update adapters in CPU and
+GPU based on active batch
+Run model forward pass for
+active batch
+SCHEDULER
+Every step actions
+ADAPTER
+CACHE
+MODEL
+Components
+Performance
+models
+ 
+scheduler latency
+ 
+available memory
+ 
+loading latency
+ 
+model latency
+Figure 3: Digital Twin behavior and architecture.
+greedy adapter caching algorithm. The greedy algorithm
+produces the final placement decision, relying on perfor-
+mance predictions generated by the ML models. Trained
+offline, these models estimate the achievable throughput of
+a GPU under a given adapter placement and Amax config-
+uration, and predict whether starvation may arise. An op-
+tional refinement phase can simplify the models into faster
+and more interpretable surrogates, at the cost of limited
+accuracy degradation.
+Training such models requires a large and diverse
+dataset capturing LLM-adapter serving behavior across
+heterogeneous workloads. Exhaustively constructing this
+dataset via real-system benchmarking is computationally
+prohibitive due to its execution time and resource cost. To
+overcome this limitation, we introduce a Digital Twin that
+emulates the internal dynamics of an LLM-adapter serving
+system through a combination of code-based and predic-
+tive behavior simulation. The DT operates orders of mag-
+nitude faster and with substantially lower resource con-
+sumption than full-system benchmarking, enabling large-
+scale synthetic data generation to train the ML mod-
+els. While the DT provides high-fidelity performance esti-
+mates, it is not directly invoked by the greedy caching algo-
+rithm, as the ML surrogate enables significantly faster in-
+ference and improved interpretability, making the pipeline
+suitable for production deployment. Prior to use, the DT
+requires a lightweight parameterization phase based on a
+small set of benchmarking experiments executed on the
+target hardware and model configuration.
+5. Digital twin
+The proposed Digital Twin (DT) reproduces the behav-
+ior of an online LLM–adapter serving system. Rather than
+acting as a simple performance metric estimator, the DT
+emulates system state transitions and execution dynam-
+ics within the continuous batching loop that characterizes
+modern serving frameworks. This design enables accurate
+performance estimation under heterogeneous and diverse
+workload distributions. The DT operates offline and ex-
+clusively on CPU to facilitate cost-efficient generation of
+training data for the ML models. Offline execution refers
+5
+
+
+--- Page 6 ---
+to advancing a simulated clock while accounting for real
+execution time, thereby avoiding idle waiting and preserv-
+ing the possibility of easily extending the approach to an
+online simulation if required.
+The DT is built on a set of modular components, each
+modeling a specific part of the real system. These com-
+ponents reproduce system behavior through simplified yet
+structurally analogous logic (code-based simulation) and
+integrate lightweight predictive performance models to es-
+timate the latency of the most computationally intensive
+operations without executing them.
+As depicted in Fig. 3, each simulation step begins by
+injecting new request arrivals according to the real execu-
+tion time and the workload arrival distribution. Requests
+are then passed to the scheduler, which updates the ac-
+tive batch by removing completed requests and admitting
+new ones. Following the design of vLLM, a greedy KV-
+cache allocation strategy is applied. The updated batch
+is subsequently processed by the adapter cache and model
+components, which emulate adapter loading/unloading as
+well as the model forward pass, respectively.
+As a standard Digital Twin, the DT requires the same
+inputs as the real system to perform the simulation. These
+include the execution duration and detailed workload char-
+acteristics, namely the arrival time of each request, the
+target adapter, adapter size, request input length, and
+the configured GPU Amax value. Unlike the real system,
+however, the DT does not internally derive the amount
+of output tokens per request. Instead, the expected out-
+put length must also be provided as an input parameter.
+Nevertheless, our evaluation shows that using the aver-
+age output length across requests yields sufficiently accu-
+rate performance estimates while remaining practical to
+approximate in production environments. By reproducing
+all major execution stages of a real serving system, the DT
+can generate a wide range of performance metrics, includ-
+ing throughput, ITL, and TTFT.
+5.1. Performance analysis
+We describe the four main overheads that we encoun-
+tered when working with adapters. This exploration rep-
+resents the foundation for the design and implementation
+of the DT and its predictive performance models. Exper-
+iments setup is described in Section 8.1.
+5.1.1. Increased memory usage
+As introduced, storing adapter weights in GPU memory
+reduces the capacity available for the requests KV-cache,
+which limits the batch size and thus the throughput. Fig. 4
+shows this decrease in both batch size and throughput,
+which appears earlier and more sharply for larger models
+and adapters due to their higher memory footprint. Un-
+expectedly, throughput decays exponentially rather than
+linearly as batch size.
+This discrepancy arises from a
+broader trait of LLM serving unrelated to adapter pro-
+cessing. As reported in several works, increasing the batch
+0
+200
+400
+600
+800
+adapters in GPU (#)
+0
+50
+100
+150
+Batch size (#)
+0
+200
+400
+600
+800
+adapters in GPU (#)
+0
+2000
+4000
+Throughput (toks/s)
+50
+100
+150
+200
+batch size (#)
+25
+50
+75
+100
+125
+ITL (ms)
+Llama-2-7B
+Llama-2-13B
+size 8
+size 16
+size 32
+Figure 4: Evolution of batch size and throughput with increasing
+numbers of loaded adapters (left, center) and ITL versus batch size
+(right), across models and adapter sizes. Crosses denote the point
+where GPU memory is exhausted.
+Measurements were obtained
+by oversaturating a single-GPU system and issuing backbone-only
+requests to isolate the memory overhead of adapter weights.
+Mi-
+nor variations in ITL across adapter sizes are nevertheless observed,
+likely due to additional operations triggered in vLLM when adapters
+are activated, even if unused.
+size beyond a certain point leads to diminishing returns
+in throughput—a phenomenon known as the throughput
+plateau [25, 26, 2]. This implies that, for example, with
+Llama-2-7B although the first 100 loaded adapters reduce
+the batch size, their impact on throughput is negligible, a
+characteristic that, to the best of our knowledge, we are the
+first to report. Lastly, the rightmost plot of Fig. 4 presents
+the relationship between ITL and batch size, which, con-
+sistent with prior reports for generic AI models [38, 27],
+exhibits a linear scaling trend.
+Insight. Each loaded adapter affects throughput, de-
+pending on model and adapter size—but this impact may
+fade due to the throughput plateau.
+5.1.2. Increased computational workload
+Fig. 5 shows the throughput slowdown and ITL over-
+head caused by the additional computation and GPU in-
+ternal transfers required to process adapters instead of
+only the backbone LLM. Both metrics increase approxi-
+mately linearly with the number of adapters, except for
+the sharp drop from zero to one adapter. This drop corre-
+sponds to the shift from a backbone-only setup to one that
+must compute both backbone and adapter activations, in-
+cluding the additional GPU data transfers involved. Be-
+yond this point, computation and transfer overheads from
+multiple adapters is partially parallelized.
+Adapter size
+has a limited impact, with size 32 occasionally yielding
+lower overhead than size 16.
+Insight.
+Serving adapters introduces computational
+overhead in both throughput and ITL compared to
+backbone-only execution, increasing linearly with the
+number of adapters.
+5.1.3. Loading time
+Fig. 6 presents the loading time to GPU memory rel-
+ative to request latency, distinguishing between loading
+from disk and from CPU memory.
+Larger adapters in-
+troduce greater overhead due to their increased size, and
+disk loading is on average 70% slower than CPU loading.
+Request length also strongly affects the relative impact:
+6
+
+
+--- Page 7 ---
+1
+20
+40
+60
+80
+100
+adapters (#)
+1
+5
+10
+15
+20
+Throughput slowdown (%)
+1
+20
+40
+60
+80
+100
+adapters (#)
+1
+5
+10
+15
+20
+ITL overhead (%)
+Llama-2-7B
+size 8
+size 16
+size 32
+Figure 5: Throughput slowdown and ITL overhead for increasing
+adapters across three adapter sizes. Results are shown for Llama-2-
+7B and relative to backbone-only execution. To avoid the impact of
+adapter weights, we fix the batch size and number of loaded adapters
+within each line. Lines are shorter for larger adapter sizes due to their
+reduced achievable batch size, which limits the maximum number of
+runnable adapters.
+size 8
+size 16
+size 32
+0
+20
+40
+60
+80
+relative load impact (%)
+From disk
+size 8
+size 16
+size 32
+0
+5
+10
+15
+From CPU
+23/27 lengths
+250/230 lengths
+423/357 lengths
+Figure 6: Loading times for varying adapter sizes, shown relative
+to request latency across three input/output lengths for Llama-2-
+7B and storage type.
+Request latency is computed as TPOT ∗
+(output_tokens −1), where TPOT is the time per output token.
+for small requests, CPU loading adds 7–16% latency de-
+pending on adapter size, whereas for longer requests the
+overhead falls below 2%. This reduction occurs because
+the fixed cost of loading becomes negligible compared to
+the computation time of longer requests.
+Insight.
+Loading overhead is significant only for
+short requests and can be largely mitigated by preload-
+ing adapters into CPU memory.
+5.1.4. Scheduler
+Fig. 7 shows the relative impact of the scheduler com-
+ponent across varying numbers of adapters and configured
+Amax. When the number of adapters is high but Amax is
+small, scheduling accounts for nearly 6% of execution time;
+in all other cases, its impact is negligible. This behavior is
+specific to the vLLM implementation rather than to LLM
+adapter serving in general. It occurs because vLLM iter-
+ates over all pending requests to select those admissible to
+the active batch; with small Amax, the scheduler must scan
+a larger fraction of requests to find those corresponding to
+loaded adapters, as requests from unloaded adapters can-
+not be processed because Amax has already been reached.
+Insight. The scheduler component of vLLM may in-
+troduce an overhead when Amax is small relative to the
+number of adapters.
+5.2. Predictive performance models
+As illustrated on the right side of Fig. 3, the Digital Twin
+relies on four predictive performance models, summarized
+in Equation (1).
+Three of these models estimate task-
+specific latency—Latsched, Latload and Latmodel—while
+100
+200
+300
+400
+500
+adapters (#)
+2
+4
+Relative scheduler time (%)
+Amax = 8
+Amax = 32
+Amax = 64
+Amax = 128
+Amax = 256
+Amax = 448
+Figure 7: Scheduler time relative to the average per-step execution
+time, as a function of the number of adapters and configured Amax.
+the fourth, Memmax, serves as an auxiliary estimator used
+by the scheduler to determine the maximum number of
+requests that can be batched together under the memory
+pressure introduced by adapter weights (see Section 5.1.1).
+Specifically, Memmax takes Amax and Smax as inputs and
+outputs the maximum number of request tokens that can
+fit within GPU memory (Tmax). This estimator is derived
+directly from profiled data, analogous to the leftmost plot
+in Fig. 4, but estimates the achievable token count rather
+than batch size. Although an analytical formulation could
+be derived from backbone and adapter sizes, using em-
+pirical profiling results proved more straightforward and
+equally accurate.
+The latency model Latsched is used by the scheduler
+to estimate the time spent in the original vLLM schedul-
+ing component. It takes as input the batch size (B), the
+number of pending requests (RP ), the number of unique
+adapters currently in the batch (AB), and the total num-
+ber of adapters being served (A). Its formulation follows
+a parameterized analytical expression with constants cal-
+ibrated through profiling. The first two terms represent
+the baseline scheduling behavior: an iteration over the ac-
+tive batch to detect completed requests and manage KV
+allocation, followed by a partial iteration over pending
+requests to assess their eligibility for inclusion.
+The fi-
+nal term models the overhead described in Section 5.1.4,
+which accounts for the additional execution time caused
+by scheduler-specific inefficiencies.
+The model Latload estimates the time required to load
+adapters during swapping (L) as a function of their size S
+(see Section 5.1.3), assuming unloading is negligible. Sim-
+ilar to Memmax, this model is derived directly from pro-
+filed data, specifically the measurements used to generate
+Fig. 6. Loading is modeled from CPU memory, since disk
+loading is treated as a one-time initialization cost.
+Finally, Latmodel estimates the latency arising from
+GPU transfers and model forward pass.
+It is decom-
+posed into two components: the backbone LLM latency
+(Latbackbone) and the additional computational overhead
+from serving adapters (OverheadA).
+The backbone la-
+tency is modeled as a linear function of batch size, consis-
+tent with prior work [38, 27] and supported by the profiling
+results in the rightmost plot of Fig. 4. The adapter-related
+overhead is modeled as a linear function of the number of
+adapters, following the findings in Fig. 5, which differs
+from previous modeling [17]. The constants for both com-
+ponents are parametrized from the profiling data shown in
+7
+
+
+--- Page 8 ---
+the referenced figures.
+Memmax(Amax, Smax) = Tmax
+Latsched(B, RP , AB, A) = K1B + K2RP + K3RP
+AB
+A
+Latload(SA) = LA
+Latmodel(B, A) = Latbackbone ∗OverheadA
+= (K4B + K5) ∗(K6A + K7)
+(1)
+where all constants Kx are parametrized with bench-
+marking data on the chosen backbone LLM, adapter types,
+and hardware configuration.
+6. ML modeling
+The ML phase produces two predictive models that esti-
+mate, for a single-GPU setting, (i) achievable throughput
+and (ii) starvation risk for a given workload, adapter place-
+ment and Amax configuration. These estimators are re-
+peatedly invoked by the greedy caching algorithm to guide
+distributed placement decisions. We adopt classical ma-
+chine learning techniques, including Random Forests and
+Support Vector Machines, which provide strong predictive
+accuracy with moderate computational overhead. An op-
+tional refinement phase further reduces inference latency
+and improves interpretability, both critical for scalable and
+accountable production deployment.
+The models are trained on a performance dataset gen-
+erated by executing the Digital Twin across a wide range
+of workload and device configurations.
+Each simulated
+scenario contributes one sample consisting of: (i) a fea-
+ture vector encoding workload and device characteristics,
+(ii) the DT-estimated throughput, and (iii) a binary star-
+vation indicator.
+Starvation is defined as the condition
+where DT-estimated throughput falls below 90% of the
+total incoming token rate. Although the DT supports ar-
+bitrary workload distributions, training data is restricted
+to long-term workload patterns that can be anticipated
+in advance. In practice, request arrivals are modeled as
+a Poisson process with different arrival rates, and simula-
+tions use the average input and output token lengths of
+requests, which are assumed to be predictable in produc-
+tion environments.
+The feature vector characterizes both the expected
+workload and the GPU configuration, comprising:
+the
+number of served adapters A; the sum and standard de-
+viation of adapter arrival rates; the maximum, mean, and
+standard deviation of adapter sizes; and the configured
+Amax value. Two independent models are trained: a re-
+gression model for throughput prediction and a binary
+classifier for starvation detection.
+6.1. Refinement phase
+Among all evaluated model families, tree–based models
+achieve the best trade-off between predictive accuracy and
+interpretability. We therefore further refine these models
+along two complementary dimensions: inference efficiency
+and interpretability.
+Starting from the best-performing
+trained model, we progressively reduce model complexity
+until obtaining a single shallow decision tree. To this end,
+the hyperparameter optimization process is modified to
+strongly penalize complex structures. Model complexity
+is quantified as the number of logical decision rules of the
+form "condition1 ∧condition2 ∧· · · →output" into which
+a decision tree can be decomposed. After complexity re-
+duction, inference performance is further optimized by ex-
+tracting the learned decision logic and re-implementing it
+in plain Python, accelerated using Numba [16]. This ap-
+proach removes framework overhead and leverages code
+compilation to generate efficient machine code. Overall,
+this refinement phase substantially reduces inference la-
+tency and improves model interpretability, at the cost of
+a moderate degradation in predictive accuracy.
+7. Caching greedy algorithm
+The greedy caching algorithm constitutes the final stage
+of the proposed pipeline.
+Its objective is to solve the
+adapter caching problem by minimizing the number of
+GPUs required to serve a given workload through appro-
+priate adapter placement and Amax configuration, while
+avoiding starvation and memory errors.
+The algorithm
+leverages the ML models to estimate the expected through-
+put and starvation risk associated with candidate GPU
+allocations and device configurations.
+This problem can be viewed as a sophisticated variant of
+the bin packing problem [8], and is therefore NP-hard. To
+address it efficiently, we adopt a tailored variation of the
+First-Fit Decreasing (FFD) algorithm [14], adapted to the
+specific constraints and objectives of the adapter caching
+problem.
+The pseudocode is shown in Algorithm 1. The algorithm
+takes as input the expected future workload, defined by the
+set of adapters to serve (A), and for each adapter a ∈A, its
+expected size s[a] and arrival rate λ[a]. It also receives the
+total number of GPUs in the system (G). The outputs are
+the GPU assignment of each adapter (g[a]) and the config-
+uration of Amax per GPU (Amax[g]). If no starvation-free
+allocation is feasible, the algorithm raises an exception to
+enforce the non-starvation constraint.
+The algorithm follows a greedy strategy, allocating
+adapters sequentially to maximize GPU packing up to the
+optimal point Maxpack.
+Allocation order is determined
+by the PrioritySorting step: adapters are first sorted
+by size (largest first) and then by arrival rate in a zigzag
+order (alternating between high and low) while preserv-
+ing size-based ordering. Sorting by size groups adapters
+with similar sizes and prioritizes larger ones first, thereby
+preventing newly allocated adapters from increasing Smax
+device configuration. The zigzag ordering was selected em-
+pirically, as it consistently improved throughput in our
+8
+
+
+--- Page 9 ---
+experiments.
+Exhaustive per-adapter testing is infeasi-
+ble, so the algorithm performs provisional allocations via
+ProvisionalInclude until a predefined testing point is
+reached (ReachTestingPoint).
+At that point, feasi-
+bility is evaluated: successful allocations are committed
+(CommitAllocation), while failed ones are rolled back
+(RollbackAllocation), merged back into the pending
+queue (Merge), and retried on another GPU. In this
+work, testing points correspond to cumulative adapter
+counts [8, 16, 32, 64, 96, 128, 160, 192, 256, 320, 384].
+After the main loop terminates, any remaining provisional
+allocations are validated and committed.
+Algorithm 1 Caching greedy algorithm
+Input: GPUs
+G
+=
+{g1, . . . , gM};
+adapters
+A
+=
+{a1, . . . , aN}; sizes s[a]; rates λ[a]
+Output: Assignment g[a]; configuration Amax[g]
+1: g[a] ←∅for all a ∈A;
+Amax[g] ←0 for all g ∈G
+2: A ←PrioritySorting(A, key = (λ[a], s[a]))
+3: Aq ←Queue(A);
+Gq ←Queue(G)
+4: while Aq ̸= ∅do
+5:
+a ←PopLeft(Aq)
+6:
+if Gq = ∅then Error Starvation
+7:
+g ←PopLeft(Gq)
+8:
+ProvisionalInclude(g, a, s[a], λ[a])
+9:
+if ReachTestingPoint(g) then
+10:
+(ok, alloc_set, pnew) ←TestAllocation(g)
+11:
+if ok then
+12:
+CommitAllocation(g)
+13:
+for all a′ ∈alloc_set do g[a′] ←g
+14:
+Amax[g] ←pnew
+15:
+PushLeft(Gq, g)
+16:
+else
+17:
+un_alloc_set
+←
+RollbackAllocation(g)
+18:
+Aq ←Merge(Aq, un_alloc_set)
+19:
+end if
+20:
+else
+21:
+PushLeft(Gq, g)
+22:
+end if
+23: end while
+24: for all g ∈G with non-tested allocation do
+25:
+(ok, alloc_set, pnew) ←TestAllocation(g)
+26:
+if not ok then Error Starvation
+27:
+repeat lines 12-14
+28: end for
+29: return (Assignment g[a], configuration Amax[g])
+Feasibility
+is
+evaluated
+by
+the
+TestAllocation
+method, which also determines the optimal Amax config-
+uration.
+Its pseudocode is shown in Algorithm 2.
+The
+method receives as input the GPU under evaluation and
+its internal state, including the number of firmly allocated
+adapters, the set of provisionally included adapters, and
+their respective sizes and arrival rates. For brevity, inter-
+nal state management is omitted from the pseudocodes.
+The method first queries the ML model for throughput
+predictions using MLPredictThroughput, evaluating
+the GPU state under two configurations: the current Amax
+and the next candidate. As with adapter allocation, ex-
+haustive exploration of all configurations is intractable. In-
+stead, candidate Amax values are restricted to a predefined
+set returned by NextGPUConfig, which reuses the same
+array of adapter counts defined earlier. The configuration
+yielding the highest predicted throughput is selected. Sub-
+sequently, the method invokes MLPredictStarvation to
+check whether the selected configuration, given the current
+GPU internal state, would lead to starvation. If starva-
+tion is predicted, the allocation is rejected as infeasible;
+otherwise, the method returns the set of new allocatable
+adapters along with the chosen Amax configuration.
+Algorithm 2 TestAllocation(g)
+Input: GPU g; internal state = (Aalloc, Aprov, s[·], λ[·], p)
+Output: (ok, alloc_set, pnew)
+1: pnext ←NextGPUConfig(g)
+2: Aall ←Aalloc ∪Aprov
+3: T ←MLPredictThroughput(Aall, s[·], λ[·], p)
+4: Tnext ←MLPredictThroughput(Aall, s[·], λ[·], pnext)
+5: if T > Tnext then pbest ←p else pbest ←pnext
+6: starve ←MLPredictStarvation(Aall, s[·], λ[·], pbest)
+7: if starve then return (False, ∅, ∅)
+8: return (True, Aprov, pbest)
+8. Evaluation
+This section evaluates the Digital Twin and ML learning
+phase in approximating real LLM-adapter serving behav-
+ior, and the effectiveness of the caching greedy algorithm
+in addressing the adapter caching problem.
+8.1. Setup
+Follows detailed information about the experimental
+setup:
+Data. We sample requests from a cleaned version of the
+ShareGPT dataset [3], preserving their original heteroge-
+neous input and output lengths. Nevertheless, for the data
+used to parametrize the DT performance models, we gen-
+erate synthetic requests composed of random words from
+the /usr/share/dict/words file of Unix systems to avoid
+bias in request content.
+Metrics. In all textual references, figures, and tables,
+throughput denotes the total processing rate, computed as
+the sum of input throughput (tokens processed as input)
+and output throughput (tokens generated as output).
+LLM models. We use Llama-3.1-8B-Instruct [9] and
+Qwen2.5-7B-Instruct [35] with LoRA adapters of different
+sizes derived from two HuggingFace adapters [33, 39]. As
+of Section 5.1, developed early in this work, we test Llama-
+2-7B and Llama-2-13B models [31] with LoRA adapters
+9
+
+
+--- Page 10 ---
+also based on a HuggingFace adapter [36]. In all experi-
+ments, we set Smax as the maximum adapter size found
+in every tested scenario, which is the default behaviour
+expected in vLLM.
+ML learning phase. We evaluate three model types:
+K-Nearest Neighbors (KNN), Random Forest (RF), and
+Support Vector Machine (SVM), all coming from the
+Python scikit-learn library [23].
+Training is performed
+with 5-fold cross-validation, and hyperparameter tuning is
+conducted using the HalvingGridSearchCV method from
+scikit-learn.
+The details of the hyperparameter search
+space are reported in Appendix B.
+Framework.
+All experiments are conducted with
+vLLM version v0.8.5, except for the analyses in Sec-
+tion 5.1,
+which was performed earlier using version
+v0.5.0.post1. In terms of implementation, we introduce mi-
+nor modifications to the server components to collect aux-
+iliary metrics and support additional arguments, and sub-
+stantially update the benchmarking script to better em-
+ulate realistic online environments with adapters. When
+using multiple GPUs, a separate vLLM instance runs on
+each GPU, and requests are routed according to the out-
+put of the greedy algorithm.
+Hardware. All experiments are conducted on a node
+equipped with four NVIDIA Hopper H100 (64GB HBM2),
+512GB RAM memory, and 80 CPU cores. When running
+the Digital Twin, the GPU is not utilized.
+8.2. Digital Twin
+We evaluate the accuracy of the proposed Digital Twin
+(DT) by comparing its predicted performance metrics
+against those measured on a real LLM-adapter serving
+system, assessing its ability to reproduce system behavior
+across a wide range of different workloads. These are gen-
+erated through a Cartesian combination of two adapter-
+size
+sets—high-to-low
+{8, 16, 32}
+and
+medium-to-low
+{8, 16}—and two arrival-rate regimes—high {1.6, 0.8, 0.4}
+and low {0.1, 0.05, 0.025} requests per second. For each
+workload, adapters randomly select a size and a Poisson
+arrival rate from the chosen sets, producing heterogeneous
+configurations. The number of served adapters is varied
+from 8 to 384, and the corresponding values of Amax are
+explored within the same range. Real-system experiments
+are executed for one hour per configuration. DT accuracy
+is quantified using the Symmetric Mean Absolute Percent-
+age Error (SMAPE) across all scenarios. Results are sum-
+marized in Table 1 under the Predictable arrivals setting.
+Two variants of DT input information regarding request
+lengths are evaluated. In the Original variant, the DT re-
+ceives the exact input and output token lengths observed
+in the real system. In the Mean variant, all requests use
+identical token lengths equal to the workload average. This
+latter configuration reflects the information typically avail-
+able in practice and corresponds to the setup used during
+the ML learning phase.
+Overall, the DT accurately reproduces real-system be-
+havior under predictable workloads for both models.
+0
+100
+200
+300
+400
+adapters (#)
+0
+5000
+10000
+15000
+Throughput (toks/s)
+0
+100
+200
+300
+400
+adapters (#)
+25
+50
+75
+100
+Mean ITL (ms)
+0
+100
+200
+300
+400
+adapters (#)
+0
+1
+2
+3
+1e6 Mean TTFT (ms)
+Real results
+Digital Twin
+ML
+Low rates
+High rates
+Figure 8: Comparison between Digital Twin predictions and real-
+system measurements for throughput, ITL, and TTFT under varying
+numbers of adapters and arrival rates. Experiments are conducted
+using adapter sizes 8 and 16 on the Qwen-2.5-7B model with Amax =
+8, in the predictable setting and Mean version.
+For throughput,
+predictions produced by the ML model are also reported.
+Throughput and ITL achieve maximum SMAPE values
+of 5.08% and 9.63%, respectively, while TTFT exhibits
+higher deviation, with a maximum SMAPE of 18.95%.
+Although the Original variant consistently yields lower er-
+ror, the Mean configuration remains comparably accurate,
+supporting its use in practical scenarios.
+Table 2 shows DT time and resource consumption. It
+achieves up to a 90× speedup compared to one-hour real-
+system executions, while requiring minimal resources: a
+single CPU core, no GPU, and approximately 200 MB of
+memory. Fig. 8 illustrates a comparison between DT pre-
+dictions and real-system measurements for a subset of the
+tested scenarios. Consistent with the aggregated results,
+throughput and ITL are closely matched, whereas TTFT
+shows larger deviations, particularly under higher arrival
+rates.
+Unpredictable arrivals: We further evaluate the ro-
+bustness of the Digital Twin under unpredictable arrivals.
+To that end, each adapter independently updates its ar-
+rival process every five minutes. At each update, the ar-
+rival distribution is randomly selected between Poisson
+and log-normal, and the corresponding arrival rate is ran-
+domly multiplied or divided by a factor of two. To pre-
+vent unrealistic behaviors, arrival rates are clipped within
+predefined bounds. This configuration generates strongly
+non-stationary traffic patterns, providing a challenging
+setting for assessing the DT’s ability to reproduce system
+behavior under rapidly changing workloads. An example
+of the resulting arrival traces is shown in the left plot of
+Fig. 9.
+We follow the same evaluation methodology as in the
+predictable-arrival experiments; however, for efficiency
+reasons, the number of evaluated scenarios is reduced.
+Adapter sizes are fixed to 8, Amax is set to 32, and the
+number of served adapters is varied among 32, 64, and 128.
+Arrival rates follow the same ranges as in the previous ex-
+periments. The resulting SMAPE values are reported in
+the right part of Table 1.
+Overall, the DT accurately reproduces system behav-
+ior under unpredictable arrival patterns, achieving error
+levels comparable to those observed for predictable work-
+loads, albeit slightly lower due to the reduced evaluation
+10
+
+
+--- Page 11 ---
+Model
+Req. lengths
+Predictable arrivals
+Unpredictable arrivals
+SMAPE comparison (%)
+SMAPE comparison (%)
+Through.
+ITL
+TTFT
+Through.
+ITL
+TTFT
+Llama
+Original
+2.25
+7.09
+18.83
+1.00
+3.55
+13.92
+Mean
+4.18
+9.63
+17.44
+2.06
+9.87
+21.28
+Qwen
+Original
+2.59
+7.18
+18.95
+1.71
+3.54
+12.26
+Mean
+5.08
+9.07
+17.92
+4.29
+5.60
+21.49
+Table 1: Final evaluation of the proposed Digital Twin across all predictable (left) and unpredictable (rigth) test scenarios. Reported values
+correspond to SMAPE between Digital Twin predictions and real-system measurements, where lower values denote higher fidelity.
+Resource consumption
+Model
+Time (s)
+CPU (%)
+Mem (MB)
+Llama
+38.94 ± 5.58
+89.51 ± 1.69
+202.58 ±
+10.85
+Qwen
+39.61 ± 5.55
+90.33 ± 1.30
+204.32 ± 9.29
+Table 2: Execution time and resource consumption results of the
+Digital Twin across all tested scenarios.
+0
+10
+20
+30
+40
+50
+60
+time (min)
+0
+50
+100
+150
+arrivals per adapter
+Arrivals
+adapter-14
+adapter-18
+adapter-2
+0
+10
+20
+30
+40
+50
+60
+time (min)
+0
+200
+400
+600
+800
+adapters (#)
+Adapters in running and waiting queues
+Real running
+Real waiting
+DT running
+DT waiting
+Figure 9: Execution with Llama-3.1-8B under initial high arrival
+rates (1.6, 0.8, 0.4) for 32 adapters in the unpredictable regime.
+(Left) Non-stationary arrival traces for randomly sampled adapters.
+(Right) Comparison of running and waiting requests over time be-
+tween the Digital Twin and the real system.
+space. The right plot of Fig. 9 illustrates the evolution of
+running and waiting requests over time for both the DT
+and the real system in a specific scenario. The close align-
+ment between the two traces highlights the DT’s ability to
+replicate scheduler dynamics, greedy KV-cache allocation,
+adapter loading behavior, and computation latency under
+highly dynamic traffic conditions.
+8.3. ML modeling
+Leveraging
+the
+Digital
+Twin
+for
+rapid
+data
+gen-
+eration,
+we train the proposed ML models over an
+extended and diverse set of workload scenarios.
+Work-
+loads are generated through a Cartesian product of
+adapter sizes and arrival rates.
+Instead of evalu-
+ating
+only
+a
+small
+number
+of
+predefined
+sets,
+we
+construct all combinations of three values drawn from
+the adapter-size set {8, 16, 32} and the arrival-rate set
+{3.2, 1.6, 0.8, 0.4, 0.1, 0.05, 0.025, 0.0125, 0.00625, 0.003125}.
+For each workload configuration, we further vary both the
+number of served adapters and the device configuration
+parameter Amax within the range 8 to 384. This process
+results in a large and heterogeneous training dataset that
+captures a wide range of workload conditions.
+Table 3
+summarizes the prediction accuracy of the three evalu-
+ated ML model types (KNN, RF, and SVM), evaluated
+against the same real-system executions employed for the
+validation of the Digital Twin..
+Throughput prediction
+accuracy is quantified using SMAPE, while starvation
+detection performance is evaluated using macro-averaged
+F1 score across all scenarios.
+Overall, the ML models achieve high predictive fidelity,
+particularly for starvation detection. Throughput predic-
+tion errors remain below 8%, slightly higher than those
+obtained using the Digital Twin, as expected given the ad-
+ditional abstraction introduced by the learning process.
+Fig. 8 additionally reports throughput predictions pro-
+duced by the best-performing RF model, showing close
+agreement with real-system measurements. Prediction la-
+tency, also reported in Table 3, remains below 0.3 ms for all
+models except SVM, representing a substantial improve-
+ment over DT execution time.
+Model
+Estimator
+Throughput
+Starvation
+SMAPE
+(%)
+Time
+(ms)
+F1
+(macro)
+Time
+(ms)
+Llama
+KNN
+4.52
+0.21
+0.95
+0.19
+RF
+4.39
+0.25
+0.95
+0.16
+SVM
+6.84
+1.70
+0.98
+0.02
+Qwen
+KNN
+5.28
+0.15
+0.99
+0.19
+RF
+5.28
+0.21
+0.99
+0.22
+SVM
+7.46
+2.24
+0.93
+0.05
+Table 3: Final evaluation results of the proposed ML model across
+the three model types and both LLMs.
+It evaluates throughput
+estimation (with SMAPE) and starvation detection (with macro-
+F1), and reports the average prediction time in milliseconds.
+11
+
+
+--- Page 12 ---
+Refinement phase: We further extend the ML learn-
+ing phase with the refinement procedure described in Sec-
+tion 6. Table 4 reports results for the original RF model,
+the simplified shallow decision tree (Small Tree), and its
+Numba-optimized implementation (Small Tree**).
+The refinement process yields substantial improvements
+in both inference efficiency and interpretability. The sim-
+plified models require at most 32 decision rules, compared
+to a minimum of 3.79e3 rules in the baseline RF. Infer-
+ence latency is reduced by over 69× for the shallow tree
+and up to 2120× for the Numba-optimized implementa-
+tion, achieving inference times below 100 ns per prediction
+in some occasions. These gains are obtained at the cost of
+reduced predictive accuracy. On average, throughput esti-
+mation exhibits a 6.74% increase in SMAPE, while starva-
+tion detection experiences a decrease of 0.025 in macro-F1
+score. This trade-off remains acceptable in scenarios where
+inference speed and model interpretability are primary re-
+quirements.
+Beyond performance improvements, the simplified mod-
+els enable direct interpretability and extraction of action-
+able insights. Appendix C presents the learned decision
+trees for both starvation and throughput prediction. For
+instance, we can extract that starvation is unlikely when
+the aggregate incoming rate remains below 23.52 tokens/s,
+and that excessively large Amax values, above 144, can
+negatively impact overall system throughput.
+8.4. Caching decisions
+We evaluate the proposed pipeline as a solution to the
+adapter caching problem, with the greedy algorithm act-
+ing as the final decision stage.
+We first analyze single-
+GPU scenarios to demonstrate throughput maximization
+and identification of the per-GPU optimal packing point
+(Maxpack).
+We then extend the analysis to distributed
+settings with four GPUs, showing how consistently reach-
+ing Maxpack improves overall GPU efficiency, and com-
+paring our approach against dLoRA. Finally, we evaluate
+an alternative configuration of the pipeline in which the
+optimization objective is shifted from resource efficiency
+to latency minimization.
+The evaluation covers a diverse set of workload scenar-
+ios.
+Arrival rates are grouped into high-rate (2.4, 1.2,
+0.6, 0.3, 0.15), low-rate (0.075, 0.0375, 0.01875, 0.009375,
+0.0046875), and mixed-rate (0.6, 0.3, 0.15, 0.075, 0.0375)
+configurations, where adapter rates are randomly dis-
+tributed from the considered configuration. Adapter sizes
+are also evaluated under varying settings, high-size (32),
+low-size (8), and mixed-size (8, 16, 32). For each workload
+configuration, the pipeline output is validated by execut-
+ing the real LLM-adapter serving system, from which all
+reported figures and tables are obtained.
+8.4.1. Single-GPU system
+To the best of our knowledge, there are no established
+baselines specifically addressing the adapter caching prob-
+lem, i.e., identifying the optimal packing point Maxpack
+0
+2E3
+5E3
+8E3
+10E3
+12E3
+through. (toks/s)
+High sizes (mixed rates)
+Low rates (mixed sizes)
+20
+40
+60
+80
+100
+120
+adapters to serve (#)
+0
+50
+100
+150
+Amax (#)
+0
+100
+200
+300
+400
+500
+adapters to serve (#)
+MaxBase
+MaxBase*
+Proposed
+Starvation
+Memory error
+Figure 10:
+(Top) Achieved throughput and (Bottom) configured
+Amax on a single-GPU system for the allocations produced by the
+proposed pipeline and the two baselines under two settings. The left
+column shows results for Qwen and the right column for Llama. Each
+line extends until the corresponding strategy deems the allocation of
+the indicated number of adapters on the x-axis as infeasible, incurs
+in starvation or trigger memory errors.
+jointly with an appropriate Amax configuration. We there-
+fore introduce two simple yet reasonable reference strate-
+gies: MaxBase and MaxBase*. Both rely exclusively on
+the benchmarked maximum throughput of the backbone
+model, without accounting for adapter-specific dynamics
+or overheads, and differ only in how GPU parallelism is
+configured.
+In both cases, adapters are allocated to a
+GPU until the aggregate input rate reaches the backbone’s
+maximum throughput. MaxBase sets Amax = A, whereas
+MaxBase* constrains parallelism to Amax = A/2, where
+A is the number of adapters being served by the system.
+Fig. 10 reports the throughput achieved by the real sys-
+tem and the configured Amax under the allocations gen-
+erated by our pipeline and the two baselines, across two
+representative scenarios. In both scenarios, our approach
+identifies the optimal packing point Maxpack, achieving
+maximum feasible throughput while stopping before star-
+vation or memory errors, which are treated as infeasi-
+ble configurations.
+By contrast, the baselines—guided
+solely by backbone throughput—continue allocating be-
+yond Maxpack, as they are unaware of adapter-induced
+overheads and serving dynamics. In the left scenario, both
+baselines incur starvation due to insufficient GPU mem-
+ory to hold the requests KV cache. In the right scenario,
+they trigger memory errors by exceeding GPU capacity
+with overly large Amax values, first in MaxBase and sub-
+sequently in MaxBase*. These results highlight that our
+method adaptively adjusts Amax to workload conditions:
+while initially allowing high parallelism, it avoids excessive
+values to avoid memory errors, obtaining higher achievable
+throughput compared to both baselines.
+8.4.2. Distributed system
+We now evaluate how accurate identification of Maxpack
+translates into improved GPU efficiency in distributed sce-
+narios with four GPUs. We continue using the MaxBase
+12
+
+
+--- Page 13 ---
+Model
+No.
+Throughput
+No.
+Starvation
+rules
+SMAPE (%)
+Time (ms)
+rules
+F1 (macro)
+Time (ms)
+Llama
+RF
+7.13e6
+4.39
+0.25
+4.44e4
+0.95
+0.16
+Small Tree
+32
+10.25
+3.24e-3
+16
+0.92
+3.25e-3
+Small Tree**
+32
+10.25
+1.13e-4
+16
+0.92
+8.30e-5
+Qwen
+RF
+6.33e6
+5.28
+0.21
+3.79e3
+0.99
+0.22
+Small Tree
+16
+12.89
+2.52e-3
+15
+0.97
+3.21e-3
+Small Tree**
+16
+12.89
+9.36e-5
+15
+0.97
+10.5e-4
+Table 4: Evaluation results of the ML models obtained by progressively simplifying the best-performing RF model into a shallow, interpretable
+decision tree (Small Tree), and its Numba-optimized implementation (Small Tree**).
+0
+50
+100
+150
+200
+250
+adapters to serve (#)
+1
+2
+3
+4
+needed GPUs (#)
+High rates (mixed sizes)
+0
+250
+500
+750
+1000 1250 1500
+adapters to serve (#)
+Low rates (mixed sizes)
+0
+50
+100
+150
+200
+250
+adapters to serve (#)
+High sizes (mixed rates)
+0
+50
+100
+150
+200
+250
+adapters to serve (#)
+Low sizes (mixed rates)
+MaxBase
+MaxBase*
+Random
+Proposed
+ProposedFast
+Starvation
+Memory error
+Figure 11: Number of GPUs required by each baseline and by the proposed pipeline on a 4-GPU system, across heterogeneous workloads with
+varying numbers of adapters, adapter sizes, and input rates. The two left plots correspond to Qwen and the two right plots to Llama. Each
+curve terminates when the corresponding method reaches an infeasible allocation, whereas Random is extended until starvation is clearly
+observed. Starvation or memory errors are extracted from running each method allocation in a real LLM-adapter serving system.
+and MaxBase* baselines and additionally include a Ran-
+dom baseline, representing a trivial strategy that randomly
+assigns adapters to GPUs and samples Amax uniformly be-
+tween 1 and the number of adapters allocated per GPU.
+Fig. 11 reports the number of GPUs that are used from
+the 4 available by each method to served adapters across
+heterogeneous workloads. The Proposed approach uses the
+best-performing ML model from Section 8.3, without the
+refinement phase, which is discussed later in this section.
+As shown in the figure, the proposed pipeline dynami-
+cally adjusts the number of GPUs used for each workload.
+For example, in the leftmost scenario, when fewer than 50
+adapters need to be served, all adapters are packed into
+a single GPU, while all four GPUs are only used once
+the number of adapters exceeds 80.
+The MaxBase and
+MaxBase* baselines exhibit a similar trend but propose
+allocations that lead to starvation or memory errors, as
+already observed in Section 8.4.1. In contrast, the Ran-
+dom baseline almost always utilizes all available GPUs,
+as expected.
+Overall, these results show that the pro-
+posed pipeline improves GPU efficiency by assigning the
+minimum number of GPUs required to serve a workload
+without incurring starvation or memory errors, effectively
+addressing the adapter caching problem. This is achieved
+by packing as many adapters as possible per utilized GPU
+while selecting an appropriate Amax, as discussed in Sec-
+tion 8.4.1.
+In addition, the proposed pipeline can sometimes serve
+more adapters without starvation within the four avail-
+able GPUs than the baselines, as observed in the two
+middle scenarios (e.g., 1280 adapters in the second plot
+and 128 in the third).
+However, the opposite can also
+occur:
+in the rightmost scenario, Random reaches 160
+adapters without starvation, while the proposed approach
+stops at 128. This behavior is expected given the stochas-
+tic nature of Random, which can occasionally find a fea-
+sible configuration by chance but is not reliable.
+No-
+tably, while Random, MaxBase, and MaxBase* are highly
+unstable—frequently triggering memory errors or starva-
+tion—the proposed method consistently produces valid al-
+locations.
+Finally, Table 5 reports the execution time of the place-
+ment algorithms. The proposed approach is slower than
+the baselines for both single- and multi-GPU placements,
+taking approximately 2 seconds in the four-GPU case.
+This overhead is acceptable for the target use case of peri-
+odic reconfiguration under predictable workload patterns.
+Nevertheless, we further evaluate the faster variant, Pro-
+posedFast, which uses the Small Tree** model obtained in
+the refinement phase of Section 8.3. This variant reduces
+execution time to below 3 ms for four GPUs. However,
+this speedup comes at the cost of less stable predictions,
+13
+
+
+--- Page 14 ---
+as illustrated by the second scenario in Fig. 11, due to the
+increased simplification of the learned model, which may
+be an acceptable tradeoff depending on the use case.
+No.
+Method
+time(s)
+GPUs
+Llama
+Qwen
+1
+Proposed
+1.54
+0.43
+MaxBase
+4.79e-4
+5.38e-4
+MaxBase*
+5.06e-4
+5.54e-4
+4
+Proposed
+2.16
+2.18
+ProposedFast
+2.17e-3
+9.61e-4
+MaxBase
+6.22e-4
+5.28e-4
+MaxBase*
+6.50e-4
+5.40e-4
+Random
+6.52e-4
+6.37e-4
+dLoRAProactive
+1.52e-1
+2.34e-2
+Table 5: Execution time of each baseline and of the two variants
+of the proposed pipeline, Proposed and ProposedFast, which respec-
+tively omit and include the refinement phase of the ML modeling
+stage.
+8.4.3. Comparison with dLoRA
+To compare against a recent placement algorithm, we
+include an evaluation against dLoRA. Although dLoRA
+is primarily designed to minimize latency rather than to
+maximize GPU efficiency, it remains one of the few systems
+that proactively compute adapter placements for LLM-
+adapter serving. Given the limited prior work targeting
+utilization-oriented objectives, this comparison serves as
+a useful reference to highlight the practical differences be-
+tween latency- and resource-driven optimization goals. We
+implement dLoRA variant with their original proactive
+placement code, which is originally periodically invoked
+to compute allocations for long-term workload patterns;
+other components of dLoRA are not included, as they are
+orthogonal to the adapter placement problem studied here.
+Fig. 12 reports the required GPUs, throughput, and ITL
+for our pipeline (Proposed) and dLoRA across a set of
+heterogeneous scenarios, reflecting their contrasting objec-
+tives. Our approach aims to minimize the number of GPUs
+required to serve a workload while maintaining feasibil-
+ity (i.e., avoiding starvation and memory errors), whereas
+dLoRA favors utilizing all available GPUs to reduce la-
+tency. As a result, our method consistently requires fewer
+GPUs, while dLoRA achieves lower latency at the cost of
+reduced GPU efficiency.
+Besides, in the top scenario, dLoRA fails at large
+adapter counts due to a time-limit error, indicating that
+allocation computation does not scale to higher adapter
+number under our evaluation settings.
+This behavior
+is consistent with dLoRA’s original scope, which targets
+smaller adapter sets. In contrast, our approach continues
+to scale and successfully serves significantly larger num-
+bers of adapters. In the bottom scenario, dLoRA initially
+supports slightly more adapters and achieves higher peak
+throughput; however, as the workload increases further, it
+fails to detect starvation conditions, resulting in infeasi-
+ble allocations. Our approach is more conservative in this
+case, stopping earlier and yielding lower peak throughput,
+but consistently avoiding starvation and memory errors.
+Finally, Table 5 reports execution times for all place-
+ment algorithms. dLoRA is approximately one order of
+magnitude faster than our default pipeline. However, our
+refined variant, ProposedFast, achieves more than two or-
+ders of magnitude speedup over dLoRA, at the cost of less
+stable predictions, as discussed in the previous section.
+8.4.4. Latency oriented
+To assess whether the proposed pipeline can be adapted
+to alternative objectives beyond GPU efficiency, we im-
+plement a proof-of-concept variant targeting latency mini-
+mization. This prototype, denoted ProposedLat, reuses the
+learned ML models but replaces the throughput-oriented
+greedy algorithm with a latency-oriented heuristic. Specif-
+ically, it assigns adapters sequentially to the GPU with the
+lowest aggregated arrival rate and configures Amax as the
+number of adapters served on each GPU. After all adapters
+are assigned, the resulting allocation is validated using the
+learned ML models; allocations predicted to trigger star-
+vation or memory errors are deemed infeasible. Results for
+ProposedLat are included in Fig. 12 alongside the compar-
+ison with dLoRA.
+Overall, ProposedLat tends to utilize all available GPUs,
+achieving latency comparable to dLoRA while consistently
+proposing allocations that do not incur in starvation or
+trigger memory errors. As expected, ProposedLat scales to
+fewer adapters than the default Proposed approach in the
+top scenario, primarily due to its trivial Amax configura-
+tion, which can over-reserve GPU memory. In the bottom
+scenario, ProposedLat, as discussed for default Proposed in
+previous section, remains more conservative than dLoRA,
+prioritizing feasible allocations over slight throughput im-
+provements.
+9. Discussion
+Our evaluation shows that accurately identifying the
+single-GPU packing limit Maxpack is a key enabler for
+efficient adapter placement.
+As illustrated in Fig. 10,
+the proposed pipeline maximizes throughput while pre-
+venting infeasible configurations, stopping before starva-
+tion or memory errors and selecting an appropriate Amax.
+This highlights that, in LLM-adapter serving, adapter-
+induced overheads and the interaction between Amax and
+KV cache growth are essential for proposing feasible allo-
+cations. When extending the same decision logic to dis-
+tributed settings (Fig. 11), the accurate identification of
+Maxpack translates directly into improved GPU efficiency.
+14
+
+
+--- Page 15 ---
+0
+500
+1000
+adapters to serve (#)
+2
+4
+needed GPUs (#)
+0
+500
+1000
+adapters to serve (#)
+0
+10k
+through. (tks/s)
+0
+500
+1000
+adapters to serve (#)
+50
+100
+ITL (ms)
+Proposed
+dLoRAProactive
+ProposedLat
+Starvation
+Time error
+Proposed
+dLoRAProactive
+ProposedLat
+Starvation
+Time error
+Proposed
+dLoRAProactive
+ProposedLat
+Starvation
+Time error
+(a) Low rates (mixed sizes)
+0
+100
+200
+adapters to serve (#)
+2
+4
+needed GPUs (#)
+0
+100
+200
+adapters to serve (#)
+20k
+40k
+through. (tks/s)
+0
+100
+200
+adapters to serve (#)
+50
+100
+150
+ITL (ms)
+Proposed
+dLoRAProactive
+ProposedLat
+Starvation
+Proposed
+dLoRAProactive
+ProposedLat
+Starvation
+Proposed
+dLoRAProactive
+ProposedLat
+Starvation
+(b) High rates (mixed sizes)
+Figure 12:
+Number of GPUs required, throughput, and ITL achieved by each method on a 4-GPU system, across two heterogeneous
+workloads using Qwen. Each curve terminates when the corresponding method reaches an infeasible allocation. Starvation and memory
+errors are identified by executing the allocations on a real LLM-adapter serving system. The time-limit failure observed for dLoRA occurs
+when its placement algorithm does not complete within one hour for large numbers of adapters.
+By packing adapters up to the feasibility boundary on each
+GPU, the pipeline dynamically determines the minimum
+number of GPUs required for a workload, reducing hard-
+ware usage whenever additional GPUs are not needed.
+As shown in Table 5, the execution time required to
+compute allocations is compatible with the target use case
+of periodic reconfiguration under predictable workloads.
+Moreover, the optimized variant ProposedFast, obtained
+through refinement of the learned ML models, reduces ex-
+ecution time by orders of magnitude and is therefore bet-
+ter suited for scenarios where fast placement estimation is
+prioritized over prediction accuracy.
+The comparison with dLoRA further emphasizes the
+impact of the optimization objective. dLoRA’s proactive
+mechanism is designed to minimize latency and therefore
+tends to use all available GPUs (Fig. 12). Our pipeline in-
+stead targets resource efficiency, using only the minimum
+number of GPUs needed to serve a given workload. Fig. 12
+also includes a proof-of-concept latency-oriented variant
+of our method, ProposedLat, which achieves latency com-
+parable to dLoRA while avoiding starvation and memory
+errors. This suggests that the proposed pipeline can be
+adapted to alternative optimization objectives, such as la-
+tency minimization, confirming its versatility beyond re-
+source utilization.
+Beyond its role in the proposed pipeline, the Digital
+Twin constitutes an additional contribution. To the best
+of our knowledge, it is the first Digital Twin specifically
+tailored to LLM-adapter serving.
+As shown in Table 1
+and Figs. 8 and 9, it closely reproduces real-system perfor-
+mance—particularly throughput—across both predictable
+and unpredictable workloads, while operating significantly
+faster and at substantially lower computational cost (Ta-
+ble 2). This enables not only rapid synthetic dataset gen-
+eration, but also broader applications such as scheduling
+optimization and server configuration.
+Finally, Section 5.1 provided an in-depth characteri-
+zation of LLM-adapter serving behavior, detailing the
+impact of the four principal overheads introduced by
+adapters. Beyond being the basis for the design and im-
+plementation of the proposed Digital Twin, this analysis
+offers independent value to the research community by ex-
+posing key system-level relationships, such as the connec-
+tion between the adapter memory footprint overhead and
+the throughput plateau.
+9.1. Limitations and future work
+Although the Digital Twin supports dynamic input and
+output length distributions, the ML models are trained
+on simulations generated from a single dataset with a
+fixed request-length distribution. This limits generaliza-
+tion to workloads with substantially different sequence-
+length characteristics.
+Future work will extend dataset
+generation to cover diverse length distributions, enabling
+both the ML models and the placement algorithm to gen-
+eralize to more heterogeneous serving conditions. In ad-
+dition, our workload model assumes predictable Poisson
+arrivals parameterized by a per-adapter rate. While this
+15
+
+
+--- Page 16 ---
+assumption is widely adopted in prior work and schedul-
+ing theory, real production traces may exhibit different
+predictable long-term arrival patterns, which should be in-
+corporated in future evaluations.
+10. Conclusions
+We presented a data-driven pipeline to improve GPU
+efficiency in distributed LLM-adapter serving through
+workload-aware adapter placement. We evaluated the ap-
+proach under heterogeneous workloads against multiple
+baselines, including a comparison with dLoRA’s proactive
+mechanism. The results show that the pipeline accurately
+identifies the feasible packing limit Maxpack and selects an
+appropriate Amax to maximize throughput and minimize
+the number of required GPUs to serve a given workload.
+The pipeline can be integrated into production systems
+to periodically update placements for predictable work-
+load patterns, reducing the amount of needed hardware.
+The freed GPUs can be reassigned to other workloads to
+improve overall system efficiency or powered down to re-
+duce energy consumption. Central to this approach is a
+high-fidelity Digital Twin for LLM-adapter serving, which
+closely reproduces real-system performance at low cost,
+enabling efficient ML training and supporting additional
+optimization tasks beyond this work.
+Acknowledgment
+This work has been partially financed by the EU-
+HORIZON MSCA programme under grant agreement
+EU-HORIZON MSCA GA.101086248. Also, it has been
+partially financed by Generalitat de Catalunya (AGAUR)
+under grant agreement 2021-SGR-00478, by Severo Ochoa
+Center of Excellence CEX-2021-001148-S-20-3, and by
+the Spanish Ministry of Science (MICINN), the Research
+State Agency (AEI) and European Regional Development
+Funds (ERDF/FEDER) under grant agreement PID2021-
+126248OB-I00,
+MCIN/AEI/10.13039/
+501100011033/
+FEDER, UE.
+The authors used OpenAI’s GPT model to assist with
+text rephrasing and stylistic refinement. All content was
+originally written and subsequently reviewed and validated
+by the authors.
+Appendix A. S-LoRA
+We include a brief analysis using the S-LoRA frame-
+work [29] to show that the adapter caching problem is
+not specific to vLLM and also arises in other serving sys-
+tems.
+Fig. A.13 reports the Maxpack point in S-LoRA
+across different arrival rates, for a fixed adapter size and
+a fixed request-length distribution, following the same
+methodology as the middle plot of Fig. 1 for vLLM. No-
+tably, throughput degradation plateaus as the number of
+adapters increases, whereas vLLM exhibits a more pro-
+nounced decline, highlighting the impact of S-LoRA’s de-
+sign choices. Nevertheless, identifying Maxpack remains
+necessary to determine how many adapters can be al-
+located per GPU without triggering starvation, and the
+throughput level at which Maxpack occurs still varies
+across workloads, with additional variability expected
+when changing adapter sizes and request-length distribu-
+tions.
+100
+200
+300
+400
+500
+600
+adapters (#)
+0
+1000
+2000
+3000
+4000
+5000
+6000
+throughput (tokens/s)
+arrival rate
+0.0125
+0.025
+0.05
+0.1
+0.2
+0.4
+Not starvation
+Starvation
+Maxpack
+Figure A.13: Throughput obtained when running S-LoRA with vary-
+ing adapter arrival rates on Llama-2-7B, using adapters of size 32 and
+requests with fixed lengths of 250 input tokens and 231 output to-
+kens.
+Appendix B. ML hyperparameter search space
+Hyperparameter optimization in the ML learning phase
+is performed using HalvingGridSearchCV with 5-fold
+cross-validation. Distinct search spaces are defined for the
+two tasks, throughput regression and starvation classifi-
+cation, using the corresponding scikit-learn model classes.
+The evaluated values for each hyperparameter are listed
+below.
+Throughput
+(Regression).
+a) Random Forest
+(RandomForestRegressor): n_estimators {32,128,256},
+max_depth
+{None,5,10,20},
+min_samples_split
+{2,5,10,20},
+criterion
+{squared_error,
+abso-
+lute_error, friedman_mse, poisson}, min_samples_leaf
+{1,2,5,10,32,128}, max_features {auto,sqrt,log2}.
+b)
+SVM (SVR): C {0.1,1,10,100,1000,10000}, kernel {lin-
+ear,poly,rbf,sigmoid},
+epsilon
+{0.1,0.5,1,5},
+degree
+{2,3,4,5},
+gamma
+{scale,auto,0.01,0.1,1,10},
+coef0
+{0,0.1,0.5,1}.
+c)
+KNN
+(KNeighborsRegressor):
+p
+{1,2},
+with
+fixed
+n_neighbors=1,
+leaf_size=8,
+weights=uniform, algorithm=kd_tree.
+Starvation
+(Classification).
+a)
+Random
+For-
+est
+(RandomForestClassifier):
+n_estimators
+{32,128,256},
+max_depth
+{None,5,10,20},
+min_samples_split
+{2,5,10,20},
+criterion
+{gini,entropy,log_loss},
+min_samples_leaf
+{1,2,5,10,32,128},
+max_features
+{None,sqrt,log2}.
+b)
+SVM
+(SVC):
+C
+{0.1,1,10,100,1000,10000},
+kernel
+16
+
+
+--- Page 17 ---
+{linear,poly,rbf,sigmoid},
+degree
+{2,3,4,5},
+gamma
+{scale,auto,0.01,0.1,1,10},
+coef0
+{0,0.1,0.5,1}.
+c)
+KNN (KNeighborsClassifier):
+p {1,2},
+with fixed
+n_neighbors=1,
+leaf_size=8,
+weights=uniform,
+algorithm=kd_tree.
+Appendix C. Derived lightweight tree estimators
+Fig. C.14 depicts two of the shallow trees resulting from
+the refinement phase described in Section 6.
+References
+[1] Agrawal, A., Kedia, N., Mohan, J., Panwar, A., Kwa-
+tra, N., Gulavani, B.S., Ramjee, R., Tumanov, A.,
+2024a. Vidur: A large-scale simulation framework for
+llm inference. Proceedings of Machine Learning and
+Systems 6, 351–366.
+[2] Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwa-
+tra, N., Gulavani, B., Tumanov, A., Ramjee, R.,
+2024b. Taming throughput-latency tradeoff in llm in-
+ference with sarathi-serve, in: 18th USENIX Sympo-
+sium on Operating Systems Design and Implementa-
+tion (OSDI 24), pp. 117–134.
+[3] anon8231489123,
+2023.
+Clean sharegpt dataset.
+URL:
+https://huggingface.co/datasets/
+anon8231489123/ShareGPT_Vicuna_unfiltered.
+[4] Brown, T., Mann, B., Ryder, N., Subbiah, M., Ka-
+plan, J.D., Dhariwal, P., Neelakantan, A., Shyam, P.,
+Sastry, G., Askell, A., et al., 2020. Language models
+are few-shot learners. Advances in neural information
+processing systems 33, 1877–1901.
+[5] Brüel-Gabrielsson,
+R.,
+Zhu,
+J.,
+Bhardwaj,
+O.,
+Choshen,
+L.,
+Greenewald,
+K.,
+Yurochkin,
+M.,
+Solomon, J., 2024.
+Compress then serve:
+Serving
+thousands of lora adapters with little overhead. arXiv
+preprint arXiv:2407.00066 .
+[6] Chen, L., Ye, Z., Wu, Y., Zhuo, D., Ceze, L., Krishna-
+murthy, A., 2024. Punica: Multi-tenant lora serving.
+Proceedings of Machine Learning and Systems 6, 1–
+13.
+[7] Cho, J., Kim, M., Choi, H., Heo, G., Park, J., 2024.
+Llmservingsim: A hw/sw co-simulation infrastructure
+for llm inference serving at scale, in: 2024 IEEE Inter-
+national Symposium on Workload Characterization
+(IISWC), IEEE. pp. 15–29.
+[8] Garey, M.R., Johnson, D.S., 1979.
+Computers
+and Intractability: A Guide to the Theory of NP-
+Completeness.
+W. H. Freeman and Company, San
+Francisco.
+[9] Grattafiori, A., et al., 2024.
+The llama 3 herd
+of models.
+URL: https://arxiv.org/abs/2407.
+21783, arXiv:2407.21783.
+[10] Guo, D., Rush, A., Kim, Y., 2021. Parameter-efficient
+transfer learning with diff pruning, in: Proceedings of
+the 59th annual meeting of the association for com-
+putational linguistics and the 11th international joint
+conference on natural language processing (volume 1:
+Long papers), pp. 4884–4896.
+[11] Houlsby, N., Giurgiu, A., Jastrzebski, S., Morrone,
+B., De Laroussilhe, Q., Gesmundo, A., Attariyan, M.,
+Gelly, S., 2019. Parameter-efficient transfer learning
+for nlp, in: International conference on machine learn-
+ing, PMLR. pp. 2790–2799.
+[12] Hu, E.J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y.,
+Wang, S., Wang, L., Chen, W., et al., 2022. Lora:
+Low-rank adaptation of large language models. ICLR
+1, 3.
+[13] Iliakopoulou, N., Stojkovic, J., Alverti, C., Xu, T.,
+Franke, H., Torrellas, J., 2025. Chameleon: Adap-
+tive Caching and Scheduling for Many-Adapter LLM
+Inference Environments. Association for Computing
+Machinery, New York, NY, USA. p. 217–231. URL:
+https://doi.org/10.1145/3725843.3756083.
+[14] Johnson, D.S., 1974. Fast algorithms for bin packing.
+Journal of Computer and System Sciences 8, 272–314.
+URL:
+https://www.sciencedirect.com/science/
+article/pii/S0022000074800267,
+doi:https:
+//doi.org/10.1016/S0022-0000(74)80026-7.
+[15] Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L.,
+Yu, C.H., Gonzalez, J., Zhang, H., Stoica, I., 2023. Ef-
+ficient memory management for large language model
+serving with pagedattention, in: Proceedings of the
+29th Symposium on Operating Systems Principles,
+pp. 611–626.
+[16] Lam, S.K., Pitrou, A., Seibert, S., 2015. Numba: A
+llvm-based python jit compiler, in: Proceedings of the
+Second Workshop on the LLVM Compiler Infrastruc-
+ture in HPC, pp. 1–6.
+[17] Li, S., Lu, H., Wu, T., Yu, M., Weng, Q., Chen, X.,
+Shan, Y., Yuan, B., Wang, W., 2024. Caraserve: Cpu-
+assisted and rank-aware lora serving for generative llm
+inference. arXiv preprint arXiv:2401.11240 .
+[18] Li, X.L., Liang, P., 2021. Prefix-tuning: Optimizing
+continuous prompts for generation. Proceedings of the
+59th Annual Meeting of the Association for Compu-
+tational Linguistics and the 11th International Joint
+Conference on Natural Language Processing (Volume
+1:
+Long Papers) , 4582–4597URL: https://api.
+semanticscholar.org/CorpusID:230433941.
+17
+
+
+--- Page 18 ---
+True
+False
+False
+True
+Figure C.14: Shallow decision trees derived from the best performing RF model to improve inference performance and enhance model
+interpretability. (Left) To estimate starvation for Llama-3.1-8B-Instruct. Final value represents the probability of starvation arising. (Right)
+To estimate throughput for Qwen2.5-7B-Instruct. Final value represents the expected throughput in toks/s.
+[19] Liu, H., Tam, D., Muqeeth, M., Mohta, J., Huang, T.,
+Bansal, M., Raffel, C.A., 2022. Few-shot parameter-
+efficient fine-tuning is better and cheaper than in-
+context learning.
+Advances in Neural Information
+Processing Systems 35, 1950–1965.
+[20] López, F.A., Oliveras, J., Wang, C., Gutierrez-Torre,
+A., Tardieu, O., Youssef, A., Torres, J., Berral, J.L.,
+2025. A data-driven ml approach for maximizing per-
+formance in llm-adapter serving, in:
+9th Machine
+Learning for Systems (ML for Systems) Workshop,
+NeurIPS 2025. Poster session, San Diego, CA.
+[21] Microsoft, 2022–2025.
+DeepSpeed-MII.
+GitHub
+repository.
+URL:
+https://github.com/
+deepspeedai/DeepSpeed-MII.
+[22] NVIDIA, 2023–2025.
+TensorRT-LLM.
+GitHub
+repository.
+URL: https://github.com/NVIDIA/
+TensorRT-LLM.
+[23] Pedregosa, F., Varoquaux, G., Gramfort, A., Michel,
+V., Thirion, B., Grisel, O., Blondel, M., Prettenhofer,
+P., Weiss, R., Dubourg, V., Vanderplas, J., Passos,
+A., Cournapeau, D., Brucher, M., Perrot, M., Duch-
+esnay, E., 2011.
+Scikit-learn: Machine learning in
+Python. Journal of Machine Learning Research 12,
+2825–2830.
+[24] Qin, G., Eisner, J., 2021. Learning how to ask: Query-
+ing lms with mixtures of soft prompts, in: Proceed-
+ings of the 2021 Conference of the North American
+Chapter of the Association for Computational Lin-
+guistics: Human Language Technologies, pp. 5203–
+5212.
+[25] Recasens, P.G., Agullo, F., Zhu, Y., Wang, C., Lee,
+E.K., Tardieu, O., Torres, J., Berral, J.L., 2025. Mind
+the memory gap: Unveiling gpu bottlenecks in large-
+batch llm inference, in: 2025 IEEE 18th International
+Conference on Cloud Computing (CLOUD), IEEE.
+pp. 277–287.
+[26] Recasens, P.G., Zhu, Y., Wang, C., Lee, E.K.,
+Tardieu, O., Youssef, A., Torres, J., Berral, J.L., 2024.
+Towards pareto optimal throughput in small language
+model serving, in: Proceedings of the 4th Workshop
+on Machine Learning and Systems, pp. 144–152.
+[27] Shen, H., Chen, L., Jin, Y., Zhao, L., Kong, B.,
+Philipose, M., Krishnamurthy, A., Sundaram, R.,
+2019.
+Nexus:
+a gpu cluster engine for accelerat-
+ing dnn-based video analysis, in: Proceedings of the
+27th ACM Symposium on Operating Systems Prin-
+ciples, Association for Computing Machinery, New
+York, NY, USA. p. 322–337. doi:10.1145/3341301.
+3359658.
+18
+
+
+--- Page 19 ---
+[28] Shen, Z., He, Y., Wang, Z., Zhang, Y., Sun, G., Ye,
+W., Li, A., 2025.
+EdgeLoRA: An Efficient Multi-
+Tenant LLM Serving System on Edge Devices. As-
+sociation for Computing Machinery, New York, NY,
+USA. p. 138–153. URL: https://doi.org/10.1145/
+3711875.3729141.
+[29] Sheng, Y., Cao, S., Li, D., Hooper, C., Lee, N., Yang,
+S., Chou, C., Zhu, B., Zheng, L., Keutzer, K., et al.,
+2024.
+Slora: Scalable serving of thousands of lora
+adapters. Proceedings of Machine Learning and Sys-
+tems 6, 296–311.
+[30] Sung, Y.L., Cho, J., Bansal, M., 2022. Lst: Ladder
+side-tuning for parameter and memory efficient trans-
+fer learning. Advances in Neural Information Process-
+ing Systems 35, 12991–13005.
+[31] Touvron, H., et al., 2023. Llama 2: Open foundation
+and fine-tuned chat models. URL: https://arxiv.
+org/abs/2307.09288, arXiv:2307.09288.
+[32] Wang, L., Chen, S., Jiang, L., Pan, S., Cai, R., Yang,
+S., Yang, F., 2025. Parameter-efficient fine-tuning in
+large language models: a survey of methodologies.
+Artificial Intelligence Review 58, 227. URL: https:
+//doi.org/10.1007/s10462-025-11236-4, doi:10.
+1007/s10462-025-11236-4.
+[33] Wengwengwhale,
+2024.
+Finance
+lora
+adapter
+for
+llama-3.1-8b
+instruct.
+URL:
+https:
+//huggingface.co/Wengwengwhale/llama_3.1_
+8B_Instruct_Finance_lora_adapter.
+[34] Wu, B., Zhu, R., Zhang, Z., Sun, P., Liu, X., Jin,
+X., 2024. dlora: Dynamically orchestrating requests
+and adapters for lora llm serving, in: 18th USENIX
+Symposium on Operating Systems Design and Imple-
+mentation (OSDI 24), pp. 911–927.
+[35] Yang,
+A.,
+et al.,
+2025.
+Qwen2.5 technical re-
+port.
+URL: https://arxiv.org/abs/2412.15115,
+arXiv:2412.15115.
+[36] yard1,
+2024.
+Sql
+lora
+for
+llama-2-7b.
+URL:
+https://huggingface.co/yard1/
+llama-2-7b-sql-lora-test.
+[37] Yu, G.I., Jeong, J.S., Kim, G.W., Kim, S., Chun,
+B.G., 2022.
+Orca:
+A distributed serving system
+for transformer-based generative models, in:
+16th
+USENIX Symposium on Operating Systems Design
+and Implementation (OSDI 22), pp. 521–538.
+[38] Zhang, H., Tang, Y., Khandelwal, A., Stoica, I., 2023.
+Shepherd: Serving dnns in the wild, in: 20th USENIX
+Symposium on Networked Systems Design and Imple-
+mentation (NSDI 23), pp. 787–808.
+[39] zjudai,
+2025.
+Medical
+lora
+for
+qwen2.5-7b-
+instruc.
+URL: https://huggingface.co/zjudai/
+flowertune-medical-lora-qwen2.5-7b-instruct.
+19
