@@ -1,10 +1,45 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-03-10
+**Last Updated:** 2026-03-12
 
 ---
 
 ## Recent Papers
+
+#### 2026-03-12 (4 papers)
+
+### [SLO-Aware Compute Resource Allocation for Prefill-Decode Disaggregated LLM Inference](https://arxiv.org/abs/2603.04716)
+
+**2026-03-05** | Kingsoft Cloud | M=4 P=9 I=7 **MUST-READ** *discuss*
+
+*Method:* Hybrid theoretical modeling (M/M/1 queuing theory) and empirical benchmarking for P/D resource calculation | *LLM role:* none
+
+> This paper proposes a hybrid resource allocation method for disaggregated Prefill/Decode (P/D) inference, using M/M/1 queuing theory to model prefill throughput under TTFT constraints and empirical profiling for decode. The results are real and validated on NVIDIA H200 clusters running DeepSeek-V3.1. The key takeaway for us is the validated analytical relationship between TTFT, input length, and effective prefill throughput ($TP_{eff} = TP_{max} - \frac{L_{in}}{TTFT - T_{overhead}}$). We can steal this equation to serve as a cheap, differentiable constraint in our 'GPUSched' OR formulations or fitness functions, replacing expensive simulations.
+
+### [Serving Compound Inference Systems on Datacenter GPUs](https://arxiv.org/abs/2603.08797)
+
+**2026-03-09** | University of Illinois Urbana-Champaign | M=7 P=8 I=7 **MUST-READ** *discuss*
+
+*Method:* Mixed Integer Linear Programming (MILP) for joint optimization of model variants, GPU spatial partitions, and task-graph-informed budgeting | *LLM role:* none
+
+> JIGSAWSERVE uses a Mixed Integer Linear Programming (MILP) formulation to jointly optimize model variant selection (accuracy scaling) and fine-grained GPU spatial partitioning (MIG/MPS) for serving compound inference DAGs. The results are strongly backed by empirical numbers on real hardware (H100s), demonstrating an 11.3x capacity improvement over the closest prior work (Loki) while maintaining under 0.6% SLO violations. The single most useful takeaway for us is their specific MILP formulation, which successfully linearizes the complexities of task-graph multiplicative factors and spatial GPU segments into a tractable objective for latency and accuracy SLOs. This is highly relevant for our GPUSched project; we should extract their MILP constraints for spatial partitioning and task-graph budgeting to adapt for our own LLM inference scheduling and multi-agent resource allocation models.
+
+### [PromptTuner: SLO-Aware Elastic System for LLM Prompt Tuning](https://arxiv.org/abs/2603.05087)
+
+**2026-03-05** | Nanyang Technological University, Unaffiliated | M=5 P=8 I=7 *discuss*
+
+*Method:* SLO-aware elastic system combining a two-layer Prompt Bank for initial prompt selection and a Workload Scheduler for dynamic multi-GPU allocation | *LLM role:* feature_extractor
+
+> PromptTuner is a cluster management system for LLM prompt tuning that combines a 'Prompt Bank' (retrieving similar past prompts to speed up convergence) with a hierarchical scheduler (warm/cold GPU pools) to meet latency SLOs. The authors demonstrate real-world efficacy on 32-96 GPU clusters, showing 4-8x reductions in SLO violations compared to INFless and ElasticFlow. The key takeaway for us is the 'Prompt Bank' mechanism: using K-medoids clustering on activation features to retrieve high-quality initial prompts. We should steal this initialization strategy for AlgoEvo to reduce the number of generations needed for convergence, and use the scheduling logic as a baseline for our GPUSched project.
+
+### [BandPO: Bridging Trust Regions and Ratio Clipping via Probability-Aware Bounds for LLM Reinforcement Learning](https://arxiv.org/abs/2603.04918)
+
+**2026-03-05** | Fudan University, Shanghai Innovation Institute | M=8 P=7 I=7 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Band-constrained Policy Optimization (BandPO) using a Band operator to project f-divergence trust regions into dynamic, probability-aware clipping intervals | *LLM role:* policy_agent
+
+> BandPO replaces the standard static clipping in PPO/GRPO with dynamic bounds derived from projecting f-divergence trust regions, specifically addressing a bottleneck where allowable updates vanish for low-probability tokens. Empirical results are rigorous, showing consistent gains (2-10%) on math benchmarks and, crucially, maintaining policy entropy where baselines collapse. The key takeaway is that standard clipping scales update margins linearly with probability, effectively freezing rare tokens; BandPO decouples this, allowing the model to actually reinforce novel, high-advantage tail strategies. We should implement the closed-form TV or Chi-squared variants immediately in our RL optimizers to improve exploration efficiency.
+
 
 #### 2026-03-08 (9 papers)
 

@@ -1,10 +1,45 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-03-10
+**Last Updated:** 2026-03-12
 
 ---
 
 ## Recent Papers
+
+#### 2026-03-12 (4 papers)
+
+### [Reinforced Generation of Combinatorial Structures: Ramsey Numbers](https://arxiv.org/abs/2603.09172)
+
+**2026-03-11** | Google DeepMind, Google, University of California, Berkeley | M=8 P=3 I=9 **MUST-READ** *discuss*
+
+*Method:* AlphaEvolve, an LLM-based code mutation agent | *LLM role:* evolutionary_search
+
+> Nagda et al. (DeepMind) apply the AlphaEvolve framework to discover novel stochastic search algorithms that improve lower bounds for five classical Ramsey numbers and match SoTA on 23 others. The results are mathematically verified and represent genuine SoTA advances in extremal combinatorics, proving the framework's capability to generate highly specialized, non-trivial heuristics. The single most useful takeaway for us is their meta-algorithm's scoring function: instead of only rewarding valid states, they evaluate a larger, infeasible 'prospect' state and provide a dense, continuous reward based on its violation count relative to a random baseline. We should immediately steal this 'prospect evaluation' trick for AlgoEvo to smooth the reward landscape when evolving heuristics for highly constrained OR problems like VRP, where finding strictly feasible intermediate solutions is a bottleneck.
+
+### [Advancing Automated Algorithm Design via Evolutionary Stagewise Design with LLMs](https://arxiv.org/abs/2603.07970)
+
+**2026-03-09** | Nanjing University, Huawei Noah’s Ark Lab | M=9 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Evolutionary Stagewise Algorithm Design (EvoStage) with multi-agent system and global-local perspective mechanism | *LLM role:* decomposition_guide, code_writer, reflection_agent, evolutionary_search
+
+> EvoStage enhances LLM-based automated algorithm design by decomposing the generation process into sequential stages, using a multi-agent system (coordinator and coders) to iteratively refine code based on real-time intermediate execution feedback. The results are highly credible and backed by strong empirical numbers; it achieves state-of-the-art HPWL on 16 chip placement benchmarks and beats AlphaEvolve/EoH on Bayesian Optimization tasks using an incredibly small budget of just 9 to 25 evaluations. The single most useful takeaway is the shift from black-box end-to-end evaluation to stagewise intermediate feedback, where a coordinator agent reflects on mid-execution metrics to guide the next stage of heuristic design. This matters immensely for our AlgoEvo and MASPRM projects; we should immediately test pausing our VRP/scheduling environments mid-execution to feed intermediate state metrics to a coordinator LLM, which could drastically reduce the number of LLM samples we need to find optimal heuristics.
+
+### [Code-Space Response Oracles: Generating Interpretable Multi-Agent Policies with Large Language Models](https://arxiv.org/abs/2603.10098)
+
+**2026-03-10** | Google DeepMind | M=8 P=7 I=8 **MUST-READ** *discuss*
+
+*Method:* Policy-Space Response Oracles (PSRO) with Large Language Model (LLM) as a code-generating oracle, enhanced by iterative refinement or evolutionary search (AlphaEvolve) | *LLM role:* code_writer
+
+> This paper replaces the deep RL oracle in Policy-Space Response Oracles (PSRO) with an LLM that generates interpretable Python code policies, using AlphaEvolve to iteratively refine the code against opponent meta-strategies. The results are backed by solid empirical metrics, showing that the AlphaEvolve variant achieves competitive exploitability and higher population returns than RL baselines (IMPALA) and CFR+ on Repeated Rock-Paper-Scissors and Leduc Poker. The single most useful takeaway for us is their 'context abstraction' technique—using an LLM to summarize opponent code into natural language to bypass context window limits during evolutionary search. This is highly relevant for our AlgoEvo project; we should immediately discuss implementing their two-level loop (outer meta-game equilibrium, inner AlphaEvolve refinement) and context abstraction for our multi-agent evolutionary search.
+
+### [Autonomous Algorithm Discovery for Ptychography via Evolutionary LLM Reasoning](https://arxiv.org/abs/2603.05696)
+
+**2026-03-05** | Argonne National Laboratory, Rice University | M=7 P=3 I=8 *discuss*
+
+*Method:* LLM-guided evolutionary search for regularization algorithms combining LLM-driven code generation with semantically-guided crossover and mutation | *LLM role:* evolutionary_search
+
+> This paper applies LLM-guided evolutionary search (similar to FunSearch/AlphaEvolve) to discover novel regularization algorithms for ptychographic image reconstruction. The results are backed by solid empirical metrics, showing up to +0.26 SSIM improvements over unregularized baselines across multiple datasets. The most useful takeaway for us is twofold: first, their 'semantically-guided crossover' explicitly prompts the LLM to analyze two successful parent algorithms and intentionally merge their complementary mathematical strengths, rather than blindly recombining code. Second, the LLM autonomously discovered the benefit of embedding stateful optimizers (like Adam) and iterative sub-loops directly inside a single heuristic step. This matters for our AlgoEvo and VRP work because we should immediately steal this semantic crossover prompting strategy and ensure our evaluation API permits the LLM to generate stateful, multi-pass operators rather than just stateless, single-pass functions.
+
 
 #### 2026-03-08 (2 papers)
 
