@@ -1,0 +1,1614 @@
+--- Page 1 ---
+SERVING COMPOUND INFERENCE SYSTEMS ON DATACENTER GPUS
+Sriram Devata 1 Rahul Singh 1 Sarita Adve 1
+ABSTRACT
+Applications in emerging domains such as XR are being built as compound inference systems, where multiple
+ML models are composed in the form of a task graph to service each request. Serving these compound systems
+efficiently raises two questions: how to apportion end-to-end latency and accuracy budgets between different
+tasks in a compound inference system, and how to allocate resources effectively for different models with varying
+resource requirements. We present JIGSAWSERVE, the first serving framework that jointly optimizes for latency,
+accuracy, and cost in terms of GPU resources by adaptively choosing model variants and performing fine-grained
+resource allocation by spatially partitioning the GPUs for each task of a compound inference system. Analytical
+evaluation of a system with a large number of GPUs shows that JIGSAWSERVE can increase the maximum
+serviceable demand (in requests per second) by 11.3× when compared to the closest prior work. Our empirical
+evaluation shows that for a large range of scenarios, JIGSAWSERVE consumes only 43.3% of the available GPU
+resources while meeting accuracy SLOs with less than 0.6% latency SLO violations. All of the features in
+JIGSAWSERVE contribute to this high efficiency – sacrificing any one feature of accuracy scaling, GPU spatial
+partitioning, or task-graph-informed resource budgeting significantly reduces efficiency.
+1
+INTRODUCTION
+As machine learning (ML) inference becomes a dominant
+workload for datacenter resources (HPC Wire, 2019; Patter-
+son et al., 2022; Wu et al., 2022), there is growing emphasis
+on maximizing the efficiency of inference serving systems.
+Compound inference systems (Zaharia et al., 2024) are be-
+coming increasingly important in many emerging domains
+such as multi-agent systems (Zhou et al., 2025) and ex-
+tended reality (XR) (Kwon et al., 2023). Such systems
+compose multiple ML models, each performing a specific
+task, to provide complex functionalities, and present new
+challenges and opportunities for increased efficiency. This
+work focuses on efficient serving of compound inference
+systems on datacenter GPUs, where each request requires
+invoking a directed acyclic graph (DAG) of ML inference
+tasks, which are potentially dynamically determined.
+We focus on two aspects that are unique to compound in-
+ference systems. First, we expect that any latency and ac-
+curacy Service Level Objectives (SLOs) are provided for
+the end-to-end compound inference system and need to be
+apportioned among the individual tasks. This affords new
+sources of flexibility for the serving system to choose among
+multiple model variants (with different latencies and accu-
+racies) and GPU resource allocation for each task, when
+compared to a single task system with a given SLO con-
+1Siebel School of Computing and Data Science, University of
+Illinois Urbana-Champaign
+Email: {sdevata2, rahuls10, sadve}@illinois.edu
+straint. Second, the ML model variants across the various
+tasks in a compound inference system have different re-
+source requirements, motivating finer-grained heterogeneity
+in the optimal resource choice for the different tasks. Re-
+cent GPU hardware provide spatial partitioning mechanisms
+that enable fine-grained allocation of GPU resources. For
+example, NVIDIA GPUs provide spatial partitioning mech-
+anisms such as Multi-Process Service (MPS) (nvi, 2025b)
+and Multi-Instance GPU (MIG) (nvi, 2025a).
+We present JIGSAWSERVE 1, the first work to jointly opti-
+mize for latency, accuracy, and fine-grained cost (in terms of
+GPU resources required) by adaptively choosing model vari-
+ants and allocating fine-grained spatial partitions of GPUs
+for each task of a compound inference system, while pre-
+serving end-to-end accuracy and latency SLOs.
+There is a plethora of literature on increasing the efficiency
+of serving systems for requests with a single model infer-
+ence, including systems that perform accuracy scaling and
+spatial partitioning (Shen et al., 2019; Romero et al., 2021;
+Tan et al., 2021; Choi et al., 2022; Ahmad et al., 2024a; Lee
+et al., 2024). Compound inference systems have received
+relatively less attention. Table 1 summarizes key prior works
+that consider resource budgeting for compound inference
+systems, accuracy scaling through different model variants
+1The name highlights the features of JIGSAWSERVE to choose
+model variants and use multiple small spatial partitions on GPUs,
+similar to how one can choose multiple small pieces that fit together
+in a jigsaw puzzle.
+arXiv:2603.08797v1  [cs.DC]  9 Mar 2026
+
+
+--- Page 2 ---
+Serving Compound Inference Systems on Datacenter GPUs
+of a task, and/or spatial partitioning of GPU resources. The
+darker grayed systems do not consider compound inferences
+but are shown for completeness. The lighter grayed systems
+do consider compound inferences but in a limited way –
+they apportion latency across different tasks (only pipelines
+for IPA (Ghafouri et al., 2024)), but do not apportion ac-
+curacy or consider accuracy scaling or GPU partitioning
+for higher efficiency. Of the remaining systems that con-
+sider compound inferences, DREAM (Kim et al., 2024) is
+a single user, multi-accelerator system and IPA does not
+consider GPUs, both presenting different use cases from our
+datacenter GPU efficiency scenario; consequently, neither
+considers the fine-grained spatial partitioning opportunity
+from GPUs. Loki (Ahmad et al., 2024b) is the closest to our
+goals, but does not consider GPU partitioning and considers
+accuracy scaling only if GPU resources are exhausted. Our
+evaluations show that GPU partitioning presents the most
+significant efficiency opportunity and jointly optimizing for
+GPU resources and accuracy for compound inference sys-
+tems is critical to highest efficiency.
+Specifically, we make the following contributions.
+1. We introduce JIGSAWSERVE, a novel framework to
+jointly optimize latency, accuracy, and fine-grained cost
+for compound inference systems on datacenter GPUs.
+JIGSAWSERVE uniquely combines: (1) per-task accu-
+racy scaling via choosing model variants, (2) GPU spatial
+partitioning, and (3) task-graph-informed latency and ac-
+curacy SLO budgeting.
+2. Our analytical evaluation compares the various combi-
+nations of the features in Table 1. We find that spatial
+partitioning (S) delivers the highest standalone gain in
+serving capacity for the same GPU resources (5.25× over
+Unopt), compared to accuracy scaling (A: 1.6×) and task-
+graph-informed budgeting (T: 1.1×). JIGSAWSERVE’s
+full integration of the three features (A+S+T) achieves
+21.6× capacity, surpassing combinations of S with A or
+T in S+A (12.1×) and S+T (7.8×).
+3. We emphasize that no prior work has evaluated GPU
+spatial partitioning for compound inference systems. Sys-
+tems without S (A, T, A+T) show significantly lower
+serving capacity than any system with S. A+T, in particu-
+lar, is closest to (and explores a larger search space than)
+prior work of Loki (Ahmad et al., 2024b). We find that
+JIGSAWSERVE allows 11.3× higher capacity than A+T.
+4. Our empirical evaluation compares the four top perform-
+ing systems (S+T, A+T, S+A, and JIGSAWSERVE) un-
+der a wide range of compound inference systems and
+workload demand conditions. JIGSAWSERVE shows the
+best overall performance, using just 43.3% of the avail-
+able GPU resources on average, respecting the accuracy
+SLO, and showing less than 0.6% average SLO violations.
+Alternatives suffer significantly: S+T/A+T exceed 10%
+Table 1. Summary of key related work.
+Related Work
+Model variants for
+accuracy scaling
+Interference-free
+spatial partitioning
+Task-graph-informed
+latency & accuracy budgets
+INFaaS
+(Romero et al., 2021)
+MIG-serving
+(Tan et al., 2021)
+ParvaGPU
+(Lee et al., 2024)
+Clover
+(Li et al., 2023)
+Nexus
+(Shen et al., 2019)
+Only apportions latency
+GPUlet
+(Choi et al., 2022)
+Only apportions latency
+DREAM
+(Kim et al., 2024)
+Considers a single-client
+multi-accelerator system
+IPA
+(Ghafouri et al., 2024)
+Only considers pipelines.
+Apportions CPU cores.
+Loki
+(Ahmad et al., 2024b)
+JIGSAWSERVE
+violations and have 2× resource usage in at least one
+case; S+A (which does not exist in prior work) requires
+33% more resources than JIGSAWSERVE with 6.7% SLO
+violations.
+Overall, our work proposes a novel serving framework for
+compound inference systems, performs a detailed compara-
+tive evaluation of efficiency-enhancing features, and shows
+that the combination of all features we explore provides
+significant efficiency improvement relative to any subset of
+features.
+2
+BACKGROUND
+Compound inference systems. ML-based applications are
+evolving from relying on the inference of a single mono-
+lithic ML model to compound inference, where multiple ML
+models each performing a particular task are composed to
+provide complex functionalities (Kwon et al., 2023). Similar
+to single ML model inference, the demand (in requests per
+second) for compound inference systems can vary over time.
+The serving system must increase the allocated GPU re-
+sources when demand rises and reduce them when demand
+falls, avoiding both SLO violations and over-provisioning.
+Tasks in a compound inference system often have unequal
+throughput demands—for instance, an object detector may
+output several detections per image, each triggering addi-
+tional downstream inferences. Prior works (Zhao et al.,
+2025; Ahmad et al., 2024b) have noted this multiplicative
+behavior between tasks and used it to divide latency budgets,
+but none have jointly optimized model variants, resource
+allocation, and accuracy across the entire system. A serving
+system for compound inference must incorporate per-task
+multiplicative factors to estimate each task’s throughput
+and use it for task-graph-informed latency, accuracy and
+resource budgeting. The system must ensure that every
+task receives sufficient resources while the overall system
+satisfies the latency, accuracy, and resource constraints
+Model variants. Each task in a compound inference system
+
+
+--- Page 3 ---
+Serving Compound Inference Systems on Datacenter GPUs
+can be executed by multiple model variants that perform the
+same function but differ in parameters, accuracy, latency,
+and resource cost. These variants may come from model
+families, compiler optimizations such as TVM or TensorRT,
+or techniques like quantization, pruning, and layer fusion.
+While allocating accuracy budget for each task, a serving
+system must meet the end-to-end accuracy threshold of
+the compound inference system. They key challenge is to
+identify a set of task variants that have minimal impact on
+end-to-end quality, while maximizing the throughput or cost
+benefit.
+GPU spatial partitioning mechanisms. Recent genera-
+tions of GPUs in GPU-based datacenters are large and are
+typically underutilized by most ML workloads. To address
+the underutilization, modern GPUs allow multiple work-
+loads to be co-located on the same physical GPU through
+temporal and spatial sharing mechanisms such as MPS and
+MIG for NVIDIA GPUs. Workloads co-located with MPS
+share internal GPU memory resources, which can result in
+performance degradation through destructive interference
+between co-located workloads (Li et al., 2022). MIG can
+divide a GPU into isolated MIG instances, each formed
+by multiple GPU slices that contain a dedicated proportion
+of SMs, caches, GPU memory, and memory bandwidth.
+This hardware-supported isolation minimizes interference
+between workloads on different MIG instances.
+To achieve even higher GPU utilization, we leverage
+NVIDIA GPUs’ capability to use MPS within MIG in-
+stances (Tan et al., 2021; Zhang et al., 2024; Lee et al.,
+2024). We use the GPU segment (Lee et al., 2024) abstrac-
+tion to describe these MPS-enabled MIG instances. Each
+GPU segment is described by its MIG instance size and
+the number of concurrent identical MPS processes running
+within it. Crucially, when we co-locate multiple GPU seg-
+ments on one physical GPU, workloads in different GPU
+segments minimally interfere with each other due to MIG’s
+hardware isolation.
+Configuration search space. We define a configuration
+as the combination of model variants, GPU segment types,
+and maximum batch sizes that the serving system selects
+for each model instance across all tasks. As Table 1 shows,
+JIGSAWSERVE has all three features of performing accu-
+racy scaling, enabling spatial partitioning, and performing
+task-graph-informed resource budgeting. For a compound
+inference system with T tasks, M model variants per task,
+N instances for each task, S GPU segment types, and B
+possible batch sizes, the configuration search space has
+(M ∗S ∗B)N∗T possible configurations. When a serv-
+ing system performs accuracy scaling and enables spatial
+partitioning while being task-graph-uninformed, the config-
+uration search space has T ∗(M ∗S ∗B)N configurations
+due to per-task resource budgets. Without accuracy scaling
+Register a 
+compound 
+inference system
+Profiler
+Profiles latency and throughput for model 
+variants, GPU segments, and batch sizes
+Requests
+Responses
+Frontend
+Handles client 
+requests, and tracks 
+demand
+Controller
+Runs MILP, sets up spatial partitions on 
+GPUs, and sets up model instances
+1/7
+…
+2/7
+…
+Partitioned 
+GPUs
+3/7
+4/7
+T1
+T1
+T2
+T3
+TN
+Generated 
+configuration
+…
+T1
+T2
+T3
+TN
+…
+…
+…
+Model 
+Instances
+Profiled latency 
+and throughput
+Registration Handler
+Registers the task 
+graph, model variants, 
+and model accuracies
+Demand
+Runtime latency, 
+multiplicative 
+factors
+Figure 1. An overview of JIGSAWSERVE.
+(M = 1) or spatial partitioning (S = 1), the configuration
+search space reduces further.
+3
+DESIGN OF JIGSAWSERVE
+JIGSAWSERVE is made of four major components as shown
+in Figure 1: a registration handler to register the compound
+inference system, a profiler that performs offline-profiling
+of each task, a controller to find the best configuration and
+set up model instances, and a frontend that clients can use
+to submit requests to the compound inference system. §3.1
+describes the components of JIGSAWSERVE in detail. §3.2
+describes the Mixed Integer Linear Programming Problem
+(MILP) formulation used by the controller. §3.3 details
+the batching and early drop mechanisms employed by each
+model instance in the compound inference system.
+3.1
+Components of JIGSAWSERVE
+Registration handler. Registering the compound inference
+system involves listing the tasks in the system, providing
+the weights of all model variants for each task along with
+their accuracies, describing the dependencies (edges) in
+the task graph, and specifying the end-to-end latency and
+accuracy SLO. The accuracy SLO is specified in terms of
+the acceptable drop in accuracy relative to the maximum
+achievable with the most accurate model variants.
+Profiler. After a compound inference system is registered
+with JIGSAWSERVE, the profiler profiles the tasks in the
+system to find the 95th percentile latency and throughput
+(inferences per second) for all combinations of model vari-
+ants, batch size, and GPU segment types. JIGSAWSERVE
+considers the GPU segments formed by all possible MIG in-
+stance sizes with up to 4 concurrent MPS processes running
+the same model in each MIG instance to avoid exhaustive
+search and GPU out-of-memory issues (Zhang et al., 2024;
+Lee et al., 2024). The one-time profiling cost is compensated
+by sustained performance gains made possible by the profil-
+ing information. JIGSAWSERVE also refines this data using
+
+
+--- Page 4 ---
+Serving Compound Inference Systems on Datacenter GPUs
+actual runtime latency and throughput during the compound
+inference system execution.
+Controller. The controller uses the profiled information
+to generate an optimal configuration to serve the required
+demand while satisfying latency and accuracy SLOs. We
+formulate the problem of finding the optimal configuration
+as an MILP, and use a commercial solver to find solutions
+for the MILP. We describe the MILP formulation in more
+detail in §3.2.
+The controller uses the generated configuration to set up
+spatial partitions on the GPUs and assigns the spatial parti-
+tions to the model instances. The controller uses a greedy
+rule-based bin-packing algorithm (Turkkan et al., 2024) to
+efficiently set up the MIG instances on the minimal num-
+ber of GPUs. The controller then spawns workers for each
+model instance, assigns the MIG instances to the workers,
+and sets up inter-task data dependencies.
+Frontend. The frontend collects requests from the clients,
+sets up the metadata for each request (request ID, and a
+deadline derived from the latency SLO), and routes the re-
+quest to the first task of the compound inference system.
+The frontend also returns the output of the compound infer-
+ence system to the client. The frontend continuously tracks
+the incoming demand and the SLO violation rate, triggering
+the controller to find a new configuration when the demand
+changes.
+3.2
+MILP Formulation
+The controller formulates the problem of finding an optimal
+configuration as an MILP. Table 2 summarizes the inputs
+and terms used for the MILP formulation. The inputs and
+profiling information are provided to the MILP. The inter-
+mediate variables are calculated within the MILP while
+evaluating candidate configurations. The decision variable
+candidate by the MILP is M(t, v, s, b), which denotes for
+each task t, the number of instances of model variant v,
+running on GPU segment type s with a maximum batch size
+b. N(t, v, s, b) is a binary variable that denotes if there is at
+least 1 instance as described by the tuple (t, v, s, b).
+N(t, v, s, b) =
+(
+1,
+if M(t, v, s, b) ≥1
+0,
+otherwise.
+(1)
+Latency constraints. To enforce the latency SLO, we en-
+sure the maximum request time along any path respects the
+request’s deadline. The worst-case latency occurs when a
+request encounters the slowest instance of every task in its
+path. ˆL(t) calculates the per-task time using the binary vari-
+able N(t, v, s, b) to find the latency of the slowest instance
+of t in a candidate configuration.
+ˆL(t) = max
+v∈Vt
+s∈S
+b∈B
+(L(t, v, s, b) ∗N(t, v, s, b))
+(2)
+Table 2. Terms in the MILP.
+Term
+Description
+Inputs
+SLOl
+end-to-end latency SLO of the entire system
+SLOa
+threshold for the overall system accuracy, ex-
+pressed as a fraction of the maximum possible
+accuracy
+Amax
+the maximum overall system accuracy possible
+for an application
+R
+demand (req/s) for the first task
+T
+set of tasks in the compound inference system
+Vt
+set of all model variants that perform task t ∈T
+S
+set of all GPU segment types (MPS-enabled MIG
+instances)
+sn
+cost of GPU segment type s in terms of GPU
+slices
+Savail
+number of total available GPU slices
+P
+set of all paths that a request can take in the com-
+pound inference system inferred from the task
+graph
+P(t)
+preceding tasks of task t inferred from the task
+graph
+fp
+fraction of requests that take path p in the com-
+pound inference system
+B
+set
+of
+all
+possible
+batch
+sizes
+[1, 2, 4, 8, 16, 32, 64, 128]
+Profiled Information
+L(t, v, s, b)
+offline-profiled latency of model variant v on GPU
+segment s with batch size b for task t
+H(t, v, s, b)
+offline-profiled throughput (req/s) of model vari-
+ant v on GPU segment s with batch size b for task
+t
+F(t, v, t′)
+multiplicative factor of model variant v in task t
+to task t′
+A(t, v)
+accuracy of model variant v for task t
+Intermediate Variables
+N(t, v, s, b)
+boolean to denote if there are any instances of
+model variant v for task t running on GPU seg-
+ment s with a maximum batch size b
+ˆL(t)
+latency of the slowest instance of task t
+ˆF(t, t′)
+average multiplicative factor from task t to task t′
+ˆR(t)
+demand (req/s) at task t
+ˆS(t)
+total GPU slices to run task t
+ˆH(t, v, s, b)
+throughput of an instance described by (t, v, s, b)
+ˆA(t)
+effective accuracy of task t
+Ap
+accuracy of path p
+Aobj
+accuracy of a candidate configuration normalized
+to the maximum possible accuracy
+Decision Variables
+M(t, v, s, b)
+number of instances of model variant v for task
+t running on GPU segment s with a maximum
+batch size b
+Similar to prior works (Shen et al., 2019; Choi et al., 2022;
+Ahmad et al., 2024b;a), we double the inference latency to
+account for queuing delays in forming a batch. The sum
+of queuing and inference times across all tasks must not
+
+
+--- Page 5 ---
+Serving Compound Inference Systems on Datacenter GPUs
+exceed the latency SLO.
+X
+t∈p
+2 ∗ˆL(t) ≤SLOl, ∀p ∈P
+(3)
+Throughput constraints.
+To meet throughput demands,
+JIGSAWSERVE determines the number of instances for
+each task’s model variants. We calculate a task’s required
+throughput by multiplying its preceding task’s request load
+by the task’s average multiplicative factor (over the past 5 de-
+mand timestamps if the data is available), which can change
+across different MILP runs. ˆF(t, t′) calculates the multi-
+plicative factor of task t to t′ by using the active instances
+inferred from N(t, v, s, b), to aggregate the multiplicative
+factor over all active model variants of task t.
+ˆF(t, t′) =
+X
+v∈Vt
+s∈S
+b∈B
+F(t, v, t′) ∗N(t, v, s, b)
+(4)
+The demand at task t from all the preceding tasks P(t) is
+ˆR(t). For the first task in the compound inference system,
+ˆR(t) = R, which can change across different MILP runs.
+For any other task t, ˆR(t) is calculated by summing the
+product of the multiplicative factor and the demand of all
+preceding tasks.
+ˆR(t) =
+X
+t′∈P (t)
+ˆR(t′) ∗ˆF(t′, t)
+(5)
+To satisfy all the requests of a task t, the total throughput
+of all the model instances must be greater than the required
+throughput of that task.
+X
+v∈Vt
+s∈S
+b∈B
+M(t, v, s, b) ∗H(t, v, s, b) ≥ˆR(t), ∀t ∈T
+(6)
+Total resources constraints. To explore the tradeoff of vary-
+ing the amount of computational resources allocated to each
+task, we add a constraint on the number of GPU slices 2 the
+entire compound inference system can use. To calculate the
+total number of GPU slices used, an intermediate variable
+ˆS(t) denotes the total number of GPU slices used for task t
+in the candidate configuration.
+ˆS(t) =
+X
+v∈Vt
+s∈S
+b∈B
+M(t, v, s, b) ∗sn
+(7)
+The total resource cost in terms of GPU slices in the entire
+compound inference system has to be less than the total
+available resources.
+X
+t∈T
+ˆS(t) ≤Savail
+(8)
+2This might not correspond to the number of GPUs due to the
+placement constraints of MIG instances.
+Accuracy constraints. To measure the accuracy of each path
+in the compound inference system, we use the pipeline accu-
+racy score (PAS) proposed by (Ghafouri et al., 2024). PAS is
+calculated as the product of the individual accuracy metrics
+of each task. We use PAS as a heuristic, and our work is
+orthogonal to research that finds better ways to measure the
+accuracy of composed ML models. The effective accuracy
+of a task ˆA(t) is the weighted average of the accuracies of
+the candidate model variants in each instance, where the
+weights are the total throughput of each instance. The to-
+tal throughput of an instance type (t, v, s, b) is ˆH(t, v, s, b),
+and the total throughput of all instance types are used to
+calculate the effective accuracy of a task t.
+ˆH(t, v, s, b) = M(t, v, s, b) ∗H(t, v, s, b)
+(9)
+ˆA(t) =
+
+
+
+
+
+
+
+
+P
+v∈Vt
+s∈S
+b∈B
+ˆH(t, v, s, b) ∗A(t, v)
+P
+v∈Vt
+s∈S
+b∈B
+ˆH(t, v, s, b)
+
+
+
+
+
+
+
+
+(10)
+The accuracy for a path p is Ap, and can be calculated by
+multiplying the accuracies of each task in the candidate
+configuration.
+Ap =
+Y
+t∈p
+ˆA(t)
+(11)
+To find the overall accuracy of the entire compound infer-
+ence system, we take a convex combination 3 of the accu-
+racies along each path weighted by the number of requests
+that take each path. We then normalize the weighted average
+with the maximum possible overall system accuracy (Amax)
+of the application. We calculate Amax in the same way as
+Aobj, but we use only the most accurate model variants for
+Equation 10 instead of all variants v ∈Vt.
+Aobj =
+P
+p∈P
+fp ∗Ap
+Amax
+(12)
+We add a constraint on the overall accuracy to be above
+the specified threshold, relative to the maximum overall
+accuracy possible for the application.
+Aobj ≥SLOa
+(13)
+Objective function. The objective of the optimization is to
+maximize the overall system accuracy and minimize the
+resources used with equations (3), (6), (8), and (13) as
+constraints. The MILP maximizes the objective function
+described by (14) while choosing the decision variables
+M(t, v, s, b), where α and β scale the relative importance
+3A convex combination is a weighted average where the
+weights are non-negative and add up to 1.
+
+
+--- Page 6 ---
+Serving Compound Inference Systems on Datacenter GPUs
+of the overall accuracy and the total resources used for a
+configuration.
+max
+M(t,v,s,b)
+ 
+αAobj −β
+X
+t∈T
+ˆS(t)
+!
+(14)
+3.3
+Batching and Early Dropping
+The MILP finds the maximum batch size b that a model
+instance can use. After waiting a maximum time of ˆL(t)
+or if the inference of the previous batch has finished early,
+the model instance starts executing the inference for a new
+batch even if the size of the batch is less than b.
+Similar to prior works (Ahmad et al., 2024b), JIG-
+SAWSERVE implements early dropping mechanisms where
+some requests are dropped to decrease the overall SLO vio-
+lation rate. At runtime, each task can take a decision to drop
+a request if it is not possible to meet the latency SLO for the
+request even if the fastest model variants of the subsequent
+tasks serve the request with no delay due to batch forma-
+tion. A task also drops requests that are considered to be
+stale, which can happen if all the model instances filled up
+their batches and the request is not picked up by any model
+instance of the task.
+4
+EVALUATION METHODOLOGY
+To empirically evaluate JIGSAWSERVE, we implemented
+the system in ∼5K lines of Python code. We run all experi-
+ments on a Dell PowerEdge XE9640 server equipped with
+four NVIDIA H100 SXM 80GB GPUs. The node features
+96 CPU cores, 1,007 GiB of RAM, and a configurable stor-
+age capacity. Our software environment includes Ubuntu
+22.04, Python 3.10, CUDA 12.4, and PyTorch 2.6.0. We use
+the nvidia−mig−parted4 tool to set up the MIG instances on
+all GPUs, and Gurobi (Gurobi Optimization, LLC, 2024) to
+find solutions to the MILP. We provide more details on the
+parameters chosen for the evaluation in §4.4, and the imple-
+mentation of the compound inference system in Appendix
+A.
+4.1
+Workloads
+We evaluate JIGSAWSERVE with three applications, built
+as compound inference systems with different depths of the
+paths a request can take. These applications consist of a
+diverse range of ML models in terms of their functionality,
+number of parameters, and resource requirements. The tasks
+of the applications and the model variants JIGSAWSERVE
+considered for each task are summarized in Figure 2.
+1. Social media (Ahmad et al., 2024b) (depth of 1): Each
+input image is processed by two models for the social
+4https://github.com/NVIDIA/mig-parted
+media application. A ResNet model (He et al., 2015)
+predicts the object present in the image, and a GIT model
+(Wang et al., 2022) generates a caption for the image.
+2. Traffic analysis (Ahmad et al., 2024b) (depth of 2): Each
+input image is processed by a YOLO (Redmon et al.,
+2016) model to detect if there are any cars or people in
+the image. For each detected car, an EfficientNet model
+(Tan and Le, 2020) predicts the make and model of the
+car. For each detected person, a VGG model (Simonyan
+and Zisserman, 2015) predicts the gender and age of the
+person.
+3. AR assistant (depth of 3): Each input image is first pro-
+cessed by a YOLO model (Redmon et al., 2016) to detect
+an object. A GIT model (Wang et al., 2022) generates a
+caption to describe the object, and a text-to-speech (TTS)
+model (Kim et al., 2021; 2020) converts the textual de-
+scription of the object into an audio description.
+When performing accuracy scaling, the accuracy values we
+use for each model variant are the relevant metrics reported
+in the available public repositories (yol, 2024; res, 2017;
+vgg, 2017) and the manuscripts (Kim et al., 2021; Wang
+et al., 2022; Tan and Le, 2020) of the model architecture
+families.
+To evaluate the configurations generated by JIGSAWSERVE
+at different demand (req/s) values that a serving system can
+observe in an entire day, we obtain values for the demand
+over a day using the request timing information from a Twit-
+ter trace (twi, 2022; Donnelly, 2023). We bin the requests
+into 5-minute intervals, where each demand timestamp in
+the binned demand trace represents the average demand
+over each 5-minute interval throughout the day from the
+Twitter trace. The trace contains a diurnal pattern that is
+representative of production serving demand (Zhang et al.,
+2019; Shahrad et al., 2020). We scale the entire trace to the
+maximum demand that can be served by JIGSAWSERVE for
+each application, while preserving the broad trends within
+the trace.
+For the payload of the requests, we use the COCO dataset
+(Lin et al., 2015) for the social media and AR assistant ap-
+plications, and the Bellevue traffic dataset (City of Bellevue,
+2017) for the traffic analysis application.
+4.2
+MILP and Reconfiguration Frequency
+To test the efficacy of JIGSAWSERVE at different demand
+conditions a serving system can observe in a day, we invoke
+the MILP and consequent system reconfiguration at each
+demand timestamp bin of the trace described above. We use
+a rudimentary demand prediction approach to average the
+demand of the 5 previous timestamp bins with an additional
+slack. We run our complete system for a short duration for
+each timestamp bin until it reaches a steady state. While
+the MILP and system reconfiguration incur overheads, these
+
+
+--- Page 7 ---
+Serving Compound Inference Systems on Datacenter GPUs
+ResNet
+GIT
+ResNet 18, 34, 50, 101, 152
+70, 73, 76, 77, 78
+GIT-base, GIT-large
+13.4, 14.4
+(a) Social media application.
+YOLOv5
+n, s, m, l, x
+28, 37, 45, 49, 51
+EfficientNet
+VGG
+B0, B1, B2, B3, B4, B5, B7, B7
+77, 79, 80, 81.6, 83, 83.6, 84, 84.3
+VGG11, VGG13, VGG16, VGG19
+69, 70, 71.5, 72.4
+(b) Traffic analysis application.
+YOLOv5
+n, s, m, l, x
+28, 37, 45, 49, 51
+GIT
+GIT-base, GIT-large
+13.4, 14.4
+TTS
+Glow TTS, VITS
+3.76, 4.38
+(c) AR assistant application.
+Figure 2. Applications and their inference task graphs used to evaluate JIGSAWSERVE. Each task is annotated with the model variants that
+can perform the task, along with the relevant accuracy metrics.
+are negligible relative to the frequency at which they are
+invoked. The MILP in particular can be invoked in the
+background and takes 2s to 20s, depending on the demand
+conditions and application.
+4.3
+Baselines Evaluated
+We point out the configuration search spaces that the base-
+lines consider when they perform accuracy scaling (A),
+enable spatial partitioning (S), and perform task-graph-
+informed resource budgeting (T).
+For the analytical evaluation, we compare the maximum
+serviceable demand of JIGSAWSERVE with baselines that
+contain all combinations of A/S/T in their configuration
+search space. For the empirical evaluation, we compare JIG-
+SAWSERVE against baselines whose configuration search
+spaces perform task-graph-informed resource budgeting
+along with A or S. We also compare against A+S, which is
+task-graph-uninformed and does not exist in prior work but
+performs well in our analytical evaluation. Some of these
+baselines are equivalent or close to the configuration search
+spaces of relevant prior works Loki (Ahmad et al., 2024b),
+Clover (Li et al., 2023), and ParvaGPU (Lee et al., 2024).
+Loki performs accuracy scaling for each task in a task-graph-
+informed manner, and is equivalent to A+T. ParvaGPU+T is
+equivalent to S+T since it enables spatial partitioning and is
+task-graph-informed and does not perform accuracy scaling.
+Clover performs accuracy scaling and enables spatial par-
+titioning in a task-graph-uninformed manner, but does not
+use MPS within the MIG instances to increase the utiliza-
+tion. Clover+MPS correctly describes A+S, since A+S will
+perform at least as well as Clover due to better utilization of
+the GPUs. Loki is the only previous work that represents a
+configuration space of using any two of the three features
+from Table 1. JIGSAWSERVE’s configuration search space
+is A+S+T, and is the superset of all relevant prior works.
+Baselines that do not perform accuracy scaling consider only
+the highest-accuracy variant, and those that do not enable
+spatial partitioning exclusively use whole-GPUs for each
+model. For task-graph-uninformed baselines we detail a
+static task-wise budget allocation method in Appendix B
+that makes them as strong as possible.
+4.4
+Parameters for Evaluation
+When finding a configuration for a demand timestamp, we
+use a slack of 5% similar to previous inference serving sys-
+tems (Romero et al., 2021). We use α = 1 and β = 0.035
+for Equation 14 to scale the range of available GPU slices
+(0 −28) in our testbed to the range of the overall system
+accuracy (0 −1) and give equal importance to both objec-
+tives. For the accuracy SLO, we allow JIGSAWSERVE to
+decrease the overall system accuracy until a threshold of
+90% of the maximum possible system accuracy for each
+application. We use latency SLOs of 650ms, 700ms, and
+1550ms for the traffic analysis, social media, and AR assis-
+tant applications to make sure that all configuration spaces
+would be able to serve the applications at some demand.
+When running the end-to-end system, we account for the
+communication latency by adding the time for each commu-
+nication hop (∼10ms) to the latency SLO based on the depth
+of the application. To measure the staleness of requests, we
+use values of 20ms for the social media and traffic analysis
+applications, and 40ms for the AR assistant application in
+proportion to their end-to-end latency SLOs.
+4.5
+Metrics
+We present three metrics for each baseline in the empirical
+evaluation: cost in terms of percentage of available GPU
+slices used, overall system accuracy drop, and the latency
+SLO violation rate. We define the overall system accuracy
+drop as a percentage of the maximum overall accuracy possi-
+ble for an application. We define the latency SLO violation
+rate (also referred to as the SLO violation rate for brevity)
+as the ratio of number of requests that miss their deadline
+to the total number of requests, similar to previous works
+that consider compound inference systems (Ahmad et al.,
+2024b). We highlight that a baseline performs particularly
+poorly if the SLO violation rate is ≥10%. We also consider
+an early dropped request as a deadline violation, and multi-
+ple violations if the task performing the early dropping has
+a multiplicative factor greater than 1.
+
+
+--- Page 8 ---
+Serving Compound Inference Systems on Datacenter GPUs
+5
+RESULTS
+We first analyze the solutions of the MILP to find the max-
+imum throughputs that can be served with each configu-
+ration search space. We then run empirical evaluations of
+the end-to-end compound inference systems with the gen-
+erated configurations to report the metrics, and analyze the
+configurations chosen by JIGSAWSERVE.
+Figure 3. Maximum demand that can be satisfied for the traffic
+analysis application on a large testbed by exploring combinations
+of A/S/T. Higher maximum demand is better.
+Maximum serviceable demand. Figure 3 shows the max-
+imum possible demand that can be served for the traffic
+analysis application to compare scenarios where a serving
+system performs accuracy scaling (A) while keeping the
+overall system accuracy above a threshold of 90%, enables
+spatial partitioning (S), and does task-graph-informed re-
+source budgeting (T). We choose to run the MILP for a
+hypothetical testbed of 120 GPUs (840 GPU slices) to en-
+sure that all configurations would be able to exactly follow
+any task-wise resource budgets. Figure 3 shows the maxi-
+mum serviceable demand of each configuration search space
+normalized to that of an unoptimized system, along with
+the actual percentage of GPU slices that each configuration
+search space uses to achieve its highest serviceable demand.
+When the serving system is unoptimized (Unopt), it does not
+perform accuracy scaling, disables spatial partitioning, and
+does task-graph-uninformed resource budgeting. Unopt has
+the lowest maximum serviceable demand among all other
+configuration search spaces. Unopt is also unable to use
+all the available GPUs due to the task-wise resource bud-
+gets since it is task-graph-uninformed. T does task-graph-
+informed budgeting, resulting in a maximum serviceable
+demand that is 1.1× that of Unopt while being able to use
+all the available GPUs. All other task-graph-uninformed
+configuration search spaces (S, A, A+S) similarly do not
+use all available GPUs, or GPU slices if they enable spatial
+partitioning.
+S enables spatial partitioning of GPUs enabling fine-grained
+resource distribution among tasks, and achieves a maximum
+serviceable demand that is 5.25× the Unopt version. S
+delivers the highest standalone gain over Unopt in serving
+capacity for the same GPU resources, compared to A (1.6×)
+and T (1.1×).
+A+T and S+T achieve a higher maximum serviceable de-
+mand that is 1.9× and 7.8× respectively while using all the
+available GPUs. A+S achieves a maximum serviceable de-
+mand that is 12×, which is a great increase compared to all
+the other configuration search spaces that use either one or
+two of A, S, and T. A+S+T corresponds to JIGSAWSERVE,
+and achieves the highest maximum serviceable demand that
+is 21.6× that of Unopt. A+T is closest to (and explores a
+larger search space than) prior work of Loki (Ahmad et al.,
+2024b), and JIGSAWSERVE’s maximum serviceable demand
+is 11.3× that of A+T. This demonstrates how performing
+accuracy scaling by choosing the model variants for each
+task in the compound inference system, enabling spatial
+partitioning on GPUs, and performing task-graph-informed
+resource budgeting allows JIGSAWSERVE to serve a much
+higher demand using the same GPU resources.
+Empirical evaluation of the end-to-end system. We em-
+pirically evaluate the top four performing systems identified
+through our comprehensive analytical evaluation that use
+at least two features from Table 1: S+T, A+T, A+S, and
+JIGSAWSERVE. Figure 4 shows the demand, resource con-
+sumption, accuracy drop, and SLO violations when JIG-
+SAWSERVE and the selected baselines find configurations
+to serve various demands for the evaluated applications.
+JIGSAWSERVE and A+S, both use only 40% of the available
+GPU slices on average across all demand timestamps for
+the social media application. The configurations chosen by
+them are also identical, since the social media application
+only has a depth of 1 and does not benefit from task-graph-
+informed resource budgeting. For the traffic analysis (depth
+2) and AR assistant (depth 3) applications, JIGSAWSERVE
+needs less GPU slices when compared to A+S and highlights
+the advantage of performing task-graph-informed budgeting
+of resources. A+S also results in an SLO violation rate that
+is ≥10% at high demand conditions for the traffic analysis
+application even though it uses less GPU slices than A+T
+and S+T.
+When comparing JIGSAWSERVE and S+T, JIGSAWSERVE
+uses fewer GPU slices across all applications. For the social
+media and traffic analysis applications, S+T is unable to
+serve a high demand and results in ≥10% SLO violation
+rate. A+T performs the worst among all the baselines, and
+has ≥10% SLO violation rate even at low demand condi-
+tions in two of three applications. Since S+T, A+T, and
+JIGSAWSERVE are task-graph-informed, they are able to
+make use of all available resources at high demand condi-
+tions if necessary, unlike A+S.
+Broad trends across all applications and baselines. All
+
+
+--- Page 9 ---
+Serving Compound Inference Systems on Datacenter GPUs
+(a) Social media application.
+(b) Traffic analysis application.
+(c) AR assistant application.
+(d) Social media application.
+(e) Traffic analysis application.
+(f) AR assistant application.
+Figure 4. (a), (b), and (c) show the statistics of all demand timestamps for the evaluated applications. We cap the SLO violation rate at
+50% for better visualization. (d), (e), (f) show the aggregated statistics for the low demand conditions (timestamp 180-240), high demand
+conditions (timestamp 100-150), and the average over all demand timestamps. The bars are hatched if the SLO violation rate is ≥10%.
+For all metrics, lower is better.
+the baselines are able to find valid configurations at low
+demand conditions, which can be seen by the relative low
+SLO violation rate. When any baseline is unable to find a
+valid configuration to solve a demand, it uses the configura-
+tion that can serve the highest demand. This results in the
+percentage of resources used plateauing at its highest value
+during high demand conditions for all baselines. At low de-
+mand conditions, even though all baselines are able to find
+valid configurations, they are sensitive to fluctuations in the
+demand and result in spikes in the SLO violation rate. This
+happens when the actual demand of a timestamp is greater
+than the demand predicted from the previous timestamps. A
+difference of 5 req/s appears small in the demand graph, but
+can be a 2× increase if a baseline finds a configuration for
+5 req/s but actually observes a demand of 10 req/s.
+JIGSAWSERVE shows the best overall performance, using
+just 43.3% of the available GPU resources on average, re-
+specting the accuracy SLO, and showing less than 0.6% av-
+erage SLO violations. In contrast, S+T and A+T show over
+10% SLO violations and use more than 2× the resources of
+JIGSAWSERVE in at least one case. A+S reaches 6.7% SLO
+violations and 33% more resources than JIGSAWSERVE in
+at least one case.
+Analyzing the configurations chosen by JIGSAWSERVE.
+Figure 5 shows the model variants and GPU segments JIG-
+SAWSERVE chooses for each task in the evaluated applica-
+tions. When performing accuracy scaling, JIGSAWSERVE is
+able to choose to scale down the accuracy for tasks that will
+have the greatest impact on the resources required based
+on the application. For example, JIGSAWSERVE chooses
+to run the yolov5l variant of YOLO for the traffic analy-
+sis, but chooses the yolov5x variant of YOLO for the AR
+assistant application. For the AR assistant application, JIG-
+SAWSERVE chooses to run less accurate model variant for
+the GIT task, while using the high accuracy models for the
+YOLO and TTS tasks. For the traffic analysis application,
+JIGSAWSERVE typically chooses a mix of model variants
+for the EfficientNet task to keep the overall accuracy above
+the accuracy threshold.
+JIGSAWSERVE also identifies the most efficient GPU seg-
+
+
+--- Page 10 ---
+Serving Compound Inference Systems on Datacenter GPUs
+(a) Social media application.
+(b) Traffic analysis application.
+(c) AR assistant application.
+Figure 5. The frequency of model variants and GPU segment types
+in the configurations chosen by JIGSAWSERVE for the evaluated
+applications. The GPU segment types are described by both a MIG
+instance type (1/7 - 7/7) and an MPS concurrency level (1, 2, 3, 4).
+ment type to run each model. VGG19 always uses the
+GPU segments described by a 1/7 MIG instance with vary-
+ing MPS concurrency. In both the social media and the
+AR assistant application, the GIT-base model frequently
+uses the GPU segments described by a 1/7 MIG instance
+with an MPS concurrency of 1, and the GPU segments de-
+scribed by a 2/7 MIG instance with an MPS concurrency of
+4. JIGSAWSERVE chooses to run all ResNet model variants
+exclusively on a 1/7 MIG instance type with varying MPS
+concurrency. The EfficientNet model variants are frequently
+run on a 1/7 MIG instance with varying MPS concurrency,
+while occasionally using the 2/7 MIG instance type. JIG-
+SAWSERVE almost never uses the 1/7+extra memory and
+3/7 MIG instance types, since they are just as expensive to
+use as a 2/7 or 4/7 MIG instance respectively due to their
+placement constraints on a GPU.
+5.1
+Overhead of JIGSAWSERVE
+The profiler takes 7-12 hours to exhaustively profile the
+entire configuration search space of all model variants, MIG
+instance sizes, MPS concurrency, and batch sizes. This
+profiling happens before the system starts serving, and has
+to be done only once. The time spent doing the profiling
+is compensated by the higher throughput and lower cost
+achieved when JIGSAWSERVE uses the profiled information
+to serve the compound inference system.
+The average time taken by the MILP in the controller to
+find the optimal configuration varies from 2-20 seconds on
+our testbed based on the demand and application. Find-
+ing the optimal configuration is not on the critical path of
+serving requests, since the controller can run the MILP asyn-
+chronously on the CPU. Repartitioning the MIG instances
+on GPUs would be another overhead due to its disruptive
+nature, since the serving system cannot use the GPUs while
+they are being repartitioned. Previous works (Turkkan et al.,
+2024) provide solutions for non-disruptive repartitioning by
+making use of additional GPUs during the repartitioning
+period, which is feasible when JIGSAWSERVE is deployed
+on large clusters of datacenter GPUs.
+6
+RELATED WORKS
+There exists extensive research on serving systems for infer-
+ence workloads. Most relevant to our work is research on
+compound inference systems (Shen et al., 2019; Ghafouri
+et al., 2024; Zhao et al., 2025; Ahmad et al., 2024b; Kim
+et al., 2024), adaptation techniques to perform accuracy
+scaling (Ahmad et al., 2024b;a; Romero et al., 2021; Kim
+et al., 2024; Chen et al., 2025; Li et al., 2023), and fine-
+grained hardware resource allocation with spatially parti-
+tioned GPUs (Zhang et al., 2024; Choi et al., 2022; Li et al.,
+2022; Lee et al., 2024; Hui et al., 2025; 2024; Tan et al.,
+2021). Table 1 summarizes the most closely related works.
+Prior works either do not consider compound systems or do
+not explore spatial partitioning schemes to address datacen-
+ter GPU under-utilization, among other limitations when
+compared to JIGSAWSERVE (§1). As we point out in §4,
+JIGSAWSERVE’s configuration search space is a superset of
+prior works, and outperforms all of them.
+Model variants for inference serving. INFaaS (Romero
+et al., 2021) and Proteus (Ahmad et al., 2024a) perform
+accuracy scaling to choose model variants to serve infer-
+ence requests for individual models. Loki (Ahmad et al.,
+2024b) and IPA (Ghafouri et al., 2024) are serving sys-
+tems for compound inference workloads that select model
+variants for each task in the system. Loki was designed
+and evaluated for consumer-grade GPUs, and will result
+in GPU under-utilization when it runs on datacenter GPUs
+since it allocates an entire GPU to each model instance.
+
+
+--- Page 11 ---
+Serving Compound Inference Systems on Datacenter GPUs
+JIGSAWSERVE focuses on serving compound inference sys-
+tems on datacenter GPUs, and co-locates models and share
+the GPU to improve utilization of the GPUs unlike Loki.
+IPA runs the individual models of the compound inference
+system on CPU cores and does not use GPUs to accelerate
+the inference. DREAM (Kim et al., 2024) is a scheduler
+that dynamically chooses the best accelerator to run each
+model in an XR-based compound inference for a system
+with multiple heterogeneous accelerators for a single user.
+LLMSelector (Chen et al., 2025) selects the large-language
+models (LLMs) to use in a compound inference system with
+multiple LLMs interacting as agents with an objective to
+maximize the end-to-end system accuracy, but does not ad-
+dress the hardware cost, latency, or throughput of serving
+their workload unlike JIGSAWSERVE.
+Serving systems with GPU sharing. GPUlet (Choi et al.,
+2022) and GSLICE (Dhakal et al., 2020) serve compound
+inference systems and share GPUs by using MPS. INFaaS
+shares GPUs by co-locating models with an interference-
+prone mechanism, and constantly probes the models to iden-
+tify when the interference is too high. Clover (Li et al.,
+2023) is a framework that hosts multiple model variants on
+different MIG instances to minimize the carbon emissions
+of serving inference for individual ML models, but does not
+consider compound inference systems. MIG-serving (Tan
+et al., 2021) finds deployments of MIG instances to serve
+inference workloads of multiple individual models when
+given the throughput and latency requirements. ParvaGPU
+(Lee et al., 2024) uses MPS-enabled MIG instance to serve
+individual models while maintaining a high GPU utilization.
+7
+FUTURE WORK AND CONCLUSION
+We plan to explore JIGSAWSERVE’s efficacy when serving
+real applications, where relaxing the accuracy threshold re-
+sults in a measurable and quantifiable decrease in the quality
+of experience. It would also be interesting to explore how
+the core ideas of JIGSAWSERVE can be applied to more com-
+pound inference systems, beyond those whose task-graphs
+can be described as a DAG. Exploring more compound in-
+ference systems could involve considering large ML models
+that need more than 1 GPU for a single instance. Designing
+a serving system for such systems would require better un-
+derstanding of the communication overheads and memory
+bottlenecks to satisfy the data dependencies.
+JIGSAWSERVE uses spatial partitioning mechanisms on
+NVIDIA GPUs, but the core ideas of JIGSAWSERVE are
+applicable even to GPUs from other vendors that provide
+spatial partitioning mechanisms such as the Modular Chiplet
+Platform on AMD GPUs. Techniques like dynamic rerout-
+ing (Ahmad et al., 2024b) of individual requests to model
+instances with unutilized capacities are complementary to
+our work, and will further improve the runtime performance
+of JIGSAWSERVE. JIGSAWSERVE uses a rudimentary work-
+load prediction to predict the future demand. Using better
+workload prediction methods to predict the demand well
+ahead of time can help hide the GPU repartitioning time
+during real deployment on a cluster of datacenter GPUs.
+JIGSAWSERVE’s MILP formulation allows for any opti-
+mization objective when exploring the configuration space
+of choosing model variants and MIG instance sizes for a
+compound inference system. For example, it can be used
+to minimize the carbon intensity of serving compound in-
+ference systems, similar to (Li et al., 2023). JIGSAWSERVE
+currently uses a bin-packing algorithm for MIG instance
+placement, which can lead to GPU fragmentation. Future
+work can optimize for ideal MIG packing and placement
+as a part of the objective. Alternatively, a multi-level re-
+source allocator can allocate pools of resources, and model
+instances can flexibly make real-time decisions at runtime
+to use from the resource pools.
+JIGSAWSERVE is the first serving system that jointly op-
+timizes model variant selection and GPU spatial partition-
+ing for compound inference systems on datacenter GPUs.
+By allocating resources and accuracy budgets in a task-
+graph–informed manner, it meets end-to-end latency and
+accuracy SLOs while using only 43.3% of available GPU
+capacity on average. Our results demonstrate that joint opti-
+mization across accuracy scaling, spatial partitioning, and
+task graph structure is key to efficient serving of compound
+inference systems. JIGSAWSERVE makes a case for two
+critical advances: (1) The ML community should continue
+to release multiple model variants per architecture to al-
+low accuracy-performance flexibility, and (2) GPU vendors
+must embrace and prioritize developing spatial partitioning
+mechanisms.
+ACKNOWLEDGMENTS
+This work is supported in part by U.S. National Science
+Foundation grant #2217144, the AMD Center of Excellence
+at UIUC, and the IBM-Illinois Discovery Accelerator In-
+stitute. This work used JetStream2 (Hancock et al., 2021)
+at Indiana University through allocation CIS250170 from
+the Advanced Cyberinfrastructure Coordination Ecosystem:
+Services & Support (ACCESS) program (Boerner et al.,
+2023), which is supported by U.S. National Science Foun-
+dation grants #2138259, #2138286, #2138307, #2137603,
+and #2138296.
+REFERENCES
+Pytorch model hub,
+resnet,
+2017.
+URL https:
+//pytorch.org/hub/pytorch_vision_
+resnet/.
+
+
+--- Page 12 ---
+Serving Compound Inference Systems on Datacenter GPUs
+Pytorch model hub, vgg-nets, 2017.
+URL https://
+pytorch.org/hub/pytorch_vision_vgg/.
+Twitter
+streaming
+traces,
+2022.
+URL
+https://archive.org/details/
+archiveteam-twitter-stream-2022-11.
+Yolov5 vs. yolov8: A detailed comparison, 2024. URL
+https://docs.ultralytics.com/compare/
+yolov5-vs-yolov8/.
+Nvidia multi-instance gpu user guide,
+release r575,
+2025a.
+URL
+https://docs.nvidia.com/
+datacenter/tesla/mig-user-guide/.
+Nvidia multi-process service, release r575, 2025b. URL
+https://docs.nvidia.com/deploy/mps/
+index.html.
+Sohaib Ahmad, Hui Guan, Brian D. Friedman, Thomas
+Williams, Ramesh K. Sitaraman, and Thomas Woo.
+Proteus: A high-throughput inference-serving system
+with accuracy scaling.
+In Proceedings of the 29th
+ACM International Conference on Architectural Sup-
+port for Programming Languages and Operating Sys-
+tems, Volume 1, ASPLOS ’24, page 318–334, New
+York, NY, USA, 2024a. Association for Computing
+Machinery.
+ISBN 9798400703720.
+doi: 10.1145/
+3617232.3624849.
+URL https://doi.org/10.
+1145/3617232.3624849.
+Sohaib Ahmad, Hui Guan, and Ramesh K. Sitaraman. Loki:
+A system for serving ml inference pipelines with hard-
+ware and accuracy scaling. In Proceedings of the 33rd
+International Symposium on High-Performance Parallel
+and Distributed Computing, HPDC ’24, page 267–280,
+New York, NY, USA, 2024b. Association for Com-
+puting Machinery.
+ISBN 9798400704130.
+doi: 10.
+1145/3625549.3658688. URL https://doi.org/
+10.1145/3625549.3658688.
+Timothy J. Boerner, Stephen Deems, Thomas R. Furlani,
+Shelley L. Knuth, and John Towns. Access: Advanc-
+ing innovation: Nsf’s advanced cyberinfrastructure co-
+ordination ecosystem: Services & support.
+In Prac-
+tice and Experience in Advanced Research Computing
+2023: Computing for the Common Good, PEARC ’23,
+page 173–176, New York, NY, USA, 2023. Associa-
+tion for Computing Machinery. ISBN 9781450399852.
+doi: 10.1145/3569951.3597559. URL https://doi.
+org/10.1145/3569951.3597559.
+Lingjiao Chen, Jared Quincy Davis, Boris Hanin, Peter
+Bailis, Matei Zaharia, James Zou, and Ion Stoica. Opti-
+mizing model selection for compound ai systems, 2025.
+URL https://arxiv.org/abs/2502.14815.
+Seungbeom Choi, Sunho Lee, Yeonjae Kim, Jongse
+Park, Youngjin Kwon, and Jaehyuk Huh.
+Serv-
+ing heterogeneous machine learning models on Multi-
+GPU servers with Spatio-Temporal sharing.
+In
+2022 USENIX Annual Technical Conference (USENIX
+ATC 22), pages 199–216, Carlsbad, CA, July 2022.
+USENIX Association.
+ISBN 978-1-939133-29-53.
+URL https://www.usenix.org/conference/
+atc22/presentation/choi-seungbeom.
+City of Bellevue.
+Bellevue Traffic Video Dataset.
+https://github.com/City-of-Bellevue/
+TrafficVideoDataset, 2017. Accessed: August 4,
+2025.
+Aditya Dhakal, Sameer G Kulkarni, and K. K. Ramakr-
+ishnan. Gslice: controlled spatial sharing of gpus for
+a scalable inference platform.
+In Proceedings of the
+11th ACM Symposium on Cloud Computing, SoCC ’20,
+page 492–506, New York, NY, USA, 2020. Associa-
+tion for Computing Machinery. ISBN 9781450381376.
+doi: 10.1145/3419111.3421284. URL https://doi.
+org/10.1145/3419111.3421284.
+Frank Donnelly.
+Parsing the inter archive’s twitter
+stream grab with python,
+2023.
+URL https:
+//atcoordinates.info/2023/04/30/
+parsing-the-internet-archives-twitter-stream-grab
+Saeid Ghafouri, Kamran Razavi, Mehran Salmani, Alireza
+Sanaee, Tania Lorido Botran, Lin Wang, Joseph Doyle,
+and Pooyan Jamshidi. [solution] ipa: Inference pipeline
+adaptation to achieve high accuracy and cost-efficiency.
+Journal of Systems Research, 4(1), April 2024. ISSN
+2770-5501. doi: 10.5070/sr34163500. URL http://
+dx.doi.org/10.5070/SR34163500.
+Gurobi Optimization, LLC. Gurobi Optimizer Reference
+Manual, 2024. URL https://www.gurobi.com.
+David Y. Hancock, Jeremy Fischer, John Michael Lowe,
+Winona Snapp-Childs, Marlon Pierce, Suresh Marru,
+J. Eric Coulter, Matthew Vaughn, Brian Beck, Nirav
+Merchant, Edwin Skidmore, and Gwen Jacobs.
+Jet-
+stream2: Accelerating cloud computing via jetstream.
+In Practice and Experience in Advanced Research Com-
+puting 2021: Evolution Across All Dimensions, PEARC
+’21, New York, NY, USA, 2021. Association for Com-
+puting Machinery.
+ISBN 9781450382922.
+doi: 10.
+1145/3437359.3465565. URL https://doi.org/
+10.1145/3437359.3465565.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+Deep residual learning for image recognition, 2015. URL
+https://arxiv.org/abs/1512.03385.
+
+
+--- Page 13 ---
+Serving Compound Inference Systems on Datacenter GPUs
+HPC
+Wire.
+Aws
+to
+offer
+nvidia’s
+t4
+gpus
+for
+ai
+inferencing,
+2019.
+URL
+https:
+//www.hpcwire.com/2019/03/19/
+aws-upgrades-its-gpu-backed-ai-inference-platform/.
+Xinning Hui, Yuanchao Xu, Zhishan Guo, and Xipeng Shen.
+Esg: Pipeline-conscious efficient scheduling of dnn work-
+flows on serverless platforms with shareable gpus. In Pro-
+ceedings of the 33rd International Symposium on High-
+Performance Parallel and Distributed Computing, HPDC
+’24, page 42–55, New York, NY, USA, 2024. Associa-
+tion for Computing Machinery. ISBN 9798400704130.
+doi: 10.1145/3625549.3658657. URL https://doi.
+org/10.1145/3625549.3658657.
+Xinning Hui, Yuanchao Xu, and Xipeng Shen. Fluidfaas:
+A dynamic pipelined solution for serverless comput-
+ing with strong isolation-based gpu sharing.
+In The
+34th International Symposium on High-Performance
+Parallel and Distributed Computing (HPDC ’25),
+Notre Dame, IN, USA, july 2025. ACM.
+doi:
+https://doi.org/10.1145/3731545.3731580. URL https:
+//research.csc.ncsu.edu/picture/
+publications/papers/hpdc2025.pdf.
+Jaehyeon Kim, Sungwon Kim, Jungil Kong, and Sungroh
+Yoon. Glow-tts: A generative flow for text-to-speech
+via monotonic alignment search, 2020. URL https:
+//arxiv.org/abs/2005.11129.
+Jaehyeon Kim, Jungil Kong, and Juhee Son. Conditional
+variational autoencoder with adversarial learning for end-
+to-end text-to-speech, 2021. URL https://arxiv.
+org/abs/2106.06103.
+Seah Kim, Hyoukjun Kwon, Jinook Song, Jihyuck Jo, Yu-
+Hsin Chen, Liangzhen Lai, and Vikas Chandra. Dream: A
+dynamic scheduler for dynamic real-time multi-model ml
+workloads. In Proceedings of the 28th ACM International
+Conference on Architectural Support for Programming
+Languages and Operating Systems, Volume 4, ASPLOS
+’23, page 73–86, New York, NY, USA, 2024. Associa-
+tion for Computing Machinery. ISBN 9798400703942.
+doi: 10.1145/3623278.3624753. URL https://doi.
+org/10.1145/3623278.3624753.
+Hyoukjun Kwon, Krishnakumar Nair, Jamin Seo, Jason
+Yik, Debabrata Mohapatra, Dongyuan Zhan, Jinook Song,
+Peter Capak, Peizhao Zhang, Peter Vajda, et al. Xrbench:
+An extended reality (xr) machine learning benchmark
+suite for the metaverse. Proceedings of Machine Learning
+and Systems, 5:1–20, 2023.
+Munkyu Lee, Sihoon Seong, Minki Kang, Jihyuk Lee,
+Gap-Joo Na, In-Geol Chun, Dimitrios Nikolopoulos, and
+Cheol-Ho Hong. Parvagpu: Efficient spatial gpu sharing
+for large-scale dnn inference in cloud environments. In
+SC24: International Conference for High Performance
+Computing, Networking, Storage and Analysis, pages
+1–14. IEEE, 2024.
+Baolin Li, Tirthak Patel, Siddharth Samsi, Vijay Gadepally,
+and Devesh Tiwari. Miso: exploiting multi-instance gpu
+capability on multi-tenant gpu clusters. In Proceedings of
+the 13th Symposium on Cloud Computing, page 173–189.
+ACM, November 2022. doi: 10.1145/3542929.3563510.
+URL http://dx.doi.org/10.1145/3542929.
+3563510.
+Baolin Li, Siddharth Samsi, Vijay Gadepally, and Devesh
+Tiwari. Clover: Toward sustainable ai with carbon-aware
+machine learning inference service. In Proceedings of
+the International Conference for High Performance Com-
+puting, Networking, Storage and Analysis, pages 1–15,
+2023.
+Tsung-Yi Lin, Michael Maire, Serge Belongie, Lubomir
+Bourdev, Ross Girshick, James Hays, Pietro Perona, Deva
+Ramanan, C. Lawrence Zitnick, and Piotr Doll´ar. Mi-
+crosoft coco: Common objects in context, 2015. URL
+https://arxiv.org/abs/1405.0312.
+David Patterson, Joseph Gonzalez, Urs H¨olzle, Quoc Le,
+Chen Liang, Lluis-Miquel Munguia, Daniel Rothchild,
+David So, Maud Texier, and Jeff Dean.
+The carbon
+footprint of machine learning training will plateau, then
+shrink, 2022.
+URL https://arxiv.org/abs/
+2204.05149.
+Joseph Redmon, Santosh Divvala, Ross Girshick, and Ali
+Farhadi. You only look once: Unified, real-time object
+detection, 2016. URL https://arxiv.org/abs/
+1506.02640.
+Francisco Romero, Qian Li, Neeraja J. Yadwadkar, and
+Christos Kozyrakis. INFaaS: Automated model-less in-
+ference serving. In 2021 USENIX Annual Technical Con-
+ference (USENIX ATC 21), pages 397–411. USENIX
+Association, July 2021.
+ISBN 978-1-939133-23-6.
+URL https://www.usenix.org/conference/
+atc21/presentation/romero.
+Mohammad Shahrad, Rodrigo Fonseca, Inigo Goiri, Gohar
+Chaudhry, Paul Batum, Jason Cooke, Eduardo Laure-
+ano, Colby Tresness, Mark Russinovich, and Ricardo
+Bianchini. Serverless in the wild: Characterizing and
+optimizing the serverless workload at a large cloud
+provider.
+In 2020 USENIX Annual Technical Con-
+ference (USENIX ATC 20), pages 205–218. USENIX
+Association, July 2020.
+ISBN 978-1-939133-14-4.
+URL https://www.usenix.org/conference/
+atc20/presentation/shahrad.
+
+
+--- Page 14 ---
+Serving Compound Inference Systems on Datacenter GPUs
+Haichen Shen, Lequn Chen, Yuchen Jin, Liangyu Zhao,
+Bingyu Kong, Matthai Philipose, Arvind Krishnamurthy,
+and Ravi Sundaram.
+Nexus: a gpu cluster engine
+for accelerating dnn-based video analysis.
+In Pro-
+ceedings of the 27th ACM Symposium on Operating
+Systems Principles, SOSP ’19, page 322–337, New
+York, NY, USA, 2019. Association for Computing
+Machinery.
+ISBN 9781450368735.
+doi: 10.1145/
+3341301.3359658.
+URL https://doi.org/10.
+1145/3341301.3359658.
+Karen Simonyan and Andrew Zisserman. Very deep convo-
+lutional networks for large-scale image recognition, 2015.
+URL https://arxiv.org/abs/1409.1556.
+Cheng Tan, Zhichao Li, Jian Zhang, Yu Cao, Sikai Qi,
+Zherui Liu, Yibo Zhu, and Chuanxiong Guo. Serving
+dnn models with multi-instance gpus: A case of the re-
+configurable machine scheduling problem, 2021. URL
+https://arxiv.org/abs/2109.11067.
+Mingxing Tan and Quoc V. Le. Efficientnet: Rethinking
+model scaling for convolutional neural networks, 2020.
+URL https://arxiv.org/abs/1905.11946.
+Bekir Turkkan, Pavankumar Murali, Pavithra Harsha, Rohan
+Arora, Gerard Vanloo, and Chandra Narayanaswami. Op-
+timal workload placement on multi-instance gpus, 2024.
+URL https://arxiv.org/abs/2409.06646.
+Jianfeng Wang, Zhengyuan Yang, Xiaowei Hu, Linjie Li,
+Kevin Lin, Zhe Gan, Zicheng Liu, Ce Liu, and Lijuan
+Wang. Git: A generative image-to-text transformer for
+vision and language, 2022. URL https://arxiv.
+org/abs/2205.14100.
+Carole-Jean Wu, Ramya Raghavendra, Udit Gupta, Bilge
+Acun, Newsha Ardalani, Kiwan Maeng, Gloria Chang,
+Fiona Aga Behram, James Huang, Charles Bai, Michael
+Gschwind, Anurag Gupta, Myle Ott, Anastasia Melnikov,
+Salvatore Candido, David Brooks, Geeta Chauhan, Ben-
+jamin Lee, Hsien-Hsin S. Lee, Bugra Akyildiz, Maxi-
+milian Balandat, Joe Spisak, Ravi Jain, Mike Rabbat,
+and Kim Hazelwood.
+Sustainable ai: Environmental
+implications, challenges and opportunities, 2022. URL
+https://arxiv.org/abs/2111.00364.
+Matei Zaharia, Omar Khattab, Lingjiao Chen, Jared Quincy
+Davis, Heather Miller, Chris Potts, James Zou, Michael
+Carbin, Jonathan Frankle, Naveen Rao, and Ali Gh-
+odsi.
+The shift from models to compound ai sys-
+tems.
+https://bair.berkeley.edu/blog/
+2024/02/18/compound-ai-systems/, 2024.
+Bowen Zhang, Shuxin Li, and Zhuozhao Li. Miger: In-
+tegrating multi-instance gpu and multi-process service
+for deep learning clusters. In Proceedings of the 53rd
+International Conference on Parallel Processing, ICPP
+’24, page 504–513, New York, NY, USA, 2024. Associa-
+tion for Computing Machinery. ISBN 9798400717932.
+doi: 10.1145/3673038.3673089. URL https://doi.
+org/10.1145/3673038.3673089.
+Chengliang Zhang, Minchen Yu, Wei Wang, and Feng
+Yan.
+MArk:
+Exploiting cloud services for Cost-
+Effective, SLO-Aware machine learning inference serv-
+ing.
+In 2019 USENIX Annual Technical Conference
+(USENIX ATC 19), pages 1049–1062, Renton, WA, July
+2019. USENIX Association. ISBN 978-1-939133-03-8.
+URL https://www.usenix.org/conference/
+atc19/presentation/zhang-chengliang.
+Zhixin Zhao, Yitao Hu, Guotao Yang, Ziqi Gong, Chen
+Shen, Laiping Zhao, Wenxin Li, Xiulong Liu, and Wenyu
+Qu. Slopt: Serving real-time inference pipeline with strict
+latency constraint. IEEE Transactions on Computers, 74
+(4):1431–1445, 2025. doi: 10.1109/TC.2025.3528125.
+Han Zhou, Xingchen Wan, Ruoxi Sun, Hamid Palangi,
+Shariq Iqbal, Ivan Vuli´c, Anna Korhonen, and Sercan O.
+Arik. Multi-agent design: Optimizing agents with better
+prompts and topologies, 2025. URL https://arxiv.
+org/abs/2502.02533.
+
+
+--- Page 15 ---
+Serving Compound Inference Systems on Datacenter GPUs
+A
+IMPLEMENTING COMPOUND
+INFERENCE SYSTEMS
+To implement the compound inference systems for empiri-
+cal evalutation, we extend ideas proposed by FluidFaaS (Hui
+et al., 2025) where each model instance performing a task
+runs as a separate CPU process, with the model instances
+satisfying data dependencies through Inter Process Commu-
+nication (IPC) via shared memory on the host system. We
+run each model instance as separate CPU processes since
+the NVIDIA CUDA driver limits each CPU process to use
+only one MIG instance. Using the host shared memory for
+IPC instead of socket-based communication reduces com-
+munication overheads between the CPU processes incurred
+by (de)serialization, heavy OS system calls, and multiple
+memory copies by the kernel.
+This implementation does not restrict JIGSAWSERVE, and
+is just a design choice suitable for our testbed. The ideas of
+JIGSAWSERVE can scale and be used for other production-
+ready implementations of compound inference systems
+where all components of the serving system and the model
+instances performing the tasks are containerized, hosted
+on different nodes or datacenters, and communicate with
+point-to-point socket-based protocols such as gRPC over
+the network.
+B
+TASK-GRAPH-UNINFORMED BASELINES
+For baselines that perform task-graph-uninformed resource
+budgeting, we need to statically divide the end-to-end la-
+tency SLO and the available resources among the tasks in a
+task-graph-uninformed manner. We use the multiplicative
+factors of the most accurate model variants to calculate the
+expected demand for each task when a serving system is
+task-graph-uninformed. We divide this expected demand by
+the maximum throughput that a model instance described by
+(t, v, s, b) can achieve for the most accurate model variant
+performing task t, and them multiply it with the number
+of GPU slices in s. This gives the expected amount of re-
+sources required for task t. We assign task-wise resource
+budgets by dividing the total resources available in the ratio
+of the expected amount of resources required for each task.
+For the task-wise latency SLO, we split the end-to-end la-
+tency SLO for each path in the task graph in the ratio of the
+highest inference latency that a model instance described
+by (t, v, s, b) can incur for the most accurate model variant
+performing task t. For a task t that belongs to multiple paths,
+the task-wise latency SLO is the minimum latency along all
+paths that t is present.
+Once these task-level latency SLO and resource budgets
+are allocated, each task is constrained to use the task-level
+limits. In contrast, task-graph-informed resource budgeting
+constrains the total end-to-end latency SLO and the total
+resources across all tasks in the compound inference system.
+The latency SLO and the resources can be flexibly appor-
+tioned among the constituent tasks in task-graph-informed
+resource budgeting.
+We choose this approach to statically divide the end-to-end
+latency SLO and resources instead of naively dividing them
+equally among all the tasks to make strong baselines of
+the task-graph-uninformed configuration search spaces. A
+task-graph-uninformed serving system would not know the
+end-to-end SLO, but only the SLO for each task that a user
+would provide. The user is not aware of the MILP formu-
+lation, and has to statically determine the latency SLO for
+each task assuming the worst case latency that the serving
+system could choose. For the task-wise resource budget, we
+use this approach to find the ratio of resources for each task
+assuming that the serving system would choose to serve the
+demand with the configuration that can achieve the maxi-
+mum throughput.
