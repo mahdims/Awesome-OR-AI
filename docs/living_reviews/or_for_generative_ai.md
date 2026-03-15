@@ -1,10 +1,21 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-03-12
+**Last Updated:** 2026-03-15
 
 ---
 
 ## Recent Papers
+
+#### 2026-03-15 (1 papers)
+
+### [Serving Compound Inference Systems on Datacenter GPUs](https://arxiv.org/abs/2603.08797)
+
+**2026-03-09** | University of Illinois Urbana-Champaign | M=7 P=8 I=7 **MUST-READ** *discuss*
+
+*Method:* Mixed Integer Linear Programming (MILP) for joint optimization of model variants, GPU spatial partitions, and task-graph-informed budgeting | *LLM role:* none
+
+> JIGSAWSERVE uses a Mixed Integer Linear Programming (MILP) formulation to jointly optimize model variant selection (accuracy scaling) and fine-grained GPU spatial partitioning (MIG/MPS) for serving compound inference DAGs. The results are strongly backed by empirical numbers on real hardware (H100s), demonstrating an 11.3x capacity improvement over the closest prior work (Loki) while maintaining under 0.6% SLO violations. The single most useful takeaway for us is their specific MILP formulation, which successfully linearizes the complexities of task-graph multiplicative factors and spatial GPU segments into a tractable objective for latency and accuracy SLOs. This is highly relevant for our GPUSched project; we should extract their MILP constraints for spatial partitioning and task-graph budgeting to adapt for our own LLM inference scheduling and multi-agent resource allocation models.
+
 
 #### 2026-03-12 (4 papers)
 
