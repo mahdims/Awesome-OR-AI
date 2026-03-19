@@ -1,10 +1,45 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-03-15
+**Last Updated:** 2026-03-19
 
 ---
 
 ## Recent Papers
+
+#### 2026-03-19 (4 papers)
+
+### [CausalEvolve: Towards Open-Ended Discovery with Causal Scratchpad](https://arxiv.org/abs/2603.14575)
+
+**2026-03-15** | Carnegie Mellon University, MBZUAI, Hong Kong Baptist University, The University of Sydney | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* CausalEvolve with causal scratchpad leveraging LLMs to identify and reason about guiding factors for evolution, incorporating outcome-level and procedure-level factors, multi-arm bandit for intervention, and abductive reasoning. | *LLM role:* heuristic_generator
+
+> CausalEvolve enhances LLM evolutionary search frameworks (like AlphaEvolve and ShinkaEvolve) by introducing a causal scratchpad that extracts outcome- and procedure-level factors to explicitly guide program mutations via a Multi-Armed Bandit. The results are backed by solid empirical numbers, showing it outperforms the state-of-the-art ShinkaEvolve across four algorithmic and mathematical tasks (Hadamard, Autocorrelation, Circle Packing, AIME) by up to 9.1% in best-found scores. The single most useful takeaway for us is their 'surprise detection' module: using LLMs to perform abductive reasoning when a seemingly good combination of factors yields a score drop, thereby uncovering hidden confounders and generating new search directions. This is highly relevant to our work; we should immediately evaluate their MAB-driven causal intervention strategy and procedure-level factor extraction to improve the sample efficiency and memory mechanisms in AlgoEvo.
+
+### [CreativeBench: Benchmarking and Enhancing Machine Creativity via Self-Evolving Challenges](https://arxiv.org/abs/2603.11863)
+
+**2026-03-12** | Tsinghua University, Peking University, Southern University of Science and Technology, University of Bristol, The Hong Kong University of Science and Technology (Guangzhou), Xi’an Jiaotong University | M=8 P=6 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Automated benchmark construction via reverse engineering and self-play; EvoRePE: Inference-time representation engineering for latent space steering. | *LLM role:* code_writer, constraint_generator, evaluator, prompt_optimizer, decomposition_guide, evolutionary_search
+
+> Wang et al. introduce CreativeBench to evaluate LLM code generation creativity and propose EvoRePE, a representation engineering technique that extracts a 'creativity vector' from AlphaEvolve search trajectories to steer model activations at inference time. The results are backed by solid empirical evaluations, showing that injecting this vector improves novelty and correctness even without running the full evolutionary search. THE SINGLE MOST USEFUL TAKEAWAY: We can run our evolutionary search (e.g., AlgoEvo) offline to collect (base_heuristic, evolved_heuristic) pairs, compute the PCA of their hidden state differences, and inject this vector during standard inference to force the model into an exploratory mode. This is highly relevant to our work as it offers a completely new, training-free mechanism to solve the sample efficiency and scalability bottlenecks in LLM evolutionary search.
+
+### [KernelFoundry: Hardware-aware evolutionary GPU kernel optimization](https://arxiv.org/abs/2603.12440)
+
+**2026-03-12** | Intel Corporation | M=8 P=6 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* MAP-Elites quality-diversity search with kernel-specific behavioral dimensions, meta-prompt evolution, and template-based parameter optimization | *LLM role:* code_writer, prompt_optimizer
+
+> KernelFoundry is an LLM-based evolutionary framework for GPU kernel optimization that combines MAP-Elites quality-diversity search with meta-prompt co-evolution and gradient-informed mutation hints. The results are rigorously backed by numbers, showing a 2.1x speedup over the AI CUDA Engineer baseline on KernelBench L2 and successful optimization of Llama 3 operations. The single most useful takeaway for us is their 'Gradient-Informed Evolution' technique: they track parent-to-child fitness transitions in the MAP-Elites archive to compute pseudo-gradients across behavioral dimensions, which are then translated into specific natural language mutation hints for the LLM (e.g., 'positive gradient in memory -> hint: add shared memory tiling'). While we do not write low-level GPU kernels, this exact architectural improvement—alongside their meta-prompting to prevent context pollution—is highly transferable and should be immediately tested in AlgoEvo and EvoCut to improve our search signal and sample efficiency.
+
+### [Procedural Generation of Algorithm Discovery Tasks in Machine Learning](https://arxiv.org/abs/2603.17863)
+
+**2026-03-18** | University of Oxford, University College London, University of California, Santa Barbara, University of Wisconsin–Madison, Delft University of Technology | M=6 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Procedural generation of algorithm discovery tasks using configurable parameters for domains, modules, and datasets | *LLM role:* research_agent, prompt_optimizer
+
+> This paper introduces DiscoGen, a procedural generator that combinatorially creates millions of algorithm discovery tasks (varying domains, editable modules, and datasets) with strict meta-train/meta-test splits to evaluate and train Algorithm Discovery Agents (ADAs). The results are backed by extensive empirical evaluation of open-source LLMs on a fixed subset (DiscoBench), demonstrating that current ADAs struggle with multi-module discovery and that prompt-tuning over a diverse set of procedurally generated tasks significantly improves generalization. The single most useful takeaway is the combinatorial task generation approach (toggling which modules are editable vs. fixed), which provides a brilliant blueprint for creating an autocurriculum to train our 'evolver' agents. This matters immensely for us; we should immediately consider using DiscoGen to evaluate AlgoEvo, and adapt their procedural task generation strategy to create diverse OR/routing environments for our own RL-infused evolutionary search training.
+
 
 #### 2026-03-15 (4 papers)
 

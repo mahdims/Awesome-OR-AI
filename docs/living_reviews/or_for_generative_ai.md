@@ -1,10 +1,61 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-03-15
+**Last Updated:** 2026-03-19
 
 ---
 
 ## Recent Papers
+
+#### 2026-03-19 (6 papers)
+
+### [MetaClaw: Just Talk -- An Agent That Meta-Learns and Evolves in the Wild](https://arxiv.org/abs/2603.17187)
+
+**2026-03-17** | Carnegie Mellon University, UC Berkeley, UNC-Chapel Hill, UC Santa Cruz | M=8 P=7 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Continual meta-learning with LLM-based gradient-free skill evolution and RL-based LoRA fine-tuning using a process reward model | *LLM role:* policy_executor, skill_generator, reward_model
+
+> MetaClaw is a continual learning framework for LLM agents that combines gradient-free skill evolution (distilling failures into reusable prompt instructions) with asynchronous RL fine-tuning guided by a process reward model. The results are backed by solid empirical gains, showing an 8.25x improvement in end-to-end task completion on a 30-day simulated CLI benchmark. The single most useful takeaway for us is their 'Skill Generation Versioning' mechanism: when co-optimizing discrete prompts/heuristics and continuous model weights, you must strictly separate support data (used to evolve the heuristic) from query data (collected after the update) and flush the RL buffer upon evolution to prevent training on stale rewards. This directly addresses the continuous learning and RL-infused evolution bottlenecks in AlgoEvo, giving us a concrete trick to steal for managing our own RL buffers during evolutionary search.
+
+### [Efficient LLM Serving for Agentic Workflows: A Data Systems Perspective](https://arxiv.org/abs/2603.16104)
+
+**2026-03-17** | National University of Singapore | M=8 P=9 I=8 **MUST-READ** *discuss*
+
+*Method:* Workflow-aware LLM serving framework integrating proactive KV cache management, global prompt caching, and cost-based cache-aware scheduling based on a templated radix tree | *LLM role:* none
+
+> Helium optimizes LLM serving for batch agentic workflows by modeling them as query plans and using a Templated Radix Tree (TRT) to enable proactive KV caching and cache-aware scheduling. The results are rigorously backed by numbers, demonstrating up to 1.56x speedups over state-of-the-art systems (vLLM, Parrot, KVFlow) on complex multi-agent workflows, and the authors even validate their greedy scheduler's optimality gap against an MILP solver. The most valuable takeaway is the TRT abstraction, which captures global prefix hierarchies across a DAG of LLM calls to maximize KV cache reuse, rather than relying on reactive, per-call caching. This is highly actionable for us: we should directly examine their scheduling formulation and TRT implementation to improve resource allocation and memory management in our GPUSched and HERMES projects.
+
+### [IEMAS: An Incentive-Efficiency Routing Framework for Open Agentic Web Ecosystems](https://arxiv.org/abs/2603.17302)
+
+**2026-03-18** | Shanghai Jiao Tong University | M=7 P=8 I=7 **MUST-READ** *discuss*
+
+*Method:* VCG-based Min-Cost Max-Flow (MCMF) for bipartite matching, guided by Hoeffding Tree predictive QoS models | *LLM role:* none
+
+> IEMAS routes client requests to distributed LLM agents by formulating the assignment as a Min-Cost Max-Flow bipartite matching problem, using VCG auctions to align economic incentives with KV-cache reuse. The results are backed by solid vLLM simulations, demonstrating an 80.2% KV-cache hit rate and a 35% cost reduction over baselines like GraphRouter. The most actionable takeaway for us is their method of quantifying KV-cache affinity (via Longest Common Prefix) and embedding it directly as a cost-reduction weight in a network flow optimization model. While the decentralized VCG auction mechanics might be overkill for centralized clusters, we should absolutely steal their cache-aware MCMF formulation for our OR-based LLM inference scheduling (GPUSched) work.
+
+### [inference-fleet-sim: A Queueing-Theory-Grounded Fleet Capacity Planner for LLM Inference](https://arxiv.org/abs/2603.16054)
+
+**2026-03-17** | MBZUAI, McGill University, University of Chicago, Tensormesh Inc | M=7 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Two-phase optimization combining M/G/c Kimura approximation for analytical sweep and discrete-event simulation (DES) for verification | *LLM role:* none
+
+> This paper introduces a two-phase capacity planner (M/G/c analytical sweep followed by discrete-event simulation) to find minimum-cost GPU fleet configurations for LLM inference under strict latency SLOs. The results are rigorously backed by simulation across multiple GPU profiles and workload traces, demonstrating that intuitive sizing rules often fail (e.g., slower GPUs can be cheaper due to KV-slot multipliers, and analytical models approve broken fleets for high-variance agent traffic). The most actionable takeaway for us is their lightweight, physics-informed (W, H, nmax) linear roofline model for GPU performance, which we can directly extract and embed into our integer programming formulations for GPUSched. This is highly relevant for our OR-for-AI infrastructure work, and we should use their open-source workload CDFs and performance constants to benchmark our own scheduling algorithms.
+
+### [Guaranteeing Semantic and Performance Determinism in Flexible GPU Sharing](https://arxiv.org/abs/2603.15042)
+
+**2026-03-17** | Shanghai Jiao Tong University, Chinese Academy of Sciences, University of Chinese Academy of Sciences | M=4 P=8 I=6 *discuss*
+
+*Method:* GPU coroutines abstraction decoupling logical execution contexts (vCtx) from physical GPU resources (pCtx) via dynamic context binding and cooperative preemption | *LLM role:* none
+
+> DETSHARE introduces 'GPU coroutines' to decouple logical execution contexts from physical GPU resources, enabling fine-grained spatial sharing without modifying kernels to preserve semantic determinism. The results are highly credible and backed by strong empirical numbers on A800/Hopper GPUs, demonstrating up to 79% higher training throughput and 69% lower inference latency compared to temporal sharing baselines. The most useful takeaway for us is the identification of 'semantic determinism'—specifically how dynamic spatial partitioning alters floating-point reduction trees and ruins training/RLHF stability. While we approach GPU scheduling via OR formulations (MIP/queueing) rather than OS-level CUDA hacking, this paper matters for our GPUSched project. We must incorporate their identified system realities—such as the 12% preemption overhead and the strict requirement for semantic determinism—into our mathematical models to ensure our theoretical schedules are actually deployable in production.
+
+### [Cost-Efficient Multimodal LLM Inference via Cross-Tier GPU Heterogeneity](https://arxiv.org/abs/2603.12707)
+
+**2026-03-13** | University of Illinois Urbana-Champaign | M=5 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Phase-aware runtime (HeteroServe) with modality-level partitioning, embedding-only transfer, and cross-type work stealing | *LLM role:* none
+
+> Yu et al. demonstrate that partitioning multimodal LLM inference at the modality boundary (vision encoder vs. language decoder) reduces cross-device transfer costs by O(L), dropping requirements from GB-scale NVLink to MB-scale PCIe. This enables heterogeneous serving architectures where cheap compute-dense GPUs (RTX 4090) handle vision and expensive bandwidth-dense GPUs (A100) handle language. Results are strongly backed by real hardware deployments, showing a 37% improvement in cost-efficiency over homogeneous vLLM baselines. WHAT WE LEARNED: The phase-separable nature of MLLMs and the use of cross-tier work stealing (idle 4090s assisting with language decoding) are massive structural opportunities. We must immediately update our integer programming formulations in the GPUSched project to model this modality-level disaggregation, otherwise our OR models will be obsolete for multimodal workloads.
+
 
 #### 2026-03-15 (1 papers)
 
