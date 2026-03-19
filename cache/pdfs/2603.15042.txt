@@ -1,0 +1,1727 @@
+--- Page 1 ---
+Guaranteeing Semantic and Performance Determinism in Flexible GPU Sharing
+Zhenyuan Yang1,2,4,*, Wenxin Zheng3,*, and Mingyu Li1,2
+1Key Laboratory of System Software (Chinese Academy of Sciences)
+2Institute of Software, Chinese Academy of Sciences
+3Shanghai Jiao Tong University
+4University of Chinese Academy of Sciences
+Abstract
+GPU sharing is critical for maximizing hardware utilization
+in modern data centers. However, existing approaches present
+a stark trade-off: coarse-grained temporal multiplexing incurs
+severe tail-latency spikes for interactive services, while fine-
+grained spatial partitioning often necessitates invasive kernel
+modifications that compromise behavioral equivalence.
+We present DETSHARE, a novel GPU sharing system that
+prioritizes determinism and transparency. DETSHARE en-
+sures semantic determinism (unmodified kernels yield iden-
+tical results) and performance determinism (predictable tail
+latency), all while maintaining complete transparency (zero
+code modification). DETSHARE introduces GPU coroutines,
+a new abstraction that decouples logical execution contexts
+from physical GPU resources. This decoupling enables flexi-
+ble, fine-grained resource allocation via lightweight context
+migration.
+Our evaluation demonstrates that DETSHARE improves
+training throughput by up to 79.2% compared to temporal
+sharing. In co-location scenarios, it outperforms state-of-the-
+art baselines, reducing P99 tail latency by 15.1% without
+compromising throughput. Furthermore, through workload-
+aware placement and our TPOT-FIRST scheduling policy,
+DETSHARE decreases average inference latency by 69.1%
+and reduces Time-Per-Output-Token (TPOT) SLO violations
+by 21.2% relative to default policies.
+1
+Introduction
+Artificial intelligence (AI) applications, such as chatbots [1,2],
+code generation [3,4], and autonomous agents [5], have be-
+come the dominant consumers of cloud compute resources
+and rely heavily on powerful GPU accelerators [6–8]. These
+workloads exhibit highly dynamic resource demands, fre-
+quently alternating between compute-bound phases (e.g.,
+prompt prefill) and memory-bound phases (e.g., autoregres-
+sive decoding). Current cloud abstractions fail to match this
+dynamism, primarily offering rigid, fixed-size instances to
+*Equal contribution
+enforce isolation. This mismatch compels operators to over-
+provision for peak loads, resulting in significant resource
+waste during off-peak cycles. For instance, Microsoft re-
+ports that compute utilization drops to under 10% during the
+memory-bound decoding phase when serving Llama3-8B [9]
+on A100 GPUs [10]. Industry surveys indicate that 60%–70%
+of GPU capacity routinely remains idle across both training
+and inference workloads in production clusters, translating
+to billions of dollars in wasted capital expenditure annually.
+Attempts to mitigate this inefficiency via manual resource
+tuning prove impractical, as the process is labor-intensive and
+fails to scale [11,12].
+GPU resource sharing offers a natural solution: by co-
+locating workloads, the capacity left idle during one task’s
+low-utilization phases can be reclaimed by co-resident jobs.
+Existing approaches can be broadly classified into two cate-
+gories. Temporal sharing [13–16] time-slices the GPU, grant-
+ing each job exclusive access for fixed quanta. While straight-
+forward, this approach fails to reduce under-utilization during
+memory-bound phases and can cause severe latency spikes
+for latency-critical services [17,18]. Spatial sharing [19–23]
+permits concurrent execution by partitioning GPU resources
+(e.g., Streaming Multiprocessors (SMs)) across workloads.
+This approach is considered more promising for achieving
+high utilization, yet existing spatial-sharing systems remain
+impractical due to three main challenges:
+• C1: Semantic Determinism—Inequivalence after sharing.
+Fine-grained spatial sharing approaches [19, 24] often
+modify kernel code, fundamentally altering execution se-
+mantics. They change either the effective batch size (dis-
+torting normalization statistics) or the computation order
+(violating floating-point associativity), causing numerical
+divergence from standalone execution [25].
+• C2: Performance Determinsim—Unpredictable SLO vio-
+lations. Co-locating services on shared GPUs inherently
+introduces resource contention. Compounding this, exist-
+ing infrastructure [26, 27] suffers from loss of semantic
+information: it remains oblivious to request priority. This
+uniform handling exacerbates interference, jeopardizing
+1
+arXiv:2603.15042v2  [cs.DC]  17 Mar 2026
+
+
+--- Page 2 ---
+strict tail-latency Service Level Objectives (SLOs).
+• C3: Transparency and Practicality—The engineering tax.
+Techniques like searching for fusible kernels [28] or man-
+ual kernel rewriting [24] require deep domain expertise
+and invasive code modifications, imposing an engineering
+tax. This not only creates maintenance burdens across
+rapidly evolving model architectures and underlying soft-
+ware stacks, but also amplifies the risk of violating seman-
+tic determinism (C1).
+This paper presents DETSHARE, a transparent GPU sharing
+system that simultaneously addresses all three challenges. Our
+key observation is that the modern GPU software-hardware
+stack already offers the necessary primitives for efficient
+spatial sharing without sacrificing semantic determinism:
+NVIDIA’s Multi-Process Service (MPS) [29] enables spa-
+tial sharing with address space isolation, while Green Con-
+texts [30] serve as lightweight execution units amenable to
+fine-grained preemption.
+Leveraging these software-hardware mechanisms, DET-
+SHARE introduces GPU coroutines, a novel abstraction that
+fully decouples logical execution contexts (visible to applica-
+tions) from physical GPU resources (managed by the CUDA
+runtime). Applications operate on virtual contexts (vCtx)
+that are dynamically bound to physical contexts (pCtx) pro-
+visioned with varying SM quotas. A centralized, workload-
+aware scheduler orchestrates this binding, migrating contexts
+between physical resources to match instantaneous workload
+priorities.
+Critically, by executing kernels without any modifications,
+DETSHARE ensures they yield identical results whether run-
+ning in isolation or under sharing, thereby preserving both
+functional correctness and semantic determinism (C1). To
+meet tail-latency SLOs, DETSHARE incorporates workload-
+aware scheduling policies that prioritize latency-critical ker-
+nels while simultaneously maximizing aggregate throughput
+(C2). Finally, DETSHARE remains fully transparent: no man-
+ual tuning or kernel annotation is required (C3).
+We evaluate DETSHARE on diverse workloads spanning
+DNN training, large language model (LLM) inference, and
+co-located training-inference scenarios. Our results show that
+DETSHARE improves throughput by up to 79.2% for DNN
+training workloads compared to temporal sharing. When co-
+locating DNN training and large-model inference tasks, DET-
+SHARE can reduce the P99 tail latency of inference by up
+to 15.1% compared to the baseline while preserving training
+throughput. By introducing workload-aware job placement
+policies, DETSHARE reduces the average inference latency
+by up to 69.1% under real-world production traces. Further-
+more, with our TPOT-FIRST scheduling policy, the TPOT
+SLO violation rate is reduced by an additional 21.2% relative
+to the default policy.
+Contributions.
+We make the following contributions.
+• We systematically classify existing GPU sharing mecha-
+nisms and identify three fundamental challenges that limit
+their applicability and efficiency.
+• We propose GPU coroutines, a novel abstraction that fully
+decouples logical execution contexts from physical GPU
+resources, enabling flexible and fine-grained multiplexing
+with determinism.
+• We
+design
+and
+implement
+DETSHARE, a
+high-
+performance, general-purpose GPU sharing system
+that outperforms state-of-the-art solutions in both DNN
+training and LLM inference, while maintaining strict SLO
+compliance.
+2
+Background and Motivation
+This section reviews AI model serving applications and exist-
+ing mechanisms to run them on GPU.
+2.1
+AI Model Serving
+AI models are now ubiquitous across modern applications,
+powering search, personalization, automation, diagnostics,
+and conversational agents. And model serving have become
+primary consumers of computing resources [6–8]. Serving
+AI models involves two broad phases, training produces a
+model and inference makes the model’s predictions available
+to various applications.
+Training includes pre-training, referring to large-scale, of-
+ten self-supervised training on massive data to build founda-
+tion models [31–33]. These pre-trained foundation models
+then serve as general-purpose backbones for downstream ap-
+plications in natural language understanding, conversational
+agents, summarization, image representation learning, and
+multimodal reasoning. Post-training further adapts foundation
+models to domain-specific tasks through fine-tuning [34,35],
+instruction tuning [36–38] or personalization [39,40]. In addi-
+tion, model compression [41,42] and quantization [43] tech-
+niques are applied to reduce memory footprint and improve
+inference latency. Another kind of training is online or contin-
+ual training [44], incrementally updating the deployed models
+using fresh or user-generated data.
+Inference entails the execution of trained AI models to gen-
+erate predictions for online or batch tasks. Within this domain,
+LLM serving has emerged as a dominant workload, under-
+pinning a diverse array of critical applications ranging from
+conversational agents [1,2] and neural code synthesis [3,4]
+to Retrieval-Augmented Generation (RAG) pipelines [45,46]
+and autonomous agentic systems [5]. Typical LLM inference
+can be conceptually divided into a prefill phase, where the
+input context is encoded and key-value caches are initialized,
+and a decode phase, where tokens are generated sequentially,
+often with beam search or sampling strategies. These phases
+exhibit distinct resource utilization patterns: prefill is primar-
+ily compute-bound, characterized by high arithmetic intensity
+due to parallel processing of input tokens. In contrast, de-
+code is memory-bound, constrained by memory bandwidth
+due to the low arithmetic intensity of auto-regressive token
+2
+
+
+--- Page 3 ---
+generation and the overhead of KV cache loading [10,47,48].
+2.2
+GPU Sharing
+An enduring challenge in systems and architecture, GPU shar-
+ing has attracted a broad spectrum of research. Existing so-
+lutions broadly fall into two paradigms: temporal and spatial
+sharing.
+Temporal sharing [13–16] allows one to switch from one
+application to another. This offers strong isolation, while
+context switching introduces heavy overhead and since only
+one context is activated, overall GPU utilization can be low
+when the workload is small [49,50].
+Spatial sharing [13–16] executes multiple workloads con-
+currently across partitioned GPU resources, spanning from
+fine-grained software multiplexing like CUDA Streams to
+coarse-grained hardware isolation. While CUDA Streams [20,
+51–53] enable intra-application parallelism by issuing opera-
+tions into distinct hardware work queues, they operate within
+a single CUDA context. Although this eliminates context
+switching overhead, the resulting unified address space en-
+forces fate sharing: a fault in one stream crashes the entire
+context, offering zero fault isolation.
+To provide stronger multi-tenant isolation, vendors offer
+dedicated spatial partitioning mechanisms like NVIDIA’s
+Multi-Instance GPU (MIG) and Multi-Process Service (MPS).
+MIG [54] achieves strict hardware-level isolation by divid-
+ing a single physical GPU into fully isolated instances, each
+with dedicated compute and memory bandwidth. However,
+this isolation comes at a severe cost: MIG relies on heavy-
+weight reconfiguration mechanisms that necessitate device
+resets, incurring latencies on the order of hundreds of millisec-
+onds [28,55]. Furthermore, its coarse-grained partitioning en-
+forces fixed resource slice sizes, inevitably leading to signifi-
+cant resource fragmentation. In contrast to hardware-centric
+partitioning, MPS [29] operates at the software level, facil-
+itating process-level spatial multiplexing via a client-server
+architecture. By multiplexing command streams from multi-
+ple independent clients into a single shared hardware context,
+MPS eliminates context-switching overheads while success-
+fully maintaining separate virtual address spaces for each
+process. This design makes MPS particularly beneficial for
+multi-tenant inference workloads where clients can safely co-
+exist within a context, effectively boosting overall utilization
+by absorbing leftover parallelism without the rigid reconfigu-
+ration penalties of MIG.
+2.3
+The Sources of Semantic Non-Determinism
+Hardware-Level Floating-Point Non-Associativity.
+At
+the lowest level, the root cause of numerical divergence is
+the IEEE 754 standard for floating-point arithmetic [56].
+Due to finite precision (especially in truncated formats like
+FP16 and BF16), floating-point addition is non-associative:
+(A + B) +C ̸= A + (B +C). Consequently, any variation in
+the sequence of arithmetic reductions will yield divergent
+rounding errors.
+System-Level Serving
+Optimizations.
+To
+maximize
+throughput, modern LLM serving engines dynamically
+adapt execution paths, which inherently introduces non-
+determinism. Techniques such as continuous batching [26]
+cause effective batch sizes to fluctuate heavily. Concurrently,
+high-performance computational kernels (e.g., cuBLAS)
+leverage dynamic tile sizing and Split-K reductions for ma-
+trix multiplications [25, 57]. By continually reshaping the
+underlying reduction trees, these performance-oriented op-
+timizations alter the sequence of floating-point operations,
+directly exacerbating numerical divergence.
+Application-Level Impact: Training-Inference Mismatch.
+This numerical non-determinism extends beyond mere the-
+oretical artifacts; it severely impacts advanced training
+paradigms such as Reinforcement Learning from Human
+Feedback (RLHF). During RL fine-tuning, identical prompts
+must consistently yield identical token trajectories. Micro-
+divergences introduced during inference trigger a policy
+shift [58]—the model’s behavior during online rollouts devi-
+ates from the policy evaluated during offline training. This
+mismatch effectively degrades online RL algorithms into sub-
+optimal offline RL, substantially stalling convergence.
+Recognizing
+this, recent serving
+frameworks
+(e.g.,
+SGLang [59, 60]) and libraries [61] have introduced strict
+“deterministic modes”. However, these application-level guar-
+antees implicitly assume dedicated, unfragmented hardware.
+As we discuss in Section 3.1, when these workloads are sub-
+jected to spatial multiplexing and sharing mechanisms at the
+infrastructure layer, the semantic determinism meticulously
+preserved by the application is once again destroyed.
+3
+Challenges of GPU Sharing Mechanisms
+In this section, we classify and summarize these existing GPU
+sharing mechanisms, as shown in Table 1.
+Current GPU sharing mechanisms can be broadly cate-
+gorized into temporal sharing, spatial sharing, and hybrid
+sharing approaches. While spatial sharing methods generally
+outperform temporal sharing in terms of utilization and SLO
+compliance, they often require significant human effort to
+tune and may not guarantee equivalence after sharing.
+3.1
+Challenge-#1: Semantic Determinism
+The bedrock of production AI systems is semantic integrity:
+a model validated in an offline environment must behave
+identically when deployed online. The core requirement
+for GPU resource sharing, therefore, is behavioral equiv-
+alence—preserving each workload’s functional behavior dur-
+ing shared execution compared to its standalone counter-
+part. This property is paramount for training-inference con-
+sistency [62]: models validated on dedicated hardware must
+yield identical predictions in inference scenarios. Any nu-
+merical divergence—however minute—can invalidate offline
+3
+
+
+--- Page 4 ---
+Table 1: Characterization of Existing GPU Sharing Mechanisms.
+Sharing
+Mechanism
+Key
+Techniques
+Semantic
+Determinism
+Performance
+Determinism
+Transparency
+& Practicality
+Utilization
+Temporal Sharing
+Time-slicing
+❍
+●
+❍
+Low
+Spatial Sharing
+Kernel atomization or scheduling
+●
+◗
+◗
+High
+Hybrid Sharing
+Combination of both
+●
+◗
+●
+Medium
+Note: ◗Partially addressed, ❍Fully addressed, ●Not addressed.
+0
+25
+50
+75
+100
+125
+150
+175
+200
+Iteration Steps
+0.4
+0.5
+0.6
+0.7
+Loss
+Impact of Batch Size on Loss Curve
+bs=16
+bs=512
+bs=1024
+Figure 1: Statistical Divergence. The impact of dynamic
+batch fragmentation on training loss. Adapting batch sizes to
+fit resource fragments alters the statistical properties of the
+workload, leading to increased loss variance compared to the
+baseline.
+accuracy metrics. While temporal sharing naturally preserves
+arithmetic determinism by granting exclusive access to full
+resources, spatial sharing introduces complex challenges.
+To maximize utilization, recent intrusive methods (e.g.,
+LithOS [24]) employ kernel atomization—dynamically par-
+titioning parallelizable dimensions to fit available resource
+fragments. We argue that such techniques fundamentally vi-
+olate the abstraction boundary between logical computation
+and physical resource availability. Specifically, standard GPU
+kernels operate on a contract where the result is a function of
+input data (D) and model state (S): Result = F(D,S). How-
+ever, by dynamically reshaping kernels to fit hardware frag-
+ments, atomization implicitly leaks instantaneous resource
+constraints (R(t)) into execution semantics, effectively al-
+tering the function to Result′ = F(D,S,R(t)). Since R(t) is
+stochastic in a multi-tenant cluster, the computation becomes
+non-deterministic. We categorize this divergence into two
+distinct levels:
+• Statistical Divergence (Batch Sensitivity): Techniques
+that partition resources by splitting batches effectively
+alter the statistical population used for operations like
+Batch Normalization [63]. As demonstrated in Figure 1,
+reducing the effective batch size to fit fragmented re-
+64
+256
+1024
+4096
+16384
+Resource Fragmentation (Grid Splits)
+0.01
+0.1
+1
+10
+100
+Deviation from Standalone
+Execution (Abs Error)
+FP16
+BF16
+Figure 2: Numerical Divergence. Absolute numerical de-
+viation of FP16 and BF16 summations compared to their
+unfragmented, standalone execution. Dynamically splitting
+the computation grid (X-axis) inevitably alters the underlying
+reduction tree, exposing the non-associativity of floating-point
+arithmetic. This semantic divergence is especially severe for
+BF16.
+sources distorts mean and variance statistics, leading to
+significant loss fluctuations and degraded convergence.
+• Numerical Divergence (FP Non-associativity): A more
+insidious issue arises in reduction-heavy kernels (e.g.,
+Softmax, LayerNorm). Due to the non-associativity of
+floating-point arithmetic [56], the order of summation
+determines rounding error accumulation. As shown in
+Figure 2, we simulate resource fragmentation by splitting
+a large tensor summation into varying grid sizes. The re-
+sults demonstrate that merely altering the reduction tree
+structure causes the absolute error (vs. standalone execu-
+tion) to fluctuate significantly. This divergence is present
+in both FP16 and BF16, with BF16 showing an order of
+magnitude higher error, confirming that fragmentation
+breaks bitwise determinism.
+Formalization.
+We formalize this observation as the
+Resource-Coupling Risk. Let Φ be a deterministic kernel func-
+tion. For any two execution instances i and j with identical
+inputs x, the condition Φ(x)i ≡Φ(x)j must hold. However,
+intrusive partitioning introduces a resource mapping function
+M : K →Ravail, where the kernel implementation K adapts
+its reduction strategy based on M. Consequently, the output
+4
+
+
+--- Page 5 ---
+divergence δ becomes non-zero:
+δ = |K(x,M(Ri))−K(x,M(Rj))| > 0
+(1)
+In deep pipelines like LLM inference, these accumulated
+"micro-divergences" create a validation-deployment gap un-
+acceptable for production critical paths.
+Principle 1: Kernel execution semantics must remain
+unchanged to guarantee sharing equivalence.
+3.2
+Challenge-#2: Performance Determinism
+Meeting strict tail-latency SLOs is a prerequisite for ensur-
+ing satisfactory user experience in interactive deep learn-
+ing workloads. However, achieving performance determin-
+ism—specifically, keeping P99 latency stable—is notoriously
+difficult in multi-tenant environments. While temporal shar-
+ing is the incumbent solution, it is fundamentally ill-suited
+for strict latency constraints. The primary limitation is that
+time-slicing enforces serialization: it introduces unavoidable
+queuing delays for applications not currently scheduled on
+the GPU [15, 64]. As contention increases, these accumu-
+lated wait times frequently cause tail latencies to exceed strict
+deadlines.
+Theoretical Containment (Stemporal ⊂Sspatial).
+Spatial
+sharing offers a fundamentally more promising approach. We
+observe that any performance target achievable via temporal
+sharing is theoretically achievable via spatial sharing. For-
+mally, let Stemporal be the set of valid schedules achievable via
+time-slicing (exclusive ownership for ∆t) and Sspatial be the
+set of spatially partitioned schedules. Since temporal sharing
+is mathematically a degenerate case of spatial sharing—where
+partition sizes toggle strictly between 0% and 100%—it fol-
+lows that Stemporal ⊂Sspatial.
+Corollary: If a workload set can satisfy SLOs under a tem-
+poral policy, there theoretically exists a spatial configuration
+that also satisfies these SLOs.
+The Reality Gap: Unmanaged Interference.
+Despite this
+theoretical potential, translating spatial partitioning into prac-
+tical service assurance is hindered by performance non-
+determinism, which we categorize into two distinct domains:
+• Micro-architectural Contention: Spatial co-location im-
+plicitly multiplexes shared resources that are not explic-
+itly partitioned, most notably Device Memory Bandwidth
+and Last-Level Cache capacity. As characterized in prior
+studies [17], a latency-sensitive inference job can suffer
+non-deterministic latency spikes (up to 3× [10]) when co-
+located with a bandwidth-heavy training job.
+• Scheduler Obliviousness: Commodity GPU hardware
+schedulers are throughput-oriented and oblivious to high-
+level SLO constraints. Without explicit intervention, a high-
+priority kernel may suffer from head-of-line blocking be-
+hind a massive, non-preemptible background kernel in the
+hardware command queue [65], rendering logical priority
+ineffective.
+While spatial sharing theoretically encompasses the so-
+lution space for meeting SLOs, naive partitioning fails to
+guarantee performance determinism due to unmanaged re-
+source contention. To bridge this gap, the sharing mechanism
+requires an SLO-aware scheduling policy coupled with low-
+latency kernel preemption, ensuring that high-priority queries
+can immediately reclaim resources from best-effort work-
+loads.
+Principle 2: The scheduling framework should be
+SLO-aware and support low-latency preemption.
+3.3
+Challenge-#3: Transparency and Practical-
+ity
+We argue that widespread adoption of GPU sharing hinges
+on deployment transparency: the infrastructure must optimize
+resource usage without imposing any semantic or syntactic
+constraints on the application layer.
+Ideally, the resource management runtime should strictly
+adhere to the end-to-end principle, treating Deep Learning
+models as opaque executables (i.e., "Black Boxes"). This
+decoupling allows for "Day-Zero" support: new model archi-
+tectures can be deployed immediately without engineering
+intervention.
+However, many existing spatial sharing designs [19, 28]
+sacrifice this practicality for theoretical utilization gains. Ap-
+proaches relying on static compiler analysis, operator fusion,
+or manual kernel rewriting introduce a high "Engineering
+Tax". By requiring deep introspection into model graphs or
+invasive source code modifications, these methods tightly cou-
+ple the sharing substrate with specific model implementations.
+This coupling creates a brittle ecosystem where even minor
+updates to framework or model architecture can invalidate the
+optimization logic, necessitating expensive manual retuning.
+The Hidden Cost: Verification Explosion.
+Crucially, this
+coupling imposes a burden beyond development—it funda-
+mentally expands the verification surface. In hyperscale pro-
+duction environments, maintaining offline-to-online equiva-
+lence is non-negotiable. Mechanisms that modify user GPU
+kernels or the runtime environment effectively invalidate rig-
+orous offline validation processes. This operational reality is
+corroborated by infrastructure practitioners at ByteDance [66],
+who note that "mechanisms requiring code rewriting are typi-
+cally rejected not just for complexity, but because they man-
+date a prohibitive re-verification process for every framework
+or model update."
+5
+
+
+--- Page 6 ---
+One-to-One Map
+pCtx1
+GPU Memory
+SMs
+Kernel 1
+pCtx2
+GPU Memory
+SMs
+Client
+Application 1
+vCtx 1
+Mapping
+Client
+Application 2
+vCtx 2
+pCtx3
+RCK
+(pCtxs unallocated)
+Kernel 1
+Mapping Table
+Update
+pCtx4
+pCtx5
+…
+3
+4
+5
+3
+4
+5
+Interception Shim Layer
+CoGPU
+Scheduler
+Kernels Launch
+Pluggable Policies
+K2
+Allocate
+RCK
+Logical View
+Physical View
+K3
+K2
+Figure 3: The overall architecture of DETSHARE.
+Principle 3: The sharing mechanism must be trans-
+parent, precluding any modification to user code or
+model semantics.
+4
+DETSHARE Design
+This section details the design of DETSHARE, a system that
+reconciles execution determinism with high hardware utiliza-
+tion. Existing spatial sharing approaches often compromise
+semantic determinism by transparently altering block size to
+fit fragmented resources [24]. In contrast, DETSHARE adopts
+a transparent spatial multiplexing approach. The core design
+philosophy of DETSHARE is the strict decoupling of logi-
+cal execution flows from physical resource provisioning. By
+maintaining kernel launch configurations as immutable invari-
+ants, DETSHARE ensures that resource elasticity never alters
+the arithmetic behavior of the application.
+We first present the overall system architecture and the core
+GPU Coroutine abstraction (§4.1). We then detail the runtime
+mechanisms for dynamic context binding and cooperative
+preemption (§4.2), followed by the state management opti-
+mizations that enable low-overhead migration (§4.3). Finally,
+we describe the extensible scheduling framework (§4.4) and
+our tiered fault isolation strategy (§4.5).
+4.1
+Overview
+As illustrated in Figure 3, DETSHARE introduces a dynamic
+decoupling layer between the application and the GPU hard-
+ware. The core abstraction enabling this flexibility is the GPU
+Coroutine, which decouples the application’s logical view of
+the device from the underlying physical hardware constraints.
+DETSHARE formalizes this decoupling through two primary
+entities:
+• Virtual Context (vCtx): A persistent, application-
+facing handle that encapsulates the logical execution
+state. DETSHARE exposes vCtx as a fully transparent
+abstraction, functionally equivalent to a standard CUDA
+context from the client’s perspective.
+• Physical Context (pCtx): An ephemeral, hardware-
+backed resource container. Each pCtx is a strictly iso-
+lated execution unit provisioned with a hard limit on
+SMs.
+Determinism via Abstraction. By separating the logical
+definition of a task from its physical execution capacity, DET-
+SHARE guarantees semantic determinism. When resource
+availability fluctuates, DETSHARE does not perform kernel
+atomization (which risks numerical divergence). Instead, it
+employs a migrate-to-yield mechanism: the vCtx is transpar-
+ently rebound to a different pCtx with an adjusted resource
+quota. Consequently, the computational function remains
+Result = F(D,S), independent of the instantaneous resource
+state R(t).
+4.2
+Mechanism: GPU Coroutines
+The DETSHARE runtime manages the lifecycle of GPU
+Coroutines, handling dynamic binding, execution signaling,
+and cooperative preemption.
+The pCtx Pool.
+Dynamically instantiating hardware con-
+texts incurs significant driver latency, which is prohibitive
+for microsecond-scale scheduling. DETSHARE mitigates this
+by maintaining a pre-provisioned pool of pCtx instances at
+initialization. These contexts are configured with discrete SM
+quota tiers (e.g., 25%, 50%, 100%). This pooling strategy re-
+moves control-plane overhead from the critical path, enabling
+zero-allocation-latency dispatch and migration.
+Dynamic Binding and Dispatch.
+DETSHARE maintains
+a Binding Table to track the mapping between active vCtxs
+and physical resources. Upon intercepting a launch API (e.g.,
+cuLaunchKernel), the runtime consults the global scheduler
+to determine the optimal placement. Depending on the current
+mapping and resource state, the dispatch process proceeds
+under two distinct scenarios:
+• Direct Dispatch: If the vCtx is already bound to a pCtx
+that meets current SLO requirements, the kernel is di-
+rectly enqueued to the hardware command queue. This
+execution flow incurs negligible overhead.
+• Context Remapping: If the scheduler detects a priority
+inversion or resource fragmentation, it triggers a Remap-
+ping Event prior to execution. The vCtx is unbound
+from its current container and undergoes a lightweight
+migration to a target pCtx with the appropriate quota.
+Cooperative Preemption via Signaling.
+To support
+latency-sensitive workloads, DETSHARE implements a low-
+latency preemption mechanism that strictly preserves ker-
+nel semantics. As shown in Figure 4, DETSHARE injects a
+lightweight Resident Control Kernel (RCK) into each active
+pCtx. The RCK is a persistent, single-thread kernel consum-
+ing negligible resources (< 0.1% SM occupancy), acting as a
+device-side signal handler.
+6
+
+
+--- Page 7 ---
+Low-Priority 
+Program
+High-Priority 
+Program
+vCtx2
+pCtx1 (Large SM Quota)
+GPU Memory
+                                       SMs
+Kernel 1
+PreemptionTrigger
+RCK
+Kernel 2
+Kernel 3
+pCtx2 (Small SM Quota)
+GPU Memory
+                         SMs
+Kernel 1
+CoGPU
+Scheduler
+pCtx Migration
+RCK
+pCtx Pool
+High-Priority First Policy
+pCtx1
+vCtx1
+pCtx2
+…
+Update
+pCtx1
+vCtx2
+pCtx2
+vCtx1
+…
+pCtx3
+...
+vCtx1
+High-Priority Kernel
+Interrupt!
+Kernel 2
+Kernel 3
+Kernel Reassign
+Lazy Copying
+pCtx4
+pCtx5
+Mapping
+①
+②
+③
+④
+⑤
+Figure 4: An example of Remapping Event and pCtx migra-
+tion.
+When the scheduler necessitates preemption (e.g., to re-
+claim SMs for a high-priority inference task), it asserts a
+flag in a shared memory region mapped to the target pCtx.
+The RCK detects this signal and triggers a cooperative yield.
+Unlike traditional mechanisms that terminate the executing
+kernel, DETSHARE leverages CUDA Stream dependencies
+to pause execution at the nearest kernel or instruction block
+boundary. This safe suspension allows DETSHARE to syn-
+chronize state and initiate the context migration process, effec-
+tively yielding physical resources while preserving the logical
+progress of the preempted task.
+4.3
+State Management and Migration
+Minimizing the volume of data transferred between pCtx
+instances is critical for efficient context migration. Since inter-
+context memory movement typically dominates migration
+latency, DETSHARE employs three complementary optimiza-
+tions to mitigate this overhead: fine-grained working set track-
+ing, dependency-aware input analysis, and demand-driven
+lazy copying.
+Fine-Grained Usage Tracing.
+A naive migration strategy
+that snapshots the entire GPU memory address space incurs
+prohibitive overheads, particularly for GPU kernels that ac-
+cess only a fraction of their allocated buffers. To address this,
+DETSHARE implements fine-grained tracing to monitor the
+"dirty" state and access patterns of memory regions. By main-
+taining a precise view of the active memory footprint for each
+vCtx, the runtime identifies the exact subset of data requiring
+coherence in the destination pCtx, thereby filtering out stale
+or idle pages from the migration set.
+Introspection-Based Input Analysis.
+To further prune the
+migration footprint, DETSHARE performs lightweight data-
+flow analysis on GPU kernel launch parameters. Prior to dis-
+patch, the runtime intercepts execution to examine parameter
+structures and their associated device pointers, deriving the
+minimal closure of memory objects required for correctness.
+By isolating the kernel-reachable working set, DETSHARE
+avoids the indiscriminate transfer of the global heap, restrict-
+ing data movement strictly to the regions touched during exe-
+cution. This approach significantly reduces migration latency,
+especially for workloads exhibiting sparse access patterns
+over large memory allocations.
+Demand-Driven Lazy Copying.
+Finally, DETSHARE lever-
+ages a lazy migration policy to amortize data transfer costs.
+During a migration event, only the critical execution state–
+comprising GPU kernel launch parameters and their immedi-
+ate dependencies—is eagerly transferred to the target pCtx.
+The remainder of the working set is migrated on demand:
+if the resumed kernel accesses a non-resident region, DET-
+SHARE triggers an asynchronous, incremental transfer in the
+background. This strategy eliminates synchronous blocking,
+effectively overlaps communication with computation, and
+ensures that migration remains transparent to the application’s
+control flow.
+4.4
+Extensible Scheduling Framework
+DETSHARE does not enforce a monolithic scheduling algo-
+rithm. Instead, it adopts a decoupled architecture that strictly
+separates the scheduling mechanism (context switching, sig-
+nal injection) from the scheduling policy. This design exposes
+an extensible framework, allowing operators to define custom
+logic tailored to specific application SLOs without modifying
+the underlying runtime.
+The Pluggable Policy Interface.
+DETSHARE abstracts the
+scheduling decision process into a Policy Interface. Users
+or cluster administrators can implement this interface to de-
+fine how DETSHARE reacts to lifecycle events. The frame-
+work exposes key hooks such as OnLaunch, OnCompletion,
+and OnCongestion. By implementing these methods, custom
+policies can inspect the global state—including the active
+pCtx pool status, queuing delays, and historical kernel execu-
+tion profiles—to make granular decisions.
+For example, a user can implement a "Cost-Aware" policy
+that prioritizes throughput during off-peak hours but switches
+to strict latency prioritization when a specific flag is set. DET-
+SHARE treats these policies as pluggable modules, enabling
+the runtime to switch strategies dynamically without recom-
+pilation.
+Reference Policies.
+While the framework is extensible,
+DETSHARE provides two production-grade reference poli-
+cies:
+• SLO-AWARE Policy (Default): This policy targets
+mixed inference-training workloads.
+It utilizes a
+lightweight predictor (based on historical grid sizes and
+duration) to estimate the "Head-of-Line Blocking" time.
+If an incoming high-priority kernel is predicted to miss
+its deadline due to a running background task, the policy
+7
+
+
+--- Page 8 ---
+returns a preempt decision, triggering the mechanism
+described in §4.2.
+• TPOT-FIRST Policy: Designed specifically for gen-
+erative AI, this policy (evaluated in §6.2) introspects
+the semantic phase of LLM inference. It prioritizes the
+decoding phase over the prefill phase, ensuring determin-
+istic inter-token latency even under heavy contention.
+QoS Enforcement Mechanisms.
+Regardless of the cho-
+sen policy, DETSHARE operationalizes scheduling decisions
+through a robust QoS layer. This layer acts as a translation
+barrier, mapping high-level logical directives into concrete
+physical resource partitions. By leveraging hardware-assisted
+isolation primitives for both spatial partitioning and temporal
+throttling, DETSHARE ensures that the user-defined policies
+are strictly bounded by hardware-enforced guarantees, pre-
+venting low-priority workloads from eroding the performance
+isolation of critical tasks.
+4.5
+Fault Isolation
+A robust multi-tenant system must ensure that failures in one
+context do not propagate to others. DETSHARE implements a
+two-tiered fault isolation strategy to handle both fatal excep-
+tions (which compromise correctness) and soft hangs (which
+degrade performance).
+Fatal Exception Containment.
+Fatal exceptions are cat-
+egorized based on their blast radius. Local exceptions (e.g.,
+illegal memory access within a kernel) corrupt only a single
+pCtx. DETSHARE leverages MPS-based static partitioning to
+strictly contain these failures; a crash in one pCtx terminates
+only the bound vCtx, while kernels in concurrent pCtx in-
+stances continue execution uninterrupted. Global exceptions
+(e.g., uncorrectable ECC errors or MMU faults) may contam-
+inate the entire GPU device state. To mitigate cross-context
+impact, DETSHARE employs an emergency migration proto-
+col. Upon detecting a global fault signal, the runtime pauses
+all unaffected vCtx instances and seamlessly migrates them
+to standby pCtx slots on alternative GPUs. This cross-device
+migration ensures high availability even in the presence of
+catastrophic hardware failures.
+Soft Hang Mitigation.
+Soft hangs, such as deadlocks or
+infinite loops, represent non-fatal but resource-wasting stalls.
+The DETSHARE scheduler detects these conditions using
+timeout-based heuristics: if a kernel exceeds its predicted
+execution window by a configurable threshold (e.g., 3×), it
+is flagged as potentially hung. To prevent these pathologi-
+cal workloads from monopolizing resources, the scheduling
+policy progressively demotes the offending vCtx. Upon sub-
+sequent scheduling rounds, the hung kernel is preempted and
+migrated to pCtx instances with strictly capped SM quotas
+(e.g., minimal tier). This "quarantine" approach ensures that
+while the hung task is not immediately killed (preserving de-
+bugging state), its resource consumption is throttled to prevent
+performance degradation for well-behaved concurrent tasks.
+5
+Implementation
+The core of DETSHARE comprises approximately 6,000 lines
+of C++ code and 1,000 lines of CUDA code. To ensure
+both application transparency and fault tolerance, the imple-
+mentation is architected around two primary components: a
+lightweight interception shim layer and a standalone global
+scheduler daemon.
+To interpose on workload submissions without modify-
+ing user codes, the shim layer (see Figure 3) is transparently
+injected via LD_PRELOAD to intercept CUDA Driver and Run-
+time APIs (e.g., cuLaunchKernel, cudaMalloc). These API
+wrappers capture launch metadata and seamlessly enqueue
+requests into lock-free, shared-memory ring buffers. By lever-
+aging shared memory for Inter-Process Communication (IPC)
+with the global scheduler, DETSHARE minimizes submission
+latency and keeps the direct dispatch overhead negligible.
+At the execution level, DETSHARE employs a hardware-
+software co-design to enforce strict physical resource isola-
+tion. The global scheduler instantiates physical GPU contexts
+(the pCtx pool) utilizing NVIDIA Green Contexts, which
+achieve fine-grained spatial partitioning by enforcing hard
+quotas on SMs. To safely multiplex these hardware units
+while strictly preserving the execution semantics of GPU ker-
+nels, DETSHARE orchestrates the contexts over NVIDIA’s
+MPS to guarantee robust address space isolation.
+6
+Evaluation
+Our key takeaways from the evaluation are:
+• Higher Training Throughput: By enabling efficient spa-
+tial sharing, DETSHARE improves training throughput by
+up to 79.2% compared to temporal sharing.
+• Lower Inference Latency: With workload-aware job
+placement policies and lightweight context migration,
+DETSHARE reduces the average inference latency by up
+to 69.1%.
+• Flexible Scheduling Policy: Utilizing our pluggable
+TPOT-FIRST policy, DETSHARE reduces the TPOT SLO
+violation rate by an additional 21.2% relative to the de-
+fault policy, demonstrating robust adaptability to dynamic
+traffic.
+Experimental Setup.
+We evaluate DETSHARE across two
+distinct hardware platforms to capture diverse resource bot-
+tlenecks: an NVIDIA A800 cluster and NVIDIA Hopper
+architecture GPUs (e.g., H20). To accurately reflect multi-
+tenant production environments, our workloads span a broad
+spectrum of AI tasks. Rather than executing tasks in iso-
+lation, we construct rigorous colocation scenarios by pair-
+ing diverse throughput-oriented training jobs together, and
+by co-scheduling heavy background training tasks alongside
+latency-critical LLM inference streams.
+8
+
+
+--- Page 9 ---
+Table 2: Experimental setup for Colocated AI Model Train-
+ing. Workloads are categorized by their dominant resource
+bottleneck.
+Category
+Config
+Colocated Workloads
+Job 1
+Job 2
+High Compute
+Contention
+A
+ResNet-50 [68]
+B
+ResNet-101
+C
+BERT-Large [31]
+D
+BERT-Large
+ResNet-50
+Low Compute
+Contention
+1
+RNN [69]
+2
+DeepFM [70]
+ResNet-101
+LLM Training
+E
+GLM-4-9B [71] (LoRA [72])
+6.1
+End-to-End Performance Evaluation
+We evaluate the end-to-end performance of DETSHARE to
+demonstrate its efficacy in maximizing aggregate throughput
+while maintaining strict performance isolation. Our evaluation
+covers two distinct colocation scenarios: (1) Homogeneous
+and Heterogeneous Model Training (Table 2); and (2) Mixed
+Workload Colocation, pairing throughput-oriented training
+with latency-critical LLM inference (Table 3).
+Baselines.
+We compare DETSHARE against industry-
+standard hardware partitioning mechanisms (NVIDIA MPS
+and MIG), as well as state-of-the-art software-defined sched-
+ulers including Orion [28], Tick-Tock [53], and Salus [67].
+Since the source code for LithOS [24] is not publicly avail-
+able, we implemented a faithful reproduction of its scheduling
+logic based on its design principles to serve as a comparative
+baseline.
+6.1.1
+Colocated AI Model Training
+Figure 5 reports the normalized throughput across all configu-
+rations. DETSHARE consistently achieves superior aggregate
+throughput by effectively balancing SM utilization and mini-
+mizing inter-job interference.
+High Compute Contention (Configs A–D).
+These con-
+figurations represent arithmetic-bound scenarios involving
+compute-intensive models where the GPU’s SMs are satu-
+rated. Traditional temporal sharing and coarse-grained spa-
+tial partitioning often degrade performance due to resource
+fragmentation. Taking Config C (dual BERT-Large) as an ex-
+ample, DETSHARE attains a normalized throughput of 0.58×
+per job. In contrast, rigid partitioning schemes like MIG are
+limited to 0.53×, while temporal sharing (Orion) drops to
+0.50× due to high context-switching overheads. By leverag-
+ing pCtx pooling and dynamic vCtx-pCtx dispatch without
+stalling the pipeline, DETSHARE significantly reduces inter-
+job interference, maintaining high efficiency even under heavy
+arithmetic contention and outperforming static heuristics such
+as GSlice.
+Low Compute Contention (Configs 1–2).
+Workloads such
+as RNNs and DeepFM exhibit intermittent GPU utilization,
+often bounded by memory bandwidth or host-device I/O.
+DETSHARE effectively harvests these ephemeral idle cycles
+(“execution bubbles”) by rapidly migrating vCtxs to under-
+utilized pCtxs. In Config 1 (dual RNN jobs), DETSHARE
+achieves near-optimal isolation with normalized speeds of
+0.99× per job, effectively matching dedicated execution per-
+formance. While baselines like Tick-Tock and Salus plateau
+around 0.85×–0.90×, DETSHARE exhibits superior schedul-
+ing granularity in identifying and filling millisecond-level idle
+slots.
+LLM Training (Config E).
+We further evaluate DET-
+SHARE on large-scale foundation model fine-tuning (GLM-4-
+9B with LoRA). DETSHARE (0.95×) outperforms hardware-
+level partitioning (MIG, 0.93×) by enabling flexible resource
+redistribution rather than static allocation. Notably, static spa-
+tial schedulers like GSlice struggle in this scenario (0.75×–
+0.79×), failing to manage the massive kernel launches and dy-
+namic memory footprints associated with LLMs. DETSHARE
+sustains high execution efficiency even under these intense
+resource demands, highlighting its robust applicability to mod-
+ern GenAI workloads.
+Table 3: Experimental setup for Mixed Workload Colocation.
+We pair a throughput-oriented batch job (Job 1) with a latency-
+critical inference job (Job 2).
+Category
+Config
+Colocated Workloads
+Job 1 (Train)
+Job 2 (Inference)
+CV + LLM
+Inference
+A
+ResNet
+Llama 3 [9]
+B
+ResNet
+GPT-J [73]
+NLP + LLM
+Inference
+1
+BERT
+Llama 3
+2
+BERT
+GPT-J
+6.1.2
+DNN Training with LLM Inference
+To evaluate DETSHARE in mixed-criticality scenarios, we
+pair throughput-oriented training jobs with latency-sensitive
+LLM inference requests. The specific workload combinations
+(Table 3) cover Computer Vision (CV) and NLP models as
+background tasks, colocated with Llama 3 and GPT-J infer-
+ence streams.
+Figure 6 presents the performance trade-offs between batch
+training throughput and inference tail latency. DETSHARE
+demonstrates a superior Pareto frontier compared to all base-
+lines, successfully maintaining strict SLOs for interactive
+workloads while maximizing the utilization of residual GPU
+cycles for background training.
+Guaranteeing Inference SLOs.
+For latency-critical LLM
+workloads, DETSHARE achieves the lowest 99th percentile
+(p99) latency across all configurations. In Config A, DET-
+9
+
+
+--- Page 10 ---
+Figure 5: Normalized throughput of colocated model training tasks (higher is better). DETSHARE consistently outperforms
+baselines, particularly in scenarios with high resource contention or varying interference patterns.
+Figure 6: Performance comparison on mixed workloads. (a)
+DNN training job throughput (higher is better) and (b) LLM
+inference job p99 latency (lower is better) under four config-
+urations. DETSHARE effectively balances system efficiency
+and SLO, outperforming methods like Orion and LithOS in
+both metrics.
+SHARE reduces the p99 latency to 4.5 (normalized units),
+representing a 2.6× and 2.2× reduction compared to Orion
+(12.0) and MIG (10.0), respectively. Similarly, in the more
+memory-intensive Config B (ResNet + GPT-J), DETSHARE
+maintains a p99 latency of 5.9, significantly outperforming
+Orion (15.0) and MPS (10.2). Hardware partitioning meth-
+ods like MIG enforce inflexible spatial boundaries; they lack
+the dynamic prioritization required to accommodate bursty
+inference traffic. Conversely, existing software schedulers
+like Orion fail to provide strict performance isolation. Under
+coarse-grained task co-location, critical inference GPU ker-
+nels are easily starved by heavy training workloads, resulting
+in severe interference. DETSHARE, by contrast, couples com-
+pute resource isolation via Green Contexts with cooperative
+preemption driven by injected RCKs. This joint mechanism
+ensures strict performance isolation and immediate physi-
+cal resource reclamation for latency-sensitive inference tasks,
+without violating semantic determinism.
+Maximizing Training Throughput.
+While prioritizing in-
+ference, DETSHARE does not compromise the progress of
+background training jobs (Job 1). For example, in Config 1,
+DETSHARE achieves a normalized throughput of 0.60, out-
+performing LithOS (0.58), MPS (0.55), and Orion (0.53).
+Because inference workloads exhibit bursty arrival patterns,
+static partitioning (MIG/MPS) leaves compute units under-
+utilized during idle gaps. DETSHARE’s dynamic vCtx-pCtx
+remapping allows the background training job to instantly
+reclaim these idle cycles, maximizing aggregate GPU utiliza-
+tion.
+6.2
+Scheduling Policy Evaluation
+We evaluate the impact of DETSHARE’s extensible scheduling
+policies through a comprehensive case study.
+6.2.1
+Traces and Baselines
+To demonstrate DETSHARE’s transparency and effectiveness
+at the infrastructure layer, we evaluate an unmodified instance
+of the state-of-the-art serving system, SGLang [59], running
+entirely on top of DETSHARE to serve the Llama-3.1-8B-
+Instruct model. We compare this against a baseline of SGLang
+executing on a default, exclusively provisioned GPU.
+We run across three traces representing distinct production
+scenarios:
+10
+
+
+--- Page 11 ---
+Figure 7: End-to-end evaluation on Azure, LongBench, and BurstGPT traces: Throughput (higher is better), Latency Breakdown
+and SLO Violations (lower is better). DETSHARE reduces average and tail latency while maintaining throughput. Adopting the
+TPOT-First strategy further decreases decoding tail latency.
+• Azure LLM Trace 2024 [74]: Highly stochastic request
+arrival times, testing general adaptability.
+• LongBench [75]: Long-context tasks imposing significant
+pressure on GPU memory capacity and bandwidth.
+• BurstGPT [76]: Extreme traffic spikes challenging the
+scheduler’s queue management.
+We analyze DETSHARE under two pluggable configura-
+tions: the DEFAULT Policy (balancing resource fairness) and
+the TPOT-FIRST Policy (explicitly prioritizing the decoding
+phase).
+6.2.2
+Performance Analysis
+Figure 7 depicts the throughput, latency breakdown, and SLO
+violation rates. Overall, DETSHARE-backed SGLang signifi-
+cantly outperforms the baseline. For instance, on the Azure
+trace, DETSHARE reduces the average TTFT by 69.1% (0.55s
+to 0.17s) while maintaining comparable throughput. Further-
+more, DETSHARE demonstrates superior stability by reduc-
+ing the P99 TPOT on LongBench by 4.7× (1723.9ms vs.
+366.2ms). Given that strict tail-latency guarantees during to-
+ken generation are paramount for a seamless interactive user
+experience, this dramatic reduction highlights DETSHARE’s
+efficacy even in severely memory-constrained scenarios.
+Impact of TPOT-FIRST Policy.
+The TPOT-FIRST Pol-
+icy exhibits enhanced robustness in minimizing generation
+latency violations, particularly under fluctuating loads.
+• General Improvement: On the Azure trace, the TPOT-
+First policy reduces TPOT SLO violations by 21.2% com-
+pared to the Default policy.
+• Trade-off in Bursty Scenarios: The advantages of the
+TPOT-First policy are most pronounced in the Burst-
+GPT benchmark. As shown in Figure 7, this policy re-
+duces TPOT SLO violations by 46.1% (17.77% to 9.58%)
+and dramatically lowers the P90 TPOT from 847.7ms to
+262.9ms. However, we observe a concomitant increase in
+TTFT SLO violations, which rise from 4.33% to 6.37%.
+Analysis: We attribute this phenomenon to a necessary
+scheduling trade-off. Under extreme burstiness, the TPOT-
+First policy proactively delays the scheduling of new pre-
+fill requests (increasing TTFT) to reserve compute and
+memory bandwidth for ongoing decoding phases. This
+strategy effectively insulates active requests from interfer-
+ence caused by sudden spikes in arrival rates, ensuring a
+smooth generation experience at the cost of slightly higher
+initial queuing delays.
+11
+
+
+--- Page 12 ---
+Figure 8: Overhead analysis. DETSHARE incurs only 4% and
+12% overhead for context switching and preemption, respec-
+tively, normalized to the exclusive execution.
+6.3
+Overhead Analysis
+Figure 8 quantifies the performance overhead introduced by
+DETSHARE, normalized to the exclusive GPU baseline. Over-
+all, DETSHARE incurs a marginal overhead of 4% for context
+switching and 12% for preemption.
+Analysis.
+The context switching overhead is kept minimal
+because the pCtx leverages Context Memory Tracing to avoid
+redundant data migration between device and host memory.
+The 12% preemption overhead is primarily dominated by the
+internal synchronization costs when the RCK interrupts the
+GPU execution flow. Given the substantial reductions in tail
+latency and SLO violations (e.g., 4.7× lower P99 TPOT),
+we argue that this moderate overhead is a highly favorable
+trade-off for multi-tenant production environments.
+7
+Related Work
+Temporal Sharing.
+Temporal sharing remains the default
+mechanism for multi-tenant GPU execution. Prior systems
+have significantly enhanced this approach for DNN workloads
+by mitigating context-switching overheads through state reuse
+(Salus [67]), dynamically managing containerized or runtime
+memory footprints (Antman [15], TGS [13], Zico [51]), and
+employing predictive scheduling to bound inference tail la-
+tency (Clockwork [64], Gandiva [14]). However, these solu-
+tions inherently operate at the granularity of the entire GPU.
+Consequently, they enforce strict execution serialization and
+fail to overlap computation. This limitation prevents them
+from reclaiming idle capacity during memory-bound phases
+or bursty workloads, leaving significant hardware resources
+underutilized.
+Spatial Sharing.
+Spatial sharing partitions hardware to en-
+able concurrent execution. Foundational mechanisms include
+intra-context CUDA Streams [77] and NVIDIA’s static par-
+titioning tools, MPS and MIG. Systems such as GSlice [19],
+GPUlets [20], and COLTI [78] build upon these primitives
+to construct higher-level spatio-temporal abstractions. Yet,
+because their underlying substrates rely on rigid, static parti-
+tioning, they cannot elastically adapt to the highly dynamic
+resource demands characteristic of modern workloads.
+Recent literature pushes for even finer-grained multiplexing.
+POD-Attention [10] rewrites attention kernels to collocate
+prefill and decode phases, while LithOS [24] atomizes ker-
+nels to pack execution fragments at the Texture Processing
+Cluster (TPC) level. While effective for utilization, these inva-
+sive techniques necessitate user-kernel modifications, risking
+behavioral inequivalence and complicating offline-to-online
+correctness guarantees. In contrast, DETSHARE avoids this
+semantic trap: by decoupling logical contexts from physical
+hardware, it dynamically remaps quotas at runtime to achieve
+elastic, fine-grained spatial multiplexing while strictly pre-
+serving execution determinism.
+LLM Inference Scheduling.
+The unique resource asymme-
+tries of LLM inference have spurred specialized scheduling
+techniques. Recent work manages the prefill-decode imbal-
+ance via stall-free chunking (Sarathi-Serve [47]) and fairness-
+aware phase balancing (FairBatching [79]). Other efforts ex-
+plore temporal scheduling through preemptible context mi-
+grations (Llumnix [80]) and output-length-guided token-level
+preemption (TRAIL [81]), or focus on QoS mitigation via
+adapter-aware caching (Chameleon [82]) and real-time la-
+tency attribution (LLMVisor [83], Niyama [84]). While these
+systems optimize application-level scheduling, DETSHARE
+provides a transparent, infrastructure-level foundation. Its
+extensible policy framework allows operators to plug in di-
+verse algorithms while enforcing execution through strict,
+hardware-level isolation primitives.
+GPU Memory Management and Disaggregation.
+Frame-
+works like AvA [85], rCUDA [16], and DCUDA [86] leverage
+API remoting for disaggregated execution and flexible GPU
+kernel placement. Simultaneously, memory-centric systems
+like DeepUM [87], Zico [51], and TGS [20] optimize device
+utilization by reducing allocation overheads and shrinking
+active working-set footprints. These memory optimization
+and disaggregation techniques are entirely orthogonal and
+complementary to DETSHARE, presenting natural avenues
+for future integration to further maximize efficiency in shared
+environments.
+8
+Conclusion
+In this paper, we identify and resolve the fundamental chal-
+lenges of execution determinism, performance predictabil-
+ity, and practical extensibility in modern GPU sharing. To
+this end, we propose DETSHARE, a transparent GPU sharing
+system designed to maximize hardware utilization without
+compromising determinism. By fundamentally decoupling
+logical execution contexts from physical hardware resources
+via a novel GPU coroutine abstraction, DETSHARE enables
+flexible spatial multiplexing with zero kernel modifications.
+Ultimately, DETSHARE successfully achieves strict seman-
+12
+
+
+--- Page 13 ---
+tic and performance determinism, providing a robust, zero-
+engineering-tax foundation for multi-tenant AI deployments.
+References
+[1] OpenAI. Chatgpt. https://chat.openai.com, 2023. Ac-
+cessed: 2025-11-28.
+[2] Gemini Team, Rohan Anil, Sebastian Borgeaud, Jean-Baptiste
+Alayrac, Jiahui Yu, Radu Soricut, Johan Schalkwyk, Andrew M
+Dai, Anja Hauth, Katie Millican, et al.
+Gemini: a fam-
+ily of highly capable multimodal models.
+arXiv preprint
+arXiv:2312.11805, 2023.
+[3] Xue Jiang, Yihong Dong, Lecheng Wang, Zheng Fang, Qiwei
+Shang, Ge Li, Zhi Jin, and Wenpin Jiao. Self-planning code
+generation with large language models. ACM Transactions on
+Software Engineering and Methodology, 33(7):1–30, 2024.
+[4] Qiuhan Gu. Llm-based code generation method for golang
+compiler testing. In Proceedings of the 31st ACM Joint Euro-
+pean Software Engineering Conference and Symposium on the
+Foundations of Software Engineering, pages 2201–2203, 2023.
+[5] Andrew Zhao, Daniel Huang, Quentin Xu, Matthieu Lin, Yong-
+Jin Liu, and Gao Huang. Expel: Llm agents are experiential
+learners. Proceedings of the AAAI Conference on Artificial
+Intelligence, 38(17):19632–19642, Mar. 2024.
+[6] Gartner. Gartner says ai-optimized iaas is poised to become
+the next growth engine for ai infrastructure, October 2025.
+Accessed: 2025-11-28.
+[7] Tom Sorensen and Bob Sorensen. Cloud-based ai activity for
+hpc: Widespread but primarily exploratory. Technical Report
+HR4.0492.09.20.2024, Hyperion Research, September 2024.
+Accessed: 2025-11-28.
+[8] Yueying Li, Zhanqiu Hu, Esha Choukse, Rodrigo Fonseca,
+G Edward Suh, and Udit Gupta. Ecoserve: Designing carbon-
+aware ai inference systems. arXiv preprint arXiv:2502.05043,
+2025.
+[9] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek
+Kulkarni, Gaurav Goel, Kanshul Nguyen, Punit Kulkarni, et al.
+The Llama 3 herd of models. arXiv preprint arXiv:2407.21783,
+2024.
+[10] Aditya K Kamath, Ramya Prabhu, Jayashree Mohan, Simon Pe-
+ter, Ramachandran Ramjee, and Ashish Panwar. Pod-attention:
+Unlocking full prefill-decode overlap for faster llm inference.
+In Proceedings of the 30th ACM International Conference on
+Architectural Support for Programming Languages and Oper-
+ating Systems, Volume 2, pages 897–912, 2025.
+[11] Edward Ionel. Improving gpu utilization: Strategies and best
+practices. Mirantis Blog.
+[12] Debo
+Ray.
+Why
+your million-dollar gpu
+clus-
+ter
+is
+80
+https://www.devzero.io/blog/
+why-your-gpu-cluster-is-idle.
+[13] Bingyang Wu, Zili Zhang, Zhihao Bai, Xuanzhe Liu, and Xin
+Jin. Transparent {GPU} sharing in container clouds for deep
+learning workloads. In 20th USENIX Symposium on Networked
+Systems Design and Implementation (NSDI 23), pages 69–85,
+2023.
+[14] Wencong Xiao, Romil Bhardwaj, Ramachandran Ramjee,
+Muthian Sivathanu, Nipun Kwatra, Zhenhua Han, Pratyush
+Patel, Xuan Peng, Hanyu Zhao, Quanlu Zhang, et al. Gan-
+diva: Introspective cluster scheduling for deep learning. In
+13th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 18), pages 595–610, 2018.
+[15] Wencong Xiao, Shiru Ren, Yong Li, Yang Zhang, Pengyang
+Hou, Zhi Li, Yihui Feng, Wei Lin, and Yangqing Jia.
+{AntMan}: Dynamic scaling on {GPU} clusters for deep learn-
+ing. In 14th USENIX Symposium on Operating Systems Design
+and Implementation (OSDI 20), pages 533–548, 2020.
+[16] Jose Duato, Antonio J Pena, Federico Silla, Juan C Fernandez,
+Rafael Mayo, and Enrique S Quintana-Orti. Enabling cuda
+acceleration within virtual machines using rcuda. In 2011 18th
+International Conference on High Performance Computing,
+pages 1–10. IEEE, 2011.
+[17] Guin Gilman and Robert J. Walls. Characterizing concur-
+rency mechanisms for nvidia gpus under deep learning work-
+loads (extended abstract). SIGMETRICS Perform. Eval. Rev.,
+49(3):32–34, March 2022.
+[18] Guin Gilman, Samuel S Ogden, Tian Guo, and Robert J Walls.
+Demystifying the placement policies of the nvidia gpu thread
+block scheduler for concurrent kernels. ACM SIGMETRICS
+Performance Evaluation Review, 48(3):81–88, 2021.
+[19] Aditya Dhakal, Sameer G Kulkarni, and K. K. Ramakrishnan.
+Gslice: controlled spatial sharing of gpus for a scalable infer-
+ence platform. In Proceedings of the 11th ACM Symposium on
+Cloud Computing, SoCC ’20, page 492–506, New York, NY,
+USA, 2020. Association for Computing Machinery.
+[20] Seungbeom Choi, Sunho Lee, Yeonjae Kim, Jongse Park,
+Youngjin Kwon, and Jaehyuk Huh. Serving heterogeneous ma-
+chine learning models on {Multi-GPU} servers with {Spatio-
+Temporal} sharing. In 2022 USENIX Annual Technical Con-
+ference (USENIX ATC 22), pages 199–216, 2022.
+[21] Bing-Shiun Han, Tathagata Paul, Zhenhua Liu, and Anshul
+Gandhi. Kace: Kernel-aware colocation for efficient gpu spatial
+sharing. In Proceedings of the 2024 ACM Symposium on Cloud
+Computing, pages 460–469, 2024.
+[22] Aditya Dhakal, Junguk Cho, Sameer G Kulkarni, KK Ramakr-
+ishnan, and Puneet Sharma. Spatial sharing of gpu for autotun-
+ing dnn models. arXiv preprint arXiv:2008.03602, 2020.
+[23] Shulai Zhang, Quan Chen, Weihao Cui, Han Zhao, Chunyu
+Xue, Zhen Zheng, Wei Lin, and Minyi Guo.
+Improving
+gpu sharing performance through adaptive bubbleless spatial-
+temporal sharing. In Proceedings of the Twentieth European
+Conference on Computer Systems, pages 573–588, 2025.
+[24] Patrick H Coppock, Brian Zhang, Eliot H Solomon, Vasilis
+Kypriotis, Leon Yang, Bikash Sharma, Dan Schatzberg, Todd C
+Mowry, and Dimitrios Skarlatos. Lithos: An operating sys-
+tem for efficient machine learning on gpus. In Proceedings
+of the ACM SIGOPS 31st Symposium on Operating Systems
+Principles, pages 1–17, 2025.
+[25] Horace He and Thinking Machines Lab. Defeating nonde-
+terminism in llm inference. Thinking Machines Lab: Con-
+nectionism, 2025. https://thinkingmachines.ai/blog/defeating-
+nondeterminism-in-llm-inference/.
+13
+
+
+--- Page 14 ---
+[26] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong
+Kim, and Byung-Gon Chun. Orca: A distributed serving sys-
+tem for {Transformer-Based} generative models.
+In 16th
+USENIX Symposium on Operating Systems Design and Im-
+plementation (OSDI 22), pages 521–538, 2022.
+[27] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah,
+Íñigo Goiri, Saeed Maleki, and Ricardo Bianchini. Splitwise:
+Efficient generative llm inference using phase splitting. In
+2024 ACM/IEEE 51st Annual International Symposium on
+Computer Architecture (ISCA), pages 118–132. IEEE, 2024.
+[28] Foteini Strati, Xianzhe Ma, and Ana Klimovic.
+Orion:
+Interference-aware, fine-grained gpu sharing for ml applica-
+tions. In Proceedings of the Nineteenth European Conference
+on Computer Systems, pages 1075–1092, 2024.
+[29] NVIDIA Corporation. CUDA Multi-Process Service (MPS)
+Overview, 2025. Describes the MPS client-server model that
+multiplexes multiple processes into a single CUDA context to
+reduce context-switch overhead and enable concurrent kernel
+execution.
+[30] NVIDIA. Cuda driver api – green contexts, 2025. Accessed:
+2025-12-10.
+[31] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina
+Toutanova. Bert: Pre-training of deep bidirectional transform-
+ers for language understanding. In Proceedings of the 2019
+conference of the North American chapter of the association
+for computational linguistics: human language technologies,
+volume 1 (long and short papers), pages 4171–4186, 2019.
+[32] Hangbo Bao, Li Dong, Songhao Piao, and Furu Wei. Beit:
+Bert pre-training of image transformers.
+arXiv preprint
+arXiv:2106.08254, 2021.
+[33] Junnan Li, Dongxu Li, Silvio Savarese, and Steven Hoi. Blip-2:
+Bootstrapping language-image pre-training with frozen image
+encoders and large language models. In International confer-
+ence on machine learning, pages 19730–19742. PMLR, 2023.
+[34] Jeremy Howard and Sebastian Ruder.
+Universal language
+model fine-tuning for text classification.
+arXiv preprint
+arXiv:1801.06146, 2018.
+[35] Ning Ding, Yujia Qin, Guang Yang, Fuchao Wei, Zonghan
+Yang, Yusheng Su, Shengding Hu, Yulin Chen, Chi-Min Chan,
+Weize Chen, et al. Parameter-efficient fine-tuning of large-scale
+pre-trained language models. Nature machine intelligence,
+5(3):220–235, 2023.
+[36] Jason Wei, Maarten Bosma, Vincent Y Zhao, Kelvin Guu,
+Adams Wei Yu, Brian Lester, Nan Du, Andrew M Dai, and
+Quoc V Le. Finetuned language models are zero-shot learners.
+arXiv preprint arXiv:2109.01652, 2021.
+[37] Baolin Peng, Chunyuan Li, Pengcheng He, Michel Galley, and
+Jianfeng Gao. Instruction tuning with gpt-4. arXiv preprint
+arXiv:2304.03277, 2023.
+[38] Haotian Liu, Chunyuan Li, Qingyang Wu, and Yong Jae Lee.
+Visual instruction tuning. Advances in neural information
+processing systems, 36:34892–34916, 2023.
+[39] Yuchen Zhuang, Haotian Sun, Yue Yu, Rushi Qiang, Qifan
+Wang, Chao Zhang, and Bo Dai. Hydra: Model factorization
+framework for black-box llm personalization. Advances in
+Neural Information Processing Systems, 37:100783–100815,
+2024.
+[40] Shuai Zhang, Lina Yao, Aixin Sun, and Yi Tay. Deep learning
+based recommender system: A survey and new perspectives.
+ACM computing surveys (CSUR), 52(1):1–38, 2019.
+[41] Song Han, Huizi Mao, and William J Dally. Deep compres-
+sion: Compressing deep neural network with pruning, trained
+quantization and huffman coding. In ICLR, 2016.
+[42] Geoffrey Hinton, Oriol Vinyals, and Jeff Dean.
+Distill-
+ing the knowledge in a neural network.
+arXiv preprint
+arXiv:1503.02531, 2015.
+[43] Ron Banner, Yury Nahshan, and Daniel Soudry. Post train-
+ing 4-bit quantization of convolutional networks for rapid-
+deployment. Advances in neural information processing sys-
+tems, 32, 2019.
+[44] German I Parisi, Ronald Kemker, Jose L Part, Christopher
+Kanan, and Stefan Wermter. Continual lifelong learning with
+neural networks: A review. Neural networks, 113:54–71, 2019.
+[45] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni,
+Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike
+Lewis, Wen-tau Yih, Tim Rocktäschel, et al.
+Retrieval-
+augmented generation for knowledge-intensive nlp tasks. Ad-
+vances in neural information processing systems, 33:9459–
+9474, 2020.
+[46] Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia, Jinliu Pan,
+Yuxi Bi, Yixin Dai, Jiawei Sun, Haofen Wang, and Haofen
+Wang.
+Retrieval-augmented generation for large language
+models: A survey. arXiv preprint arXiv:2312.10997, 2(1),
+2023.
+[47] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan,
+Nipun Kwatra, Bhargav Gulavani, Alexey Tumanov, and Ra-
+machandran Ramjee. Taming {Throughput-Latency} tradeoff
+in {LLM} inference with {Sarathi-Serve}. In 18th USENIX
+Symposium on Operating Systems Design and Implementation
+(OSDI 24), pages 117–134, 2024.
+[48] Kan Zhu, Yufei Gao, Yilong Zhao, Liangyu Zhao, Gefei Zuo,
+Yile Gu, Dedong Xie, Zihao Ye, Keisuke Kamahori, Chien-
+Yu Lin, et al. {NanoFlow}: Towards optimal large language
+model serving throughput. In 19th USENIX Symposium on
+Operating Systems Design and Implementation (OSDI 25),
+pages 749–765, 2025.
+[49] Rachata Ausavarungnirun, Vance Miller, Joshua Landgraf,
+Saugata Ghose, Jayneel Gandhi, Adwait Jog, Christopher J
+Rossbach, and Onur Mutlu. Mask: Redesigning the gpu mem-
+ory hierarchy to support multi-application concurrency. ACM
+SIGPLAN Notices, 53(2):503–518, 2018.
+[50] Zhihao Bai, Zhen Zhang, Yibo Zhu, and Xin Jin. {PipeSwitch}:
+Fast pipelined context switching for deep learning applications.
+In 14th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 20), pages 499–514, 2020.
+[51] Gangmuk Lim, Jeongseob Ahn, Wencong Xiao, Youngjin
+Kwon, and Myeongjae Jeon. Zico: Efficient {GPU} mem-
+ory sharing for concurrent {DNN} training. In 2021 USENIX
+Annual Technical Conference (USENIX ATC 21), pages 161–
+175, 2021.
+14
+
+
+--- Page 15 ---
+[52] Manos Pavlidakis, Stelios Mavridis, Antony Chazapis, Giorgos
+Vasiliadis, and Angelos Bilas. Arax: a runtime framework
+for decoupling applications from heterogeneous accelerators.
+In Proceedings of the 13th Symposium on Cloud Computing,
+pages 1–15, 2022.
+[53] Guanhua Wang, Kehan Wang, Kenan Jiang, Xiangjun Li, and
+Ion Stoica.
+Wavelet: Efficient dnn training with tick-tock
+scheduling. Proceedings of Machine Learning and Systems,
+3:696–710, 2021.
+[54] NVIDIA Corporation. NVIDIA Multi-Instance GPU (MIG)
+User Guide, 2025. Describes GPU partitioning into multiple
+isolated GPU instances with dedicated compute, cache, and
+memory resources, enabling spatial sharing with strong isola-
+tion.
+[55] Baolin Li, Tirthak Patel, Siddharth Samsi, Vijay Gadepally, and
+Devesh Tiwari. Miso: exploiting multi-instance gpu capabil-
+ity on multi-tenant gpu clusters. In Proceedings of the 13th
+Symposium on Cloud Computing, pages 173–189, 2022.
+[56] David Goldberg. What every computer scientist should know
+about floating-point arithmetic.
+ACM computing surveys
+(CSUR), 23(1):5–48, 1991.
+[57] NVIDIA Corporation. cuBLAS library documentation. https:
+//docs.nvidia.com/cuda/cublas/index.html, 2025.
+[58] Aleksei Petrenko, Ben Lipkin, Kevin Chen, Erik Wijmans,
+Marco Cusumano-Towner, Raja Giryes, and Philipp Krähen-
+bühl. Entropy-preserving reinforcement learning. In Interna-
+tional Conference on Learning Representations (ICLR), 2026.
+[59] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun,
+Jeff Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion
+Stoica, Joseph E. Gonzalez, Clark Barrett, and Ying Sheng.
+SGLang: Efficient execution of structured language model
+programs. In Proceedings of the 38th Annual Conference on
+Neural Information Processing Systems (NeurIPS), 2024.
+[60] LMSYS Org.
+SGLang v0.4.3: Deterministic attention
+and pytorch-native backend.
+https://lmsys.org/blog/
+2025-09-22-sglang-deterministic/, September 2025.
+[61] Peichen Xie, Xian Zhang, and Shuo Chen. Repdl: Bit-level
+reproducible deep learning training and inference, 2025.
+[62] Jiacai Liu, Yingru Li, Yuqian Fu, Jiawei Wang, Qian Liu, and
+Zhuo Jiang. When speed kills stability: Demystifying RL
+collapse from the training-inference mismatch.
+https://
+richardli.xyz/rl-collapse, September 2025.
+[63] Sergey Ioffe and Christian Szegedy. Batch normalization: Ac-
+celerating deep network training by reducing internal covariate
+shift. In International conference on machine learning, pages
+448–456. pmlr, 2015.
+[64] Arpan Gujarati, Reza Karimi, Safya Alzayat, Wei Hao, Antoine
+Kaufmann, Ymir Vigfusson, and Jonathan Mace. Serving dnns
+like clockwork: performance predictability from the bottom up.
+In Proceedings of the 14th USENIX Conference on Operating
+Systems Design and Implementation, OSDI’20, USA, 2020.
+USENIX Association.
+[65] Weihang Shen, Mingcong Han, Jialong Liu, Rong Chen, and
+Haibo Chen. Xsched: preemptive scheduling for diverse xpus.
+In Proceedings of the 19th USENIX Conference on Operating
+Systems Design and Implementation, OSDI ’25, USA, 2025.
+USENIX Association.
+[66] ByteDance Infrastructure Team. Private communication re-
+garding production gpu sharing constraints. Personal Commu-
+nication, 2026. Unpublished industry insights.
+[67] Peifeng Yu and Mosharaf Chowdhury. Salus: Fine-grained
+GPU sharing primitives for deep learning applications. In
+Proceedings of the 3rd MLSys Conference (MLSys), Austin,
+TX, USA, March 2020.
+[68] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+Deep residual learning for image recognition. In Proceed-
+ings of the IEEE conference on computer vision and pattern
+recognition (CVPR), pages 770–778, 2016.
+[69] David E Rumelhart, Geoffrey E Hinton, and Ronald J Williams.
+Learning representations by back-propagating errors. Nature,
+323(6088):533–536, 1986.
+[70] Huifeng Guo, Ruiming Tang, Yunming Ye, Zhenguo Li, and
+Xiuqiang He. DeepFM: a factorization-machine based neural
+network for CTR prediction. In Proceedings of the 26th In-
+ternational Joint Conference on Artificial Intelligence (IJCAI),
+pages 1725–1731, 2017.
+[71] GLM-4 Team and Zhipu AI. GLM-4: Towards open source
+language models for academic research.
+arXiv preprint
+arXiv:2406.12793, 2024.
+[72] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu,
+Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen. LoRA:
+Low-rank adaptation of large language models. In Interna-
+tional Conference on Learning Representations (ICLR), 2022.
+[73] Ben Wang and Aran Komatsuzaki.
+GPT-J-6B: A 6 bil-
+lion parameter autoregressive language model.
+https:
+//github.com/kingoflolz/mesh-transformer-jax,
+2021. EleutherAI.
+[74] Jovan Stojkovic, Chaojie Zhang, Íñigo Goiri, Josep Torrel-
+las, and Esha Choukse. DynamoLLM: Designing LLM in-
+ference clusters for performance and energy efficiency. In
+Proceedings of the 31st IEEE International Symposium on
+High-Performance Computer Architecture (HPCA), 2025. Best
+Paper Award.
+[75] Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang,
+Zhidian Huang, Zhengxiao Du, Xiao Liu, Aohan Zeng, Lei
+Hou, Yuxiao Dong, Jie Tang, and Juanzi Li. LongBench: A
+bilingual, multitask benchmark for long context understanding.
+In Proceedings of the 62nd Annual Meeting of the Association
+for Computational Linguistics (ACL), 2024.
+[76] Yuxin Wang, Yibo Chen, Zhaozhu Li, Xinyu Kang, Yinan
+Fang, Yangtian Zhou, Yujie Zheng, Zhennan Tang, Xiuming
+He, Rong Guo, Xin Wang, Qiang Wang, Aoying Zhou, and
+Xiaowen Chu. BurstGPT: A real-world workload dataset to
+optimize LLM serving systems. In Proceedings of the 31st
+ACM SIGKDD Conference on Knowledge Discovery and Data
+Mining (KDD), 2025.
+[77] Cuda
+runtime
+api
+::
+Cuda
+toolkit
+documentation.
+https://docs.nvidia.com/cuda/cuda-runtime-api/
+group__CUDART__STREAM.html, November 2025. (Accessed
+on 01/12/2025).
+15
+
+
+--- Page 16 ---
+[78] Jaiaid Mobin, Avinash Maurya, and M Mustafa Rafique. Colti:
+Towards concurrent and co-located dnn training and inference.
+In Proceedings of the 32nd International Symposium on High-
+Performance Parallel and Distributed Computing, pages 309–
+310, 2023.
+[79] Hongtao Lyu, Boyue Liu, Mingyu Wu, and Haibo Chen. Fair-
+batching: Fairness-aware batch formation for llm inference.
+arXiv preprint arXiv:2510.14392, 2025.
+[80] Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao, Xinyi
+Zhang, Yong Li, and Wei Lin. Llumnix: Dynamic scheduling
+for large language model serving. In 18th USENIX symposium
+on operating systems design and implementation (OSDI 24),
+pages 173–191, 2024.
+[81] Rana Shahout, Chunwei Liu, Weifan Jiang, Minlan Yu, Michael
+Mitzenmacher, et al. Don’t stop me now: Embedding based
+scheduling for llms. In The Thirteenth International Confer-
+ence on Learning Representations, 2025.
+[82] Nikoleta Iliakopoulou, Jovan Stojkovic, Chloe Alverti, Tianyin
+Xu, Hubertus Franke, and Josep Torrellas. Chameleon: Adap-
+tive caching and scheduling for many-adapter llm inference
+environments. In Proceedings of the 58th IEEE/ACM Inter-
+national Symposium on Microarchitecture®, pages 217–231,
+2025.
+[83] Shuowei Jin, Xueshen Liu, Jiaxin Shan, Le Xu, Tieying Zhang,
+Liguang Xie, and Z Morley Mao. Llmvisor: A real-time latency
+attribution model for multi-tenant llm serving.
+[84] Kanishk Goel, Jayashree Mohan, Nipun Kwatra, Ravi Shreyas
+Anupindi, and Ramachandran Ramjee.
+Niyama: Break-
+ing the silos of llm inference serving.
+arXiv preprint
+arXiv:2503.22562, 2025.
+[85] Hangchen Yu, Arthur Michener Peters, Amogh Akshintala,
+and Christopher J Rossbach. Ava: Accelerated virtualization
+of accelerators. In Proceedings of the Twenty-Fifth Interna-
+tional Conference on Architectural Support for Programming
+Languages and Operating Systems, pages 807–825, 2020.
+[86] Fan Guo, Yongkun Li, John CS Lui, and Yinlong Xu. Dcuda:
+Dynamic gpu scheduling with live migration support. In Pro-
+ceedings of the ACM Symposium on Cloud Computing, pages
+114–125, 2019.
+[87] Jaehoon Jung, Jinpyo Kim, and Jaejin Lee. Deepum: Tensor
+migration and prefetching in unified memory. In Proceedings
+of the 28th ACM International Conference on Architectural
+Support for Programming Languages and Operating Systems,
+Volume 2, pages 207–221, 2023.
+16

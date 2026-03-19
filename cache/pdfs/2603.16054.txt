@@ -1,0 +1,994 @@
+--- Page 1 ---
+inference-fleet-sim:
+A Queueing-Theory-Grounded Fleet Capacity Planner
+for LLM Inference
+Huamin Chen1
+Xunzhuo Liu1
+Yuhan Liu2
+Junchen Jiang3
+Bowei He4∗
+Xue Liu4
+1vLLM Semantic Router Project
+2University of Chicago
+3Tensormesh Inc / UChicago
+4MBZUAI / McGill University
+2026
+Abstract
+Sizing a GPU fleet for LLM inference is harder than it looks. The obvious questions—
+how many GPUs, which type, where to split a two-pool fleet—have no closed-form answers.
+They depend on the full token-length distribution, the routing policy, and queueing dynamics
+that turn ugly under heavy-tailed workloads. Existing tools [Agrawal et al., 2024, Xu et al.,
+2025] optimize per-engine configuration for a fixed GPU count; none of them address the
+upstream question of how many GPUs to buy and how to arrange them.
+inference-fleet-sim fills that gap.
+It combines analytical M/G/c queueing with
+discrete-event simulation (DES) to find the minimum-cost fleet configuration that empiri-
+cally meets a P99 TTFT SLO. It includes a physics-informed GPU performance model cov-
+ering A10G, A100, and H100 across monolithic, two-pool-routed, and disaggregated topolo-
+gies, all without requiring access to real hardware. We run the tool on seven fleet-planning
+scenarios drawn from two public workload traces (LMSYS, Azure) and one synthetic agent-
+heavy trace. Each one surfaces a result that simple analysis gets wrong—the right split
+threshold, the cheapest GPU type, whether an apparently idle fleet is actually broken—and
+shows why joint simulation of queueing, routing, and hardware is necessary to find it.
+1
+Introduction
+GPU infrastructure for LLM inference is expensive. A100 and H100 GPUs rent for roughly
+$1.50–$7.00 per GPU-hour depending on cloud provider and contract type [Laurent, 2026]—
+AWS and Google Cloud on-demand H100 rates settled around $3.00–$3.93 after a 44% AWS
+price cut in June 2025, while specialty clouds and marketplaces undercut hyperscalers with
+H100 rates as low as $1.49–$1.99/hr.1 A fleet of 24 nodes therefore runs $315K–$1.47M per
+year depending on provider, before software, networking, and operations costs. Despite this,
+the basic sizing question—how many GPUs to serve λ requests per second with P99 TTFT
+≤T ms?—has no clean analytical answer. It depends on the joint distribution of prompt and
+∗Corresponding author: Bowei.He@mbzuai.ac.ae
+1The simulator’s pre-built profiles (fleet_sim/gpu_profiles/profiles.py) use cost_per_hr defaults of $2.21
+(A100 80 GB) and $4.02 (H100 80 GB), calibrated against 2024 Lambda Labs on-demand rates. These defaults
+can be overridden with current pricing via ManualProfile. All cost-efficiency rankings in this paper are robust to
+moderate (±30%) price changes because the ratios between configurations matter more than the absolute dollar
+figures.
+1
+arXiv:2603.16054v1  [cs.DC]  17 Mar 2026
+
+
+--- Page 2 ---
+completion lengths, the routing policy, the GPU hardware, and nonlinear queueing dynamics
+that get especially bad under heavy tails.
+Available tools are built for related but different problems. Vidur [Agrawal et al., 2024]
+and AIConfigurator [Xu et al., 2025] tune per-engine configuration (tensor parallelism, batch
+size, chunk size, KV-cache fraction) for a given GPU cluster; they presuppose that the fleet
+size is already decided. Mélange [Griggs et al., 2024] picks the optimal mix of GPU types for
+a given workload and SLO, but it does not model pool routing or multi-pool queue dynamics.
+SageServe [Jia et al., 2025] and TokenScale [Dong et al., 2024] autoscale a live fleet in response
+to traffic; they need production traces and real hardware, and they answer a runtime question,
+not a procurement one. DistServe [Zhong et al., 2024] and Splitwise [Patel et al., 2024] study
+prefill/decode disaggregation within a single cluster, not fleet-level pool routing.
+None of these tools answer the provisioning question: given a token-length CDF, an arrival
+rate λ, an SLO, and a catalog of GPU types, what is the minimum-cost fleet—number of pools,
+split boundary Bshort, GPU type per pool, routing policy—that actually meets the SLO?
+inference-fleet-sim answers that question. Its contributions are:
+1. A two-phase optimizer that uses the M/G/c Kimura approximation for a fast analytical
+sweep to identify candidate configurations, then runs DES to verify the top candidates
+against actual queueing dynamics.
+2. A physics-informed GPU performance model parameterized by (W, H, nmax)—baseline
+compute, memory-bandwidth cost per concurrent sequence, and maximum KV-slot count—
+that computes expected service times without any hardware access. Constants are cali-
+brated from published hardware data [Xu et al., 2025] for A10G, A100-80GB, and H100-
+80GB.
+3. Seven capacity-planning case studies (Section 4) where simulation produces a different
+answer than analytical intuition: the optimal split threshold is not readable off the CDF;
+a 30%-utilized fleet fails its SLO; a slow GPU beats a fast one on cost; GPU scaling
+is sub-linear; the sizing router should not be the production router; mixed GPU types
+can fail even as they save money; and in disaggregated serving, the cheaper GPU should
+handle prefill, not decode.
+4. Reliability-aware sizing via a node_avail parameter derived from published GPU failure-
+rate and MTTR data [Kokolis et al., 2024, Cui et al., 2025], so that production fleet counts
+account for nodes under repair.
+2
+Background
+2.1
+KV-Cache Slots and the Cost Cliff
+LLM serving systems [Kwon et al., 2023] allocate GPU memory in PagedAttention blocks. An
+A100-80GB holds 65,536 blocks of 16 tokens each. A sequence needing up to B tokens requires
+⌈B/16⌉blocks; the maximum concurrent sequences per GPU is nmax(B) = ⌊65 536/⌈B/16⌉⌋.
+At B = 8,192 this is 128; at B = 65,536 it drops to 16. That 8× ratio is the main lever on
+fleet cost.
+In a two-pool fleet, requests with total token budget Lin + Lout ≤Bshort go to the short
+pool Ps (many concurrent sequences, high throughput); longer requests go to the long pool Pl
+(few concurrent sequences, large KV cache). The cost savings over a homogeneous fleet is not
+monotone in Bshort: it depends on the fraction of traffic below Bshort and the resulting queue
+imbalance. That interaction is what the simulator resolves (Section 4.1).
+A request at Bshort + 1 tokens lands in the long pool and consumes a slot provisioned for
+the full context—8× more capacity than its neighbor just below the threshold. Requests in
+the borderline band (Bshort, γBshort] are not genuinely long; Compress-and-Route [Chen et al.,
+2026] addresses this by squeezing such prompts back below Bshort at the gateway.
+2
+
+
+--- Page 3 ---
+2.2
+The M/G/c Queue and Kimura’s Approximation
+Each GPU pool is modeled as an M/G/c queue: Poisson arrivals at rate λ, general service time
+with mean E[S] and squared coefficient of variation C2
+s = Var[S]/(E[S])2, and c parallel servers
+(GPUs). The Erlang-C formula gives the probability an arriving request has to wait:
+C(c, ϱ) =
+(cϱ)c/(c! (1 −ϱ))
+Pc−1
+k=0(cϱ)k/k! + (cϱ)c/(c! (1 −ϱ)),
+(1)
+where ϱ = λ/(cµ) is per-server utilization.
+The standard two-moment M/G/c approxima-
+tion [Kimura, 1994] gives the P99 queue wait:
+W99 ≈
+C(c, ϱ)
+cµ(1 −ϱ) · 1 + C2
+s
+2
+· ln(100).
+(2)
+For high-C2
+s workloads—agent traffic where service times range from milliseconds to minutes—
+M/M/c badly underestimates tail latency. The (1 + C2
+s)/2 term corrects for this, and the DES
+validates whether the correction is sufficient (Section 4.2).
+GPU iteration latency under continuous batching scales with concurrent sequences n:
+titer(n) = W + H · n,
+(3)
+where W (ms) is baseline compute and H (ms/slot) is the memory-bandwidth cost per con-
+current sequence. For Llama-3-70B on A100-80GB: W = 8 ms, H = 0.65 ms/slot. Expected
+service time for a request with Lin input and Lout output tokens is:
+E[S] = ⌈Lin/Cchunk⌉+ Lout
+nmax
+· titer(nmax),
+(4)
+where Cchunk is the prefill chunk size. TTFT decomposes as:
+TTFT = Wqueue + ⌈Lin/Cchunk⌉· titer(nmax)
+|
+{z
+}
+Tprefill
++titer(nmax).
+(5)
+For large requests near Bshort, Tprefill alone can eat most of the SLO budget even when there is
+no queue wait at all. This is invisible in (2) and only shows up in a full simulation.
+3
+Simulator Design
+3.1
+Two-Phase Optimization
+The joint space of (ns, nl, Bshort, GPU type) is large enough that exhaustive DES simulation is
+impractical. The two-phase design (Figure 1) sidesteps this.
+Phase 1—Analytical sweep. For each candidate (Bshort, ns, nl), the model:
+1. Splits λ into λs = λ · F(Bshort) and λl = λ · (1 −F(Bshort)) using the workload CDF F.
+2. Computes E[S] and C2
+s for each pool by integrating over F restricted to that pool’s length
+range.
+3. Evaluates (2) and the full TTFT (5) to check whether both pools meet the SLO under
+the utilization cap ϱ ≤0.85.
+4. Records total GPU cost cs · costs + cl · costl.
+The sweep runs in milliseconds and produces a ranked list of candidates.
+Phase 2—DES verification. The top-k candidates are verified by simulation:
+1. A Poisson arrival stream at rate λ is generated; each request’s lengths are drawn i.i.d.
+from the empirical CDF.
+3
+
+
+--- Page 4 ---
+Workload
+(CDF / Trace)
+GPU Profiles
+(A10G/A100/H100)
+Fleet Config
+(PoolConfig)
+FleetOptimizer
+(analytical sweep)
+DES Verifier
+(top-k candidates)
+FleetSimResult
+P99 / Cost / Util
+Pareto frontier
+(ns, nl, Bshort)
+candidates
+Figure 1: Two-phase fleet optimizer. The analytical sweep finds the lowest-cost candidate pool
+configurations; DES verifies the top candidates under actual queueing dynamics.
+2. Requests are routed to pools; each pool runs n GPU instances, each simulating continuous
+batching with a min-heap event queue.
+3. The simulation collects per-request queue wait, TTFT, and end-to-end latency. The SLO
+check is P99 TTFT ≤T.
+The DES is request-level, not token-level: each request fires exactly two events (arrival and
+completion), so simulating 104 requests takes under one second.
+3.2
+GPU Performance Model
+Each GPU type is characterized by (W, H, nmax, Cmax):
+GPU
+W (ms)
+H (ms/slot)
+nmax at 8K ctx
+VRAM (GB)
+A10G 24GB
+12.0
+0.90
+64
+24
+A100 80GB
+8.0
+0.65
+128
+80
+H100 80GB
+4.0
+0.32
+256
+80
+These are the hand-calibrated constants in fleet_sim/gpu_profiles/profiles.py (ManualProfile),
+targeting Llama-3-70B with single-node TP serving. ProfileBuilder can derive equivalent
+constants from first principles using the roofline decomposition from AIConfigurator [Xu et al.,
+2025]. Users can substitute measured constants from a Vidur [Agrawal et al., 2024] profiling
+run via ManualProfile for higher accuracy.
+Model fidelity. For chatbot workloads (low C2
+s), the Kimura model is conservative by
+8–14% vs. DES: it over-predicts P99 TTFT, so the analytically selected GPU count passes
+DES comfortably. For agent workloads (high C2
+s, service times from milliseconds to minutes),
+Erlang-C assumes bounded variance and under-estimates tail latency; DES is authoritative in
+that regime. Puzzle 2 (Section 4.2) demonstrates this directly.
+3.3
+Workload Model
+The simulator accepts two workload formats.
+Empirical CDF. A JSON file mapping cumulative probability to token-budget breakpoints.
+Three CDFs ship with the tool:
+• LMSYS [Zheng et al., 2024]: chat conversations; long-tailed to 65K tokens; F(4,096) ≈
+0.984.
+• Azure LLM Trace [Microsoft Azure, 2023]: enterprise chat; 78% of requests below 2K
+tokens; max context 8K.
+4
+
+
+--- Page 5 ---
+• Agent-heavy (synthetic): a bimodal CDF modeling coding-agent sessions in the style of
+SWE-bench, with 46% of requests above 4K tokens and a heavy tail to 300K tokens. This
+is not from a public production trace; results for it should be read accordingly.
+Poisson with synthetic lengths. For sensitivity analysis, the workload generator syn-
+thesizes Poisson arrivals with token lengths drawn from a Pareto or log-normal distribution.
+Sub-stream Poisson note. Routing by token length splits the Poisson stream with a
+deterministic rule, not independent random thinning. By the Poisson thinning theorem, the
+sub-streams are not strictly Poisson—a standard engineering approximation [Harchol-Balter,
+2013]. When prompt length and arrival time are correlated, queue-length estimates may be off.
+The DES checks whether the approximation holds in each case.
+3.4
+Routing Algorithms
+The simulator includes four routing policies:
+LengthRouter Send to Ps if total token budget ≤Bshort, else to Pl. Default production policy.
+CompressAndRoute Compress borderline requests (Bshort < Ltotal ≤γBshort) down to Bshort
+before sending to Ps; intended for fleet sizing, not production [Chen et al., 2026].
+RandomRouter Route uniformly at random across pools; baseline.
+ModelRouter Route to one of N model-specific pools via a semantic classifier; supports multi-
+model fleets.
+3.5
+Reliability-Aware Sizing
+GPU hardware fails at measurable rates. The node_avail parameter A ∈(0, 1] represents the
+fraction of nodes in steady-state operation; a pool analytically sized to n GPUs gets rounded
+up to ⌈n/A⌉in production. The simulator computes A as:
+A =
+1
+1 + rf · MTTR,
+(6)
+where rf is failures per node-day and MTTR is mean time to repair in days. Pre-computed
+constants from the literature [Kokolis et al., 2024, Cui et al., 2025]:
+Constant
+Value
+Scenario
+A100_AVAIL_RSC1_FAST
+0.9989
+Soft failure (driver reset, ∼4h MTTR)
+A100_AVAIL_RSC1_SLOW
+0.9871
+Hard failure (GPU/NVLink swap, ∼48h MTTR)
+H100_AVAIL_5PCT
+0.9500
+5% overprovisioning rule [Cui et al., 2025]
+The utilization cap ϱmax = 0.85 covers queueing stability; node_avail covers hardware
+reliability. These are independent concerns and both apply in production.
+4
+Case Studies
+Seven scenarios follow, each a question that comes up in practice and cannot be resolved from the
+workload CDF alone. All runs use Llama-3-70B as the served model unless noted. GPU costs
+are illustrative 2026 spot-instance rates: A10G $8.85K/yr, A100 $19.4K/yr, H100 $35.2K/yr;
+the qualitative ordering of results holds under moderate price variation.
+4.1
+Puzzle 1: Where Exactly Should I Split?
+The workload CDF says most requests are short—but short compared to what?
+The split
+threshold Bshort controls which requests land in the high-efficiency short pool. Getting it right
+is not obvious: too low and the long pool handles too much traffic; too high and the short
+5
+
+
+--- Page 6 ---
+pool’s slot advantage disappears. We sweep Bshort ∈{512, 1024, 2048, 4096, 8192, 12288} for
+three workloads at representative arrival rates.
+LMSYS, λ = 100 req/s, A100, SLO=500 ms.
+Table 1: Pareto frontier for Bshort selection on LMSYS. Homogeneous baseline: 14 A100s at
+$271K/yr.
+Bshort
+αs
+ns
+nl
+GPUs
+$/yr
+Saving
+SLO
+512
+63.8%
+2
+13
+15
+$290K
+−7.1%
+✓
+1,024
+83.1%
+2
+10
+12
+$232K
++14.3%
+✓
+2,048
+94.8%
+2
+7
+9
+$174K
++35.7%
+✓
+4,096
+98.4%
+3
+5
+8
+$155K
++42.9%
+✓←optimal
+8,192
+99.7%
+4
+4
+8
+$155K
++42.9%
+✓
+12,288
+99.9%
+5
+3
+8
+$155K
++42.9%
+✓
+Bshort = 4096 routes 98.4% of LMSYS traffic short. At that boundary the short pool runs
+256 concurrent sequences vs. 16 for the long pool—a 16× slot advantage that cuts the fleet from
+14 GPUs to 8 (−43% cost). By contrast, Bshort = 512 costs 7% more than going homogeneous:
+it leaves only 64% of traffic in the short pool, too little to offset the Erlang fragmentation in
+the long pool.
+Azure (λ = 200, A100).
+The entire Azure CDF fits within 8K tokens (context ratio
+= 2×). The best Pareto point (Bshort = 3072) saves only 4% cost, but cuts short-pool P99 from
+26 ms to 19 ms. Here, splitting is about latency isolation, not cost.
+Agent (λ = 200, A100, SLO=500 ms). Bshort = 16384 (64 KV slots vs. 16 for homo)
+saves 64 GPUs (−13.3%). At Bshort = 32768 the SLO breaks—not from queue wait, but because
+long-pool requests carry 300–600 ms prefill times that use up the entire SLO budget. Adding
+more GPUs does not help; the only fix is a lower Bshort. This failure is invisible in (2).
+Insight 1. The optimal Bshort cannot be read off the CDF. It depends on the interaction
+between slot efficiency, traffic fraction, and Erlang fragmentation across both pools—and a
+factor-of-2 mistake can cost more than not splitting at all.
+4.2
+Puzzle 2: Why Is My Agent Fleet Failing SLO?
+A 24-GPU H100 fleet at λ = 20 req/s sits at ∼30% utilization. The Erlang-C model says the
+fleet is fine. Users are seeing latency violations.
+Table 2: Agent fleet SLO analysis (λ = 20, H100, SLO=1000 ms).
+Config
+GPUs
+Cost/yr
+P99 TTFT
+SLO
+Homo 65K ctx
+24
+$845K
+1,052 ms
+× FAIL
+Two-pool 4K/65K
+25
+$880K
+17ms / 147ms
+✓
+The M/G/c model assumes i.i.d. service times drawn from a distribution with bounded
+variance. Agent requests span 10–300 seconds of service (SWE-bench-style coding tasks); Cs ≫
+1. A single 300-second request locks a KV slot for five minutes, blocking subsequent requests
+even when GPU utilization reads low. Erlang-C, which uses only mean service time, misses this
+entirely.
+The DES replays the actual arrival sequence with realistic service time draws. At ϱ ≈0.30, it
+measures P99 TTFT = 1,052 ms because long-tail service events create cascading back-pressure
+that persists for hundreds of seconds.
+6
+
+
+--- Page 7 ---
+Moving to a two-pool design routes the 46% of long requests (> 4K tokens) to a dedicated
+23-GPU pool, where their slow service cannot block short requests. Short-request P99 drops to
+17 ms. The cost increase is +4%.
+Insight 2. For agent or heavy-tail workloads, the analytical model does not err on the safe
+side—it approves fleets that are broken. DES is the only way to catch head-of-line blocking
+when C2
+s ≫1.
+4.3
+Puzzle 3: Which GPU Type Is Actually Cheapest?
+An operator is picking between A10G ($8.85K/yr), A100 ($19.4K/yr), and H100 ($35.2K/yr)
+for an Azure-workload fleet at λ = 100 req/s. The instinct is: faster GPU, fewer GPUs, lower
+cost.
+Table 3: GPU type vs. layout (Azure, λ = 100, SLO=500 ms).
+GPU
+Layout
+GPUs
+Cost/yr
+P99 TTFT
+A10G
+Two-pool
+19
+$168K
+155ms / 335ms
+H100
+Homo
+6
+$211K
+26ms
+A100
+Two-pool
+12
+$232K
+52ms / 112ms
+H100
+Two-pool
+7
+$247K
+13ms / 30ms
+The instinct is wrong. A10G in a two-pool layout is cheapest at $168K—$43K less than 6
+H100s. A10G’s low per-card cost ($8.85K/yr vs. $35.2K/yr) means 19 cards still totals less than
+6 H100s. The two-pool layout compensates for A10G’s lower throughput: at Bshort = 4096,
+each A10G gets nmax = 128 concurrent sequences in the short pool vs. 64 at max ctx=8K—a
+2× slot bonus.
+Different constraints call for different choices:
+Priority
+Choice
+Minimum annual cost
+A10G two-pool ($168K)
+Minimum rack space / power
+H100 homo (6 GPUs)
+Best short-request latency
+H100 two-pool (13 ms P99)
+Long-context / agent workload
+H100 or A100 (A10G VRAM limits KV cache)
+Insight 3. GPU cost depends on pool topology, not just price and throughput. The slot
+multiplier from a well-chosen Bshort can make a slower, cheaper GPU the minimum-cost
+option.
+4.4
+Puzzle 4: When Do I Need to Add GPUs?
+Traffic is growing. At what arrival rate does the current fleet run out of headroom, and how
+much warning does the operator have?
+GPU scaling is sub-linear: traffic grows 16× (25→400 req/s) but GPU count grows only
+5.75× (4→23).
+This is a consequence of Erlang-C convexity—each additional GPU pushes
+down utilization ϱ, which reduces tail latency at an accelerating rate, so each marginal GPU is
+increasingly effective. The table gives the exact λ at which each fleet size runs out of headroom.
+Waiting until SLO is already broken means at least one traffic bracket with degraded P99 before
+new capacity comes online.
+7
+
+
+--- Page 8 ---
+Table 4: GPU step thresholds, H100 two-pool fleet (Azure, SLO=500 ms).
+λ (req/s)
+GPUs
+Cost/yr
+Provision more before λ =
+25
+4
+$141K
+65
+50
+5
+$176K
+90
+100
+7
+$247K
+130
+150
+10
+$352K
+185
+200
+12
+$423K
+270
+300
+18
+$634K
+370
+400
+23
+$810K
+—
+Insight 4. GPU provisioning does not scale linearly with traffic. The whatif sweep pro-
+duces exact step thresholds, so capacity planning can stay ahead of demand rather than
+react to violations.
+4.5
+Puzzle 5: Which Router Causes SLO Violations?
+The fleet is correctly sized. Does the choice of routing policy still matter? We compare three
+routers on the agent fleet (λ = 20, ns = 2, nl = 23 H100s, SLO=1000 ms).
+Table 5: Router comparison on the agent fleet.
+Router
+P99 TTFT
+SLO 1000 ms
+LengthRouter
+495 ms
+✓99.98%
+CompressAndRoute
+534 ms
+× 99.94%
+RandomRouter
+292 ms
+✓100%
+Two results are unexpected. First, CompressAndRoute fails the SLO even though it was
+designed to reduce the GPU count. It compresses borderline requests and routes them to the
+2-GPU short pool; when several arrive together, they overwhelm that pool and spike P99.
+CompressAndRoute is a sizing tool—it finds the minimum GPU count—but LengthRouter
+should be what runs in production.
+Second, RandomRouter actually passes with the lowest P99 (292 ms) by spreading all 25
+GPUs’ KV slots uniformly and diluting heavy-tail service events. But this is brittle: short
+requests share slots with long ones, so any shift in the traffic mix can cause unpredictable
+latency. For standard chatbot workloads at low utilization, all three routers pass comfortably.
+Insight 5. The router used to size the fleet and the router deployed in production should be
+different. CompressAndRoute finds the floor on GPU count; LengthRouter operates that
+fleet safely. Conflating them produces SLO violations the sizing simulation never predicted.
+4.6
+Puzzle 6: Does Mixing GPU Types Save Money?
+Short requests are memory-bandwidth-bound and inexpensive to serve; long requests need large
+KV caches and fast prefill. Can an operator save money by putting cheap GPUs in the short
+pool and premium GPUs only in the long pool?
+On Azure, A10G+H100 saves 9% vs. all-A100 with the same 12 GPUs. Cheap A10Gs handle
+98% of the traffic; the H100s go where the long context warrants them.
+On LMSYS at 65K context, the picture changes sharply. A10G+A100 is 11% cheaper on
+paper, but it fails the SLO: prefill time for a 65K-token request on A100 reaches 700–2800 ms,
+8
+
+
+--- Page 9 ---
+Table 6: Mixed GPU types, Azure workload (λ = 100, SLO=500 ms).
+Config
+GPUs
+Cost/yr
+P99-short
+P99-long
+All-A100
+12
+$232K
+52 ms
+112 ms
+A10G Ps + H100 Pl
+12
+$212K
+155 ms
+30 ms
+A10G Ps + A100 Pl
+15
+$206K
+155 ms
+112 ms
+Table 7: Mixed GPU types, LMSYS workload (λ = 100, max ctx=65K, SLO=500 ms).
+Config
+GPUs
+Cost/yr
+P99-short
+P99-long
+All-A100
+8
+$155K
+43 ms
+2,822 ms ×
+A10G Ps + H100 Pl
+7
+$141K
+129 ms
+181 ms ✓
+A10G Ps + A100 Pl
+9
+$132K
+129 ms
+2,822 ms ×
+blowing past the 500 ms budget before any queue wait is counted. H100’s larger chunk size
+(1024 vs. 512) and lower W halve that time. A10G+H100 saves 9% vs. all-A100 and fixes the
+SLO that all-A100 couldn’t meet.
+Insight 6. Mixing GPU types is not just a cost optimization; the wrong long-pool GPU
+makes the SLO infeasible regardless of how many you add. Joint optimization over pool
+assignment and GPU type is required, and some pairings are simply invalid.
+4.7
+Puzzle 7: When Should I Switch to Disaggregated Serving?
+Disaggregated prefill/decode (P/D) serving [Zhong et al., 2024, Patel et al., 2024] separates
+compute-bound prefill from memory-bandwidth-bound decode onto different GPU pools. Which
+GPU should handle prefill, which decode, and does the cost saving justify the higher TTFT
+from KV-transfer overhead?
+Table 8:
+Disaggregated P/D configurations (Azure λ
+=
+100,
+TTFT SLO=500 ms,
+TPOT
+SLO=100 ms).
+KV-transfer
+adds
+1.8×
+raw
+prefill
+time
+(BETA_TTFT=1.80
+in
+fleet_sim/optimizer/disagg.py).
+Config
+GPUs
+Cost/yr
+TTFT
+TPOT
+All-A100 aggregated
+12
+$232K
+26 ms
+—
+All-H100 aggregated
+6
+$211K
+8 ms
+—
+H100P + A100D
+7 (1P+6D)
+$151K
+162 ms
+91 ms
+H100P + H100D
+4 (1P+3D)
+$141K
+162 ms
+45 ms
+A100P + H100D
+4 (1P+3D)
+$125K
+492 ms
+45 ms
+Disaggregation cuts cost by 35–46% vs. aggregated serving, at the price of higher TTFT
+from KV-transfer overhead. The optimal assignment—A100 prefill, H100 decode—is counter-
+intuitive. H100 decode workers process 2.5× more requests per second than A100 (lower W,
+faster per-token iteration), so only 3 are needed vs. 6. One A100 handles all prefill at λ = 100
+req/s. Despite H100 costing 1.82× more per card, it is the decode pool where the premium
+pays off.
+Two practical thresholds emerge. For TTFT SLO ≤200 ms, use H100P+H100D ($141K,
+TTFT=162 ms). For TTFT SLO ≤100 ms, disaggregated serving is not viable and aggregated
+H100 ($211K) is the only option. At arrival rates below ∼50 req/s, the operational complexity
+9
+
+
+--- Page 10 ---
+of disaggregation—separate scaling policies, KV-transfer networking—is not justified by the
+savings.
+Insight 7. In disaggregated serving, the premium GPU should handle decode, not prefill.
+The counter-intuitive assignment emerges from joint optimization over decode throughput,
+GPU cost, and KV-transfer TTFT overhead—not something readily derived by hand.
+4.8
+Puzzle 8: How Much Grid Power Can I Shed Without an SLO Breach?
+Data centers increasingly participate in grid demand-response (DR) programs, where the grid
+operator requests a temporary power reduction (typically 10–30% for 15–60 minutes) in ex-
+change for reduced electricity tariffs or ancillary-service revenue.
+The GPU-to-Grid (G2G)
+framework [Hassan et al., 2025] demonstrates that capping the serving engine’s maximum in-
+flight batch size (max_num_seqs in vLLM) is the most effective software knob for modulating
+GPU power: fewer concurrent requests reduce memory-bandwidth pressure, lowering power
+draw without touching clock frequency or voltage. The trade-off is higher queuing delay, which
+may breach the TTFT SLO.
+inference-fleet-sim quantifies the trade-off via grid_flex_analysis(). The function
+sweeps target power-reduction percentages, inverts the GPU power model to find the implied
+batch cap (nmax), and recomputes P99 TTFT with the reduced KV-slot count using the same
+M/G/c approximation used in optimization.
+Power model.
+Each GPU profile implements the logistic power curve from the G2G
+paper [Hassan et al., 2025] (Eq. 2):
+P(b) =
+Prange
+1 + e−k (log2 b−x0) + Pidle
+where b ≈nmax (concurrent requests), Prange = Pnom −Pidle, and the shape parameters
+(k = 1.0, x0 = 4.2) are fitted to ML.ENERGY Benchmark v3.0 data [Chung et al., 2025]
+for H100-SXM5 running vLLM. The logistic fit gives P(1)≈304 W and P(128)≈583 W (mea-
+sured: ≈600 W, error <3%). The M/G/c service rate is recalibrated at each batch cap so the
+analytical model reflects the faster-per-iteration throughput at lower concurrency. A DES run
+with N = 15,000 requests independently verifies the analytical P99 estimates.
+Table 9: Grid flexibility curve for 40 H100 GPUs, λ = 200 req/s, SLO = 500 ms (Azure work-
+load). Logistic power model, DES-verified. For short-burst DR events (≲75 s) the fleet safely
+commits up to 40% power curtailment; steady-state stability holds to 30%.
+Flex
+nmax
+W/GPU
+Fleet kW
+P99 anal.
+P99 DES
+SLO
+0%
+128
+583 W
+23.3 kW
+7.9 ms
+35 ms
+✓
+10%
+48
+540 W
+21.6 kW
+7.9 ms
+38 ms
+✓
+20%
+24
+479 W
+19.1 kW
+7.9 ms
+41 ms
+✓
+30%
+13
+413 W
+16.5 kW
+7.9 ms
+51 ms
+✓
+40%
+6
+350 W
+14.0 kW
+∞
+190 ms
+✓†
+50%
+1
+304 W
+12.2 kW
+∞
+≫SLO
+×
+†Safe for short DR events (<2 min); analytically unstable at steady state.
+The logistic model reveals a key G2G insight: at full production load (nmax = 128), H100
+power is already at ≈97% of nominal. Halving the batch from 128 to 64 saves only ≈13 W
+(∼2%). Meaningful savings require deep batch reduction (e.g., 40% flex at nmax = 6, saving
+9.3 kW fleet-wide), which approaches but does not breach the Erlang-C saturation threshold for
+time-limited DR events.
+10
+
+
+--- Page 11 ---
+The DES verification confirms the analytical recalibrated estimates for 0–30% flex (both
+predict P99 ≈8–50 ms). At 40% flex, the analytical model flags steady-state instability (∞)
+while DES shows P99 = 190 ms during a 75-second event window—still within the 500 ms SLO.
+At 50%, both DES and analysis agree the queue collapses.
+Insight 8. The safe DR commitment depth depends on event duration. For sustained
+reduction (hours), the recalibrated M/G/c model shows 30% is the stability limit. For
+short events (minutes), DES verification shows 40% is feasible (saves 9.3 kW from 23.3 kW
+baseline) before the queue collapses catastrophically at 50%. inference-fleet-sim is the
+only tool that provides both bounds together from a single workload CDF and GPU profile.
+5
+Limitations
+Poisson sub-stream approximation.
+Splitting a Poisson stream by token length is a deter-
+ministic rule, not random thinning, so the sub-streams are not strictly Poisson [Harchol-Balter,
+2013]. When prompt length correlates with arrival time (e.g., long requests arrive in bursts),
+queue-length estimates from the analytical model are approximations. The DES checks the
+approximation in each case.
+Request-level service model.
+The DES fires one event per request, not one per decode
+iteration.
+It does not simulate preemption, batching reorder, or speculative decoding.
+For
+detailed scheduler comparison, Vidur [Agrawal et al., 2024] provides higher fidelity at the cost
+of slower simulation.
+Linear roofline performance model.
+The GPU model uses a linear (W, H) roofline. Non-
+linear effects such as FlashAttention speedup, quantization, and NCCL overlap are absorbed
+into calibrated constants but not explicitly modeled.
+Users can replace any constant with
+measured data for higher accuracy.
+Single-node replica model.
+Each GPU instance is assumed to be a single-node replica.
+Inter-node communication overhead for tensor-parallel configurations (NVLink vs. InfiniBand)
+is not modeled; users should adjust W and H to reflect collective latency when running multi-
+node TP.
+Logistic power model accuracy.
+Grid flex analysis (§4.8) uses a logistic power curve fitted
+to ML.ENERGY Benchmark v3.0 H100-SXM5 data [Chung et al., 2025]. The fit is accurate to
+within ∼3% at batch ≥16; at batch < 8 (deep curtailment) it is less well-constrained because
+few ML.ENERGY data points fall in that regime. The analytical M/G/c model is recalibrated
+at each batch-cap level, correcting for the faster per-iteration throughput at lower concurrency;
+DES verification provides an independent check. Users should re-fit power_logistic_k and
+power_logistic_x0 from measured vllm serve profiling runs for their specific model and
+GPU generation.
+6
+Related Work
+Single-instance simulators.
+Vidur [Agrawal et al., 2024] simulates one engine replica at
+operator level (GEMM, attention, KV-cache management, preemption) with < 9% latency pre-
+diction error. It optimizes engine configuration for a fixed GPU cluster and does not address
+fleet-level pool routing or cost. APEX [Lin et al., 2024] is an extensible, dynamism-aware sim-
+ulator for selecting parallel execution plans (TP/PP/data parallelism) across dense and MoE
+11
+
+
+--- Page 12 ---
+LLMs; it finds optimal plans 71× faster than GPU-based search but targets intra-cluster paral-
+lelism, not inter-pool fleet topology. AIConfigurator [Xu et al., 2025] searches TP/EP/batch-size
+configurations against a calibrated kernel performance database in under 30 seconds; its output
+(W/H constants) feeds inference-fleet-sim’s ProfileBuilder.
+GPU type selection. Mélange [Griggs et al., 2024] formulates heterogeneous GPU allo-
+cation as cost-aware bin packing and achieves up to 77% cost reduction vs. single-GPU-type
+deployments. It chooses GPU types but does not model pool routing or multi-pool queue dynam-
+ics. inference-fleet-sim takes the GPU type as input—chosen optionally with Mélange—and
+sizes the fleet.
+Disaggregated serving. DistServe [Zhong et al., 2024] introduces P/D disaggregation and
+models each phase as an M/D/1 queue. Splitwise [Patel et al., 2024] co-designs heterogeneous
+hardware for the two phases. inference-fleet-sim’s DisaggFleetOptimizer builds on these
+ideas by sizing fleets of disaggregated pool pairs using M/G/c with the full token-length CDF.
+Runtime autoscaling. SageServe [Jia et al., 2025] uses ARIMA forecasting and ILP scaling
+to manage an existing O365 fleet, saving 25% GPU-hours. TokenScale [Dong et al., 2024] uses
+Token Velocity as a leading indicator for burst handling in disaggregated fleets. Both operate at
+runtime; inference-fleet-sim operates at the provisioning layer and provides the peak-hour
+sizing that SageServe and TokenScale scale around.
+Queueing theory in systems. Two-moment M/G/c approximations [Kimura, 1994] have
+been applied to DNN serving in Clockwork [Gujarati et al., 2020] and AlpaServe [Li et al.,
+2023]. inference-fleet-sim extends this to multi-pool, multi-GPU-type LLM fleet planning
+with DES validation.
+Tool
+Core question answered
+Vidur
+Best batching/scheduling config for one GPU?
+APEX
+Best TP/PP/data-parallel plan for one cluster?
+AIConfigurator
+Best TP/EP/engine flags for one cluster?
+Mélange
+Which GPU types to mix for minimum cost?
+Splitwise
+Which GPU generation for prefill vs. decode?
+DistServe
+Prefill-to-decode GPU ratio per cluster replica?
+TokenScale
+Scale P/D pools in real time under bursts?
+SageServe
+VM count through a 24-hour demand cycle?
+inference-fleet-sim
+Pool topology, routing policy, total GPU count, fleet cost?
+7
+Conclusion
+inference-fleet-sim is a two-phase LLM GPU fleet capacity planner that combines analytical
+M/G/c optimization with discrete-event simulation to find minimum-cost fleet configurations
+that meet a P99 TTFT SLO. Running it on eight scenarios across two public workload traces,
+one synthetic agent trace, and one demand-response study produced findings that resist simple
+analysis: the optimal split threshold is not readable off the CDF; a 30%-utilized fleet can fail its
+SLO; a slow, cheap GPU can be cheaper than a fast, expensive one; GPU scaling is sub-linear;
+sizing-time and production routers should differ; mixed GPU pools have invalid pairings the
+simulator flags before purchase; in disaggregated serving, the premium GPU earns back its cost
+in decode, not prefill; and a 40-GPU H100 fleet can commit 30% sustained power curtailment or
+40% short-event curtailment (saving 9.3 kW) while meeting SLO—with the G2G logistic power
+curve and DES verification confirming both bounds.
+These results emerge from the joint space of pool topology, routing policy, GPU performance,
+queueing dynamics, and now power management.
+No single tool in the existing ecosystem
+explores that space; inference-fleet-sim does.
+12
+
+
+--- Page 13 ---
+inference-fleet-sim is open-source and part of the vLLM Semantic Router project [vLLM
+Project Contributors, 2026]. All case-study results are reproducible via the run_sim.py CLI
+and the CDF data files in the repository.
+References
+Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S
+Gulavani, Ramachandran Ramjee, and Alexey Tumanov. Vidur: A large-scale simulation
+framework for LLM inference, 2024. URL https://arxiv.org/abs/2405.05465.
+Huamin Chen, Xunzhuo Liu, Junchen Jiang, Bowei He, and Xue Liu. Compress-and-route:
+Routing-layer prompt compression against the long-context cost cliff in LLM inference fleets.
+arXiv preprint, 2026. Manuscript under review.
+Jae-Won Chung, Woosuk Kwon, and Ion Stoica. LLM-Pilot: Characterize and optimize infer-
+ence of LLMs on dedicated GPU servers. In Proc. NeurIPS Datasets and Benchmarks Track,
+2025. URL https://ml.energy/leaderboard. ML.ENERGY Benchmark v3.0: measured
+H100-SXM5 GPU power vs. batch size (1–256) running vLLM on Llama-3.1 variants. Idle
+(batch≈1) ≈300 W; saturated (batch=128) ≈600 W for 70B-class model.
+Shengkun Cui, Archit Patke, Hung Nguyen, Aditya Ranjan, Ziheng Chen, Phuong Cao, Gre-
+gory Bauer, Brett Bode, Catello Di Martino, Saurabh Jha, Chandra Narayanaswami, Daby
+Sow, Zbigniew T. Kalbarczyk, and Ravishankar K. Iyer.
+Story of two GPUs:
+Charac-
+terizing the resilience of Hopper H100 and Ampere A100 GPUs. arXiv:2503.11901, 2025.
+URL https://arxiv.org/abs/2503.11901. 11.7M GPU-hours on Delta (1,056 A100+H100
+GPUs); recommends ∼5% H100 overprovisioning.
+Chenhe Dong et al. TokenScale: Timely and accurate autoscaling for disaggregated LLM serving
+with token velocity. arXiv:2512.03416, 2024. URL https://arxiv.org/abs/2512.03416.
+Tyler Griggs, Xiaoxuan Liu, Jiaxiang Yu, Doyoung Kim, Wei-Lin Chiang, Alvin Cheung, and
+Ion Stoica. Mélange: Cost efficient large language model serving by exploiting GPU hetero-
+geneity. arXiv:2404.14527, 2024. URL https://arxiv.org/abs/2404.14527.
+Arpan Gujarati, Reza Karimi, Safya Alzayat, Wei Hao, Antoine Kaufmann, Ymir Vigfusson,
+and Jonathan Mace.
+Serving DNNs like clockwork: Performance predictability from the
+bottom up. In Proc. OSDI, 2020.
+Mor Harchol-Balter. Performance Modeling and Design of Computer Systems: Queueing Theory
+in Action. Cambridge University Press, 2013.
+M. Hassan, J. Lin, D. Kim, R. Bhatt, Y. Wang, N. Li, and S. Grijalva. GPU-to-Grid: Coupling
+LLM inference with power system control. arXiv:2602.05116, 2025. URL https://arxiv.
+org/abs/2602.05116. Shows vLLM max_num_seqs is the primary GPU power knob; power
+follows a logistic curve vs. log2(batch size); data from ML.ENERGY Benchmark on H100-
+SXM5.
+Ningxin Jia et al. SageServe: Optimizing LLM serving on cloud data centers with forecast
+aware auto-scaling. arXiv:2502.14617, 2025. URL https://arxiv.org/abs/2502.14617.
+Toshikazu Kimura.
+Two-moment approximations for the mean waiting time in the M/G/c
+queue. J. Oper. Res. Soc. Japan, 37(3):238–256, 1994.
+Apostolos Kokolis, Michael Kuchnik, John Hoffman, Adithya Kumar, Parth Malani, Faye Ma,
+Zachary DeVito, Shubho Sengupta, Kalyan Saladi, and Carole-Jean Wu. Revisiting reliability
+13
+
+
+--- Page 14 ---
+in large-scale machine learning research clusters.
+arXiv:2410.21680, 2024.
+URL https:
+//arxiv.org/abs/2410.21680. RSC-1 failure rate: 6.50 per 1000 node-days; MTTF at 1024
+GPUs ≈7.9 h.
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu,
+Joseph E. Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large
+language model serving with PagedAttention. In Proc. SOSP, 2023.
+Adrien Laurent.
+H100 rental prices compared: $1.49–$6.98/hr across 15+ cloud providers
+(2026). https://intuitionlabs.ai/articles/h100-rental-prices-cloud-comparison,
+March 2026. Comprehensive 2026 survey of on-demand GPU cloud prices: H100 ranges $1.49–
+$6.98/GPU-hr (marketplace to Azure); AWS P5 on-demand approx. $3.93/GPU-hr after June
+2025 44% price cut; A100 now below $2.06/GPU-hr on major providers and sub-$1/hr on
+open marketplace.
+Zhuohan Li, Lianmin Zheng, Yinmin Zhong, Vincent Liu, Ying Sheng, Xin Jin, Yanping Huang,
+Zhifeng Chen, Hao Zhang, Joseph E. Gonzalez, and Ion Stoica. AlpaServe: Statistical mul-
+tiplexing with model parallelism for deep learning serving. In Proc. OSDI, 2023.
+Yi-Chien Lin, Woosuk Kwon, Ronald Pineda, and Fanny Nina Paravecino.
+APEX: An ex-
+tensible and dynamism-aware simulator for automated parallel execution in LLM serving.
+arXiv:2411.17651, 2024.
+URL https://arxiv.org/abs/2411.17651.
+Intra-cluster paral-
+lelism plan search (TP/PP/data); 71× faster than GPU-based exploration; validated against
+vLLM and SGLang.
+Microsoft
+Azure.
+Azure
+LLM
+inference
+trace
+2023.
+https://github.com/Azure/
+AzurePublicDataset, 2023.
+Pratyush Patel, Esha Choukse, Chaojie Zhang, Íñigo Goiri, Brijesh Warrier, Nithish Ma-
+halingam, and Ricardo Bianchini. Splitwise: Efficient generative LLM inference using phase
+splitting. In Proc. ISCA, 2024.
+vLLM Project Contributors. vLLM semantic router. https://github.com/vllm-project/
+semantic-router, 2026.
+Open-source LLM request routing framework;
+includes the
+inference-fleet-sim fleet capacity planner.
+Tianhao Xu, Yiming Liu, Xianglong Lu, Yijia Zhao, Xuting Zhou, Aichen Feng, Yiyi Chen,
+et al. AIConfigurator: Lightning-fast configuration optimization for multi-framework LLM
+serving. arXiv:2601.06288, 2025. URL https://arxiv.org/abs/2601.06288.
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Tianle Li, Siyuan Zhuang, Zhanghao Wu, Yong-
+hao Zhuang, Zhuohan Li, Zi Lin, Eric P. Xing, Joseph E. Gonzalez, Ion Stoica, and Hao Zhang.
+LMSYS-Chat-1M: A large-scale real-world LLM conversation dataset. In Proc. ICLR, 2024.
+Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao
+Zhang. DistServe: Disaggregating prefill and decoding for goodput-optimized large language
+model serving. In Proc. OSDI, 2024. URL https://arxiv.org/abs/2401.09670.
+14
