@@ -1,10 +1,29 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-03-19
+**Last Updated:** 2026-03-22
 
 ---
 
 ## Recent Papers
+
+#### 2026-03-22 (2 papers)
+
+### [CausalEvolve: Towards Open-Ended Discovery with Causal Scratchpad](https://arxiv.org/abs/2603.14575)
+
+**2026-03-15** | Carnegie Mellon University, MBZUAI, Hong Kong Baptist University, The University of Sydney | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* CausalEvolve with causal scratchpad leveraging LLMs to identify and reason about guiding factors for evolution, incorporating outcome-level and procedure-level factors, multi-arm bandit for intervention, and abductive reasoning. | *LLM role:* heuristic_generator
+
+> CausalEvolve enhances LLM evolutionary search frameworks (like AlphaEvolve and ShinkaEvolve) by introducing a causal scratchpad that extracts outcome- and procedure-level factors to explicitly guide program mutations via a Multi-Armed Bandit. The results are backed by solid empirical numbers, showing it outperforms the state-of-the-art ShinkaEvolve across four algorithmic and mathematical tasks (Hadamard, Autocorrelation, Circle Packing, AIME) by up to 9.1% in best-found scores. The single most useful takeaway for us is their 'surprise detection' module: using LLMs to perform abductive reasoning when a seemingly good combination of factors yields a score drop, thereby uncovering hidden confounders and generating new search directions. This is highly relevant to our work; we should immediately evaluate their MAB-driven causal intervention strategy and procedure-level factor extraction to improve the sample efficiency and memory mechanisms in AlgoEvo.
+
+### [Procedural Generation of Algorithm Discovery Tasks in Machine Learning](https://arxiv.org/abs/2603.17863)
+
+**2026-03-18** | University of Oxford, University College London, University of California, Santa Barbara, University of Wisconsin–Madison, Delft University of Technology | M=6 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Procedural generation of algorithm discovery tasks using configurable parameters for domains, modules, and datasets | *LLM role:* research_agent, prompt_optimizer
+
+> This paper introduces DiscoGen, a procedural generator that combinatorially creates millions of algorithm discovery tasks (varying domains, editable modules, and datasets) with strict meta-train/meta-test splits to evaluate and train Algorithm Discovery Agents (ADAs). The results are backed by extensive empirical evaluation of open-source LLMs on a fixed subset (DiscoBench), demonstrating that current ADAs struggle with multi-module discovery and that prompt-tuning over a diverse set of procedurally generated tasks significantly improves generalization. The single most useful takeaway is the combinatorial task generation approach (toggling which modules are editable vs. fixed), which provides a brilliant blueprint for creating an autocurriculum to train our 'evolver' agents. This matters immensely for us; we should immediately consider using DiscoGen to evaluate AlgoEvo, and adapt their procedural task generation strategy to create diverse OR/routing environments for our own RL-infused evolutionary search training.
+
 
 #### 2026-03-19 (4 papers)
 
