@@ -1,0 +1,1061 @@
+--- Page 1 ---
+AREAL-HEX: Accommodating Asynchronous RL Training
+over Heterogeneous GPUs
+Ran Yan1∗, Youhe Jiang1∗, Tianyuan Wu1, Jiaxuan Gao2, Zhiyu Mei3, Wei Fu2, Haohui
+Mai1, Wei Wang1, Yi Wu2, Binhang Yuan1
+1HKUST, 2Tsinghua University, 3Ant Group
+∗Equal contribution
+Abstract
+Maximizing the training throughput and cost-efficiency of reinforcement learning (RL) for large
+language models (LLMs) is essential to democratize this advanced technique. One promising but
+challenging approach is to deploy such a computational workflow over heterogeneous GPU clusters.
+Unlike conventional large-scale LLM pretraining, RL training generally decomposes into three cou-
+pled stages, i.e., rollout generation, reward computation, and policy/value updates, which exhibit
+markedly different compute intensities, memory footprints, and communication patterns. Recent
+research shows that fully asynchronous RL training can disaggregate these stages across disjoint
+hardware pools without sacrificing training stability, creating a great opportunity for real-world
+heterogeneous deployment. Towards this end, we present AREAL-HEX, a heterogeneity-aware asyn-
+chronous RL training system that effectively schedules how to execute rollout generation and policy
+model training over heterogeneous GPU clusters while enforcing data staleness bounds. Concretely,
+AREAL-HEX uses a two-phase scheduler: (i) a constrained search with mixed-integer linear pro-
+gramming to select per-stage parallelization strategies and workload assignments given a resource
+budget, and (ii) a graph-partitioning step that allocates heterogeneous GPUs and interconnects to
+maximize end-to-end throughput. Built atop a fully asynchronous RL architecture, AREAL-HEX maps
+HBM-I/O-bound generation and compute-bound optimization to more cost-efficient resources and
+balances their producer–consumer interactions to avoid both idleness and stale rollout trajectories.
+On the mathematical reasoning task with various model scales (1.5B, 7B, and 14B), compared to
+homogeneous deployments of state-of-the-art asynchronous RL systems: (i) When maintaining the
+same total budgets, AREAL-HEX delivers up to 1.50× higher training throughput; (ii) When achieving
+the same training throughput, AREAL-HEX results in up to 1.46× reduction in training cost.
+1
+Introduction
+Reinforcement learning (RL) has emerged as a popular approach for enhancing large language models (LLMs)
+across various tasks [1], including math [2], code generation [3], agentic tool use [4], etc, which becomes
+essential to advance the development of AI. Unlike conventional large-scale pretraining by standard stochastic
+gradient-based optimization, RL training comprises multiple coupled stages, where each stage includes
+heterogeneous compute intensities, memory footprints, and communication patterns [5]; furthermore, recent
+study suggests that asynchronous RL paradigm can effectively disaggregate these different stages over different
+set of hardwares without compromising the stability in RL training [6, 7]. Such an intrinsic computational
+heterogeneity under the disaggregated infrastructure naturally provides a great opportunity to deploy such a
+1
+arXiv:2511.00796v1  [cs.DC]  2 Nov 2025
+
+
+--- Page 2 ---
+Pipeline Parallelism
+Tensor Parallelism
+Data Parallelism
+H20-96G
+H100-80G
+Model Replica/DP Worker i
+Trajectory
+Workload
+Model
+Weights
+Rollout Worker
+Parallelism Strategy
+Workload Assignment
+Rollout Input
+𝐑𝟏
+Policy Training
+Parallelism Strategy
+Workload Assignment
+Trajectory Workload
+1
+2
+𝐑𝟏
+𝐑𝟐
+𝐑𝟑
+𝐑𝟒
+𝐑𝟏
+𝐑𝟐
+𝐑%
+𝐑𝟏
+𝐑𝟐
+𝐑𝟏
+𝐑𝟐
+𝐑𝟑
+𝐑𝟒
+Rollout Worker 1
+Rollout Worker 2
+Rollout Worker 3
+Rollout Worker 4
+Train Worker 1
+Train Worker 2
+Time
+Model Training
+Rollout Generation
+Model Update
+Figure 1 Left: Illustration of the asynchronous RL training workflow. The computations for rollout generation and model
+training are overlapped. When a new version of model weights becomes available, both rollout and training processes
+are temporarily paused to update the rollout workers’ weights. Right: An example of scheduling results. Multiple rollout
+replicas, potentially configured with distinct parallelization strategies and hardware resources, are created to perform
+rollout generation tasks. (i) Once rollouts are completed, they are transmitted to the training workers. (ii) When the
+updated model weights are ready, training workers broadcast the new weights to rollout workers via NCCL collective
+communication operations.
+workflow over a heterogeneous GPU cluster. In this paper, we explore how to effectively schedule asynchronous
+RL workloads on heterogeneous resources to maximize end-to-end RL training throughput and cost-efficiency.
+Deploying asynchronous RL training in heterogeneous environments promises substantial gains in resource
+utilization and reductions in service cost. RL training for LLM is highly resource-intensive and includes three
+different stages: (i) rollout generation, which conducts HBM IO–bound inference on GPUs that produces
+multiple responses (known as rollout) per prompt; (ii) reward estimation, which uses strategies that may require
+large numbers of CPU cores (e.g., sandboxed execution for coding tasks or rule-based evaluation for math)
+or additional GPU capacity for LLM-based value models; and (iii) model training, which is compute-bound
+GPU updates of the policy (and optionally value) LLMs via stochastic gradient-based optimizations, potentially
+with a reference model for stability. Recently, fully asynchronous RL training paradigm has been shown
+to be effective, where the three stages can execute over disjoint GPU pools, and the rollout worker GPU
+keeps the generation continuously while training GPUs update opportunistically, rather than waiting for
+the longest rollout sequence in a synchronous batch. This multi-stage disaggregated paradigm exhibits
+inherent heterogeneity in terms of compute intensity, memory bandwidth, and communication paradigm in
+corresponding parallel execution for each stage, making it a natural fit for clusters with different GPU with
+the heterogeneous GPU-interconnects, which are common in cloud and enterprise settings. We believe an
+efficient scheduler that is able to map the distributed execution in each stage to more cost-efficient devices and
+balances their asynchronous interactions could fully exploit available heterogeneous hardware, lower both
+time and monetary cost, and make large-scale RL more accessible.
+However, scheduling asynchronous RL training workflows over heterogeneity is also fundamentally challenging
+due to the complex training dynamics of RL and the constraints it imposes on the data staleness [8]. The
+state-of-the-art asynchronous RL training paradigm operates as a producer–consumer paradigm in which the
+rollout worker GPUs use the policy LLM to continuously generate rollouts while the training worker GPUs
+concurrently update the policy LLM. In such an asynchronous situation, an effective heterogeneity-aware
+scheduler must regulate this interaction under the explicit data staleness constraints, i.e., the training worker
+GPUs require a steady supply of rollouts, yet such rollouts must not be generated by policy LLM too stale
+that the rollout trajectory becomes obsolete. The difficulty is further amplified by the heterogeneity that
+enlarges the search space: GPU devices differ in compute throughput, HBM memory capacity and bandwidth,
+and interconnect topology, turning computation task placement into a complicated search problem in an
+exponential search space. The scheduled plan must simultaneously maintain high GPU device utilization and
+limit rollout data staleness, which demands some careful design of the scheduler.
+Despite growing interest in heterogeneity-aware scheduling for LLM serving, existing efforts address only iso-
+2
+
+
+--- Page 3 ---
+lated slices of the problem, i.e., either inference or training, thus falling short of the end-to-end requirements of
+asynchronous RL training. For the LLM training workloads, heterogeneous LLM systems such as HexiScale [9]
+and Metis [10] optimize synchronous LLM training across heterogeneous GPUs; on the inference side, serving
+frameworks including Helix [11], HexGen [12], and HexGen-2 [13] orchestrate largely general inference
+workloads on heterogeneous clusters. Simply composing these techniques is inadequate: an asynchronous
+RL training pipeline is inherently multi-stage and requires explicit control of rollout data staleness, ensuring
+that rollouts consumed by the training worker GPUs are bounded by the configured data staleness constraint.
+Thus, an effective scheduler must therefore jointly consider cross-stage heterogeneity and inter-stage coupling,
+which makes the scheduling space of asynchronous RL training fundamentally departs from synchronous LLM
+training or general LLM inference.
+In this paper, we introduce AREAL-HEX, a novel asynchronous RL training system designed to maximize
+end-to-end training throughput and cost-efficiency for RL training workloads on heterogeneous GPU clusters.
+The core of AREAL-HEX is a heterogeneity-aware scheduling algorithm that determines effective allocation of
+generation and training computation and corresponding communication under different parallelism across
+heterogeneous GPUs and network interconnects. Concretely, we summarize our contributions as follows:
+• Contribution 1. We systematically characterize multi-stage asynchronous RL workloads and demon-
+strate that their intrinsic computational heterogeneity, i.e., HBM IO-bound rollout generation versus
+compute-bound policy model training, naturally aligns with heterogeneous GPU clusters. Through
+extensive profiling, we show that matching each stage’s resource demands to appropriate GPU types can
+substantially improve overall system efficiency compared to homogeneous deployments.
+• Contribution 2. We formulate the problem of asynchronous RL training scheduling over heterogeneity,
+which encompasses resource allocation, parallel strategies, and workload assignments, as a constrained
+optimization problem with explicit data staleness bounds. To efficiently solve the scheduling problem, we
+propose a two-phase algorithm: (i) the first phase employs constrained search and mixed-integer linear
+programming (MILP) to determine optimal parallel strategies and workload assignments for generation
+and training under a given resource allocation; and (ii) the second phase uses graph partitioning to
+optimize resource allocation across heterogeneous devices, maximizing end-to-end training performance.
+• Contribution 3. We implement AREAL-HEX and conduct extensive experiments for mathematical reason-
+ing RL tasks and model scales (1.5B, 8B, and 14B). We want to highlight that compared to homogeneous
+deployments of state-of-the-art asynchronous RL systems, AREAL-HEX achieves 1.31× ∼1.50× improve-
+ment in training throughput given the same training budget, demonstrating the substantial benefits of
+heterogeneity-aware scheduling for asynchronous RL training. On the other hand, when achieving the
+same training throughput, AREAL-HEX results in up to 1.46× reduction in training cost.
+2
+Preliminaries and Related Work
+2.1
+RL Training System for LLMs.
+RL has been applied to enhance the reasoning capabilities of LLMs [14, 15]. Existing RL training demonstrates
+strong performance on reasoning tasks, achieving significant improvements in various tasks, including
+mathematical problem solving, code generation, and multi-hop question answering [16–20]. RL training
+includes both the HBM IO-bound rollout generation phase and the compute-bound training phase [6, 7, 21],
+where both phases require careful orchestration of different parallelism strategies (e.g., data-, pipeline-,
+and tensor model- parallelisms), GPU resource allocation, and sequence-level scheduling (e.g., packing, KV
+cache management) [22–26]. RL training for LLMs can be categorized into synchronous and asynchronous
+paradigms. In synchronous RL training, different phases are iteratively executed: the rollout generation phase
+uses the latest model parameters to produce reasoning traces for each input question, and the training phase
+updates the model parameters based on these rollouts [5, 27]. On the other hand, in asynchronous RL training,
+these phases can run in parallel: the generation phase continuously produces rollouts using potentially stale
+model parameters, and the training phase updates the parameters based on such rollouts [6, 28–31].
+Due to the distinct computational characteristics of RL training with a multi-stage pipeline, recent efforts
+attempt to develop efficient RL training systems [21, 32, 33]. Among them, Verl [5] accelerates RL training
+3
+
+
+--- Page 4 ---
+with a 3D-HybridEngine for zero-redundancy resharding between actor training and generation, and an
+auto-mapping algorithm for GPU allocation and placement. StreamRL [7] addresses the pipeline bubbles and
+skewness-induced inefficiencies present in existing disaggregated RL frameworks, enabling flexible resource
+allocation. AsyncFlow [34] allows one-step parameter asynchronization between rollout generation and policy
+model update, minimizing hardware idling across iterations while maintaining algorithmic integrity. AReaL [6]
+decouples streaming generation from training through a fully asynchronous architecture and incorporates
+several algorithmic innovations, including staleness-aware training and a decoupled RL objective, which
+enables efficient and stable RL training for LLM reasoning. Different from existing works, AREAL-HEX focuses
+on effectively scheduling multi-stage asynchronous RL training workflows across heterogeneous GPU clusters
+in order to maximize resource utilization and minimizing training costs.
+2.2
+LLM Service over Heterogeneity.
+Earlier cluster management frameworks laid some groundwork for heterogeneous resource scheduling in
+distributed computation [35, 36]. For instance, Mesos [35] pioneered a two-level scheduling architecture that
+enables fine-grained sharing of cluster resources among diverse frameworks, while Paragon [37] provided a
+QoS-aware scheduler that classifies incoming workloads to places them on the most appropriate servers based
+on hardware differences. Collectively, these efforts explored adapting scheduling policies to heterogeneous
+infrastructures.
+Recent research has investigated methods for leveraging heterogeneous computational resources to enhance
+the cost-efficiency of LLM services [10, 38–43]. For instance, several works [44, 45] explore training LLMs
+on heterogeneous GPUs to enhance cost-effectiveness and resource utilization. Among them, HexiScale [9]
+supports hybrid and asymmetric parallelism implementations to leverage heterogeneous GPU capabilities, and
+optimizes these asymmetric computations with a hierarchical graph partitioning algorithm. In the context of
+LLM inference and serving, Helix [11] formulates heterogeneous GPU allocation and network connectivity as a
+max-flow problem, applying mixed-integer linear programming to identify optimal strategies for LLM inference
+serving. HexGen [12] introduces asymmetric partitioning and advanced scheduling mechanisms for generative
+inference in decentralized, heterogeneous settings. HexGen-2 [13] further extends the heterogeneity-aware
+scheduling on top of the disaggregated inference paradigm.
+3
+Observation and Opportunity
+Asynchronous RL training exhibits intrinsic computational heterogeneity, where the HBM I/O-bound rollout
+generation and compute-bound model training can be disaggregated over different sets of GPUs. This
+disaggregated computational heterogeneity motivates the design of AREAL-HEX: Heterogeneous clusters
+can naturally align their different hardware capabilities with the heterogeneous computational demands of
+asynchronous RL training, providing opportunities to reduce the real-world training costs. We explore this
+motivation and present our observations through an illustrative case study.
+Benchmark setups. We maintain the same total budget, and benchmark the asynchronous RL training throughput
+across three settings on the 1.5B, 7B, and 14B models: (i) Homogeneous setting 1: 32 H800 GPUs. (ii)
+Homogeneous setting 2: 88 H20 GPUs. (iii) Heterogeneous setting: 24 H800 GPUs and 24 H20 GPUs. We
+benchmark both the rollout generation latency and model training latency, which comprise the major execution
+cost of RL training. We use the reported H800 and H20 GPU rental price by MegaScale-Infer [46]—For the
+H800 GPU, the rental price is $5.28 per hour; and for the H20 GPU, the rental price is $1.85 per hour.
+Observation 1: H800 GPUs with high computational power are not efficient for inference. H800 GPUs have
+limited HBM memory bandwidth; to avoid being bound by rollout generation, we must allocate a large
+fraction of H800 GPUs to rollout generation while allocating only a small fraction to model training. Under
+asynchronous execution, although we can balance rollout generation and model training throughput, the
+overall performance remains suboptimal due to inefficient rollout generation performance.
+Observation 2: H20 GPUs are insufficient for computationally intensive model training. Homogeneous setting 2
+falls short in compute-bound model training, as the H20 GPUs have limited computational capabilities in terms
+of peak FLOPS. Since H20 GPUs provide only limited computational power, we must allocate a large fraction
+4
+
+
+--- Page 5 ---
+Homo 1Homo 2 Hetero
+Model 1.5B
+0
+32
+64
+95
+127
+Execution Latency (s)
+Homo 1Homo 2 Hetero
+Model 7B
+0
+69
+138
+206
+275
+Homo 1Homo 2 Hetero
+Model 14B
+0
+195
+390
+586
+781
+Homo 1-Inf
+Homo 1-Train
+Homo 2-Inf
+Homo 2-Train
+Hetero-Inf
+Hetero-Train
+Figure 2 Rollout inference (short as INF) and model training (short as TRAIN) execution latency comparison between
+homogeneous setting 1, 2 and heterogeneous setting across different model scales.
+of H20 GPUs to model training. Additionally, training with a large number of H20 GPUs introduces scalability
+issues; empirically, we find that training with 5× H20 GPUs cannot sufficiently achieve the same training
+throughput as H800 GPUs, even if the theoretical computation power of 5 H20 GPUs is equal to 1 H800 GPU.
+As a result, the overall performance of homogeneous setting 2 remains suboptimal due to inefficient model
+training.
+Observation 3: Heterogeneous setting naturally leverages the advantages of both GPU types. The heterogeneous
+setting, which hybridizes compute-efficient H800 GPUs and memory bandwidth-efficient H20 GPUs, naturally
+leverages the advantages of both GPU types, thereby demonstrating superior system performance. We
+disaggregate the rollout generation and model training on different hardware. On the one hand, we assign
+the HBM memory-bound rollout generation phase to H20 GPUs, fully utilizing the abundant HBM memory
+bandwidth. On the other hand, we assign the compute-bound model training phase to H800 GPUs, fully
+leveraging the advanced computational power. Under this arrangement, both phases achieved optimal
+performance, thereby boosting the system performance. Compared with the homogeneous settings 1 and 2,
+the heterogeneous setting achieved up to 2.67×, and at least 1.49× reduction in the end-to-end RL training
+execution time.
+Table 1 Rollout and training per-token cost comparison of different GPU types on different model scales.
+Model
+GPU
+$ Per Inference Token
+$ Per Training Token
+1.5B
+H800
+$5.58 × 10−3
+$1.66 × 10−3
+H20
+$2.06 × 10−3
+$5.16 × 10−3
+7B
+H800
+$1.14 × 10−2
+$3.05 × 10−3
+H20
+$4.15 × 10−3
+$9.51 × 10−3
+14B
+H800
+$3.43 × 10−2
+$0.99 × 10−2
+H20
+$1.27 × 10−2
+$3.10 × 10−2
+Cost-efficiency analysis of different GPU types. Asynchronous RL training workloads across heterogeneous
+disaggregated GPUs naturally align with the distinct cost-efficiency of different GPU types. In Table 1, we
+present the per-token cost for H800 and H20 GPUs under both training and inference computation. For rollout
+generation, H20 demonstrates 2.72× higher cost efficiency; for training, H800 demonstrates 3.12× higher
+cost efficiency. These results confirm that the performance gains from hybridizing different GPUs originate
+from utilizing more cost-efficient devices for the two phases of RL training.
+4
+Scheduling with Heterogeneity
+We first introduce the scheduling problem and the overview of our two-phase solution in§4.1 and then propose
+introduce the search phase in §4.2 and repartition phase in §4.3.
+5
+
+
+--- Page 6 ---
+4.1
+Problem Formulation
+Formulation. Given a set of heterogeneous GPUs noted by D, staleness constraint parameterized by η, and
+an expected generated rollout length distribution P, the goal of the scheduler is to identify the optimal
+asynchronous RL execution plan that minimizes the δ(η)-step averaged RL training time, where δ(η) represents
+a window size used to calculate the average training time under asynchronous rollout generation, depending
+on the staleness η. Concretely, to optimize asynchronous RL training, the scheduling algorithm should
+determine two essential components:
+• Resource allocation, which determines the optimal allocation of the GPU set for policy (and optionally
+value) model training, noted by DT , where DT ⊂D and the GPU set for rollout generation by generative
+inference noted by DI, where DI ⊂D. Note that DT ∪DI = D, DT ∩DI = ∅, and the ideal balances
+between DT and DI should maximize overall RL training throughput.
+• Parallel strategy and workload assignment, that determines the allocation of the distributed computational
+workload to each heterogeneous GPU under asynchronous RL training, given a particular resource
+allocation. To be more specific, this component needs to assign the parallel inference execute plan τ
+over the GPU set DI and the training plan σ over the GPU set DT .
+We define a solution including these two components as a scheduled plan as the output. Concretely, given
+D = {d1, . . . , dN} as a set of N GPUs, where we note the device memory limit Md for GPU d, we define
+the scheduling problem to seek optimal parallel execution plans σ∗for model training and τ ∗for rollout
+generation over the optimal resource allocation noted by D∗
+T and D∗
+I that utilize all N GPUs in D to minimize
+δ(η)-step average RL training execution time subject to each GPU’s memory constraints:
+σ∗, τ ∗, D∗
+T , D∗
+I = arg
+min
+σ,τ,DT ,DI max{CT , CI}
+where CT = CTRAIN (σ, DT , δ(η)) ,
+CI = CROLLOUT (τ, DI, P, δ(η)) + CREWARD (δ(η)) + CUPDATE(σ, DT , τ, DI, δ(η)),
+s.t. DT ∪DI = D, DT ∩DI = ∅, MEM-CUMSUM (d) ≤Md
+∀d ∈D.
+(1)
+where CT represents the δ(η)-step average training execution cost, including CTRAIN(σ, DT , δ(η)) that captures
+the gradient computation and parameter update for policy (optionally value) model; CI represents the δ(η)-
+step average rollout cost, including CROLLOUT (τ, DI, P, δ(η)) for rollout generation; CREWARD (δ(η)) for reward
+computation (involving reward and reference model computation) latency; and CUPDATE(σ, DT , τ, DI, δ(η))
+that represents the cost of synchronizing updated policy model weights to rollout workers. . MEM-CUMSUM(d)
+denotes memory consumption on device d to execute the allocated policy σ and τ. We want to be explicit that
+our algorithm assumes rollout generation execution cost generally exceeds the model training execution cost
+(i.e., CI > CT ). Because when model training execution cost exceeds rollout generation execution cost (i.e.,
+CT > CI), the system gradually approaches its data staleness tolerance threshold, causing rollout workers to
+stall and wait for slow model training before resuming rollout generation after at least one training batch is
+consumed—In this scenario, computational resources on rollout workers are significantly wasted, degrading
+overall system throughput. Conversely, when the rollout generation execution cost exceeds the model training
+execution cost (i.e., CI > CT ), the system can leverage the asynchronous rollout feature to minimize the
+stalling time of model training. Therefore, we exclude cases where the model training execution cost exceeds
+the rollout generation execution cost.
+Overview of the scheduling algorithm. Notice that finding the optimal scheduled plan is NP-hard due to the
+exponential space of candidate allocations. Furthermore, one can imagine that the process of determining
+these two essential components (i.e., resource allocation DT , DI and parallel strategy and workload assignment
+σ, τ) introduces a “chicken and egg” dilemma—the optimal plan σ, τ can only be estimated over the optimal
+resource allocation DT , DI; while the resource allocation DT , DI should be determined by the underlying
+optimal potential plan σ, τ. To resolve this issue, we propose a two-phase scheduling approach enlightened by
+the classic EM algorithm [47], summarized as below:
+• Search-Phase: Given a particular fixed resource allocation, we employ constrained and MILP-based search
+6
+
+
+--- Page 7 ---
+Algorithm 1 Scheduling Algorithm
+Input: (D0
+T , D0
+I): initial allocation, D: GPU device info,
+K: stable iteration threshold, δ(η): window size
+/* σ: model training plan, τ: rollout generation plan */
+Output: optimized σ∗, τ ∗, D∗
+T , D∗
+I
+Intermediate Variables:
+CT : Model training cost, CI: Rollout generation cost
+/* Initialize training and inference resource allocation. */
+DT , DI ←D0
+T , D0
+I
+while convergence not reached do
+/* Search-Phase: Optimize execution plans (§4.2) */
+(σ, CT ) ←CONSTRAINED_SEARCH(DT )
+(τ, CI) ←MILP(DI, P, δ(η))
+/* Repartition-Phase: Optimize resource allocation (§4.3) */
+(DT , DI) ←GRAPH_PARTITION(CT , CI, D)
+/* Check convergence condition. */
+if max{CT , CI} is stable for K iterations then
+break
+end if
+end while
+to determine the optimal parallel strategy and workload assignment (§4.2). This phase optimizes system
+performance for both model training and rollout generation within the allocated resources, generating
+execution plans with minimum cost.
+• Repartition-Phase: Given the estimated execution costs obtained from the Search-Phase, we apply a
+cost-guided graph partition algorithm to identify the optimal resource allocation (§4.3). This phase
+balances computational resources between model training and rollout generation, ensuring globally
+optimized system performance.
+These two phases alternate iteratively and terminate when the maximum execution cost (i.e., max{CT , CI})
+remains stable for multiple consecutive iterations (e.g., 20 iterations). We summarize this process in Algo-
+rithm 1.
+4.2
+Search Phase Algorithm
+Given a particular resource allocation DT and DI, the search phase determines the optimal execution plans
+for model training σ and rollout generation τ that maximize their training or inference throughput.
+4.2.1
+Searching Model Training Execution Plan
+Given the resources set DT allocated for the model training, we determine an optimal training execution plan
+σ, which involves both parallel strategy and workload assignment noted as CONSTRAINED_SEARCH(DT ), as
+follows:
+Parallel strategy search. Given the heterogeneous resources allocated to model training, we propose an efficient
+and effective constrained search algorithm to determine an optimal parallel strategy i.e., a combination of
+data parallelism (DP), tensor model parallelism (TP), and pipeline parallelism (PP), that minimizes training
+execution cost. Our approach is motivated by the observation that different GPU types are typically connected
+via low-bandwidth networks in real-world distributed environments [9, 10]. To mitigate extensive cross-
+GPU-type communication overhead, we impose a simple yet effective practical constraint: Both TP and DP
+must utilize GPUs of the same type. Under this constraint, we systematically enumerate all feasible parallel
+strategies. This constraint substantially reduces the search complexity while maintaining solution quality.
+Finally, we follow the search algorithm in Metis [10] to select the parallel strategy that yields the maximal
+training throughput across all evaluated configurations. The scheduled results will ensure that across pipeline
+7
+
+
+--- Page 8 ---
+stages, we allocate transformer layers proportionally to the computational capabilities of heterogeneous
+devices, where each pipeline stage is configured with distinct data and tensor model parallelism.
+Workload assignment optimization. We employ a greedy sequence packing strategy [6] to balance token
+distribution across data parallel workers and optimize GPU memory utilization: For each training batch, we
+sequentially assign sequences to the DP worker with the minimum current workload, measured by token
+count.
+4.2.2
+Searching Rollout Generation Execution Plan
+Let DI be the set of GPUs allocated for rollout generation, we formulate how to find the optimal rollout
+generation plan as a mixed integer linear program problem (MILP) noted as MILP(DI, P, δ(η)) as below.
+Model replica configurations. Different from model training, multiple rollout inference replicas should work in
+parallel to generate rollouts independently. Note that such replicas could duplicate the same configuration,
+i.e., execute the same parallel strategy over the same type of GPUs connected by the network with the same
+bandwidth. To enumerate this process, we include some new notations: Suppose there are T different types
+of GPUs, define TI = [i1, i2, ..., iT ] as the count of each type of GPUs, e.g., it represents the count of type-t
+GPUs. To determine the execution plan τ, we characterize rollout replica parallel strategies, replica counts,
+and workload assignment as follows:
+Let Ψ denote possible configurations for one rollout inference replica. Each configuration ψ ∈Ψ represents
+the configuration for a rollout inference replica characterized by (vψ, sψ, hψ, yψ): (i) Vector vψ = [iψ
+1 , iψ
+2 , ..., iψ
+T ],
+0 ≤iψ
+t ≤it, ∀t ∈[1, T] indicates GPU count of each type indexed by t used in configuration ψ. (ii) Vector
+sψ = [tpψ
+1 , tpψ
+2 , ..., tpψ
+Sψ] indicates this inference serving replica is equipped with Sψ pipeline stages, where tpψ
+s
+is the TP degrees of the s-th stage (s ∈[1, Sψ]). (iii) The estimated inference throughput hψ is estimated based
+on the parallel strategy following the cost model from HexGen [12]. (iv) Free integer variable yψ suggests the
+number of replicas following configuration ψ.
+Workload assignment to rollout replicas. During rollout generation, the input prompt length is predefined by the
+task; in contrast, the output length of each rollout is nondeterministic during RL training. Here, we sample the
+output length from the skew distribution P that can be profiled during the cold-start of RL training to estimate
+the output tokens, where we note the output sequence length lenrollout ∼P. The allocation problem should
+determine the number of rollouts that each rollout inference replica should host in its local inference batch.
+Formally, let Xδ(η) denote the maximum processing capacity (measured in number of rollouts) within δ(η)
+training steps, and let B denote the total number of rollouts that all of the rollout replicas should process. Our
+algorithm determines an assignment AI = {xψ : ψ ∈Ψ}, where xψ ∈[0, B] represents the number rollouts
+assigned to configuration ψ, subject to the constraints that P
+ψ∈Ψ xψ = B.
+Optimization objective. We define a makespan variable Θ ≥0 that represents the overall rollout generation
+completion time across δ(η) training steps.
+For each configuration ψ ∈Ψ that is duplicated yψ times
+and processes xψ rollout sequences from the total rollout count B, the total effective throughput of all ψ
+configuration is yψ · hψ (noted that hψ denotes the per-replica throughput of configuration ψ defined before).
+Consequently, the time required for configuration ψ to complete its assigned workloads is Θψ = xψ·lenrollout
+yψ·hψ
+.
+Since all rollout inference replicas operate in parallel, the system completes when the slowest configuration
+finishes, which imposes the constraint Θψ ≤Θ for all ψ ∈Ψ. Our objective is to minimize the makespan Θ.
+MILP formulation. The problem for optimizing rollout generation throughput can be summarized as the
+following Mixed-Integer Linear Program (MILP):
+arg min
+Θ
+s.t.
+X
+ψ∈Ψ
+xψ = B, xψ · lenrollout
+yψ · hψ,w
+≤Θ, ∀ψ ∈Ψ,
+X
+ψ∈Ψ
+iψ
+t · yψ ≤it, ∀t ∈[1, T].
+(2)
+8
+
+
+--- Page 9 ---
+After solving this MILP, we obtain a rollout generation execution plan τ, which encompasses replica counts for
+each configuration (yψ) and workload assignment (AI) through the above formulation, subject to memory and
+GPU availability constraints. To accelerate the algorithm, we restrict rollout replicas to use bandwidth-sensitive
+tensor model parallelism only within single machines to reduce the search space. Additionally, since reward
+computation varies minimally across rollout generation tasks, we treat the reward computation cost as a
+constant obtained through profiling, which would not influence MILP results.
+Optimize across different δ(η) values. Across algorithm iterations, we iteratively optimize parallel strategy and
+workload assignment for model training and rollout generation under varying step window δ(η). The choice of
+δ(η) involves a fundamental tradeoff: optimizing over the entire training horizon (δ = ∞) is computationally
+infeasible and requires an unknown total training iteration, while optimizing over too few steps (δ ≈1) fails to
+accurately capture asynchronous RL training and data staleness characteristics. To balance these concerns, we
+adopt an adaptive strategy: We initialize δ(η) to a small value empirically determined from the data staleness
+parameter η, then iteratively increase δ(η) until the scheduling results exhibit stable RL training execution
+latency. This approach leverages the key insight that when δ(η) accurately captures the asynchronous training
+dynamics and data staleness characteristics, scheduling decisions remain stable under larger values of δ(η),
+indicating diminishing returns from further increases of δ(η).
+4.3
+Repartition Phase Algorithm
+The previous search-phase presented an approach for obtaining the optimal execution plans for a given
+resource allocation. On the other hand, in this section, we introduce a cost-guided graph partition algorithm
+noted by GRAPH_PARTITION(CT , CI, D) to find a resource allocation that minimizes the overall execution cost
+of the system.
+Cost-guided graph partition. To determine the optimal resource allocation of the GPU set D for model training
+DT and the set of GPUs for rollout generation DI, we design a graph partition approach guided by the costs
+generated in the first phase. We extend the GPU set D to a graph G = (D, E), where each GPU d ∈D is a
+vertex noted with a computation power cd, HBM memory bandwidth md, and HBM limit Md; ∀d1, d2 ∈D,
+communication bandwidth βd1,d2 represents an edge between GPUs in set E. We bisect graph G into partition
+D = {DT , DI}, where DT ∪DI = D and DT ∩DI = ∅. When partitioning the graph, we adopt the following
+heuristics:
+• High network bandwidth should be allocated for model training. Since model training involves intensive
+collective communication operations (e.g., all-reduce in TP and DP) that demand high communication
+volume [7], we prioritize allocating GPUs with high aggregate interconnect bandwidth to model training.
+Formally, we define the metric
+P
+d1,d2∈DT βd1,d2
+P
+d′
+1,d′
+2∈D βd′
+1,d′
+2 , i.e., the aggregated communication bandwidth of DT
+over the aggregated communication bandwidth of D, to guide the graph partition by this heuristic.
+• High HBM bandwidth GPUs should be allocated for rollout generation. Since rollout generation is mainly
+HBM I/O-bound during generative inference computation, we prioritize allocating GPUs with high HBM
+bandwidth to rollout generation. Formally, denoting we define the metric
+P
+d∈DI md
+P
+d′∈D md′ , i.e. the aggregated
+HBM bandwidth of DI over the aggregated HBM bandwidth of D, to guide the graph partition.
+• Careful balance of the computation power should maintained between model training and rollout inference.
+Both rollout generation and model training demands the computation capacity, to maintain an adaptive
+balance, we let the fraction of computation capacity occupied by model training, i.e.,
+P
+d∈DT cd
+P
+d′∈D cd′ , to fall
+into a tunable range [γL, γH], where γL and γH will be tuned automatically along with the iterative
+resource allocation as we will enumerate next.
+By integrating the above criteria into our graph partition formulation, we define the final constrained
+optimization as:
+9
+
+
+--- Page 10 ---
+D∗
+T , D∗
+I = arg max
+DT ,DI
+ P
+d1,d2∈DT βd1,d2
+P
+d′
+1,d′
+2∈D βd′
+1,d′
+2
++
+P
+d∈DI md
+P
+d′∈D md′
+!
+s.t.
+γL ≤
+P
+d∈DT cd
+P
+d′∈D cd′ ≤γH
+(3)
+Iterative refinement. Across graph partition optimization iterations, we dynamically adjust the fraction of total
+computational power allocated to model training (i.e., γL and γH) based on the execution costs generated
+in the search phase algorithm (i.e., CT and CI). To balance model training and rollout generation costs, we
+fine-tune γL and γH, which control the computational power ratio between them. We initialize γL = γH = 1,
+assigning all FLOPS to model training. In subsequent iterations, the optimal resource allocation is determined
+by tuning γL and γH using a binary search procedure. Specifically, we define the search range as [q, r], where
+q = 0 and r = 1 initially. At each iteration, we first update the FLOPS allocated to model training by updating
+γL = γH = (q + r)/2, and then evaluate the execution costs CT and CI: If CT < CI, we set the upper bound
+r = (q + r)/2; otherwise, if CT ≥CI, we update the lower bound q = (q + r)/2. This process continues until
+CT ≈CI, at which point the final resource allocation is selected to minimize the overall execution cost.
+This section presents a comprehensive evaluation of AREAL-HEX across various configurations. We aim to
+investigate the following research questions:
+• RQ1: What is the end-to-end performance of AREAL-HEX under heterogeneous clusters and AREAL under
+homogeneous clusters with the same total budget?
+• RQ2: What is the breakdown performance of AREAL-HEX and AREAL, and how does each RL training
+component contribute to the RL training step execution latency?
+• RQ3: What is the ablation performance and cost efficiency of AREAL-HEX and AREAL?
+• RQ4: How effective is the scheduling algorithm of AREAL-HEX?
+4.4
+Experimental Setup
+Experimental environments. Our heterogeneous RL training experiments are conducted using two distinct GPU
+architectures: NVIDIA H20 GPUs[48], which provide 148 TFLOPS of tensor core computational power, 4
+TB/s memory bandwidth, and 450 GB/s single-direction NVLink intra-machine bandwidth; and NVIDIA H800
+GPUs[49], which deliver 756 TFLOPS of tensor core computational power, 2 TB/s memory bandwidth, and
+200 GB/s single-direction NVLink intra-machine bandwidth. The inter-machine bandwidth between H20 or
+H800 machines is 5 GB/s, while the communication bandwidth between H20 and H800 machines is 1.5 GB/s.
+The homogeneous RL training experiments are conducted using homogeneous NVIDIA H800 GPUs or H20
+GPUs.
+Baselines. Since our primary focus is accommodating RL training on heterogeneous GPUs, we primarily
+compare the asynchronous RL training end-to-end performance of AREAL-HEX in heterogeneous environments
+against AREAL in homogeneous environments under equivalent total budgets. For RL training algorithms, we
+evaluate AREAL-HEX and AREAL on the GRPO algorithm, which is among the most impactful RL algorithms
+in current practice. We employ identical training hyperparameters to those used in AREAL [6].
+Evaluation metrics. Following established practices in prior research [6], we employ the RL training throughput
+metric to assess system efficiency. RL training throughput is calculated by dividing the average number
+of tokens processed by the average RL training execution time, which is defined as the sum of the weight
+synchronization latency and the maximum duration between rollout generation (encompassing both rollout
+and reward computation) and model training (encompassing policy and, optionally, value model gradient
+computation). Given that RL training with AREAL-HEX and AREAL operates asynchronously, we compute the
+RL training throughput as the average value across 30 RL training steps.
+10
+
+
+--- Page 11 ---
+0
+8158
+16315
+24472
+32630
+Throughput (t/s)
+2.80×
+1.36×
+1.5B model
+0
+2542
+5083
+7624
+10166
+2.76×
+1.31×
+7B model
+0
+1056
+2112
+3169
+4225
+2.29×
+1.50×
+14B model
+AReaL (H20)
+AReaL (H800)
+AReaL-Hex
+Figure 3 We present the end-to-end experimental results of AREAL-HEX operating on H800 and H20 mixed heterogeneous
+GPUs compared to AREAL operating on homogeneous H800 or H20 GPUs. All experimental settings maintain the same
+total budgets using the same prices as in §3.
+0
+100
+200
+301
+401
+Latency (ms)
+1.5B model
+0
+181
+362
+543
+724
+7B model
+0
+362
+724
+1085
+1447
+14B model
+AReaL (H20)-Infer
+AReaL (H20)-Train
+AReaL (H800)-Infer
+AReaL (H800)-Train
+AReaL-Hex-Infer
+AReaL-Hex-Train
+Figure 4 We present a breakdown of experiments comparing AREAL-HEX running on a 56-GPU heterogeneous cluster
+against AREAL running on a 24-GPU H800 homogeneous cluster. The terms INFER and TRAIN denote the execution
+latencies for rollout generation and model training.
+4.5
+End-to-end System Performance Comparison (Q1)
+End-to-end experimental results: On the GRPO RL training workloads, we benchmark the end-to-end training
+performance of AREAL-HEX with heterogeneous clusters against AREAL with homogeneous clusters (either
+homogeneous H800 GPUs or H20 GPUs) under the same total budget. We compare the asynchronous RL
+training throughput of AREAL-HEX and AREAL. As shown in Figure 3, experimental results across different
+model sizes (ranging from 1.5B to 14B parameters) of the DeepSeek Distilled Qwen-2.5 models [50–52]
+demonstrate that AREAL-HEX consistently reduces RL training latency across all evaluated cases when both
+AREAL-HEX and AREAL apply the optimal parallel configurations. Compared to the baseline where AREAL
+runs on H800 homogeneous GPUs, AREAL-HEX achieves up to 1.50× speedup (on the 14B model), at least
+1.31× speedup (on the 7B model), and an average 1.39× speedup; compared to the baseline where AREAL
+runs on H20 homogeneous GPUs, AREAL-HEX achieves up to 2.76× speedup (on the 7B model), at least
+2.29× speedup (on the 14B model), and an average 2.62× speedup.
+Discussion: In essence, heterogeneous RL training aligns diverse hardware capabilities with the heterogeneous
+computational demands of RL training. By strategically allocating H20 GPUs for memory-bound rollout
+generation and H800 GPUs for compute-bound model training, we effectively leverage the advantages of
+both GPU architectures. H800 GPUs excel at computation-intensive tasks, while H20 GPUs demonstrate
+superior performance in rollout generation due to their distinct hardware specifications on computational
+power and HBM memory bandwidth. Our experimental results demonstrate that AREAL-HEX deployed on
+heterogeneous GPUs consistently outperforms AREAL running on either homogeneous H800 or H20 GPU
+clusters. Specifically, the H800 homogeneous baseline exhibits suboptimal performance in rollout generation,
+whereas the H20 homogeneous baseline underperforms in model training phases. These findings confirm that
+strategic heterogeneous deployment, which respects the distinct computational characteristics of different
+hardware architectures, yields superior overall performance.
+11
+
+
+--- Page 12 ---
+24 GPUs
+32 GPUs
+40 GPUs
+56 GPUs
+0
+68
+136
+204
+272
+Throughput per $ (t/s)
+1.5B model
+24 GPUs
+32 GPUs
+40 GPUs
+56 GPUs
+0
+21
+42
+62
+83
+7B model
+24 GPUs
+32 GPUs
+40 GPUs
+56 GPUs
+0
+8
+16
+24
+32
+14B model
+Figure 5 Case study of AREAL-HEX’s performance cost-efficiency across different cluster sizes ranging from 24 to 56 GPUs.
+For the H20 and H800 GPU per-hour costs, we follow the prior practice [46].
+4.6
+Breakdown System Performance Comparison (Q2)
+Performance breakdown results. We present a comprehensive breakdown performance of the asynchronous
+GRPO RL training using AREAL-HEX (running over heterogeneous GPUs) and AREAL (running over homo-
+geneous H800 or H20 GPUs) across various model sizes in Figure 4. Compared to AREAL running over
+homogeneous H800 GPUs, AREAL-HEX achieves a maximum of 1.61×, a minimum of 1.35×, and on average
+1.46× lower rollout generation execution latency; compared to AREAL running over homogeneous H20
+GPUs, AREAL-HEX achieves a maximum of 3.13×, a minimum of 1.85×, and on average 2.46× lower model
+training execution latency. The comparison of weight synchronization execution cost, which comprises a
+small fraction for both AREAL-HEX and AREAL, is presented in Table 2. For AREAL operating on H800 GPUs,
+weight synchronization costs represent, on average, 1.9% of the GRPO RL training iteration duration. For
+AREAL-HEX operating in heterogeneous GPU environments with 1.5 GB/s communication bandwidth, weight
+synchronization costs account for 13.54% of the total RL training time.
+Table 2 Weight update time comparison across homogeneous and heterogeneous GPU configurations.
+Model
+AREAL (H800)
+AREAL (H20)
+AREAL-HEX
+1.5B model
+4.75 s
+2.74 s
+10.06 s
+7B model
+14.79 s
+7.46 s
+58.34 s
+14B model
+26.00 s
+13.05 s
+112.93 s
+Discussion: Experimental results demonstrate that rollout generation in AREAL running on homogeneous H800
+GPUs frequently emerges as the primary system bottleneck, as the relatively short model training duration
+fails to provide sufficient temporal overlap with rollout generation. In contrast, AREAL-HEX running on
+heterogeneous GPUs exhibits more balanced rollout generation and model training speeds, achieving optimal
+system performance under asynchronous operation. Fundamentally, the integration of H20 GPUs enhances
+rollout generation capacity, thereby delivering substantial system performance improvements. Moreover, the
+communication overhead between heterogeneous devices remains acceptable under 1.5GB/s inter-machine
+bandwidth constraints. Given that 1.5GB/s communication bandwidth between heterogeneous GPUs is
+typically readily available in practice, heterogeneous RL training deployment represents a practical solution
+for real-world applications without requiring extensive engineering efforts for network communication across
+heterogeneous devices.
+Table 3 Throughput comparison between AREAL and AREAL with uniform resource allocation, i.e., AREAL (u).
+Model
+AREAL (u)
+AREAL
+1.5B model
+1.17 × 104 t/s
+1.84 × 104 t/s (1.57×↑)
+7B model
+3.57 × 103 t/s
+5.98 × 103 t/s (1.68×↑)
+14B model
+1.29 × 103 t/s
+2.16 × 103 t/s (1.67×↑)
+12
+
+
+--- Page 13 ---
+Table 4 Cost-efficiency comparison between AREAL-HEX running on a 32-GPU heterogeneous cluster and AREAL running
+on 24 H800 GPUs.
+Model
+System
+Throughput
+Cost
+1.5B model
+AREAL (H800)
+1.84 × 104 t/s
+$126.72/h
+AREAL-HEX
+1.79 × 104 t/s
+$86.64/h
+7B model
+AREAL (H800)
+5.98 × 103 t/s
+$126.72/h
+AREAL-HEX
+6.00 × 103 t/s
+$86.64/h
+14B model
+AREAL (H800)
+2.16 × 103 t/s
+$126.72/h
+AREAL-HEX
+2.30 × 103 t/s
+$86.64/h
+4.7
+Ablation Study & Case Studies (Q3)
+Ablation on resource allocation. In Table 3, we present the performance variations of AREAL under different
+resource allocation strategies. The experimental results demonstrate that our resource allocation optimization
+approach (detailed in §4.3) delivers substantial and consistent improvements in system performance for 1.5B,
+7B, and 14B models. Specifically, our resource allocation optimization achieves a maximum speedup of 1.68×,
+and an average speedup of 1.63× compared to configurations where this scheduling optimization is disabled.
+These results highlight the necessity of careful scheduling of the resource allocation.
+Case study on the cost efficiency of AREAL-HEX. In Figure 5, we present the per-dollar end-to-end system
+performance of AREAL-HEX under varied cluster sizes. Experimental results demonstrate that AREAL-HEX
+maintains stable per-dollar system throughput across heterogeneous GPU clusters ranging from 24 to 56
+GPUs. Concretely, the per-dollar throughput for the 1.5B, 7B, and 14B models is around 200, 62, and 24
+tokens/s, across cluster configurations ranging from 24 to 56 heterogeneous GPUs. These results validate that
+heterogeneous RL training can deliver stable performance, regardless of the cluster size.
+Case study on the cost efficiency comparison. In Table 4, we present the experimental results where AREAL-HEX
+and AREAL achieves the same throughput. In this case, AREAL-HEX running over heterogeneous GPUs
+demonstrates a lower per-hour training cost than AREAL running over homogeneous GPUs. For 1.5B, 7B, and
+14B models, the heterogeneous setting demonstrates 1.42×, 1.31×, and 1.50× lower per-hour training cost
+than the H800 homogeneous baseline. For the H20 baseline, our heterogeneous settings achieving the same
+throughput also demonstrate a 50% RL training cost reduction. These results confirm that heterogeneous RL
+training is an economical choice.
+4.8
+Evaluation on Scheduling Algorithm (Q4)
+Table 5 Scheduling (algorithm convergence) time across different cluster sizes. “Ours (w/o Search)" and “Ours (w/o
+Repartition)" mean replacing the search phase (§4.2) and the repartition phase (§4.3) of our scheduling algorithm with
+exhaustive search, respectively. The algorithm is considered converged when the solution remains stable for more than 20
+consecutive iterations.
+Cluster Size
+Ours
+Ours (w/o Search)
+Ours (w/o Repartition)
+24 GPUs
+14.9s
+6.1min (24.6×↑)
+5.0min (20.1×↑)
+32 GPUs
+23.1s
+11.3min (29.4×↑)
+7.7min (20.0×↑)
+40 GPUs
+46.7s
+34.4min (44.2×↑)
+16.4min (21.1×↑)
+56 GPUs
+2.0min
+≥40min (≥20.0×↑)
+≥40min (≥20.0×↑)
+Algorithm execution speed. In Table 5, we present a comparative analysis of the execution speed of our
+scheduling algorithm against two baselines where each of our algorithm phases is replaced with an exhaustive
+search approach. Experimental results demonstrate that our algorithm efficiently determines optimal resource
+allocation and parallelization strategies for rollout generation and model training, achieving a substantial
+speedup of 20.0× to 44.2× in search time compared to the exhaustive search baseline algorithms.
+13
+
+
+--- Page 14 ---
+5
+Conclusion
+In this paper, we introduced AREAL-HEX, a novel system that enhances asynchronous RL training on heteroge-
+neous GPUs. We carefully designed a two-phase scheduling algorithm, which is capable of effectively and
+efficiently determining the resource allocation and parallel strategy for rollout generation and model training.
+Maintaining the same total, experimental results demonstrate that AREAL-HEX running over heterogeneous
+GPUs achieves superior performance than AREAL running over homogeneous GPUs on models with 1.5B,
+7B, and 14B model parameters. By allocating suitable resources for rollout generation and model training,
+AREAL-HEX has unlocked the potential of heterogeneous resources and provides an economic alternative
+compared to the homogeneous clusters.
+References
+[1] Kaiyan Zhang, Yuxin Zuo, Bingxiang He, Youbang Sun, Runze Liu, Che Jiang, Yuchen Fan, Kai Tian, Guoli Jia, Pengfei
+Li, et al. A survey of reinforcement learning for large reasoning models. arXiv preprint arXiv:2509.08827, 2025.
+[2] ZZ Ren, Zhihong Shao, Junxiao Song, Huajian Xin, Haocheng Wang, Wanjia Zhao, Liyue Zhang, Zhe Fu, Qihao Zhu,
+Dejian Yang, et al. Deepseek-prover-v2: Advancing formal mathematical reasoning via reinforcement learning for
+subgoal decomposition. arXiv preprint arXiv:2504.21801, 2025.
+[3] Binyuan Hui, Jian Yang, Zeyu Cui, Jiaxi Yang, Dayiheng Liu, Lei Zhang, Tianyu Liu, Jiajun Zhang, Bowen Yu, Keming
+Lu, et al. Qwen2. 5-coder technical report. arXiv preprint arXiv:2409.12186, 2024.
+[4] Shunyu Yao, Noah Shinn, Pedram Razavi, and Karthik R Narasimhan. τ-bench: A benchmark for tool-agent-user
+interaction in real-world domains. In The Thirteenth International Conference on Learning Representations, 2025.
+[5] Guangming Sheng, Chi Zhang, Zilingfeng Ye, Xibin Wu, Wang Zhang, Ru Zhang, Yanghua Peng, Haibin Lin, and Chuan
+Wu. Hybridflow: A flexible and efficient rlhf framework. In Proceedings of the Twentieth European Conference on
+Computer Systems, pages 1279–1297, 2025.
+[6] Wei Fu, Jiaxuan Gao, Xujie Shen, Chen Zhu, Zhiyu Mei, Chuyi He, Shusheng Xu, Guo Wei, Jun Mei, Jiashu Wang,
+et al. Areal: A large-scale asynchronous reinforcement learning system for language reasoning. arXiv preprint
+arXiv:2505.24298, 2025.
+[7] Yinmin Zhong, Zili Zhang, Xiaoniu Song, Hanpeng Hu, Chao Jin, Bingyang Wu, Nuo Chen, Yukun Chen, Yu Zhou,
+Changyi Wan, et al. Streamrl: Scalable, heterogeneous, and elastic rl for llms with disaggregated stream generation.
+arXiv preprint arXiv:2504.15930, 2025.
+[8] Michael Noukhovitch, Shengyi Huang, Sophie Xhonneux, Arian Hosseini, Rishabh Agarwal, and Aaron Courville.
+Asynchronous rlhf: Faster and more efficient off-policy rl for language models. In The Thirteenth International
+Conference on Learning Representations, 2025.
+[9] Ran Yan, Youhe Jiang, Xiaonan Nie, Fangcheng Fu, Bin Cui, and Binhang Yuan. Hexiscale: Accommodating large
+language model training over heterogeneous environment. arXiv preprint arXiv:2409.01143, 2024.
+[10] Taegeon Um, Byungsoo Oh, Minyoung Kang, Woo-Yeon Lee, Goeun Kim, Dongseob Kim, Youngtaek Kim, Mohd
+Muzzammil, and Myeongjae Jeon. Metis: Fast automatic distributed training on heterogeneous {GPUs}. In 2024
+USENIX Annual Technical Conference (USENIX ATC 24), pages 563–578, 2024.
+[11] Yixuan Mei, Yonghao Zhuang, Xupeng Miao, Juncheng Yang, Zhihao Jia, and Rashmi Vinayak. Helix: Serving
+large language models over heterogeneous gpus and network via max-flow. In Proceedings of the 30th ACM
+International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 1,
+pages 586–602, 2025.
+[12] Youhe Jiang, Ran Yan, Xiaozhe Yao, Yang Zhou, Beidi Chen, and Binhang Yuan. Hexgen: Generative inference of
+large language model over heterogeneous environment. In International Conference on Machine Learning, pages
+21946–21961. PMLR, 2024.
+[13] Youhe Jiang, Ran Yan, and Binhang Yuan. Hexgen-2: Disaggregated generative inference of llms in heterogeneous
+environment. In The Thirteenth International Conference on Learning Representations, 2025.
+[14] OpenAI. Learning to reason with llms. OpenAI Blog, 09 2024.
+[15] OpenAI. Introducing openai o3 and o4-mini. OpenAI Blog, 04 2025.
+14
+
+
+--- Page 15 ---
+[16] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde De Oliveira Pinto, Jared Kaplan, Harri
+Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, et al. Evaluating large language models trained on code.
+arXiv preprint arXiv:2107.03374, 2021.
+[17] Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn Song, and Jacob
+Steinhardt. Measuring mathematical problem solving with the math dataset. arXiv preprint arXiv:2103.03874,
+2021.
+[18] Xiao Liu, Hao Yu, Hanchen Zhang, Yifan Xu, Xuanyu Lei, Hanyu Lai, Yu Gu, Hangliang Ding, Kaiwen Men, Kejuan
+Yang, et al. Agentbench: Evaluating llms as agents. arXiv preprint arXiv:2308.03688, 2023.
+[19] Yiping Wang, Qing Yang, Zhiyuan Zeng, Liliang Ren, Liyuan Liu, Baolin Peng, Hao Cheng, Xuehai He, Kuan Wang,
+Jianfeng Gao, et al. Reinforcement learning for reasoning in large language models with one training example. arXiv
+preprint arXiv:2504.20571, 2025.
+[20] Jiaxuan Gao, Wei Fu, Minyang Xie, Shusheng Xu, Chuyi He, Zhiyu Mei, Banghua Zhu, and Yi Wu. Beyond ten turns:
+Unlocking long-horizon agentic search with large-scale asynchronous rl. arXiv preprint arXiv:2508.07976, 2025.
+[21] Yinmin Zhong, Zili Zhang, Bingyang Wu, Shengyu Liu, Yukun Chen, Changyi Wan, Hanpeng Hu, Lei Xia, Ranchen
+Ming, Yibo Zhu, et al. Optimizing {RLHF} training for large language models with stage fusion. In 22nd USENIX
+Symposium on Networked Systems Design and Implementation (NSDI 25), pages 489–503, 2025.
+[22] Zhuohan Li, Lianmin Zheng, Yinmin Zhong, Vincent Liu, Ying Sheng, Xin Jin, Yanping Huang, Zhifeng Chen, Hao
+Zhang, Joseph E Gonzalez, et al. {AlpaServe}: Statistical multiplexing with model parallelism for deep learning
+serving. In 17th USENIX Symposium on Operating Systems Design and Implementation (OSDI 23), pages 663–679,
+2023.
+[23] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan Ngiam,
+Quoc V Le, Yonghui Wu, et al. Gpipe: Efficient training of giant neural networks using pipeline parallelism. Advances
+in neural information processing systems, 32, 2019.
+[24] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. Megatron-
+lm: Training multi-billion parameter language models using model parallelism. arXiv preprint arXiv:1909.08053,
+2019.
+[25] Xupeng Miao, Yujie Wang, Youhe Jiang, Chunan Shi, Xiaonan Nie, Hailin Zhang, and Bin Cui. Galvatron: Effi-
+cient transformer training over multiple gpus using automatic parallelism. Proceedings of the VLDB Endowment,
+16(3):470–479, 2022.
+[26] Youhe Jiang, Fangcheng Fu, Xupeng Miao, Xiaonan Nie, and Bin Cui.
+Osdp: Optimal sharded data parallel
+for distributed deep learning. In Proceedings of the Thirty-Second International Joint Conference on Artificial
+Intelligence, pages 2142–2150, 2023.
+[27] John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal policy optimization
+algorithms. arXiv preprint arXiv:1707.06347, 2017.
+[28] Volodymyr Mnih, Adria Puigdomenech Badia, Mehdi Mirza, Alex Graves, Timothy Lillicrap, Tim Harley, David Silver,
+and Koray Kavukcuoglu. Asynchronous methods for deep reinforcement learning. In International conference on
+machine learning, pages 1928–1937. PmLR, 2016.
+[29] Lasse Espeholt, Hubert Soyer, Remi Munos, Karen Simonyan, Vlad Mnih, Tom Ward, Yotam Doron, Vlad Firoiu,
+Tim Harley, Iain Dunning, et al. Impala: Scalable distributed deep-rl with importance weighted actor-learner
+architectures. In International conference on machine learning, pages 1407–1416. PMLR, 2018.
+[30] Lasse Espeholt, Raphaël Marinier, Piotr Stanczyk, Ke Wang, and Marcin Michalski. Seed rl: Scalable and efficient
+deep-rl with accelerated central inference. arXiv preprint arXiv:1910.06591, 2019.
+[31] Zhiyu Mei, Wei Fu, Jiaxuan Gao, Guangju Wang, Huanchen Zhang, and Yi Wu. Srl: Scaling distributed reinforcement
+learning to over ten thousand cores. arXiv preprint arXiv:2306.16688, 2023.
+[32] Zhiyu Mei, Wei Fu, Kaiwei Li, Guangju Wang, Huanchen Zhang, and Yi Wu. Real: Efficient rlhf training of large
+language models with parameter reallocation. arXiv preprint arXiv:2406.14088, 2024.
+[33] Junyu Wu, Weiming Chang, Xiaotao Liu, Guanyou He, Haoqiang Hong, Boqi Liu, Hongtao Tian, Tao Yang, Yunsheng
+Shi, Feng Lin, et al. G-core: A simple, scalable and balanced rlhf trainer. arXiv preprint arXiv:2507.22789, 2025.
+15
+
+
+--- Page 16 ---
+[34] Zhenyu Han, Ansheng You, Haibo Wang, Kui Luo, Guang Yang, Wenqi Shi, Menglong Chen, Sicheng Zhang, Zeshun
+Lan, Chunshi Deng, et al. Asyncflow: An asynchronous streaming rl framework for efficient llm post-training. arXiv
+preprint arXiv:2507.01663, 2025.
+[35] Benjamin Hindman, Andy Konwinski, Matei Zaharia, Ali Ghodsi, Anthony D Joseph, Randy Katz, Scott Shenker, and
+Ion Stoica. Mesos: A platform for {Fine-Grained} resource sharing in the data center. In 8th USENIX Symposium on
+Networked Systems Design and Implementation (NSDI 11), 2011.
+[36] Gunho Lee and Randy H Katz. {Heterogeneity-Aware} resource allocation and scheduling in the cloud. In 3rd
+USENIX Workshop on Hot Topics in Cloud Computing (HotCloud 11), 2011.
+[37] Christina Delimitrou and Christos Kozyrakis. Qos-aware scheduling in heterogeneous datacenters with paragon.
+ACM Transactions on Computer Systems (TOCS), 31(4):1–34, 2013.
+[38] Zizhao Mo, Jianxiong Liao, Huanle Xu, Zhi Zhou, and Chengzhong Xu. Hetis: Serving llms in heterogeneous gpu
+clusters with fine-grained and dynamic parallelism. arXiv preprint arXiv:2509.08309, 2025.
+[39] Ziming Mao, Tian Xia, Zhanghao Wu, Wei-Lin Chiang, Tyler Griggs, Romil Bhardwaj, Zongheng Yang, Scott Shenker,
+and Ion Stoica. Skyserve: Serving ai models across regions and clouds with spot instances. In Proceedings of the
+Twentieth European Conference on Computer Systems, pages 159–175, 2025.
+[40] Youhe Jiang, Fangcheng Fu, Xiaozhe Yao, Guoliang He, Xupeng Miao, Ana Klimovic, Bin Cui, Binhang Yuan, and
+Eiko Yoneki. Demystifying cost-efficiency in llm serving over heterogeneous gpus. arXiv preprint arXiv:2502.00722,
+2025.
+[41] Youhe Jiang, Fangcheng Fu, Xiaozhe Yao, Taiyi Wang, Bin Cui, Ana Klimovic, and Eiko Yoneki. Thunderserve:
+High-performance and cost-efficient llm serving in cloud environments. arXiv preprint arXiv:2502.09334, 2025.
+[42] Chris Tong, Youhe Jiang, Gufeng Chen, Tianyi Zhao, Sibian Lu, Wenjie Qu, Eric Yang, Lynn Ai, and Binhang Yuan.
+Parallax: Efficient llm inference service over decentralized environment. arXiv preprint arXiv:2509.26182, 2025.
+[43] You Peng, Youhe Jiang, Chen Wang, and Binhang Yuan. Hexgen-text2sql: Optimizing llm inference request scheduling
+for agentic text-to-sql workflow. arXiv preprint arXiv:2505.05286, 2025.
+[44] Binhang Yuan, Yongjun He, Jared Davis, Tianyi Zhang, Tri Dao, Beidi Chen, Percy S Liang, Christopher Re, and
+Ce Zhang. Decentralized training of foundation models in heterogeneous environments. Advances in Neural
+Information Processing Systems, 36:25464–25477, 2022.
+[45] Xupeng Miao, Yining Shi, Zhi Yang, Bin Cui, and Zhihao Jia.
+Sdpipe: A semi-decentralized framework for
+heterogeneity-aware pipeline-parallel training. Proceedings of the VLDB Endowment, 16(9):2354–2363, 2023.
+[46] Ruidong Zhu, Ziheng Jiang, Chao Jin, Peng Wu, Cesar A Stuardo, Dongyang Wang, Xinlei Zhang, Huaping Zhou,
+Haoran Wei, Yang Cheng, et al. Megascale-infer: Serving mixture-of-experts at scale with disaggregated expert
+parallelism. arXiv preprint arXiv:2504.02263, 2025.
+[47] Todd K Moon. The expectation-maximization algorithm. IEEE Signal processing magazine, 13(6):47–60, 1996.
+[48] NVIDIA.
+Nvidia
+h20
+solution
+brief.
+https://images.nvidia.com/content/pdf/dgx-apps/
+NVIDIA-H2O-Solution-Brief-June17.pdf, 2024.
+[49] NVIDIA. Nvidia ai enterprise product support matrix, 2024. H800 Tensor Core GPU specifications.
+[50] DeepSeek-AI. Deepseek-r1-distill-qwen-1.5b, 2024.
+[51] DeepSeek-AI. Deepseek-r1-distill-qwen-7b, 2024.
+[52] DeepSeek-AI. Deepseek-r1-distill-qwen-14b, 2024.
+16
