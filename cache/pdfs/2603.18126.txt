@@ -1,0 +1,1539 @@
+--- Page 1 ---
+1
+A Survey of Neural Network Variational Monte Carlo from a
+Computing Workload Characterization Perspective
+Zhengze Xiao1,*, Xuanzhe Ding1,*, Yuyang Lou2, Lixue Cheng2,†, Chaojian Li1,†
+1Department of Computer Science and Engineering, Hong Kong University of Science and Technology
+2Department of Chemistry, Hong Kong University of Science and Technology
+Abstract—Neural Network Variational Monte Carlo (NNVMC)
+has emerged as a promising paradigm for solving quantum many-
+body problems by combining variational Monte Carlo with expres-
+sive neural-network wave-function ans¨atze. Although NNVMC can
+achieve competitive accuracy with favorable asymptotic scaling,
+practical deployment remains limited by high runtime and mem-
+ory cost on modern graphics processing units (GPUs). Compared
+with language and vision workloads, NNVMC execution is shaped
+by physics-specific stages, including Markov-Chain Monte Carlo
+sampling, wave-function construction, and derivative/Laplacian
+evaluation, which produce heterogeneous kernel behavior and
+nontrivial bottlenecks. This paper provides a workload-oriented
+survey and empirical GPU characterization of four representative
+ans¨atze: PauliNet, FermiNet, Psiformer, and Orbformer. Using
+a unified profiling protocol, we analyze model-level runtime
+and memory trends and kernel-level behavior through fam-
+ily breakdown, arithmetic intensity, roofline positioning, and
+hardware utilization counters. The results show that end-to-end
+performance is often constrained by low-intensity elementwise
+and data-movement kernels, while the compute/memory balance
+varies substantially across ans¨atze and stages. Based on these
+findings, we discuss algorithm–hardware co-design implications
+for scalable NNVMC systems, including phase-aware scheduling,
+memory-centric optimization, and heterogeneous acceleration.
+Index Terms—AI for Quantum Chemistry, Workload Charac-
+terization, Performance Analysis, Hardware Profiling.
+I. INTRODUCTION
+Solving the electronic Schr¨odinger equation is central to
+quantum many-body simulation in chemistry and materials
+science. A long-standing challenge is the trade-off between
+accuracy and computational cost in traditional methods, such
+as coupled-cluster singles, doubles, and perturbative triples
+(CCSD(T)), full configuration interaction (FCI), and auxiliary-
+field quantum Monte Carlo (AFQMC) [1]. Neural Network
+Variational Monte Carlo (NNVMC) has emerged as a promising
+alternative by combining variational Monte Carlo with neural-
+network wavefunction modeling.
+NNVMC represents the electronic wavefunction with a
+neural network and optimizes model parameters under the
+variational principle. Prior studies show that this approach
+can achieve strong accuracy while offering favorable asymp-
+totic scaling in representative settings (often cited as O(N 4)
+versus O(N 7) for CCSD(T)) [2]. Since Neural Quantum
+States were introduced, multiple neural wavefunction ans¨atze
+*These authors contributed equally to this work.
+†Correspondence to: Lixue Cheng (lixuecheng@ust.hk) and Chaojian Li
+(chaojian@ust.hk).
+have been proposed. In this work, we focus on four repre-
+sentative models for ground-state problems: FermiNet [3],
+PauliNet [4], Psiformer [5], and Orbformer [6]. Other models,
+e.g., DeepSolid [7], LapNet [8], QiankunNet [9], [10], Neural
+Pfaffians [11], [12], and FiRE [13] are out of scope for this
+survey; in this study, we treat them as extensions of these
+parent families rather than distinct workload families.
+Figure 1 outlines the end-to-end NNVMC workflow. Despite
+its algorithmic promise, practical deployment remains con-
+strained by high computational cost [3], [4], [14], [15]. Current
+implementations typically handle only tens of electrons; re-
+peated MCMC iterations require many forward evaluations [3],
+[14], Laplacian computation stresses memory bandwidth [3],
+[14], and large parameter counts increase optimization cost [4],
+[5]. These factors lead to substantial runtime and memory
+pressure and limit scalability to larger systems.
+Unlike typical language or vision workloads, NNVMC
+has physics-specific execution stages, and kernel composition
+varies substantially across those stages [3]–[6], [14], [16],
+[17]. As a result, aggregate floating-point operation (FLOP)
+counts alone are a weak predictor of runtime and memory
+behavior [14], [15]. This motivates dedicated stage-aware
+workload characterization.
+Building on prior NNVMC profiling studies [14], [15], this
+work combines a workload-oriented survey with empirical
+GPU characterization under a unified profiling protocol across
+FermiNet, PauliNet, Psiformer, and Orbformer [3]–[6]. We
+connect operator-level behavior to end-to-end runtime and mem-
+ory trends and discuss implications for algorithm–hardware
+co-design in scalable NNVMC systems.
+To address these challenges, this study makes the following
+three contributions:
+• We provide a workload-oriented review of representative
+NNVMC ans¨atze, covering PauliNet and FermiNet im-
+plemented in the DEEPQMC codebase and extending the
+discussion to Psiformer and Orbformer implemented in
+the ONEQMC codebase [3]–[6], [14].
+• We present operator- and kernel-level characterization,
+using empirical arithmetic intensity and roofline analysis
+to explain why fused elementwise and data-movement
+kernels often dominate runtime, even alongside general
+matrix multiplication (GEMM) kernels [14], [15], [18].
+• We report hardware-level behavior, including streaming
+multiprocessor (SM) utilization, Tensor Core activity,
+memory throughput, and level-2 (L2) cache hit rate, and
+arXiv:2603.18126v2  [cs.AR]  22 Mar 2026
+
+
+--- Page 2 ---
+2
+C
+H
+H
+H
+H
+INPUT
+Electrons
+Nuclei
+Distances
+STAGE A
+Embedding
+STAGE B
+Propagation
+(Message passing /
+Self attention)
+STAGE C
+Readout
+STAGE D
+Wavefunction Assembly
+OUTPUT
+Ψ
+C
+H
+H
+H
+H
+C
+H
+H
+H
+H
+Electron
+Electron
+Markov Chain Monte Carlo
+Predicting Reaction Energetics 
+from the Wavefunction
+Characterizing the Electrostatic Features 
+of Protein–DNA Interactions
+Jastrow
+Envelope
+Projection
+Backflow
+…
+-10                        0                        10
+Electrostatic Potential
+Desorption
+Surface Reaction
+Adsorption
+Adsorption
+Modeling Catalytic Surface Adsorption 
+and Reaction Pathways
+Reconstructing Crystal Structures from 
+Wavefunction-Derived Electron Density
+Fig. 1. Overview of the end-to-end NNVMC workflow (top) and representative application domains (bottom). The workflow covers ans¨atz construction,
+Markov chain Monte Carlo (MCMC) sampling of electron configurations, wavefunction and local-energy evaluation, and iterative variational optimization.
+discuss the implications for algorithm–hardware co-design
+in scalable NNVMC systems.
+II. PRELIMINARIES
+NNVMC workloads vary widely because different ans¨atze
+encode different physical priors and architectural choices.
+They nevertheless share the same variational quantum Monte
+Carlo (VMC) foundation, which we review in Section II-A.
+Sections II-B and II-C then compare how pipeline structure
+and dominant operator patterns differ across model families.
+Section II-D builds on this discussion and introduces the
+profiling metric used in the remainder of the paper.
+A. Variational quantum Monte Carlo with neural-network
+ans¨atze (NNVMC)
+For a system with M atoms and n electrons, the time-
+independent electronic Schr¨odinger equation is
+ˆHψ(x1, x2, ..., xn) = Eψ(x1, x2, ..., xn),
+(1)
+where xi = {ri, σi}, with ri and σi denoting the position and
+spin of electron i. Here, E is the energy eigenvalue, ψ is the
+wavefunction, and ˆH is the Hamiltonian operator. Under the
+Born–Oppenheimer approximation, the nuclei are treated as
+classical particles with fixed positions, and ˆH becomes
+ˆH = −1
+2
+X
+i
+∇2
+i +
+X
+i
+X
+j<i
+1
+|ri −rj|
+−
+X
+i
+X
+I
+ZI
+|ri −RI| +
+X
+I
+X
+J<I
+ZIZJ
+|RI −RJ|,
+(2)
+where ZI and RI are the charge and position of nucleus I,
+and ∇2
+i is the Laplacian with respect to electron coordinate ri.
+Classical quantum chemistry typically relies on hand-
+designed ans¨atze. NNVMC instead parameterizes the wave-
+function with a neural network ψθ and optimizes the parameter
+set θ under the variational principle. In this paper, we focus
+on ground-state problems, for which the target parameter set
+θ′ minimizes the expected Hamiltonian:
+θ′ = arg min
+θ ⟨ˆH⟩ψθ.
+The objective is estimated by sampling nsamples = nb × ns
+electron configurations {r} from |ψθ|2, where nb denotes the
+number of parallel walkers and ns denotes the number of
+sampling steps, and then evaluating ψθ({r}):
+L(θ) = ⟨ˆH⟩ψθ = ⟨ψθ| ˆH|ψθ⟩
+⟨ψθ|ψθ⟩
+= E{r}∼|ψθ|2Eloc[ψθ],
+(3)
+where the local energy is
+Eloc[ψθ] = Tloc({r}) + V ({r}),
+(4)
+where Tloc denotes the local kinetic energy and V is the
+Coulomb potential. These two terms are given by
+Tloc({r}) = −1
+2
+X
+i
+∇2
+riψθ({r})
+ψθ({r})
+,
+(5)
+V ({r}) =
+X
+i<j
+1
+|ri −rj| −
+X
+i,I
+ZI
+|ri −RI| +
+X
+I<J
+ZIZJ
+|RI −RJ|.
+(6)
+In practice, optimization uses the following unbiased estimator
+of the loss gradient:
+∇θL(θ) = 2E{r}∼|ψθ|2
+h
+(Eloc[ψθ]({r}) −L(θ))
+· ∇θ log |ψθ({r})|
+i
+(7)
+
+
+--- Page 3 ---
+3
+Optimization yields the converged ground-state wavefunction
+ψθ′ and the corresponding expected energy E0:
+⟨E0⟩=
+1
+nbns
+nb
+X
+i=1
+ns
+X
+j=1
+Eloc[ψθ′]({r}ij)
+(8)
+Highlight 1 (Optimization objective). NNVMC directly
+parameterizes the many-electron wavefunction with a neural net-
+work and optimizes it through stochastic estimation of Eq. (3)
+and its gradient. This unifies physical energy minimization and
+model training in one variational loop.
+Highlight 2 (Execution structure). Each optimization step
+jointly performs MCMC sampling, wavefunction evaluation,
+and derivative/Laplacian computation. This coupling is a key
+reason NNVMC runtime behavior differs from standard deep-
+learning workloads and motivates stage-aware profiling in later
+sections. Figure 1 summarizes this end-to-end workflow.
+Beyond the released ONEQMC models profiled here, other
+potentially more efficient model designs may also exist. For
+example, approximating the Laplacian through Hutchinson
+trace estimation (HTE) is a potential direction for improving
+the efficiency of local-energy evaluation [19]. However, since
+no corresponding public model release is currently available,
+we leave profiling of such designs to future work.
+Sections II-B and II-C then turn to model-specific architec-
+ture details and execution pipelines for PauliNet, FermiNet,
+Psiformer, and Orbformer in the DEEPQMC and ONEQMC
+codebases.
+B. PauliNet and FermiNet via the deepqmc codebase
+In this work, PauliNet and FermiNet are treated as
+determinant-based NNVMC ans¨atze. We use DEEPQMC for
+implementation and profiling [3], [4], [14]. Figure 2 summarizes
+their stage-wise execution flow.
+Pipeline overview. Each VMC iteration samples electron
+configurations from |ψθ|2 using Markov chain Monte Carlo,
+typically Metropolis–Hastings, and then evaluates wavefunction-
+and local-energy-related quantities for those samples [14], [16],
+[17]. The neural-network forward path is therefore embedded
+in the sampling loop and executed repeatedly.
+• Stage A (feature construction). Electron coordinates are
+transformed into physically motivated inputs, including
+electron–nuclear and electron–electron distances, relative
+coordinate vectors, and spin features.
+• Stage B (correlation update). Permutation-equivariant
+neural layers update electron representations to capture
+many-body correlations and provide the structural basis
+for fermionic antisymmetry.
+• Stage C (readout projection). Updated features are
+projected into intermediate orbital-like representations for
+wavefunction construction.
+• Stage D (wavefunction assembly). Multiple Slater de-
+terminants are formed and combined to produce ψθ(R),
+optionally with additional correlation terms such as Jas-
+trow/backflow components [3], [20]. In practice, outputs
+are commonly represented by logarithmic amplitude and
+sign for numerical stability.
+• Stage E (derivative/Laplacian evaluation). Local-energy
+evaluation requires first- and second-order derivatives. In
+DEEPQMC, this stage uses Jacobian–vector product (JVP)-
+based replay of earlier computations to obtain gradient
+and Laplacian terms [14], [21].
+Summary. For PauliNet/FermiNet in DEEPQMC, a single
+evaluation consists of Stages A–D followed by derivative
+evaluation in Stage E, all within the MCMC loop. This
+execution pattern is the basis for the workload characterization
+in later sections.
+C. Psiformer and Orbformer via the oneqmc codebase
+Within the variational quantum Monte Carlo (VMC) frame-
+work, Psiformer and Orbformer [5], [6] are implemented in the
+ONEQMC codebase. Figure 3 summarizes the corresponding
+execution flow.
+Pipeline overview. As in DEEPQMC, each VMC iteration
+samples configurations from |ψθ|2, evaluates wavefunction-
+related quantities, and computes derivatives for local-energy
+estimation. The forward path remains embedded in the Monte
+Carlo loop and is executed repeatedly.
+• Stage A (feature construction). Atomic/system coordi-
+nates are transformed into electron- and nucleus-related
+input features; Orbformer additionally includes nucleus-
+side features for its Nuclei MPNN [6].
+• Stage B (Transformer interaction). Psiformer and
+Orbformer use a single-stream ElectronTransformer with
+multi-head self-attention for electron-representation up-
+dates [5], [6]. Orbformer further introduces an Orbital
+Generator and a Nuclei MPNN to support cross-system
+transferability.
+• Stage C (readout projection). Electron representations
+are projected into orbital/readout quantities used for
+determinant construction (multi-layer perceptron (MLP)
+projection in Psiformer; Orbital-Generator-conditioned
+projection in Orbformer).
+• Stage D (wavefunction assembly). Slater determinants
+are assembled from Stage C outputs and combined with
+Jastrow terms to produce ψθ(R) [5], [6]. In practice,
+outputs are commonly represented in logarithmic form
+for numerical stability.
+• Stage E (derivative/Laplacian evaluation). Local-energy
+evaluation includes a kinetic-energy (KE) term Tloc({r})
+and a potential-energy (PE) term V ({r}), as shown in
+Eq. (4). Compared with DEEPQMC, ONEQMC uses a
+forward Laplacian [8] estimator for the KE term, improv-
+ing the Laplacian computation by directly propagating
+first-order derivatives and Laplacian terms through the
+network in a single forward pass without any explicit
+Hessian constructions; the PE term is evaluated directly
+from the sampled coordinates. This keeps the number of
+differentiation passes constant rather than scaling with all
+Cartesian directions of all electrons [21].
+Summary. For Psiformer/Orbformer in ONEQMC, Stages A–D
+provide forward wavefunction evaluation and Stage E provides
+local-energy evaluation through a forward Laplacian path, again
+
+
+--- Page 4 ---
+4
+STAGE A
+Embedding
+STAGE D
+Wavefunction Heads & Assembly
+ 
+  
+  
+STAGE B
+Message Passing (Paulinet/Ferminet
+Forward×1 (Without E) + JVP× d ×N�
+)
+STAGE E
+JVP Laplacian Evaluation
+C
+H
+H
+H
+STAGE C
+Readout
+Envelope
+Projection
+Jastrow
+Backflow
+…
+H
+Fig. 2. Overview of the execution pipeline of PauliNet and FermiNet in the DEEPQMC codebase. Stages A–E represent feature construction and embedding,
+electron-correlation updates through neural blocks, readout projection, Slater-determinant wavefunction assembly, and derivative/Laplacian evaluation for
+local-energy computation. The bracket below the pipeline indicates that one VMC evaluation includes one forward pass through Stages A–D and then a Stage E
+replay over all Cartesian directions of all electrons through JVP, summarized in the figure as a cost scaling with d × Ne, where d is the spatial dimensionality
+and Ne is the number of electrons. The rightmost inset schematically illustrates the JVP-based Laplacian evaluation in Stage E: it traces an input quantity x,
+an intermediate state h = F(x), and an output y = F ′(x), while the paired ∇(·) and ∆(·) annotations indicate the gradient- and Laplacian-related quantities
+propagated in this procedure.
+within the MCMC loop. This execution pattern supports the
+profiling analysis in Section III.
+D. Arithmetic Intensity as a Performance Metric
+Our performance analysis operates at GPU-kernel granularity.
+Each kernel corresponds to a numerical operator, such as dense
+matrix multiplication, fused elementwise transformation, or
+STAGE B
+Transformer Message Passing
+STAGE A
+STAGE D~E
+STAGE C
+Readout
+Forward×1 (Sampling) + JVP (𝑇!"# {𝑟} ) ×1 + Forward (𝑉{𝑟} ) ×1
+Orbital Generator
+Electron Transformer
+Attention Visualization  
+Nuclei MPNN
+……
+……
+Fig. 3. Overview of the execution pipeline of Psiformer and Orbformer in the
+ONEQMC codebase. The upper panels show the Orbformer-specific modules
+used in Stage B, namely the orbital generator, nuclei message-passing neural
+network (MPNN), and electron Transformer, while the lower block diagram
+contrasts the Orbformer path with the simpler Psiformer path. Specifically,
+Stage B (Transformer-based electron representation learning) and Stage C
+(orbital/readout projection) are the main departures from DEEPQMC; Stages A
+and D (feature construction and Slater-determinant wavefunction assembly)
+follow the same high-level structure as in Figure 2, while Stage E uses a
+forward Laplacian estimator and is omitted here for brevity.
+Jacobian–vector product computation. We summarize each ker-
+nel by its arithmetic intensity (AI), defined as the ratio between
+floating-point operations (FLOPs) and off-chip memory traffic:
+AI =
+FLOPs
+Bytes moved.
+(9)
+Kernels with high AI perform many floating-point opera-
+tions per byte transferred and are therefore more likely to
+approach compute limits, whereas low-AI kernels are typically
+bandwidth-limited. In the roofline model, AI determines
+whether a kernel lies in the memory-bound or compute-bound
+region and thus provides a compact way to interpret NNVMC
+behavior on GPUs.
+We use empirical AI reported by NVIDIA Nsight Compute
+rather than hand-derived FLOP formulas. For each kernel
+instance, Nsight Compute provides hardware-counter estimates
+of executed floating-point operations and off-chip memory
+traffic; Section III aggregates these measurements by kernel
+family and model stage. This empirical view is especially
+useful for heterogeneous NNVMC workloads: GEMM kernels
+in embedding and message-passing blocks often show relatively
+high AI, whereas fused elementwise kernels typically remain
+at very low AI. In the DEEPQMC PauliNet/FermiNet path, JVP-
+based replay during Laplacian evaluation further introduces
+long sequences of fine-grained, bandwidth-sensitive kernels.
+These AI patterns help explain the roofline results and why
+end-to-end execution can remain memory-bound despite the
+presence of large matrix multiplications.
+III. PROFILING
+We profile determinant-based NNVMC workloads at two
+complementary levels: end-to-end runtime/memory and kernel-
+level execution behavior [5], [6], [14]. We first report system-
+level trends across molecules and GPUs using Figure 4, and
+then analyze dominant kernel families and bottlenecks.
+A. Profiling Settings
+We summarize the experimental setup by category:
+
+
+--- Page 5 ---
+5
+LiH
+CH4
+C2H6
+C4H4
+Molecule
+10
+2
+10
+3
+Runtime (ms)
+3111
+(a) Training Runtime
+146
+190
+292
+369
+131
+161
+197
+249
+74
+113
+141
+170
+372
+445
+557
+681
+253 269
+321
+361
+138
+167 184
+219
+1267
+1822
+1107
+1570
+637
+760
+601
+770
+328
+422
+295
+445
+3651
+5702
+2547
+1610
+1992
+1303 1451
+770
+1020
+622
+718
+GPU
+A5000
+A100
+H200
+Ansatz
+Ferminet
+Paulinet
+Psiformer
+Orbformer
+LiH
+CH4
+C2H6
+C4H4
+Molecule
+10
+2
+10
+3
+Runtime (ms)
+2839
+(b) Inference Runtime
+116
+133
+262
+305
+104 116
+142
+180
+61
+74
+96
+115
+375 398
+519
+601
+224 223
+254 276
+117
+134 141
+164
+1317
+1754
+1045
+1556
+613
+696
+523
+671
+298
+372
+248
+362
+3744
+5638
+2441
+1575
+1951
+1226 1331
+740
+966
+571
+646
+GPU
+A5000
+A100
+H200
+Ansatz
+Ferminet
+Paulinet
+Psiformer
+Orbformer
+LiH
+CH4
+C2H6
+C4H4
+Molecule
+1
+2
+4
+8
+16
+32
+64
+Memory (GB)
+38.9
+(c) Training Memory
+1.12 1.18
+0.84
+2.45
+1.30 1.30
+1.56
+2.67
+2.05 2.05 2.04
+3.14
+1.89
+2.97
+4.44 4.58
+2.05
+3.05
+4.66 4.79
+3.30
+4.30
+5.13 5.27
+6.41 5.77
+8.44
+16.8
+6.55
+5.80
+16.7
+33.0
+7.30
+10.8
+17.1
+33.5
+11.9
+17.2 16.6
+12.0
+19.1
+32.8
+40.1
+12.8
+19.8
+33.3
+65.6
+GPU
+A5000
+A100
+H200
+Ansatz
+Ferminet
+Paulinet
+Psiformer
+Orbformer
+LiH
+CH4
+C2H6
+C4H4
+Molecule
+1
+2
+4
+8
+16
+32
+64
+Memory (GB)
+38.9
+(d) Inference Memory
+0.77 0.79 0.86
+2.46
+0.97 0.98
+1.57
+2.70
+1.23 1.23
+1.80
+2.92
+1.78 1.81
+4.42 4.62
+1.97 1.98
+4.63 4.82
+2.23 2.24
+4.86 5.05
+3.29
+5.60
+8.42
+16.9
+3.47
+5.74
+16.6
+33.1
+3.73
+6.24
+16.9 17.1
+5.80
+10.9
+16.5
+5.97
+11.0
+32.8
+40.1
+6.23
+11.2
+33.0
+65.3
+GPU
+A5000
+A100
+H200
+Ansatz
+Ferminet
+Paulinet
+Psiformer
+Orbformer
+Fig. 4. Comparison of GPU runtime and memory usage across four molecules, four determinant-based NNVMC ans¨atze, and three GPUs (A5000, A100, and
+H200). From top to bottom, the panels report training runtime, inference runtime, training memory, and inference memory. Runtime uses log scale and memory
+uses log2 scale. Training runtime denotes one optimization step (forward, backward, and optimizer update), while inference runtime includes MCMC sampling
+and local-energy evaluation with model-specific Stage E Laplacian implementations. Dashed outlines indicate that Orbformer encounters out-of-memory issues
+on the A5000 for C2H6 and C4H4.
+• Hardware platform. Kernel-level profiling is conducted
+in inference mode on an NVIDIA RTX A5000 GPU
+(24 GB).
+• Model
+implementations
+and
+software
+stack.
+For
+PauliNet
+and
+FermiNet,
+we
+use
+JAX
+0.4.28
+(jaxlib 0.4.28) [22] with
+DEEPQMC 1.2.0 [14] on
+CUDA 12.4. Psiformer and Orbformer are profiled in the
+ONEQMC codebase under the same software and platform
+configuration.
+• Profiling tools. Execution traces are collected with Nsight
+
+
+--- Page 6 ---
+6
+Systems 2025.5.1 [23], and kernel-level metrics are
+collected with Nsight Compute 2025.3.1 [24].
+• Timing and statistical protocol. We report GPU kernel
+time only: CUDA kernel durations are summed, while
+host-side overheads, memory-copy operations, and just-in-
+time (JIT) compilation time are excluded. Each workload
+is executed 11 times; the first run is treated as warm-up
+and discarded, and we report the mean of the remaining
+10 runs.
+• Kernel-family attribution. Kernels are grouped into
+families using name-based regular expressions. Since
+XLA (Accelerated Linear Algebra) JIT fusion in the
+JAX stack [22], [25] can combine elementwise operations,
+layout transforms, and small GEMM-like work into one
+kernel, family attribution is approximate.
+• Workload configuration. We use 32-bit floating point
+(FP32) and a batch of 1024 electron configurations
+(parallel MCMC walkers) for all experiments in this
+section. For kernel-level profiling, we focus on methane
+(CH4; 10 electrons). For PauliNet and FermiNet, each
+profiling run uses default DEEPQMC sampling settings
+and consists of ten Metropolis–Hastings MCMC transi-
+tions [16], [17], one forward pass through Stages A–D,
+and 3Ne JVP replays for Laplacian evaluation (Stage E),
+which re-execute computations from Stages A–D. For
+Psiformer and Orbformer, we use corresponding ONEQMC
+defaults with the same precision and batch settings;
+each run contains one forward pass through Stages A–D
+and one Stage E local-energy path based on a forward
+Laplacian estimator [8], within the same Metropolis–
+Hastings process.
+Unless otherwise stated, all analyses in Sections III-C–III-F
+use the profiling setup defined in this subsection.
+B. Runtime and Memory Summary
+Using the unified profiling setup in Section III-A, we first
+examine model-level behavior before moving to kernel-level
+attribution. Two patterns are most salient: runtime scaling is
+strongly ans¨atz-dependent, and memory behavior differs across
+implementation stacks (Figure 4).
+Observation 1 (runtime scaling and ranking). Runtime
+scales with molecule size, but the slope is ans¨atz-dependent.
+On A5000, kernel time is in the hundreds of milliseconds
+for LiH/CH4 and reaches seconds for C2H6/C4H4. PauliNet
+and FermiNet scale steeply from LiH to C4H4 (about 30–
+42× and 25–32× across training/inference), while Psiformer
+and Orbformer scale more mildly (∼8–9×) (Figure 4). The
+runtime ranking also changes with system size: FermiNet is
+fastest on LiH and CH4, whereas Psiformer is fastest on C2H6
+and C4H4, and PauliNet is slowest at larger systems. The main
+driver is Laplacian strategy and kernel mix. PauliNet/FermiNet
+use automatic differentiation (AD) and JVP replay with roughly
+3Ne re-executions of Stages A–D, which amplifies fine-grained
+elementwise and layout kernels. Psiformer/Orbformer reduce
+this replay overhead with a forward Laplacian path, so more
+time shifts to sampling and larger GEMM/attention kernels.
+Observation 2 (memory scaling and hardware gains).
+Memory trends also depend on implementation stack. Train-
+ing memory is consistently higher than inference memory.
+PauliNet/FermiNet grow relatively smoothly with molecular
+size, whereas Psiformer/Orbformer on A100 and H200 show
+step-like jumps near powers of two at C2H6 and C4H4 in the
+two memory panels of Figure 4. This pattern is consistent with
+ONEQMC allocator effects (dynamic allocation and memory-
+pool growth granularity), so these points should be interpreted
+as effective allocated memory rather than pure model-state size.
+Across hardware, moving from A5000 to A100 yields about
+1.1×–2.9× speedup, while H200 yields about 1.7×–5.8×, with
+the largest gains on C4H4. On A5000, training and inference
+are close for CH4 and larger systems (typically within ∼15%),
+while LiH shows larger gaps for some ans¨atze.
+Takeaway: Runtime by Ans¨atz, Memory by Stack
+At the model level, runtime trends are mainly driven by
+ans¨atz design and Laplacian strategy, while memory trends are
+strongly shaped by implementation-level allocation behavior.
+C. PauliNet Workload Characterization
+We use PauliNet as the baseline workload for cross-model
+comparison. The following analysis focuses on kernel-family
+composition and bottlenecks along the Stage A–E pipeline.
+PauliNet combines neural embeddings with Slater determi-
+nants, a Jastrow factor, and backflow [4], and uses AD/JVP for
+Laplacian evaluation. This makes it a representative PauliNet
+workload in the DEEPQMC implementation for profiling.
+Observation 1 (kernel composition and phase share).
+PauliNet is dominated by fused elementwise kernels, with
+MCMC at 13% of total runtime, fused elementwise at 52%,
+GEMM at 20%, and triangular solve matrix (TRSM) at 5% in
+the non-sampling slices of Figure 5(a). Connection with model
+architecture: The Stage E JVP replay generates many fine-
+grained elementwise kernels, while Stages A–D add additional
+elementwise and layout work around ElectronGNN blocks and
+wavefunction assembly.
+Observation 2 (roofline position and utilization). Most
+PauliNet kernel families cluster at 10−2–10−1 FLOP/byte, and
+only GEMM kernels in Stages A–C approach the compute
+roof (Figure 6(a)). PauliNet hotspots remain underutilized,
+with about 26% peak instruction throughput, about 14%
+fused multiply-add (FMA) activity, around 27% SM memory
+throughput, and roughly 48% level-2 (L2) cache hit rate.
+Connection with model architecture: The pipeline alternates
+between GEMM and low-intensity elementwise/layout kernels,
+and repeated Stage E derivative paths create small-kernel
+granularity with limited reuse; end-to-end behavior therefore
+remains memory-limited.
+Takeaway: Stage-E Replay Dominates PauliNet
+PauliNet remains a heterogeneous workload in which fused
+elementwise and layout kernels dominate total runtime,
+especially along the Stage E replay path [14]. End-to-end
+performance is therefore constrained more by memory traffic
+and kernel granularity than by peak FLOP capacity [18].
+
+
+--- Page 7 ---
+7
+D. FermiNet Workload Characterization
+We analyze FermiNet against PauliNet to isolate how ans¨atz
+design changes runtime composition. Relative to PauliNet,
+FermiNet shifts a larger non-sampling share toward GEMM
+kernels and reduces fused elementwise dominance.
+Observation 1 (kernel composition and phase share).
+FermiNet shifts non-sampling runtime toward GEMM and
+away from fused elementwise kernels relative to PauliNet,
+with GEMM increasing from 20% to 30%, fused elementwise
+decreasing from 52% to 29%, and MCMC at 28% (Figure 5(b)).
+Connection with model architecture: This shift matches Fer-
+miNet’s higher-capacity ElectronGNN design (more blocks,
+wider embeddings, and a simpler update head), which increases
+dense linear-algebra workload while Stage E still introduces
+many fine-grained kernels.
+Observation 2 (roofline position and utilization). FermiNet
+places a larger GEMM share in higher-arithmetic-intensity
+regions, but end-to-end behavior remains memory-sensitive;
+hotspot counters are still modest, with about 22% peak
+instruction throughput and around 50% L2 hit rate (Figure 6(b)).
+Connection with model architecture: Compared with PauliNet,
+FermiNet relies more on neural blocks and less on explicit
+physics-inspired terms, which improves GEMM intensity but
+does not remove bandwidth pressure from Stage E replay and
+tensor-layout operations [3], [4].
+Takeaway: More GEMM, Still Memory-Sensitive
+Relative to PauliNet, FermiNet moves more runtime into
+higher-intensity GEMM kernels as model capacity grows [14].
+Even so, low-intensity elementwise and layout kernels
+continue to limit end-to-end utilization through memory traffic
+and kernel granularity [18].
+E. Psiformer Workload Characterization
+Psiformer shifts the workload profile toward compute-
+intensive GEMM operations and concentrates more runtime in
+the sampling phase, driven by Transformer-based interactions
+and a reduced-cost Laplacian path.
+Observation 1 (kernel composition and phase share).
+MCMC sampling accounts for 57% of end-to-end kernel
+time. Within sampling, GEMM dominates at 62%, followed
+by elementwise (24%), transpose (9%), TRSM (3.2%), and
+slice/reduce (1%). In non-sampling phases, GEMM remains
+the largest component at about 19%, followed by elementwise
+at 14%. Relative to PauliNet/FermiNet, GEMM appears more
+frequently and at higher arithmetic intensity in the roofline,
+while transpose shifts upward and slice/reduce shifts toward
+the memory-bound side. Connection with model architec-
+ture: Transformer attention in Stage B introduces substantial
+query-key-value (QKV)-related matrix computation, increasing
+GEMM share and shifting part of execution toward higher-
+intensity regions.
+Observation 2 (roofline position and utilization). Hot-
+kernel counters increase versus PauliNet/FermiNet: peak in-
+struction throughput rises from about 22%–26% to 42%, SM
+memory throughput from about 21% to 31%, and combined
+compute/memory throughput from about 34% to 53%. Tensor
+Core utilization remains low on average (about 19%) but
+with high variance (up to 76–78% for a subset of kernels),
+and L2 hit rate increases slightly to about 60%. Connection
+with model architecture: In the ONEQMC implementation, the
+Laplacian strategy in Stage E reduces replay overhead compared
+with PauliNet/FermiNet, so a larger fraction of time shifts to
+sampling-stage kernels.
+Fig. 5. Kernel-level runtime breakdown for (a) PauliNet, (b) FermiNet, (c) Psiformer, and (d) Orbformer on an NVIDIA RTX A5000 GPU.
+
+
+--- Page 8 ---
+8
+Operation Intensity (FLOPS/Byte)
+Attainable Performance (TFLOPS/s)
+(a)
+Operation Intensity (FLOPS/Byte)
+Attainable Performance (TFLOPS/s)
+(b)
+Operation Intensity (FLOPS/Byte)
+Attainable Performance (TFLOPS/s)
+(c)
+Operation Intensity (FLOPS/Byte)
+Attainable Performance (TFLOPS/s)
+(d)
+Fig. 6. Roofline analysis [18] for (a) PauliNet, (b) FermiNet, (c) Psiformer, and (d) Orbformer on an NVIDIA RTX A5000 GPU.
+Takeaway: Sampling-Heavy and GEMM-Heavy
+Compared with PauliNet/FermiNet, Psiformer exhibits a
+more GEMM-intensive profile with higher sampling-phase
+concentration, but end-to-end behavior remains heterogeneous
+and not purely compute-bound.
+F. Orbformer Workload Characterization
+Orbformer shifts the workload back toward a memory-bound
+regime. FlashAttention and additional MPNN modules reduce
+GEMM dominance and increase elementwise/data-movement
+share.
+Observation 1 (kernel composition and phase share). Com-
+pared with Psiformer, GEMM is roughly halved in both phases
+(62% to 31% in sampling, 19% to 9.3% in non-sampling), while
+elementwise rises (24% to 38% in sampling; 14% to 17.2%
+in non-sampling). Sampling increases slightly from 57% to
+59%. The mhsea FlashAttention family appears with 11% of
+sampling time and 3.6% of non-sampling time; transpose drops
+from 9% to 1.5% in sampling, while concat/reduce increase.
+Connection with model architecture: FlashAttention fuses
+previously separate attention-related operations, reducing ex-
+plicit GEMM/transpose calls, while Orbformer-specific MPNN
+modules introduce additional elementwise and aggregation
+kernels.
+Observation 2 (roofline position and utilization). Relative
+to Psiformer, GEMM/transpose/concat kernels shift toward
+lower arithmetic intensity, and the overall roofline distribution
+becomes more concentrated in the memory-sensitive region.
+Hot-kernel counters also decline slightly: top-100 SM utiliza-
+tion is 37%, SM memory throughput is 29%, L2 hit rate
+is 51%, and combined compute/memory throughput is 51%.
+Connection with model architecture: The combined effect of
+FlashAttention restructuring and added MPNN computation
+shifts the end-to-end balance away from GEMM dominance
+toward a more memory-bound operator mix.
+Takeaway: Lower GEMM, Stronger Memory-Bound
+Trend
+Compared with Psiformer, Orbformer exhibits a stronger
+memory-bound profile, with reduced GEMM share and
+increased elementwise/data-movement cost.
+IV. DISCUSSION
+Section III suggests two coupled facts about NNVMC
+execution. First, many dominant kernels are low-arithmetic-
+
+
+--- Page 9 ---
+9
+intensity elementwise/layout operators concentrated in the
+memory-bound roofline region [18] (Figures 5 and 6), so data
+movement and kernel granularity can be major bottlenecks.
+Second, memory-bound dominance does not mean GEMM
+is negligible: GEMM in embedding/message-passing stages
+(Stages A–C) still contributes a substantial runtime share
+and becomes more prominent in some higher-capacity model
+variants (e.g., FermiNet vs. PauliNet). This combination
+indicates that NNVMC can behave as a mixed and phase-
+dependent workload rather than a single-kernel regime. In
+particular, Stage E derivative/Laplacian evaluation replays
+earlier computations and amplifies fine-grained kernels, which
+can shift the effective operator balance across stages and
+ans¨atze [6], [14], [21]. Therefore, compute-only or memory-
+only tuning may be insufficient.
+Based on these observations, this section discusses five
+algorithm–hardware co-design directions: PIM for memory-
+bound kernel clusters, collaborative GPU–PIM partitioning,
+phase-aligned reconfigurable acceleration, architecture support
+beyond attention kernels, and CPU/SSD memory offload-
+ing [26]–[30]. Table I summarizes how findings in Section III
+map to these directions.
+A. PIM for Memory-Bound Kernels
+Targeted Challenge: Memory-Bound Kernel Clusters
+Low-intensity elementwise/layout kernels dominate substan-
+tial runtime share, so reducing data movement is more
+impactful than adding peak compute throughput.
+Processing-in-memory (PIM) can move part of computation
+closer to memory arrays to reduce off-chip data movement and
+improve bandwidth efficiency for data-movement-dominated
+kernels. This direction has been widely explored in top
+architecture venues for both convolutional/deep neural network
+(CNN/DNN)-style workloads and Transformer/large language
+model (LLM) workloads [31]–[35]. Fused elementwise and
+layout kernels operate at very low arithmetic intensity (Figure 6)
+and occupy substantial runtime share in PauliNet/FermiNet
+(Figure 5), so reducing data movement can be more effective
+than increasing peak compute throughput. PIM is promising
+for this regime because it executes streaming kernels close
+to data [26], [36]. In NNVMC, candidate clusters include
+fused elementwise transforms, reshape/transpose, concatenation,
+and slicing, which appear in Stages A–D and become more
+frequent in Stage E due to AD/JVP expansion. In practice,
+PIM may best complement rather than replace GPU execution:
+GEMM-heavy segments can stay on GPU, while coarse
+memory-bound clusters can be offloaded to near-memory
+engines with boundaries/data layouts that amortize transfer
+and synchronization overhead.
+From a methodology perspective, it is also useful to define
+PIM candidate clusters using trace-level criteria rather than
+operator names alone. Useful criteria can include low arithmetic
+intensity, short kernel duration with high invocation count,
+and repeated layout conversion around stage boundaries. Such
+criteria can help avoid over-offloading kernels whose memory
+behavior appears favorable in isolation but whose end-to-end
+benefit is reduced by migration overhead.
+A practical evaluation plan for NNVMC PIM prototypes
+can report not only runtime speedup, but also energy per opti-
+mization step, synchronization overhead ratio, and sensitivity
+to molecule size. This can provide clearer evidence on when
+PIM remains beneficial as the Stage E replay pattern becomes
+more dominant.
+B. Collaborative GPU–PIM Heterogeneous System
+Targeted Challenge: Phase-Varying Substrate Mapping
+A fixed GPU-only or PIM-only mapping is not robust; parti-
+tioning must track phase-level operator mix while keeping
+transfer boundaries coarse.
+NNVMC alternates between GEMM-dominated segments
+and segments with many small memory-bound kernels. In
+Section III, GEMMs are concentrated in embedding and
+message passing (Stages A–C), while much of the remaining
+time is spent in fused elementwise and layout transforms
+(Figure 5). Stage E can strengthen this pattern because AD/JVP
+Laplacian evaluation replays earlier stages and generates many
+fine-grained kernels. The balance also changes by ans¨atz (e.g.,
+PauliNet vs. FermiNet), so a fixed mapping to one substrate
+may be less robust [15].
+A collaborative GPU–PIM system can keep GEMM-heavy
+blocks on GPU and offload memory-bound clusters to near-
+memory execution at coarse granularity [26]. Profiling signals
+from Section III, including arithmetic intensity and kernel-
+family breakdowns, can help choose a small set of cut points
+(for example near stage boundaries or major blocks) where
+data layout is already materialized. Inspired by ORCHES [37],
+one practical strategy can be offline partitioning plus online
+scheduling: offline, representative traces can be used to choose
+GPU vs. PIM clusters; online, assignment can be adjusted
+across phases to reduce imbalance and idle time. Here ORCHES
+is used as scheduling methodology inspiration, not as direct
+empirical evidence on NNVMC. Transfer and synchronization
+remain key constraints, and overly fine-grained offloading may
+remove the benefit even for memory-bound kernels.
+For deployment, a lightweight runtime policy can further
+improve robustness. For example, a scheduler can switch among
+a small number of pre-profiled mappings based on observed
+queueing delay and achieved bandwidth during training itera-
+tions. This may reduce sensitivity to phase imbalance when
+the operator mix changes across molecules or ans¨atze.
+C. Reconfigurable Acceleration
+Targeted Challenge: Static Accelerator Balance
+One static compute–memory design cannot match all phases;
+practical gains require coarse reconfiguration modes aligned
+to stage transitions.
+Section III suggests that one fixed balance between compute
+throughput and memory bandwidth may not fit all NNVMC
+phases or ans¨atze. Even between PauliNet and FermiNet,
+time excluding sampling shifts between GEMM and fused
+elementwise kernels, while Stage E replay often introduces
+many low-intensity kernels and layout operations. Therefore,
+an accelerator optimized for one phase (e.g., GEMM-heavy
+
+
+--- Page 10 ---
+10
+TABLE I
+MAPPING WORKLOAD FINDINGS IN SECTION III TO THE CO-DESIGN DIRECTIONS DISCUSSED IN SECTION IV.
+Direction
+Evidence from Section III
+Primary Bottleneck
+Co-design Opportunity
+PIM for memory-bound
+kernels
+Elementwise/layout kernels dominate
+large runtime shares and stay at low
+arithmetic intensity across models.
+Data movement and
+bandwidth pressure in
+low-intensity kernels.
+Coarse-grained near-memory
+offloading for memory-bound kernel
+clusters can be promising when
+transfer overhead is controlled.
+Collaborative GPU–PIM
+system
+Execution alternates between
+GEMM-heavy phases and
+memory-bound phases, with phase
+balance varying by ans¨atz.
+One fixed substrate
+mapping may underutilize
+hardware across phases.
+Stage-aware GPU/PIM partitioning
+with adaptive scheduling can be
+effective.
+Reconfigurable
+acceleration
+Operator mix and memory/compute
+balance shift across stages and model
+families.
+A static compute-memory
+balance may not fit all
+phases.
+Coarse, phase-aligned
+reconfiguration modes can help
+match throughput- vs.
+bandwidth-oriented phases.
+Architecture support
+beyond attention
+In Orbformer, attention kernels are a
+limited share of end-to-end runtime,
+while other kernels remain significant.
+Attention-only optimization
+may yield limited
+end-to-end gain.
+Support for
+elementwise/layout/data-movement
+kernels and memory-efficient access
+patterns may improve end-to-end
+impact.
+CPU/SSD memory offload
+Memory demand grows non-linearly
+with system size and can exceed
+constrained GPU memory budgets.
+Capacity bottlenecks in
+large-system
+training/inference.
+Offloading suitable low-frequency
+state tensors with asynchronous
+prefetching can be promising, but
+requires NNVMC-specific validation.
+message passing) can be underutilized when execution moves
+to more memory-bound phases.
+Reconfigurable accelerators can address this variability
+by adapting compute fabric and data paths to the current
+workload mix [27]. At processing-element level, bitwidth
+reconfiguration and sparsity support can change arithmetic
+cost. At processing-element-array level, reconfigurable dataflow,
+tiling, and buffering can better match layer shapes and reuse pat-
+terns, including multi-engine organizations with heterogeneous
+dataflows. At system level, chip-level reconfiguration ideas such
+as hybrid parallelism can support operator-aware partitioning
+and scheduling when pipelines span multiple devices.
+For NNVMC, reconfiguration can be most useful when
+it is coarse and phase-aligned. Profiling can guide a small
+set of modes: some favor GEMM throughput in embed-
+ding/message passing, others favor bandwidth efficiency for
+elementwise/layout and AD/JVP replay. Switching may best
+happen at major stage boundaries. This can complement
+collaborative GPU–PIM partitioning by keeping utilization
+higher as operator mix changes across phases and ans¨atze.
+Overall, Section III suggests two practical requirements for
+future NNVMC systems: bandwidth efficiency and coarse,
+phase-aligned specialization. This also motivates a second-
+level question: once phase-level mapping is improved, which
+kernel families still limit end-to-end gains? The next subsection
+addresses this question by examining why attention-only
+optimization is often insufficient for Orbformer-like workloads.
+D. Architecture Support Beyond Attention
+Targeted Challenge: Attention-Only Optimization Ceiling
+Attention
+kernels
+are
+not
+the
+sole
+bottleneck
+in
+Orbformer;
+end-to-end
+speedup
+requires
+support
+for
+elementwise/layout/data-movement kernels as well.
+In Orbformer, FlashAttention-related kernels account for
+a limited share of total runtime (Figure 5(d)). Therefore,
+optimizing attention alone may be unlikely to deliver large
+end-to-end gains. In our tests, Orbformer with FlashAttention-1
+achieves less than 20% speedup over the original attention
+implementation for one MCMC sampling step. FlashAttention-
+3 [38], with optimizations such as warp specialization and
+asynchronous warp-group pipelining, already reports high
+hardware utilization on modern GPUs. This suggests that
+additional attention-only tuning may provide diminishing end-
+to-end returns for NNVMC unless other dominant kernel
+families are also addressed.
+The kernel breakdown also shows non-negligible element-
+wise and transpose time beyond FlashAttention and GEMM.
+These kernels have low arithmetic intensity and are memory-
+bound. Their performance can therefore be limited by memory
+throughput and latency. Prior work (e.g., WaferLLM [29])
+shows that data movement, especially transposition and non-
+contiguous access, can trigger remote accesses and tiling
+overheads, which reduce bandwidth utilization. Optimizing
+memory access patterns, such as shift-based key-value (KV)
+cache reordering [29], can reduce latency and improve these
+kernels. For NNVMC ans¨atze with many memory-dense
+operators, architectural support for efficient memory access may
+be a more practical direction than attention-only optimization.
+
+
+--- Page 11 ---
+11
+E. CPU/SSD Memory Offload
+Targeted Challenge: GPU Memory Capacity Bottleneck
+Memory growth can exceed constrained GPU memory, but
+NNVMC-specific offload policies still need rigorous tensor-
+level validation and scheduling design.
+Section III shows that NNVMC memory demand can grow
+non-linearly with system size and ans¨atz complexity. For larger
+systems (e.g., C4H4), GPUs with limited memory, such as the
+24GB A5000, can encounter out-of-memory. This motivates
+considering offloading selected state to higher-capacity host
+memory in central processing unit dynamic random-access
+memory (CPU DRAM) or secondary storage in solid-state
+drives (SSDs) to reduce GPU memory pressure.
+Prior LLM systems work such as FlexGen [30] suggests
+that offloading can be effective when tensors have regular
+access patterns, relatively low access frequency, and tolerance
+to transfer latency. In NNVMC, potential candidates include
+parts of sampler and optimizer state and other low-frequency
+intermediate state. With asynchronous prefetching and coarse
+transfer scheduling, these tensors may be moved off device
+while preserving throughput.
+However, direct evidence for NNVMC-specific offloading
+policies is still limited. The key open problem is to identify
+which tensor groups can be offloaded without destabilizing
+training or harming time-to-solution. Future work should
+provide controlled ablation studies and execution plans that
+jointly optimize offload granularity, prefetch distance, and
+synchronization overhead.
+V. RELATED WORK
+A. Profiling Workloads in Other Emerging AI Applications
+Profiling-oriented system studies have expanded to several
+emerging artificial intelligence (AI) domains beyond quantum
+chemistry. In neural rendering, [39] identifies shared operator
+motifs across heterogeneous rendering pipelines and uses them
+to motivate unified acceleration abstractions. For real-time
+3D neural reconstruction, prior works [40], [41] report that
+workload scalability is often limited by memory traffic and fine-
+grained kernel behavior rather than nominal peak throughput.
+In neuro-symbolic AI, cross-layer profiling has also been used
+to connect model design choices with hardware efficiency and
+deployment cost [42].
+These efforts establish profiling as a practical methodology
+for model-system co-design, but they target workloads with
+different computational structures from NNVMC. NNVMC in-
+troduces physics-constrained operators, including Markov chain
+Monte Carlo sampling, Laplacian evaluation, and antisymmetry-
+preserving computation, which produce a heterogeneous kernel
+mix that remains insufficiently compared across model families
+and hardware platforms. In this study, we fill this gap by
+providing a unified stage-aware profiling view across four
+representative NNVMC ans¨atze (PauliNet, FermiNet, Psiformer,
+and Orbformer), connecting model-level trends to kernel-level
+bottlenecks under one protocol.
+B. Algorithm-Hardware Co-Design in Foundation Models
+Recent large language model (LLM) co-design studies show
+that accelerator gains are increasingly tied to model-specific
+execution patterns. Duplex [43] co-designs a heterogeneous
+xPU+Logic-PIM device for mixture-of-experts, grouped query
+attention, and continuous batching in serving pipelines, where
+xPU denotes an umbrella term for heterogeneous AI-oriented
+processing units beyond conventional CPUs and GPUs [44].
+Pimba [34] and PAISE [35] both target memory-bound infer-
+ence stages with PIM-centric strategies, but at different levels:
+Pimba proposes a unified architecture for Transformer and post-
+Transformer serving, whereas PAISE focuses on GPU–PIM
+scheduling and kernel-level offloading for attention-dominated
+decoding. Oaken [45] further couples key-value cache quan-
+tization with dedicated quantization/dequantization hardware
+and memory management to improve throughput under long-
+context serving. Compared with these LLM-focused systems,
+our work targets NNVMC workloads whose bottlenecks are
+driven by physics-constrained operators and stage-dependent
+kernel mixes rather than attention- or cache-centric pipelines.
+Accordingly, our contribution is not a new accelerator design,
+but a workload-to-co-design bridge for NNVMC: we identify
+where memory-centric and phase-aware strategies are likely
+to help, and map empirical profiling evidence to actionable
+co-design directions in Section IV.
+VI. CONCLUSION
+This work provides a workload-oriented study of represen-
+tative NNVMC ans¨atze from a GPU execution perspective
+by combining a structured survey and unified profiling of
+PauliNet, FermiNet, Psiformer, and Orbformer. The results
+suggest that end-to-end performance is frequently constrained
+by low-arithmetic-intensity elementwise and data-movement
+kernels, while runtime composition and compute/memory
+balance vary across ans¨atze and execution stages, especially
+through different Laplacian evaluation and sampling paths.
+These observations indicate that scalable NNVMC acceleration
+may benefit from phase-aware and memory-centric co-design
+rather than isolated kernel optimization, and motivate future
+validation on broader molecular settings and hardware platforms
+with concrete mechanisms such as heterogeneous partitioning,
+stage-aware scheduling, and memory offloading.
+REFERENCES
+[1] J. Hermann, J. Spencer, K. Choo, A. Mezzacapo, W. M. C. Foulkes,
+D. Pfau, G. Carleo, and F. No´e, “Ab initio quantum chemistry with neural-
+network wavefunctions,” Nature Reviews Chemistry, vol. 7, no. 10, pp.
+692–709, 2023.
+[2] G. Carleo and M. Troyer, “Solving the quantum many-body problem
+with artificial neural networks,” Science, vol. 355, no. 6325, pp. 602–606,
+2017.
+[3] D. Pfau, J. S. Spencer, A. G. Matthews, and W. M. C. Foulkes, “Ab initio
+solution of the many-electron Schr¨odinger equation with deep neural
+networks,” Physical Review Research, vol. 2, no. 3, p. 033429, 2020.
+[4] J. Hermann, Z. Sch¨atzle, and F. No´e, “Deep-neural-network solution of
+the electronic Schr¨odinger equation,” Nature Chemistry, vol. 12, no. 10,
+pp. 891–897, 2020.
+[5] I. von Glehn, J. S. Spencer, and D. Pfau, “A self-attention ansatz
+for ab-initio quantum chemistry,” in The Eleventh International
+Conference on Learning Representations, 2023. [Online]. Available:
+https://openreview.net/forum?id=xveTeHVlF7j
+
+
+--- Page 12 ---
+12
+[6] A. Foster, Z. Sch¨atzle, P. B. Szab´o, L. Cheng, J. K¨ohler, G. Cassella,
+N. Gao, J. Li, F. No´e, and J. Hermann, “An ab initio foundation model of
+wavefunctions that accurately describes chemical bond breaking,” arXiv
+preprint arXiv:2506.19960, 2025.
+[7] X. Li, Z. Li, and J. Chen, “Ab initio calculation of real solids via neural
+network ansatz,” Nature Communications, vol. 13, no. 1, p. 7895, 2022.
+[8] R. Li, H. Ye, D. Jiang, X. Wen, C. Wang, Z. Li, X. Li, D. He,
+J. Chen, W. Ren et al., “A computational framework for neural network-
+based variational monte carlo with forward laplacian,” Nature Machine
+Intelligence, vol. 6, no. 2, pp. 209–219, 2024.
+[9] H. Shang, C. Guo, Y. Wu, Z. Li, and J. Yang, “Solving the many-
+electron schr¨odinger equation with a transformer-based framework,”
+Nature Communications, vol. 16, no. 1, p. 8464, 2025.
+[10] B. Kan, Y. Tian, Y. Wu, Y. Zhang, and H. Shang, “Bridging the gap
+between transformer-based neural networks and tensor networks for
+quantum chemistry,” Journal of Chemical Theory and Computation,
+vol. 21, no. 7, pp. 3426–3439, 2025.
+[11] N. Gao and S. G¨unnemann, “Neural pfaffians: solving many many-
+electron schr¨odinger equations,” in Proceedings of the 38th International
+Conference on Neural Information Processing Systems, 2024, pp. 125 336–
+125 369.
+[12] N. Gao, T. Grutschus, F. No´e, and S. G¨unnemann, “Excited pfaffians:
+Generalized neural wave functions across structure and state,” 2026.
+[Online]. Available: https://arxiv.org/abs/2603.14515
+[13] M. Scherbela, N. Gao, P. Grohs, and S. G¨unnemann, “Accurate ab-initio
+neural-network solutions to large-scale electronic structure problems,”
+arXiv preprint arXiv:2504.06087, 2025.
+[14] Z. Sch¨atzle, P. B. Szab´o, M. Mezera, J. Hermann, and F. No´e, “DeepQMC:
+An open-source software suite for variational optimization of deep-
+learning molecular wave functions,” The Journal of Chemical Physics,
+vol. 159, no. 9, p. 094108, 2023.
+[15] Y. Qian, X. Li, Z. Li, W. Ren, and J. Chen, “Deep learning quantum
+Monte Carlo for solids,” Wiley Interdisciplinary Reviews: Computational
+Molecular Science, vol. 15, no. 2, p. e70015, 2025.
+[16] N. Metropolis, A. W. Rosenbluth, M. N. Rosenbluth, A. H. Teller, and
+E. Teller, “Equation of state calculations by fast computing machines,”
+The Journal of Chemical Physics, vol. 21, no. 6, pp. 1087–1092, 1953.
+[17] W. K. Hastings, “Monte Carlo sampling methods using Markov Chains
+and their applications,” Biometrika, vol. 57, no. 1, pp. 97–109, 1970.
+[18] S. W. Williams, A. Waterman, and D. A. Patterson, “Roofline: An
+insightful visual performance model for multicore architectures,” Com-
+munications of the ACM, vol. 52, no. 4, pp. 65–76, 2009.
+[19] Z. Hu, Z. Shi, G. E. Karniadakis, and K. Kawaguchi, “Hutchinson trace
+estimation for high-dimensional and high-order physics-informed neural
+networks,” Computer Methods in Applied Mechanics and Engineering,
+vol. 424, p. 116883, 2024.
+[20] P. L´opez R´ıos, A. Ma, N. D. Drummond, M. D. Towler, and R. J.
+Needs, “Inhomogeneous backflow transformations in quantum monte
+carlo calculations,” Physical Review E, vol. 74, no. 6, p. 066701, Dec.
+2006. [Online]. Available: https://doi.org/10.1103/PhysRevE.74.066701
+[21] A. G. Baydin, B. A. Pearlmutter, A. A. Radul, and J. M. Siskind,
+“Automatic differentiation in machine learning: a survey,” Journal of
+Machine Learning Research, vol. 18, no. 153, pp. 1–43, 2018. [Online].
+Available: https://jmlr.org/beta/papers/v18/17-468.html
+[22] J. Bradbury, R. Frostig, P. Hawkins, M. J. Johnson, C. Leary, D. Maclau-
+rin, G. Necula, A. Paszke, J. VanderPlas, S. Wanderman-Milne, and
+Q. Zhang, “JAX: Composable transformations of Python+NumPy pro-
+grams,” 2018, version 0.4.28. https://github.com/jax-ml/jax. Accessed:
+2026-02-04.
+[23] NVIDIA Nsight Systems User Guide, NVIDIA Corporation, 2024, https:
+//docs.nvidia.com/nsight-systems/.
+[24] NVIDIA Nsight Compute User Guide, NVIDIA Corporation, 2024, https:
+//docs.nvidia.com/nsight-compute/.
+[25] OpenXLA Project, “XLA: A machine learning compiler for gpus,
+cpus, and ml accelerators,” https://github.com/openxla/xla, 2026, gitHub
+repository. Accessed: 2026-03-19.
+[26] O. Mutlu, S. Ghose, J. G´omez-Luna, R. Ausavarungnirun, M. Sadrosadati,
+and G. F. Oliveira, “A modern primer on processing in memory,”
+arXiv preprint arXiv:2012.03112, 2020. [Online]. Available: https:
+//arxiv.org/abs/2012.03112
+[27] S. Wei, X. Lin, F. Tu, Y. Wang, L. Liu, and S. Yin, “Reconfigurability,
+why it matters in AI tasks processing: A survey of reconfigurable AI
+chips,” IEEE Transactions on Circuits and Systems I: Regular Papers,
+vol. 70, no. 3, pp. 1228–1241, 2023.
+[28] J. T. Krogel, “Building a better QMC: A survey of performance
+bottlenecks and opportunities,” Computer Physics Communications, vol.
+198, pp. 154–168, 2016.
+[29] C. He, Y. Huang, P. Mu, Z. Miao, J. Xue, L. Ma, F. Yang, and L. Mai,
+“WaferLLM: Large language model inference at wafer scale,” in 19th
+USENIX Symposium on Operating Systems Design and Implementation
+(OSDI), 2025. [Online]. Available: https://arxiv.org/abs/2502.04563
+[30] Y. Sheng, L. Zheng, B. Yuan, Z. Li, M. Ryabinin, D. Y. Fu,
+Z. Xie, B. Chen, C. Barrett, J. E. Gonzalez, P. Liang, C. R´e,
+I. Stoica, and C. Zhang, “FlexGen: High-throughput generative inference
+of large language models with a single GPU,” in International
+Conference on Machine Learning (ICML), 2023. [Online]. Available:
+https://arxiv.org/abs/2303.06865
+[31] D. Kim, H. T. Kung, S. Chai, S. Yalamanchili, and S. Mukhopadhyay,
+“Neurocube: A programmable digital neuromorphic architecture with high-
+density 3d memory,” in Proceedings of the 43rd Annual International
+Symposium on Computer Architecture (ISCA), 2016, pp. 380–392.
+[32] P. Chi, S. Li, C. Xu, T. Zhang, J. Zhao, Y. Liu, Y. Wang, and Y. Xie,
+“PRIME: A novel processing-in-memory architecture for neural network
+computation in reram-based main memory,” in Proceedings of the 43rd
+Annual International Symposium on Computer Architecture (ISCA), 2016,
+pp. 27–39.
+[33] Y. Zhou, X. Xu, M. Kwon, and M. Rhu, “TransPIM: A memory-based
+acceleration via data compression for transformer,” in IEEE International
+Symposium on High-Performance Computer Architecture (HPCA), 2022,
+pp. 322–336.
+[34] W. Kim, Y. Lee, Y. Kim, J. Hwang, S. Oh, J. Jung, A. Huseynov, W. G.
+Park, C. H. Park, D. Mahajan, and J. Park, “Pimba: A processing-in-
+memory acceleration for post-transformer large language model serving,”
+in Proceedings of the 58th IEEE/ACM International Symposium on
+Microarchitecture (MICRO), 2025, pp. 292–307.
+[35] H. Lee, D. Baek, J. Son, J. Choi, K. Moon, and M. Jang, “PAISE: PIM-
+accelerated inference scheduling engine for transformer-based LLM,”
+in IEEE International Symposium on High-Performance Computer
+Architecture (HPCA), 2025, pp. 1707–1719.
+[36] K.
+Asifuzzaman,
+N.
+R.
+Miniskar,
+A.
+R.
+Young,
+F.
+Y.
+Liu,
+and J. S. Vetter, “A survey on processing-in-memory techniques:
+Advances and challenges,” Memories - Materials, Devices, Circuits
+and Systems, vol. 4, p. 100022, Jul. 2023. [Online]. Available:
+https://doi.org/10.1016/j.memori.2022.100022
+[37] S. Li, Y. Chen, C. Li, Y. Fu, Z. Wang, Z. Yu, H. You, Z. Ye, W. Zhou,
+Y. Zhang, and Y. Lin, “ORCHES: Orchestrated test-time-compute-based
+LLM reasoning on collaborative GPU-PIM heterogeneous system,” in Pro-
+ceedings of the 58th IEEE/ACM International Symposium on Microarchi-
+tecture (MICRO), 2025, https://dl.acm.org/doi/10.1145/3725843.3756039.
+[38] J. Shah, G. Bikshandi, Y. Zhang, V. Thakkar, P. Ramani, and T. Dao,
+“FlashAttention-3: Fast and accurate attention with asynchrony and
+low-precision,” in Advances in Neural Information Processing Systems
+(NeurIPS), 2024. [Online]. Available: https://arxiv.org/abs/2407.08608
+[39] C. Li, S. Li, L. Jiang, J. Zhang, and Y. Lin, “Uni-Render: A unified
+accelerator for real-time rendering across diverse neural renderers,” in
+Proceedings of the IEEE International Symposium on High-Performance
+Computer Architecture (HPCA), 2025.
+[40] S. Li, C. Li, and Y. Lin, “Hardware race for scalable real-time 3D neural
+reconstruction and rendering,” Computer, vol. 58, no. 10, pp. 162–167,
+2025.
+[41] S. Li, C. Li, W. Zhu, B. Yu, Y. Zhao, C. Wan, H. You, H. Shi, and Y. Lin,
+“Instant-3d: Instant neural radiance field training towards on-device ar/vr
+3d reconstruction,” in Proceedings of the 50th Annual International
+Symposium on Computer Architecture, 2023, pp. 1–13.
+[42] Z. Wan, C.-K. Liu, H. Yang, R. Raj, C. Li, H. You, Y. Fu, C. Wan,
+S. Li, Y. Kim, A. Samajdar, Y. C. Lin, M. Ibrahim, J. M. Rabaey,
+T. Krishna, and A. Raychowdhury, “Towards efficient neuro-symbolic AI:
+From workload characterization to hardware architecture,” arXiv preprint
+arXiv:2409.13153, 2024.
+[43] G. Yun, H. Kwon, C. Chang, S. Kim, K. Kim, J. Oh, J. Park, J. Cha,
+and D. Kim, “Duplex: A device for large language models with
+mixture of experts, grouped query attention, and continuous batching,”
+in Proceedings of the 57th IEEE/ACM International Symposium on
+Microarchitecture (MICRO), 2024, pp. 404–419.
+[44] Y. Xie, “A brief guide of xpu for ai accelerators,” SIGARCH
+Blog, Apr. 2018, accessed: 2026-03-19. [Online]. Available: https:
+//www.sigarch.org/a-brief-guide-of-xpu-for-ai-accelerators/
+[45] M. Kim, H. Kwak, J. Cha, J. Lee, S. Kim, D. Kim, and J. Park,
+“Oaken: Fast and efficient LLM serving with online-offline hybrid KV
+cache quantization,” in Proceedings of the 52nd Annual International
+Symposium on Computer Architecture (ISCA), 2025, pp. 1459–1474.

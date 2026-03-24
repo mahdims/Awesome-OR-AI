@@ -1,0 +1,2694 @@
+--- Page 1 ---
+Incremental GNN Embedding Computation on
+Streaming Graphs
+Qiange Wang1, Haoran Lv2, Yanfeng Zhang2, Weng-Fai Wong1, Bingsheng He1
+1National University of Singapore, Singapore
+2School of Computer Science and Engineering, Northeastern University, Shenyang, China
+wangqiange94@gmail.com;{2401878@stu,zhangyf@mail}.neu.edu.cn; {dscwwf,dcsheb}@nus.edu.sg;
+Abstract—Graph Neural Network (GNN) on streaming
+graphs has gained increasing popularity. However, its prac-
+tical deployment remains challenging, as the inference pro-
+cess relies on Runtime Embedding Computation (RTEC) to
+capture recent graph changes. This process incurs heavy-
+weight multi-hop graph traversal overhead, which signifi-
+cantly undermines computation efficiency. We observe that
+the intermediate results for large portions of the graph
+remain unchanged during graph evolution, and thus redun-
+dant computations can be effectively eliminated through
+carefully designed incremental methods. In this work, we
+propose an efficient framework for incrementalizing RTEC
+on streaming graphs. The key idea is to decouple GNN
+computation into a set of generalized, fine-grained operators
+and safely reorder them, transforming the expensive full-
+neighbor GNN computation into a more efficient form over
+the affected subgraph. With this design, our framework
+preserves the semantics and accuracy of the original full-
+neighbor computation while supporting a wide range of GNN
+models with complex message-passing patterns. To further
+scale to graphs with massive historical results, we develop
+a GPU–CPU co-processing system that offloads embeddings
+to CPU memory with communication-optimized scheduling.
+Experiments across diverse graph sizes and GNN models
+show that our method reduces computation by 64%–99% and
+achieves 1.7x–145.8x speedups over existing solutions.
+I. IntRoduction
+Graph neural networks (GNNs) have gained signifi-
+cant popularity for their effectiveness in modeling graph-
+structured data [21], [52], [46], [49]. However, many real-
+world applications involve evolving graphs, which require
+GNN systems to promptly update embeddings and prediction
+results according to graph changes [58]. For example, short-
+video platforms [57], [6] aim to incorporate real-time user–
+video interactions into user embeddings for recommendation
+and content moderation, while online financial services [55],
+[21], [25] analyze the latest transactions to detect money
+laundering and malicious accounts.
+Recently,
+Runtime
+Embedding
+Computation
+(RTEC) [9], [58], [36], [48], [29] has emerged as a promising
+solution for efficiently serving GNNs on streaming graphs.
+By updating embeddings with pre-trained models only for
+affected vertices, RTEC can rapidly incorporate structural
+and feature changes from the most recent graph snapshots
+into prediction results. Compared with widely adopted
+periodical
+retraining-and-recomputation
+approaches [52],
+[25], [21], [55], it delivers high-quality inference results.
+1
+2
+3
+4
+5
+1
+2
+3
+4
+5
+1
+2
+3
+4
+5
+1
+2
+3
+4
+5
+1
+3
+4
+2
+(b) The affected subgraph 
+for a 2-layer GNN model
+(c) The naive computation
+graph of RTEC for vertex 2
+Hop-0  Hop-1
+Hop-2
+2-hop full-neighbor
+recomputation
+1
+2
+3
+4
+5
+(a) A toy graph with
+two edge updates
+Fig. 1: RTEC on a toy graph with edge updates ⟨4, 2⟩and ⟨4, 4⟩
+using a 2-layer model. Blue items in (c) indicate redundant compu-
+tations on the unaffected subgraph.
+However, high-performance deployment of RTEC remains
+challenging, as it relies on a heavyweight inference-time L-
+layer GNN computation. The core inefficiency arises from
+the neighbor explosion problem [13], where updating a
+single vertex can trigger computation across its entire L-hop
+neighborhood, as illustrated in Figure 1.a-c. Consequently,
+RTEC still incurs substantial overhead on real-world graphs:
+even with as little as 0.1% of edge updates, the cost can reach
+up to 80% of full-graph recomputation. We observe that RTEC
+performs substantial redundant computation on subgraphs
+whose results remain valid. In an L-layer GNN, graph up-
+dates typically propagate up to L hops, forming an affected
+subgraph that consists of both the update propagation paths
+and the final-layer affected vertices (Figure 1.b). Naive RTEC
+recomputes not only the update propagation paths (in red)
+but also the unaffected subgraph, whose intermediate results
+remain valid within the L-hop neighborhood (in blue). As
+shown in Figure 1.c, updating just two edges (⟨4, 2⟩and
+⟨4, 4⟩) triggers recomputation of v2 using all nine edges, even
+though the contributions of seven edges have already been
+incorporated into the embeddings of v2 (hop 2) and v4 (hop
+1). This inefficiency is further amplified on real-world graphs,
+where the redundant computation can account for up to 95%
+of the total overhead (Section III-A).
+To address this inefficiency, an intuitive approach is to
+leverage incremental processing, which eliminates redundant
+computation by transforming full recomputation into an
+equivalent yet more efficient procedure that reuses previ-
+ously computed results. While such techniques have demon-
+strated substantial performance gains in graph processing
+and database analytics [4], [40], [30], [31], [12], extending
+arXiv:2603.20622v1  [cs.DC]  21 Mar 2026
+
+
+--- Page 2 ---
+them to GNN embedding computation remains challenging.
+This is because GNNs exhibit diverse and sophisticated com-
+putation patterns involving complex message-passing mecha-
+nisms and non-linear neural network operations. Traditional
+incremental methods are typically designed for analytical
+tasks with simple arithmetic operations, whose correctness
+assumptions do not naturally hold for GNN models, thereby
+rendering existing approaches unsuitable for GNN embed-
+ding computation (Section III-C).
+In this work, we propose an efficient and generalized GNN
+RTEC framework that enables incremental processing of
+RTEC across diverse GNN models with theoretical accuracy
+guarantees. The framework finely decouples GNN compu-
+tation into three components: neighbor-wise computation,
+aggregation of neighbor embeddings, and edge-level message
+computation, and executes them in a unified and safely
+reordered workflow. Under this workflow, each component’s
+output on affected subgraph is updated incrementally by
+reusing results from its unaffected subgraph. We further
+derive sufficient conditions under which the reordering is
+sound, ensuring that the final result is equivalent to that
+of full-neighborhood recomputation even in the presence of
+complex edge-level message dependencies. This design broad-
+ens applicability to GNN families previously considered in-
+compatible, making real-time inference on streaming graphs
+practical and efficient, and delivering superior performance
+over state-of-the-art non-incremental methods [36], [9].
+Incremental RTEC requires maintaining historical results
+across layers [38], [23]. To efficiently support GNN RTEC
+on large-scale graphs, we develop NeutronRT, a CPU–GPU
+co-processing system that offloads intermediate embeddings
+to CPU memory, performs computation on GPUs, and em-
+ploys a communication-efficient scheduling mechanism to
+minimize transfer overhead. Experimental results show that
+NeutronRT can efficiently process billion-scale streaming
+graphs on a single NVIDIA A5000 GPU, reducing redundant
+computation by 64%–99% and achieving speedups ranging
+from 1.7x–145.8x over naive full-neighbor RTEC and other
+non-incremental solutions, including neighbor sampling [36],
+and directed embedding reuse [9].
+In summary, we make the following contributions.
+• We propose an general and efficient incremental RTEC
+framework that transforms heavyweight full-neighbor
+computation into an equivalent yet more efficient form
+with fine-grained operator decoupling and reordering.
+• We formally establish the equivalence between incremental
+RTEC and full-neighborhood computation under sufficient
+conditions, and demonstrate the theoretical correctness of
+our framework through illustrative examples.
+• We develop a GPU-CPU co-processing system that enables
+GPU-accelerated RTEC on large-scale streaming graphs,
+achieving 1.7×–145.8× speedup over state-of-the-art base-
+lines across diverse GNN models and datasets.
+II. BacKgRound
+A. GNN Basics
+GNNs take a graph with features associated to each vertex
+as input, producing a representation vector for each vertex
+by stacking multiple message-aggregate-update layers:
+hl
+v = UPD
+(
+AGG({hl−1
+u
+∗MSG(hl−1
+u
+, hl−1
+v
+)|u ∈N(v)}), hl−1
+v
+)
+(1)
+hl
+v represents the embedding/feature of v in the l-th layer.
+The MSG function computes the message for each edge. The
+AGG function gathers message-applied layer embeddings to
+produce a neighborhood representation, which is fed into the
+UPD function to calculate the embedding in the l-th layer.
+Examples.
+In GCN model [14], the MSG function is the
+normalized degree of <u, v>. The AGG function is a sum().
+The UPD function involves a linear transformation and a
+non-linear activation.
+hl
+v = σ(W l(
+∑
+u∈N(v)
+1
+√dudv
+hl−1
+u
+))
+(2)
+Other GNN models with similar computation patterns include
+GraphSAGE [7], GIN [51], and CommNet [35].
+In contrast, some other models [39], [1], [19], [2] use
+sophisticated message functions that involves neural net-
+work and neighborhood data synchronizations. For example,
+the GAT model [39] introduces self-attention mechanisms
+(softmax()) to distinguish important neighborhood. The
+message function is as follows:
+attl
+u,v =
+exp(LeakyReLU(al([W lhl−1
+v
+||W lhl−1
+u
+))
+∑
+u∈N(v) exp(LeakyReLU(al[W lhl−1
+v
+||W lhl−1
+u
+])),
+(3)
+The aggregate and update functions in GAT involve simple
+sum aggregation and non-linear activations.
+hl
+v = σ(∑
+u∈N(v) attl
+u,vW lhl−1
+u
+)
+(4)
+Similar models include A-GNN [1], GGCN [19], and RGAT[2].
+B. GNN Training and Inference for Streaming Graphs
+On static graphs, GNNs are trained over multiple epochs,
+followed by a forward embedding computation pass that
+computes final-layer embeddings for downstream inference.
+Streaming graphs evolve continuously through edge and
+vertex updates and support high-value applications such
+as real-time recommendation and fraud detection. These
+applications require timely and accurate node embeddings
+that reflect recent structural and feature changes [36]. How-
+ever, retraining models and recomputing embeddings over
+the entire graph for each update batch is computationally
+prohibitive. As a result, industrial systems often rely on
+periodic recomputation on snapshot graphs [25], [6], [21],
+which reduces overhead but fails to capture time-sensitive in-
+teractions, potentially leading to incorrect recommendations
+or classifications for hundreds of thousands of users.
+
+
+--- Page 3 ---
+ 0
+ 10
+ 20
+ 30
+ 40
+FN
+NS5
+NS10
+NS20
+UER
+Inc(Ours)
+Full Recomp
+AS
+95%
+90%
+0%
+Avg Degree=7.0
+Edge accesses 
+ normalized to AS
+(a) ogbn-arxiv
+ 0
+ 8
+ 16
+ 24
+ 32
+FN
+NS5
+NS10
+NS20
+UER
+Inc(Ours)
+Full Recomp
+AS
+95%
+91%
+0%
+Avg Degree=25.8
+(b) ogbn-product
+ 0
+ 1
+ 2
+ 3
+ 4
+FN
+NS5
+NS10
+NS20
+UER
+Inc(Ours)
+Full Recomp
+AS
+65%
+61%
+0%
+Avg Degree=475.0
+(c) reddit
+Fig. 2: Processed edge volume is normalized to the Affected Sub-
+graph (AS). FN, NS#, and UER denote RTEC with full-neighbor
+computation, neighbor sampling, and unaffected embedding reuse,
+respectively. The percentage of redundant computation on unaf-
+fected subgraphs is labeled above each bar, except for NS approaches,
+which compute on both sampled affected and unaffected subgraphs.
+1
+2
+3
+4
+5
+1
+3
+4
+2
+(a) RTEC with Neighborhood
+Sampling  (fanout=2)
+c
+0
+2
+3
+4
+5
+1
+3
+4
+2
+(b) RTEC With Unaffected
+Embedding Reusing
+Randomly select
+2 neighborhoods
+for each vertex
+Reusing the
+result of unchanged 
+vertices (1 and 3)
+(c) Incremental RTEC
+Reusing the
+computation result
+of unaffected subgraph
+1
+2
+3
+4
+5
+1
+3
+4
+2
+c
+Fig. 3: An illustration of RTEC-NS and RTEC-UER and RTEC-Inc for
+the affected vertex v2. RTEC-NS and RTEC-UER cannot eliminate
+redundant computation on unaffected subgraphs.
+III. RTEC foR StReaming GRaphs
+Recent
+work
+has
+proposed
+RunTime
+Embedding
+Computation (RTEC) [9], [58], [48], [36], [29], which
+continuously
+identifies
+and
+recomputes
+affected
+vertex
+embeddings using pre-trained models and evolving graph
+structures,
+achieving
+higher
+accuracy
+than
+periodic
+recomputation without model retraining (Section VI-A).
+A. The Redundant Computation of RTEC
+Although RTEC achieves high accuracy, its deployment on
+streaming graphs is hindered by redundant computation, i.e.,
+repeatedly processing valid results from unaffected subgraphs
+(blue region in Figure 1.c). To quantify this overhead, we
+compare the number of edges processed by the RTEC com-
+putation graph with those in the affected subgraph (AS, red
+region in Figure 1.b–c). We split the most recent 10% of edges
+into 100 batches and process each batch independently. Fig-
+ure 2 reports the average processed-edge volume per batch,
+normalized to AS. Even when only 0.1% of edges are updated,
+AS typically contains just 2.5%–15% of the original graph,
+while naive full-neighbor RTEC (FN) processes 2.9×–22.2×
+more edges than AS, approaching full-graph recomputation
+on large graphs. Notably, 65%–95% of this computation is
+spent on unaffected subgraphs.
+B. Limitation of Non-incremental Solutions
+RTEC with Neighborhood Sampling (NS). Neighborhood
+sampling-based RTEC [36], [43], [7] reduces computation by
+randomly dropping a subset of the L-hop neighborhoods
+of affected vertices (Fig. 3.a). However, its effectiveness is
+highly data-dependent. As shown in Fig. 2, varying the
+sampling fanout from 5 to 20 leads to diverse outcomes.
+On high-degree graphs (e.g., Reddit), sampling can reduce
+computation below the size of the affected subgraph (AS),
+while on low- and medium-degree graphs, the processed edge
+volume remains high even with small fanouts. Moreover,
+TABLE I: Summary of existing RTEC solutions.
+Approach
+Baseline
+Redundant
+Accuracy
+Complex
+Computation
+Guarantee Model Support
+Non-
+SMP [36]
+Unstable
+×
+✓
+Incremental UER [9]
+High
+✓
+✓
+Incremental Naive [48], [29]
+Low ✓(simple GNN)
+×
+Our work
+Low
+✓
+✓
+(b) Incremental RTEC with partial aggregation
+Skipped neighbors
+Full aggregation
+Partial aggregation 
+𝐡2
+2
+መ𝐡4
+1
+𝐡1
+1
+MLP( 𝟏+ 𝐞𝐡𝟐
+𝟏+ 𝒂𝟐
+𝟐)
+𝐡3
+1
+𝒂2
+2=sum(𝒂2
+2-𝐡𝟒
+𝟏,መ𝐡𝟒
+𝟏)
+𝐡2
+2
+𝐡1
+1
+MLP( 𝟏+ 𝐞𝐡𝟐
+𝟏+ 𝒂𝟐
+𝟐)
+𝐡3
+1
+1 ⋅𝐡𝟏
+𝟏
+𝒂2
+2=sum(𝐡1
+1,𝐡𝟑
+𝟏,𝐡𝟒
+𝟏)
+(a) RTEC with full-neighbor aggregation
+1 ⋅𝐡𝟑
+𝟏
+1 ⋅መ𝐡𝟒
+𝟏
+Update
+ v4
+Reuse sum(𝐡1
+1,𝐡𝟑
+𝟏)
+Computed neighbors
+Message
+Aggregate
+Update
+Message
+Aggregate
+Update
+𝐡4
+1
+1 ⋅𝐡𝟒
+𝟏
+Fig. 4: Full-neighbor RTEC and incremental RTEC for the GIN
+model. Message: f(x) = x; Aggregate:sum(); update: MLP().
+random neighbor dropping may cause significant accuracy
+degradation, since only a subset of the affected subgraph
+is evaluated. As shown in Section VI-A, small fanouts can
+yield lower accuracy than periodic recomputation, as the
+information loss from sampling may outweigh the benefit
+of fresher graph snapshots.
+RTEC with unaffected embedding reuse (UER). Another
+approach is to cache and reuse embeddings of unaffected
+vertices [9], [44]. However, this vertex-centric approach still
+performs full-neighbor aggregation for affected vertices, even
+when only a single incoming edge changes. As illustrated in
+Figure 3.b, updating the embedding of vertex 2 requires pro-
+cessing seven edges, four of which are unaffected. As shown
+in Figure 2, RTEC-UER processes 2.5×–12.3× more edges
+than the affected subgraph, with redundant computation on
+unaffected edges still accounting for 61%–91% of the total.
+As summarized in Table I, RTEC-NS and RTEC-UER either
+sacrifice inference accuracy or incur significant redundant
+computation, making them unsuitable for RTEC applications.
+C. Incremental RTEC: Opportunity and Challenges
+Opportunity.
+Incremental processing reduces redundant
+computation by reusing historical results from unaffected
+regions and updating only newly affected parts. Figure 4
+illustrates this intuition using the GIN model [14] with sum
+aggregation and constant edge messages. When vertex v4
+is updated, only the message on edge ⟨v4, v2⟩needs to be
+recomputed as 1 · ˆh
+1
+4. The valid contributions from unaf-
+fected edges ⟨v1, v2⟩and ⟨v3, v2⟩are reused by subtracting
+the outdated message h1
+4 from the previous aggregation
+a2
+2 and adding the updated one. The new embedding h2
+2
+is then obtained by applying the MLP to the updated ag-
+gregation. This process recomputes only the affected edge
+while producing results equivalent to full recomputation,
+enabled by 1) the associativity of the sum operator ensures
+sum(h1
+1, h1
+3, ˆh
+1
+4) = sum(sum(h1
+1, h1
+3, h1
+4) −h1
+4, ˆh
+1
+4),, and 2)
+the validity of unaffected edge contributions (e.g., 1·h1
+1, 1·h1
+3).
+Overhead Comparison.
+Incremental RTEC (RTEC-Inc)
+restricts propagation to the affected subgraph and can be
+viewed as performing an L-hop broadcast from the updated
+
+
+--- Page 4 ---
+vertices, with an edge computation volume of O(d |Vupd| ·
+αL+1), where d is the average degree and α denotes the aver-
+age number of affected neighborhood per layer; α varies with
+graph size, degree distribution, skewness, and the distribution
+of updates. In contrast, RTEC-Full reprocesses the L-hop
+neighborhoods of the final-layer affected vertices, performing
+an additional L-hop broadcast over RTEC-Inc and incurring a
+computation volume of O(d |Vupd|·α2L+1). RTEC-UER avoids
+recomputing unaffected vertices but still incurs an (L+1)-
+hop broadcast with cost O(d |Vupd| · αL+2). In general, when
+update batches are small (|Vupd|) and α is large, RTEC-Inc
+achieves orders-of-magnitude lower computation than RTEC-
+Full and RTEC-UER. When updates span the entire graph,
+all three methods degenerate to full-graph computation.
+Sampling-based methods (RTEC-NS) follow a similar 2L-hop
+propagation pattern but operate on a sampled subgraph of
+size O(d, |Vupd|· ˆα2L+1), where ˆα is bounded by the sampling
+fanout; consequently, on high-degree graphs (e.g., Reddit),
+RTEC-NS can even incur lower computation overhead than
+RTEC-Inc, as shown in Figure 8.
+Related Work. Despite the advantages, general incremental
+GNN embedding computation remains highly challenging.
+Recent efforts [48], [29] study incremental GNN embed-
+ding computation for models with constant edge message
+functions and simple aggregation operators (min, max,
+sum), such as GraphConv, GraphSAGE-sum, and GIN, where
+recomputation over unaffected regions (e.g., the blue area
+in Fig. 1) can be avoided. However, their applicability be-
+comes limited when edge message computation depends
+on neighborhood information. A representative example is
+GCN: although degree normalization appears constant, it
+changes dynamically as the graph evolves, causing updates to
+propagate to all incident edges of a neighbor. Correctly iden-
+tifying and handling such dependencies across different GNN
+architectures is non-trivial and cannot be directly supported
+by existing execution models. As a result, prior systems
+fall back to full-neighbor recomputation for more complex
+models (e.g., GCN and GAT) to ensure correctness [48], [29].
+Challenges.
+The core challenge arises from the mismatch
+between the diverse GNN computation patterns and the
+strict applicability conditions. Specifically, two requirements
+are hard to satisfy simultaneously. First, the neighborhood
+aggregation operation must be associative, i.e., f(x, y, z) =
+f(f(x, y), z), to allow new messages to allow new messages
+to be combined incrementally with historical results. Second,
+the intermediate embeddings to be reused must remain valid,
+meaning that messages from unaffected neighborhoods do
+not need to be recomputed. These conditions are violated
+in many common GNN models. For example, GraphSAGE-
+mean employs non-associative mean aggregation, where
+mean(hx, hy, hz) ̸= mean(mean(hx, hy), hz). In GCN and
+GAT, neighbor-dependent contexts such as degree normal-
+ization and attention weights are coupled with message
+computation; updates to these contexts can invalidate all
+neighbor messages and prevent reuse.
+IV. IncRemental RTEC FRamewoRK
+In this work, we propose a unified and fine-grained GNN
+abstraction that decouples neighborhood-wise context com-
+putation from message and aggregation operations, enabling
+unified and correct incremental processing across both simple
+and complex GNN architectures with theoretical guarantee.
+A. Fine-grained Operator Decoupling for Incremental RTEC
+We formally describe the abstraction as follows.
+{
+mlcuv = ms_local
+(
+hl−1
+u
+, hl−1
+v
+)
+| u ∈N(v)
+}
+(5)
+nctv = nbr_ctx
+(
+{mlcuv|u ∈N(v)}
+)
+(6)
+{
+msguv = ms_cbn
+(
+nctv, mlcuv
+)
+| u ∈N(v)
+}
+(7)
+al
+v = aggregate(
+{
+msguv · f_nn(hl−1
+u
+) | u ∈N(v)
+}
+)
+(8)
+hl
+v = update(al
+v)
+(9)
+This abstraction extends the standard message-aggregate-
+update model by explicitly decoupling the neighbor-wise
+context computation. Specifically, ms_local() denotes an
+edge-wise message function that can be computed inde-
+pendently. nbr_ctx() represents the neighbor-wise context
+computation. It takes as input either edge-wise messages or
+constant values from all neighborhoods and produces a single
+value representing a neighborhood property. For example,
+in GCN, the destination vertex degree can be computed by
+summing a constant value of 1 from each neighboring vertex
+using nbr_ctx(). The msg_cbn() function operates on each
+edge, combining the edge message with the neighbor-wise
+context to reproduce the original message semantics. The
+aggregate and update operation retain the same semantic
+as in the original form, where the f_nn(hl−1
+u
+) is a linear
+transformation function applying the message to the vertex
+feature, which can be constants or matrix computations. We
+provide a graphical example in Figure 5.a, where f_nn() is
+implicitly included in the aggregation operation.
+The key insight of this abstraction is that, by decoupling
+the neighbor-wise context, the ms_local() retains only com-
+ponents that can be evaluated independently on each edge,
+and the aggregation operation can be transformed into an
+associative form, e.g., replacing mean with sum by sepa-
+rating the in-degree computation. The neighbor-wise context
+can also be incrementally updated if the nbr_ctx() operation
+is associative. Furthermore, if its effect is independent of the
+local messages and separable from the aggregation operation,
+changes in the neighbor-wise context can be directly applied
+to the aggregated result, rather than recomputing all edge
+messages, via efficient vertex-wise msg_cbn(). This decou-
+pling enables these components to be reordered to support
+incremental processing on only affected neighborhoods.
+B. Reordered Incremental RTEC Workflow
+Algorithm 1 shows the general form of incremental RTEC
+for a single layer. The input includes a target vertex v,
+the affected neighbors ∆N(v), previous aggregated neighbor
+embedding al
+v, and the previous neighborhood context nctv.
+In the first step, msg_local recomputes local messages mlcuv
+
+
+--- Page 5 ---
+(a) Full neighbor recomputation from the scratch for Snapshot1
+(b) Incremental computation based on the old result on Snapshot0 and new update for Snapshot1
+=
+𝐡2
+2
+𝐡1
+1
+𝐡3
+1
+⊕
+msg_local
+aggregate
+update
+nbr_ctx
+msg_cbn
+⊕
+Snapshot0
+Snapshot1
+𝐡2
+2
+𝐡4
+1
+𝐡1
+1
+𝐡3
+1
+⊕
+msg_local
+aggregate
+update
+nbr_ctx
+⊕
+msg_cbn
+msg_cbn−1
+Add v4
+𝐡2
+2
+𝐡4
+1
+𝐡1
+1
+𝐡3
+1
+⊕
+msg_local
+aggregate
+update
+nbr_ctx
+msg_cbn
+⊕
+Snapshot1
+Add v4
+…
+Fig. 5: A graphical illustration of full-neighbor RTEC and the reordered incremental RTEC. Colored boxes represent result tensors and
+their compositions from upstream operations; solid arrows indicate data flow, while dashed arrows denote the reuse paths.
+Algorithm 1 Reordered incremental RTEC for a single layer.
+Input: Destination vertex v; Affected neighborhood ∆N(v), pre-
+vious neighbor embedding al
+v; previous neighbor context nctv.
+Output: New result hl
+v
+1: for each u in ∆N(v) do
+2:
+mlcuv = ms_local
+(
+hl−1
+u
+, hl−1
+v
+)
+3:
+ˆ
+nctv = nbr_ctx(nctv,
+{
+msg_lcuv | u ∈∆N(v)
+}
+)
+4: ˆal
+v = ms_cbn−1(
+nctv, al
+v
+)
+5: ˆal
+v = aggregate(ˆal
+v,
+{
+mlcuv · f_nn(hl−1
+u
+) | u ∈∆N(v)
+}
+)
+6: al
+v = ms_cbn
+( ˆ
+nctv, ˆal
+v,
+)
+7: hl
+v = update(al
+v)
+for affected edges (Line 1-2) and then nbr_ctx partially
+computes the neighbor-wise context using the old nctv and
+new local edge messages (Line 3). In the second step, local
+messages and new neighbor-wise context are separately ap-
+plied to the neighbor aggregation embedding al
+v. It first uses
+ms_cbn()’s inverse operation ms_cbn()−1 to remove the
+effect of old nctv from al (Line 4), then partially aggregates
+the update of local messages from affected neighborhoods
+to ˆal (Line 5), reusing the valid aggregation result of un-
+affected subgraphs, and finally recalls ms_cbn() to restore
+al using the new neighbor-wise context
+ˆ
+nct (Line 6). In
+the third step, the update operation recomputes the new
+layer-output embedding using the new al (Line 7). Note
+that Algorithm 1 presents a generalized formulation for
+different type of affected vertices. For each inserted element
+in ∆N(v), ms_local() adds a positive message; for each
+deleted element, it produces a negative message to cancel
+the outdated contribution. Element updates are accomplished
+through a combination of both operations.
+C. Equivalence Analysis
+Algorithm 1 is equivalent to the original full-neighbor
+formulation (Equation 5-9). Figure 5 illustrates the key insight
+behind the equivalence between full-neighbor RTEC (a) and
+its incremental counterpart (b). In addition to the associa-
+tive property that enables the nbr_ctx() and aggregate()
+operations to be computed incrementally. The key property
+enabling the algorithm is that the effects of neighborhood
+context and local messages are independent and separable
+from the aggregation result, i.e., ms_cbn() is distributive over
+the aggregate operation (Condition 3 in theorem 1). This
+allows us to use vertex-centric msg_cbn−1() and msg_cbn()
+operations to remove outdated and apply updated neighbor-
+hood context to the aggregation result, and to independently
+accumulate local messages from affected edges (e.g., ⟨4, 2⟩)
+into the intermediate aggregation state. We formalize the
+correctness condition in the following theorem.
+Theorem 1: Equivalence of full-neighbor RTEC and
+incremental RTEC Given a vertex v, its original neighbor-
+hood N, an update set ∆N, and the corresponding vertex
+embeddings {hl
+u | u ∈N ∪∆N}, the output embedding
+computed by Algorithm 1, using the incremental update over
+N and ∆N, is equivalent to the embedding obtained by
+recomputing from scratch using Equations (9)–(13) on the
+combined neighborhood N ∪∆N, provided the following
+conditions hold. M and X represent a set of edge messages
+and vertex embeddings from the domain of nbr_ctx and
+aggregate, respectively.
+• (1) nbr_ctx(Ml ∪Mr) = nbr_ctx
+(
+nbr_ctx(Ml), Mr
+)
+• (2) aggregate(Xl ∪Xr) = aggregate
+(
+aggregate(Xl), Xr
+)
+• (3) aggregate({msg_cbn(z, m) | m ∈M}) =
+1
+msg_cbn(z, aggregate({m | m ∈M}))
+• (4) ∀z1, z2
+∈
+M, z1
+≤
+z2
+⇒
+msg_cbn(z1, m)
+⪯
+msg_cbn(z2, m)
+Proof: In the proof, we use the superscript notation
+[] to distinguish the input data of neighborhood context
+and aggregate result. For brevity, we denote N ∪∆N as
+N +. Since msg_local() is edge-wise, full-neighbor RTEC
+and incremental RTEC produce the same output messages.
+Then, the full neighbor-wise computation (Equation 10) can
+be converted into the partial computation form in Line 3
+using condition (1):
+nct[N+]
+v
+=nbr_cxt({mlcuv | u ∈N+})
+=nbr_cxt(nbr_cxt({mlcuv | u ∈N) ∪{mlcuv | u ∈∆N})
+=nbr_cxt(nct[N]
+v
+, {mlcuv | u ∈∆N})
+(10)
+Condition 2, similar to Condition 1, ensures that partial
+aggregation in Line 5 yields the same outcome as full
+aggregation over complete data. Condition 3 indicates that
+the msg_cbn() function is distributive over the aggregate()
+operation. Such that Equations 11-12 can be rewrite as follow:
+al,[N+]
+v
+= aggregate(
+{
+ms_cbn
+(
+nct[N+]
+v
+, mlcuv · f_nn(hl−1
+u
+)
+)
+| u ∈N+}
+)
+= ms_cbn
+(
+nct[N+]
+v
+, aggregate(
+{
+mlcuv · f_nn(hl−1
+u
+) | u ∈N+}
+)
+)
+= ms_cbn(nct[N+]
+v
+, aggregate
+(
+aggregate(
+{
+mlcuv · f_nn(hl−1
+u
+) | u ∈N
+}
+)
+∪
+{
+mlcuv · f_nn(hl−1
+u
+) | u ∈∆N
+})
+(11)
+
+
+--- Page 6 ---
+Condition 4 is a sufficient condition for the existence of the
+inverse function msg_cbn−1(), with which we can decouple
+the effect of neighborhood-wise computation from the aggre-
+gation result. Such that, the last aggregate(…) in Equation
+15 can be rewrote as follows:
+aggregate(
+{
+mlcuv · f_nn(hl−1
+u
+) | u ∈N
+}
+)
+=msg_cbn−1(
+nct[N]
+v
+, msg_cbn(nct[N]
+v
+,
+aggregate(
+{
+mlcuv · f_nn(hl−1
+u
+) | u ∈U
+}
+))
+)
+=msg_cbn−1(
+nct[N]
+v
+,
+aggregate(
+{
+msg_cbn
+(
+nct[U]
+v
+, mlcuv · f_nn(hl−1
+u
+)
+)
+| u ∈N
+}))
+=ms_cbn−1(
+nct[N]
+v
+, al,[N]
+v
+)
+(12)
+Finally, Equation 15 can be rewrote with Equation 16 as
+follows:
+al,[N+]
+v
+= ms_cbn(nct[N+]
+v
+, aggregate
+(
+ms_cbn−1(nct[N]
+v
+, al,[N]
+v
+) ∪
+{
+mlcuv · f_nn(hl−1
+u
+) | u ∈∆N
+})
+(13)
+This formulation aligns to Lines 4-6 of Algorithm 1, with
+which update() computation produces the correct result.
+Proved.
+GNN models with constrained incremental processing.
+Theorem 1 establishes the theoretical foundation for the
+correctness of incremental processing based on the properties
+of computational operators. It implicitly assumes that the
+destination embedding hl−1
+v
+does not participate in the
+ms_local() function in Equation (5), which ensures that
+results from unaffected regions remain correct for safe reuse..
+However, in GNN models where the message computation
+also involves destination embedding (e.g., hl−1
+v
+in GAT), any
+destination embedding updates can affect the local messages
+of all its neighbors, leading to incorrect result reuse even
+when the conditions are satisfied. To guarantee correctness,
+our method recomputes embeddings for such destination-
+affected vertices using their full neighborhoods. Importantly,
+this constraint does not compromise the overall efficiency of
+incremental processing, as the number of such vertices is sig-
+nificantly smaller than that of vertices requiring incremental
+updates (Section VI-B).
+D. Application to Various GNN Models
+We summarize ten representative incrementalizable GNN
+models in Table II and demonstrate its practical application
+using GAT [39] as a representative example.
+Graph Attention Network (GAT).
+The GAT model, as
+defined in Equations 3 and 4, computes the parameterized
+attention value for each edge and applies the softmax()
+operation across all neighbors to obtain normalized impor-
+tance scores to distinguish important neighborhoods. Under
+our fine-grained abstraction, the softmax()-based mes-
+sage computation (Equation 3) can be naturally decomposed
+into three components, as illustrated in Algorithm 2. First,
+msg_local() computes the raw attention logits for each edge
+(Lines 1–2). Then, nbr_ctx() performs attention summation
+by aggregating logits across all neighbors (Line 3). Finally,
+msg_cbn() normalizes the attention values by dividing each
+Algorithm 2 Full-neighbor RTEC for GAT
+Input: Input vertex v; Affected neighborhood ∆N(v); The new
+embedding of ∆N(v): {hl−1
+u
+| u∈∆N(v)}.
+Output: New aggregation embedding al
+v and vertex embedding hl
+v.
+1: for each u in N(v) ∪∆N(v) do //msg_local
+2:
+atuv=exp
+(
+LeakyReLU(al([W lhl−1
+v
+||W lhl−1
+u
+)
+)
+3: at_sumv= sum
+({
+atuv | u∈N(v) ∪∆N(v)
+})
+//nbr_ctx
+4: for each u in N(v) ∪∆N(v) do
+5:
+a_scoreuv=
+atuv
+at_sumv //msg_cbn
+6: al
+v=sum
+({
+a_scoreuvW lhl−1
+u
+|u
+∈
+N(v) ∪∆N(v)
+})
+//aggregate
+7: hl
+v = elu (al
+v) //update
+Algorithm 3 Incremental RTEC for GAT
+Input: Input vertex v; Affected neighborhood ∆N(v); The new
+embedding of ∆N(v): {hl−1
+u
+| u∈∆N(v)}, The old embedding
+of ∆N(v): {h_oldl−1
+u
+| u∈∆N(v)}; The old neighbor aggre-
+gation embedding al
+v; The old neighbor-wise context: attention
+sum at_sumv;
+Output: New aggregation embedding al
+v and vertex embedding hl
+v.
+1: at_sum_oldv = at_sumv
+2: for each u in ∆N(v) do
+3:
+at_olduv = atuv
+4:
+atuv=exp
+(
+LeakyReLU(al([W lhl−1
+v
+||W lhl−1
+u
+)
+)
+//msg_local
+5: at_sumv= sum
+(
+at_sumv,
+{
+atuv−at_olduv
+|
+u∈∆N(v)
+})
+//nbr_ctx
+6: ˆal
+v = al
+v · at_sum_oldv //msg_cbn−1
+7: ˆal
+v=sum
+(ˆal
+v,
+{
+atuvW lhl−1
+u
+−at_olduvW lh_oldl−1
+u
+|u∈∆N(v)
+})
+//agg
+8: al
+v =
+ˆal
+v
+at_sumv //msg_cbn
+9: hl
+v = elu (al
+v) //update
+raw score by the summed value (Line 5). The aggregation
+and update steps remain consistent with Equation 4, where
+f_nn(hl
+v) = W lhl
+v. Therefore, the full-neighbor RTEC exe-
+cution using Algorithm 2 yields results equivalent to the
+original formulation in Equations 3 and 4.
+Algorithm 3 outlines the workflow for incremental com-
+putation using the decoupled operators in Algorithm 2. In
+addition to the basic inputs, it leverages historical neigh-
+bor context and aggregated result, i.e., the attention sum
+at_sumv and the neighborhood aggregation embedding al
+v.
+First, the algorithm computes the raw attention value for
+each edge in the affected neighborhood (Lines 2–4) while
+preserving the outdated attention values for later correction
+(Line 3). Then, nbr_ctx() updates the old attention sum
+at_sumv to the new one by applying the delta value of
+affected neighborhoods (Line 5). Next, the outdated attention
+sum at_sum_oldv is removed from the existing aggregation
+embedding al
+v through the multiplication (Line 6), i,e., the
+inverse operation of division. This is possible because the
+attention normalization of msg_cbn() is distributive over
+summation, i.e., sum(
+m1
+at_sumv ,
+m2
+at_sumv ) = sum(m1,m2)
+at_sumv
+. The
+algorithm then performs a partial update to the intermediate
+embedding ˆal
+v using the new local attention values and the
+input embeddings of affected neighbors (Line 7). Finally, the
+
+
+--- Page 7 ---
+TABLE II: Representative GNN models adaptable to incremental computation. The layer superscript is omitted for brevity. MoNet and
+CommNet are inherently incremental models, while the remaining ones can be incrementalized with our design.
+Model
+msg_local(hu, hv) nbr_ctx
+(
+{mlcuv|u∈U}
+)
+msg_cbn(mlcuv, nctv)) msg_cbn−1(msguv, nctv) aggregate(·) f_nn(hu)
+update(hv, av)
+= mlcuv
+= nctv
+= msguv
+= mlcuv
+= av
+⇒agg
+= hv
+MoNet [1]
+exp( 1
+2 (hu−wu)tWj(hu−wu))
+1
+1 · mlcuv
+1 · msguv
+sum(·)
+1
+ReLU(W av)
+CommNet [35]
+1
+1
+1 · mlcuv
+1 · msguv
+sum(·)
+hu W1hv + W2av
+GCN[51]
+1
+√
+du
+count(·)
+mlcuv ·
+1
+√nctv
+msguv · √nctv
+sum(·)
+hu
+ReLU(W av)
+GraphSAGE[52]
+1
+count(·)
+mlcuv
+/
+nctv
+msguv · nctv
+sum(·)
+hu
+ReLU(W av)
+PinSAGE[52]
+αu,vσ(Qhu + q)
+count(·)
+mlclc
+/
+nctv
+msguv · nctv
+sum(·)
+1
+σ(W (hv∥av))
+RGCN [34]
+Wr
+count(·)
+mlclc
+/
+nctv
+msguv · nctv
+sum(·)
+hu σ(Wohv + av)
+GAT[39]
+exp
+(
+σ(a([W hv||W hu)
+)
+sum(·)
+mlcuv
+/
+nctv
+msguv · nctv
+sum(·)
+W hu
+elu(av)
+G-GCN[19]
+σ(W1hu + W2hv)
+1
+1 · mlc_uv
+1 · msguv
+sum(·)
+hu
+σ(W av)
+A-GNN[10]
+w
+hT
+v ·hu
+∥hv∥∥hu∥
+1
+1 · mlcuv
+1 · msguv
+sum(·)
+hu
+σ(W av)
+RGAT[2]
+exp
+(
+σ(ar([Wrhv||Wrhu)
+)
+sumr∈R(·)
+mlcuv
+/
+nctv[R(u,v)]
+msguv · nctv[R(u,v)]
+sum(·)
+Wrhu
+σ(av)
+updated aggregation embedding is recomputed using the new
+attention sum and passed to the update operation (Lines 8–
+9). The incremental computation yields outputs equivalent to
+the original GAT formulation.
+More examples. Many commonly used GNN models that
+are treated as non-incremental or lack accuracy guarantees in
+existing frameworks [29], [48] can benefit from incremental
+RTEC [1]. Table II presents the decomposed formulations
+of ten representative models. Among them, CommNet and
+MoNet are naturally compatible with incremental process-
+ing due to their use of edge-wise message functions and
+sum aggregation, whereas the remaining models can be
+incrementalized with our design. The GCN model can be
+incrementalized by decomposing the degree normalization
+into:
+1
+√du , dv, and √·, which correspond to msg_local(),
+nbr_ctx(), and msg_cbn(), respectively. GraphSAGE and
+PinSAGE employ the non-associative mean() aggregation,
+but mean() can be decomposed into a sum() followed
+by division by the destination vertex’s degree, enabling full
+incremental processing. In contrast, models such as GAT, G-
+GCN, and A-GNN incorporate destination vertex embeddings
+into edge-wise message computation and therefore employ
+conditional incremental processing. Beyond homogeneous
+GNNs, heterogeneous models designed to handle graphs
+with multiple edge types (e.g., GCN and GAT) can also be
+incrementalized by processing each edge type independently
+and merging results in the final step. It is worth noting that
+NeutronRT can also support multi-hop aggregation variants
+of these models [42], since the indirect-aggregation across
+multi-hop neighborhoods can be viewed as adding temporal
+edges, which violates the condition.
+V. NeutRonRT System
+Incremental RTEC requires caching intermediate embed-
+dings across layers, making full in-GPU processing impracti-
+cal for large graphs. We introduce NeutronRT, a CPU–GPU
+co-processing system that computes embeddings on GPUs
+while storing intermediate results and graph data in the
+larger CPU memory. Figure 6 shows an overview.
+A. Incremental Computation Engine
+Backend and operator implementation. NeutronRT im-
+plements the incremental RTEC engine on top of DGL [43],
+NeutronRT
+CPU
+Incremental computation engine
+Input from 𝑮𝒊−𝟏
+Final-layer vertex 
+embedding (𝐡𝑳)
+(computation target) 
+(Graph snapshot)
+0
+1
+5
+3
+2
+4
+Updates:
+Insert edge <0,2>
+Update feature v3
+Neighborhood aggregation
+embedding (𝐚)
+(Cached data) 
+Embedding I/O
+GPU
+0
+1
+5
+3
+2
+4
+Output for 𝑮𝒊
+Split Computation
+Graph
+Neighborhood 
+aggregation
+embedding
+Final-layer
+vertex
+embedding 
+Vertex-centric
+embedding
+management
+Chunk-based
+task
+scheduling
+Computation graph
+construction
+Embedding
+storage
+PMA-based
+dynamic CSR
+Fig. 6: NeutronRT system overview.
+a widely adopted graph learning library. It leverages DGL’s
+underlying subgraph representation to maintain the compu-
+tation graph and its highly optimized GNN operator imple-
+mentations for efficient GPU execution. NeutronRT extends
+DGL’s programming interface to support incremental compu-
+tation operators. For the aggregate and update operations, it
+directly reuses DGL’s native implementations. For message
+computation, NeutronRT introduces four new user-defined
+functions to support the msg_local(), nbr_ctx(), msg_cbn(),
+and msg_cbn−1() operations as defined in Algorithm 1. We
+now demonstrate an example using the GAT model:
+def msg_local(G, mlc_old: Tensor, h_src: Tensor,
+h_dst: Tensor):
+m = torch.concat(W(h_src), W(h_dst))
+return mlc_old, torch.exp(LeakyReLU(a(m), 0.2))
+def nbr_ctx(nct_old: Tensor, mlc: list[Tensor]):
+return nct_old, torch.sum(mlc)
+def msg_cbn(nct: Tensor, mlc: Tensor):
+return nct / mlc
+def msg_cbn_r(a_dst: Tensor, nct: Tensor):
+return a_dst * nct
+Listing 1: GAT Implementation
+NeutronRT introduces minimal programming overhead, as
+most GNN models follow a small set of common patterns
+(Table II). To apply NeutronRT to a custom GNN model,
+users first check whether the aggregation function satisfies
+associativity for incremental accumulation, or can be trans-
+formed to do so by removing constant factors. They then
+examine the edge-level computation. Models with linear and
+constant edge computations can be handled similarly to the
+GCN decomposition shown in the third row. More complex
+models (e.g., GAT, shown in the 7th row) are supported when
+
+
+--- Page 8 ---
+both aggregation and non-aggregation components can be
+decomposed into linearly accumulable forms that preserve
+distributivity with respect to the aggregation. We demon-
+strate this process using GAT as an example in Listing 1.
+LLM-assisted programming.
+NeutronRT provides auto-
+mated operator decomposition and applicability-condition
+verification tools powered by LLMs and Satisfiability Mod-
+ulo Theories (SMT) solvers [54], thus reducing engineering
+efforts. Specifically, we construct an external knowledge
+base that maps GNNs’ original formulations to their im-
+plementations in NeutronRT ’s API, along with applicability
+conditions. This enables users to automatically verify the re-
+quired conditions and generate incremental programs for any
+potential GNN model directly from its original formulation
+via LLMs. To ensure the reliability of LLM-generated pro-
+grams, NeutronRT leverages the SMT solvers [47] to detect
+inconsistencies between incremental and original results of
+the generated programs, thereby guaranteeing correctness.
+Computation Graph Construction.
+The computation
+graph is constructed via parallel GPU BFS starting from
+updated vertices and edges, as shown in Algorithm 4. At each
+layer, the affected edge set Ecurr consists of the updated
+edges and the outgoing edges of affected vertices in the
+previous layer (Line 3). The destination vertices of Ecurr
+then form the affected vertex set for the next layer (Line
+4). For constrained models (Section IV-C), incoming edges
+of affected destination vertices are additionally included to
+ensure correctness (Line 5-7). Finally, the resulting per-hop
+subgraph is appended to the DGL computation graph for
+execution (Line 8).
+Packed-memory-array-based CSR structure. To contin-
+uously and efficiently support large-scale dynamic graphs,
+NeutronRT adopts a CPU-resident packed memory array
+(PMA)-based dynamic CSR representation [11] for graph
+storage. The PMA-CSR stores all vertex neighborhoods in a
+single packed array, enabling compact storage and efficient
+neighborhood access to each vertex. Neighborhoods of dif-
+ferent vertices are separated by adaptively balanced gaps to
+accommodate dynamic edge insertions. We refer interested
+readers to [11], [45] for more details.
+B. Out-of-Memory Embedding Management
+When input features and intermediate embeddings fit in
+GPU memory, they are fully cached for fast access; otherwise,
+they remain in CPU memory and are accessed on demand.
+Embedding-centric data migration. Incremental compu-
+tation involves sparse vertex embedding accesses, resulting
+in complex and inefficient CPU–GPU communication. To
+mitigate this, NeutronRT adopts the GPU-directed zero-copy
+memory access to directly read sparsely distributed vertex
+embeddings from CPU memory with optimized PCIe band-
+width utilization [28], [27]. After computation, NeutronRT
+group all update embeddings and write them back in parallel.
+NeutronRT omits GPU-side intermediate caching, as it offers
+limited benefit under tight memory constraints.
+Algorithm 4 Computation graph construction
+Input: Computation graph {CG1...CGL}
+Output: Computation graph {CG1...CGL}
+1: Vcurr ←Vupd
+2: for hop l ∈{1, · · · , L} do in parallel
+3:
+Ecurr ←Eupd ∪{< u, v >| u ∈Vcurr}
+4:
+{Vdst, Vsrc} ←Ecurr; Erecomp ←∅; Vcurr ←∅
+5:
+for each v ∈Vdst do in parallel
+6:
+if constraint_model and v ∈Vsrc then
+7:
+Erecomp ←Erecomp ∪inEdges(v)
+8:
+CG ←construct_graph(Vdst,{Ecurr ∪Erecomp}, l)
+Recomputation-based embedding storage optimization.
+Maintaining both the aggregate output neighbor embedding
+al and the update output layer embedding hl results in
+doubled CPU memory overhead. We observe that the update
+computation, transforming al into hl, typically incurs very
+little overhead, as it involves only vertex-wise neural network
+computation. Therefore, to reduce the CPU memory con-
+sumption of embedding storage for large graphs, we choose
+to cache and access only the neighbor embedding al, and
+recompute hl on the GPU at runtime.
+Out-of-CPU embedding management.
+NeutronRT core
+design assumes that the intermediate embeddings can be fully
+cached in CPU memory for efficient incremental processing.
+When the graph exceeds the memory capacity of a single
+machine, NeutronRT can fall back to selectively caching
+embeddings of high-degree vertices and recomputing the rest
+on demand. Although this heuristic retains embeddings with
+higher reuse potential [26], even removing a small fraction
+(e.g., 10%) of cached embeddings can lead to over an order-of-
+magnitude slowdown. This behavior stems from the inherent
+space-time trade-off of incremental processing.
+C. Chunked Task Scheduling with Shard Embedding Reuse
+Considering the memory requirements of large compu-
+tation graphs may exceed the capacity of a single GPU,
+NeutronRT adopts a chunked task scheduling approach
+that partitions each layer’s computation graph into smaller
+chunks that fit within GPU memory. During partitioned
+processing, a vertex may appear in the neighborhoods of
+multiple chunks, causing its embedding to be transferred
+multiple times within the same layer. To reduce such re-
+dundant transfers, NeutronRT incorporates an inter-chunk
+embedding reuse mechanism [44]. Specifically, NeutronRT
+precomputes neighborhood intersections across adjacency
+chunks and caches the shared embeddings in an intermediate
+GPU buffer, enabling reuse across chunks within the same
+layer. In practice, the chunk size is chosen to be as large as
+possible within the GPU memory budget, as larger chunks
+reduce data movement and increase cross-chunk overlap,
+facilitating embedding reuse.
+D. On-Demand Embedding Computation
+In some online applications, only a small set of query
+vertices is requested at a time, requiring their embeddings
+
+
+--- Page 9 ---
+TABLE III: Dataset description. #F, #H, and #L indicate the number
+of features, hidden dimension, and labels, respectively.
+scale
+Dataset
+|V|
+|E|
+#F #H #L
+Type
+ogbn-arxiv [10] (AX) 0.17M 1.2M 128 256 40
+citation
+small
+reddit [8] (RD) 0.23M 114M 602 256 41
+post-to-post
+ogbn-products [10] (PT)
+2.4M 62M 100 256 47
+co-purchasing
+Twitter [16] (TW)
+41M 1.5B 128 128 64
+social media
+large
+ogbn-paper [10] (PR) 111M 1.6B 128 128 172 citation network
+friendster [17](FS) 65.6M 2.5B 128 128 64
+social media
+to be computed on demand. This mode, termed On-Demand
+Embedding Computation (ODEC), can be viewed as a special
+case of RTEC that processes only the K-hop subgraph induced
+by the queried vertices for serving online queries in real
+time [32], [25]. From an execution perspective, ODEC sim-
+ilarly incurs redundant computation over unaffected edges
+within the K-hop subgraph. As the computation logic is
+unchanged, it can benefit from incremental execution and is
+efficiently supported by NeutronRT. Specifically, NeutronRT
+constructs the ODEC computation graph by intersecting the
+affected subgraph with the query-induced K-hop subgraph
+and executes it using the same task scheduling engine.
+VI. ExpeRimental Evaluation
+Environments. The experiments are conducted on a GPU
+server with 2 Intel(R) Xeon(R) Silver 4316 CPUs, 512GB
+DRAM, and one NVIDIA A6000 (48GB) GPU connected to
+the CPU via the PCIe 4.0@32GB/s. The server runs Ubuntu
+20.04 OS with GCC-9.4.0, CUDA 11.3 and PyTorch 1.13.0.
+Datasets and workloads.
+Table III shows the major pa-
+rameters of the used real-world graphs. Four of them use
+their attached properties and default training/validation/ test
+splits. We generate random features, labels, and edge time
+stamps following [5] for the Twitter and Friendster graph
+and randomly allocate 25%, 25%, and 50% of the vertices for
+training, validation, and testing, respectively. In the experi-
+ments, we use edge insertion/deletion hybrid workload [3],
+[8], [10]. The number of graph updates is controlled using
+the number of edges, as the power-law property leads to
+significant variations in edge counts across different vertices.
+By default, the update batch size is set to 0.01% of |E| for
+small graphs and 0.001% of |E| for large graphs.
+GNN models.
+We evaluate six models with diverse com-
+putation patterns. GCN, GraphSAGE, MoNet, and GIN can
+be fully incrementalized. AGNN and GAT are constrained
+incremental models.
+Baselines. We compare NeutronRT employing incremental
+RTEC processing (denoted by NrtInc) against RTEC-Full,
+RTEC-NS [36], and RTEC-UER [9]. λGrapher [9] optimizes
+RTEC on serverless platforms by reusing intermediate results
+with RTEC-UER, while Helios [36] accelerates dynamic graph
+sampling for RTEC-NS on memory–computation decoupled
+architectures. As both use different deployment settings from
+ours, we reimplemented their core approaches in NeutronRT
+using DGL’s built-in sampling engine and NeutronRT ’s
+task scheduling mechanism to ensure a fair comparison. For
+RTEC-NS We adopt sampling sizes of 5 and 10 [43], [36].
+TABLE IV: Accuracy comparison of different GNN Inference
+approaches with a 2-layer GraphSage on three real graphs.
+Approach
+Accuracy comparison of 5 runs
+ogbn-arxiv ogbn-product
+reddit
+ogbn-paper
+MTEC-Optimal 68.57%±0.05%72.84%±0.06%96.68%±0.03%65.03%±0.06%
+MTEC-Period
+67.10%±0.15% 72.28%±0.07% 94.73%±0.04% 63.37%±0.01%
+RTEC-NS5
+66.70%±0.11% 71.23%±0.07% 95.47%±0.16% 63.12%±0.10%
+RTEC-NS10
+67.74%±0.09% 72.30%±0.09% 95.92%±0.20% 63.67%±0.14%
+RTEC-NS20
+67.91%±0.11% 72.72%±0.08% 96.21%±0.11% 64.43%±0.08%
+RTEC(NrtInc)1 68.20%±0.11%72.86%±0.08%96.58%±0.03%64.88%±0.04%
+[1] RTEC and NrtInc achieve nearly identical results across GNN models.
+The mean squared error (MSE) between the final-layer embeddings produced
+by RTEC-Inc and RTEC-Full is below 10−4. We therefore report only the
+GraphSAGE results as a representative case, using a single row.
+The comparison against existing Incremental framework is
+given in Section VI-D. The chunk size for memory-efficient
+task scheduling is set to 8192 to ensure each chunk fits
+into GPU memory. In our evaluation, we report only the
+result of embedding computation and exclude training time,
+which is performed offline. All reported results are averaged
+over 20 batches for consistency. We exclude recent model-
+or channel-pruning-based approximation methods [58] from
+the evaluation, as they are orthogonal to our structure-centric
+approach. Applying such techniques to both NeutronRT and
+RTEC-Full would yield similar computation reductions and
+accuracy trade-offs.
+A. Accuracy Analysis of Incremental RTEC
+In this section, we show that incremental RTEC (NrtInc)
+matches the accuracy of full RTEC, outperforms RTEC-
+NS [50] and MTEC-Period [25], [55], and incurs only minor
+accuracy loss compared with the theoretically optimal but
+impractical MTEC-Optimal (real-time model retraining and
+embedding recomputation). The experiments are conducted
+on three real-world graphs using node classification tasks1.
+Accuracy Results.
+As shown in Table IV, MTEC-Period
+can lag behind the MTEC-Optimal solution by up to 2%,
+which may affect hundreds of thousands of users in large-
+scale applications. In contrast, NrtInc improves accuracy
+over MTEC-Period by 1.18% on average, while keeping
+the gap to the optimal solution within 0.15%. These results
+indicate that embedding quality is more sensitive to graph
+structure changes than to model freshness. Sampling-based
+methods perform even worse than MTEC-Period with a
+fanout of 5, as the discarded subgraph is much larger than
+the actual update region. Although increasing the fanout
+improves accuracy, performance remains inferior to incre-
+mental RTEC even at a fanout of 20, while also incurring
+significantly lower computation efficiency (Section VI-B).
+1Reddit and ogbn-arxiv include native timestamps, while ogbn-products
+adopts synthesized timestamps following [5]. All experiments employ the
+GraphSAGE model and DGL’s default training configuration (200 epochs, 2
+layers, a batch size of 2048, and a sampling fanout of 10). For the MTEC-
+Period method, both training and inference are conducted on 90% of the
+old graph. The MTEC-Optimal trains and infers on the updated graph. In
+contrast, RTEC trains on 90% of the old graph and performs inference on
+the updated graph.
+
+
+--- Page 10 ---
+ 0
+ 0.02
+ 0.04
+ 0.06
+GraphSAGE GCN
+GIN
+MONET AGNN
+GAT
+RTEC-Full
+RTEC-NS10
+RTEC-NS5
+RTEC-UER
+NrtInc
+43.1K
+45.7K
+56.5K
+43.5K
+37.4K
+37.8K
+42.9K
+35.0K
+62.4K
+60.5K
+55.6K
+31.1K
+53.8K
+50.1K
+66.5K
+64.5K
+60.9K
+57.6K
+62.7K
+53.9K
+37.7K
+42.1K
+30.9K
+43.1K
+141.5K
+118.1K
+154.3K
+143.5K
+76.7K
+83.2K
+Runtime (s)
+(a) ogbn-arxiv
+ 0
+ 0.4
+ 0.8
+ 1.2
+ 1.6
+GraphSAGE GCN
+GIN
+MONET AGNN
+GAT
+99.2K
+89.2K
+145.5K
+82.8K
+90.4K
+87.7K
+267.7K
+258.0K
+272.2K
+251.4K
+238.7K
+199.8K
+311.9K
+306.2K
+329.3K
+284.3K
+217.2K
+232.6K
+216.1K
+192.1K
+207.1K
+191.2K
+191.8K
+151.4K
+1718.5K
+1768.1K
+1681.8K
+1470.8K
+918.1K
+1021.0K
+ (b) ogbn-products
+ 0
+ 0.3
+ 0.6
+ 0.9
+ 1.2
+ 1.5
+GraphSAGE GCN
+GIN
+MONET AGNN
+GAT
+72.8K
+54.3K
+74.9K
+77.8K
+64.9K
+70.7K
+327.5K
+335.3K
+322.7K
+323.3K
+321.2K
+319.7K
+369.6K
+367.2K
+380.0K
+378.2K
+369.3K
+370.0K
+93.1K
+68.7K
+93.4K
+92.3K
+61.2K
+91.7K
+240.4K
+178.6K
+211.7K
+226.6K
+122.4K
+226.8K
+(c) reddit
+Fig. 7: Average Response time and throughput (on the top of each bar) comparison across fix models with GPU in-memory processing.
+ 0
+ 2
+ 4
+ 6
+ 8
+AX
+PT
+RD
+Full
+NS10
+NS5
+UER
+NrtInc
+NrtInc(C)
+Normalized to NrtInc
+(a) Vertex data access
+ 0
+ 6
+ 12
+ 18
+ 24
+AX
+PT
+RD
+(b) Edge data access
+Fig. 8: Data access volume on small graphs.
+0
+1
+2
+3
+Graph
+Runtime
+Feat+Label
+Intermediate
+CompData
+Full
+NS10
+NS5
+UER
+NrtInc
+Memory (GB)
+(a) AX
+0
+10
+20
+30
+40
+50
+Full
+NS10
+NS5
+UER
+NrtInc
+(b) PT
+0
+10
+20
+30
+40
+Full
+NS10
+NS5
+UER
+NrtInc
+(c) RD
+Fig. 9: Memory consumption.
+ 0
+ 30
+ 60
+ 90
+ 120
+ 150
+Upd+ASD
+CGC
+Comp
+Full
+NS10
+NS5
+UER
+NrtInc
+Full
+NS10
+NS5
+UER
+NrtInc
+Runtime (s)
+(a) twitter
+GAT
+GCN
+ 0
+ 60
+ 120
+ 180
+ 240
+ 300
+Full
+NS10
+NS5
+UER
+NrtInc
+Full
+NS10
+NS5
+UER
+NrtInc
+(b) ogbn-papers
+GAT
+GCN
+ 0
+ 70
+ 140
+ 210
+ 280
+ 350
+Full
+NS10
+NS5
+UER
+NrtInc
+Full
+NS10
+NS5
+UER
+NrtInc
+(b) friendster
+GAT
+GCN
+Fig. 10: Runtime and the breakdown for large graphs.
+B. Performance of In-Memory Processing
+In this section, we compare NeutronRT (NrtInc) against all
+baselines with three small graphs and six GNN models. The
+intermediate embedding is maintained in the GPU.
+Runtime and throughput results. Figure 7 reports the re-
+sponse time per update batch under different configurations.
+On arXiv and Products graphs, NrtInc achieves speedups
+ranging from 2.6x to 3.3x (10.0x to 19.8x), 1.9x to 3.1x (3.8x
+to 6.9x), 1.7x to 3.4x (4.2x to 5.8x), and 2.2x to 4.1x (4.8x
+to 9.2x) over RTEC-Full, RTEC-NS10, RTEC-NS5, and RTEC-
+UER, respectively. On the Reddit graph, NrtInc outperforms
+RTEC-Full by 1.9x-3.3x RTEC-UER by 2.0x-2.6x, but is 0.3x
+to 0.7x slower than RTEC-NS. The throughput, shown above
+each bar, is computed as |updated_edges|
+response_time , which is inversely
+proportional to response time. Under the default setting
+(0.01% edges per batch), NeutronRT achieves 76.7K–154.3K,
+918.1K–1768.1K, and 178.6K–378.2K edge updates per second
+on the three graphs, respectively.
+Access volume reduction.
+Figure 8 compares vertex and
+edge access volumes across different approaches. All models
+exhibit similar access patterns, except constrained models
+(e.g., GAT and AGNN), which incur slightly higher accesses,
+denoted by NrtInc(c). Overall, NrtInc consistently reduces ac-
+cess volumes compared to RTEC-Full. Compared to RTEC-NS,
+NrtInc incurs higher edge accesses but significantly reduces
+vertex accesses. On Reddit, the high average degree and small
+vertex set cause sampled subgraphs to cover most vertices,
+diminishing the effectiveness of sampling. Importantly, re-
+ductions in edge and vertex accesses are not always aligned,
+and vertex access volume has a non-negligible impact on
+compute efficiency. As a result, although RTEC-NS reduces
+edge accesses by up to 97% relative to NrtInc, its speedup is
+limited to at most 3×. In contrast, NrtInc reduces both vertex
+and edge accesses, leading to consistent and substantial
+performance improvements without compromising accuracy.
+Performance of constrained incremental models.
+For
+constrained incremental models (AGNN and GAT), the over-
+head is generally less than twice that of pure incremental pro-
+cessing, as the recomputed subgraph shares the same struc-
+ture with the incremental computation graph and contains
+duplicated vertices and edges. As shown by the NrtInc(c)
+bar in Figure 8, the recomputation introduces 31%–94% more
+vertex accesses and 33%–94% more edge accesses, resulting
+in a 1.2x–1.7x slowdown compared to NrtInc. Nevertheless,
+the average speedup of NrtInc(c) over RTEC-Full remains
+substantial, ranging from 2.1x to 10.9x across three graphs.
+Memory consumption. NeutronRT caches all intermediate
+embeddings during computation, but this will not increase
+the memory consumption. Figure 9 shows the total memory
+usage under in-memory processing (collected via Nsight)
+along with the breakdown across different components. The
+CompData component includes the affected subgraph, its
+associated features, embeddings, intermediate tensors, and
+GPU memory retained by the Python runtime. We observe
+that the intermediate result cache of NrtInc (Intermediate)
+accounts for 3% (RD) to 28% (PT) of the total runtime
+memory. This is much smaller than the memory saved by
+reducing the computation graph. Across the three graphs,
+total memory usage is reduced by 23% to 69% (avg. 42%).
+C. Performance of Out-of-Memory Processing
+In this section, we evaluate GCN and GAT model on three
+large graphs, as other models exhibit similar behaviors.
+Runtime and throughput comparison.
+The runtime
+results are presented in Figure 10. We observe that the
+processing time of RTEC-Full and RTEC-UER ranges from
+107.8s to 324.3s and from 46.4s to 127.2s, respectively. Al-
+though RTEC-NS effectively reduces computation, its runtime
+still exceeds 20 seconds. In contrast, NeutronRT reduces the
+per-batch processing time to just a few seconds (2.2s–2.9s).
+This enables NeutronRT to effectively handle scenarios with
+frequent updates on large-scale graphs, while incurring no
+correctness issues like those found in sampling-based meth-
+ods (Section 3). Specifically, for the GCN (and GAT) models,
+NrtInc achieves speedups ranging from 37.8x to 145.8x (22.7x
+to 76.8x), 8.6x to 26.1x (4.2x to 8.6x), 7.3x to 17.1x (3.6x to
+6.6x), and 16.3x to 57.1x (10.0x to 30.4x) over RTEC-Full,
+RTEC-NS10, RTEC-NS5, and RTEC-UER, respectively. GAT
+
+
+--- Page 11 ---
+ 0
+ 3
+ 6
+ 9
+ 12
+ 15
+TW
+PR
+FS
+Full
+NS10
+NS5
+UER
+NrtInc
+NrtInc(C)
+Normalized to NrtInc
+(a) Vertex data access
+1
+10
+100
+1K
+TW
+PR
+FS
+(b) Edge data access
+Fig. 11: Access volume on large graphs.
+TABLE V: Edge-access re-
+duction over high-, mid-,
+and low-degree vertices.
+Top20% Mid30% Bot50%
+TW
+85.0%
+9.3%
+5.7%
+FS
+79.2%
+17.2%
+3.6%
+PR
+71.9%
+18.5%
+9.6%
+incurs higher computation overhead than GCN, primarily
+due to increased computation and data transfer for the
+recomputation part. In out-of-memory setting, NeutronRT
+achieves throughput ranging from 681.8K–872.5K edge upd/s
+among the three large graphs.
+Performance Breakdown.
+Figure 10 presents the perfor-
+mance breakdown for the three large graphs. In the out-of-
+memory configuration, computation becomes the dominant
+bottleneck, accounting for 82% to 89% of the total runtime
+in the RTEC-Full setup. This overhead stems not only from
+the increased volume of graph accesses but also from ad-
+ditional scheduling and engine launch costs introduced by
+chunked graph processing. Computation graph construction
+contributes a further 11% to 18% of the total runtime, while
+the overhead of graph updates and affected region detec-
+tion is negligible. The RTEC-NS method effectively reduces
+computation through neighborhood dropping. However, its
+benefit in reducing communication is limited, and its overall
+computation cost remains higher than that of the incremental
+approach. In contrast, NrtInc significantly reduces both com-
+putation graph construction and overall computation costs,
+by 90%–98% and 95%–99%, respectively. With the NrtInc
+configuration, Upd+ASD, CGC, and Comp account for 4%–
+18% (average 10%), 16%–58% (average 36%), and 37%–68%
+(average 53%) of the total execution time, respectively.
+Access volume reduction.
+As shown in Figure 11, we
+extend the redundancy analysis to large-scale graphs and
+observe that NrtInc consistently achieves substantial reduc-
+tions in both vertex and edge access volumes compared
+to existing methods. On billion-scale datasets, NrtInc re-
+duces vertex accesses by 3.6×–10.8× and edge accesses
+by 4.9×–168.5×. On the Twitter (TW) dataset, sampling-
+based methods achieve edge access volumes comparable to
+NrtInc. This behavior is mainly attributed to the stronger
+power-law property of TW, where a small fraction of hub
+vertices with extremely high degrees dominate neighborhood
+expansion, causing the incremental computation subgraph to
+grow rapidly even for small updates. Table V further shows
+a finer-grained access volume breakdown by vertex degree
+percentiles. Across all datasets, high-degree vertices account
+for 72%–85% of the total access reduction, while the bottom
+50% contribute less than 10% despite comprising half of the
+vertices. This result indicates that the effectiveness of NrtInc
+primarily arises from eliminating redundant edge accesses
+around high-degree vertices.
+CPU memory consumption for large graphs. As shown
+TABLE VI: CPU memory consumption for large graphs (GB).
+twitter
+friendser
+ogbn-paper
+Full Inc-Naive
+Inc
+Full Inc-Naive
+Inc
+Full Inc-Naive
+Inc
+20.99
+83.97 62.98 56.83
+227.32 170.4 33.58
+134.35 100.76
+in Table VI. RTEC-Full and RTEC-NS only store the original
+features, resulting in the lowest memory usage. However,
+for large-scale graphs, even this can exceed the capacity of
+a single GPU. The naive NrtInc stores both the intermediate
+neighborhood aggregation and vertex embeddings alongside
+the original feature, leading to a 2.3x–8.2x increase in mem-
+ory usage. In contrast, the recomputation-based optimization
+reduces the CPU memory consumption by 19%–30% with
+negligible recomputation cost (smaller than 1%).
+D. Sensitivity Analysis
+Performance of RTEC with varying batch sizes (|∆E|).
+Figure 12.a–b show the response time and throughput on
+the ogbn-Paper graph as the number of edge updates |∆E|
+increases from 1 to 100M. When |∆E| < 10, NrtInc exhibits
+slightly lower performance than other solutions due to the
+overhead of constructing the affected subgraph. As |∆E|
+increases, the runtime and throughput of NrtInc gradually
+approach those of RTEC-Full. Notably, NrtInc’s runtime
+increases slowly, while its throughput grows rapidly. The
+performance advantage of NrtInc becomes significant with
+moderate update sizes, peaking at a 285.0x speedup over
+RTEC-Full when |∆E| = 1K. Beyond this point, the advan-
+tage gradually declines, dropping to 3.8x at |∆E| = 100M,
+where the updates account for approximately 16% of the
+original edge set. At this scale, RTEC-Full almost needs to
+recompute the entire graph, and RTEC-NS5 achieves similar
+performance to NrtInc. However, RTEC-NS5 suffers from
+information loss and accuracy degradation, as many affected
+graph components are omitted during recomputation. NrtInc
+maintains stable improvement across varying batch sizes.
+Throughput with various latency requirements.
+Real-
+world applications require high throughput (updates/sec)
+while satisfying latency constraints, such that the updated
+embeddings are visible to downstream applications within a
+bounded time. However, practical GNN embedding compu-
+tation latency may vary significantly under the same batch
+size due to irregular update propagation and varying neigh-
+borhood sizes. We therefore estimate a stable and achievable
+throughput empirically. For each latency requirement (1 s,
+5 s, 25 s, 50 s, and 100 s), we gradually increase the batch size
+from 1 to 10M and evaluate each batch configuration using
+20 randomly sampled edge update sets. We select the largest
+batch size for which all runs satisfy the latency bound and
+report the corresponding minimal achievable throughput. As
+shown in Figure 12.c, NrtInc consistently achieves orders-
+of-magnitude higher throughput than competing methods,
+ranging from 3K edge/s under a 1 s latency bound to 229K
+edges/s under a 100 s latency bound.
+Performance of ODEC with varying query vertices.
+In
+real-world ODEC applications, the number of query vertices
+(|VQ|) varies dynamically. To evaluate incremental ODEC
+
+
+--- Page 12 ---
+0.01
+0.1
+1
+10
+100
+1K
+10K
+1
+10 1001K 10K100K1M 10M100M
+Full
+Ns10
+NS5
+UER
+NrtInc
+Runtime (s)
+(a) Response time of RTEC with varying 
+ batch size |∆E|
+0.1
+1
+10
+100
+1K
+10K
+100K
+1M
+1
+10 1001K 10K100K1M 10M100M
+Full
+Ns10
+NS5
+UER
+NrtInc
+Edge Updates/s
+(b) Throughput of RTEC with varying 
+ batch size |∆E|
+1
+10
+100
+1K
+10K
+100K
+1M
+1S
+5S
+25S 50S 100S
+Full
+Ns10
+NS5
+UER
+NrtInc
+Edge updates/s
+(c) Throughput of RTEC with varying 
+ Latency requirements
+0.01
+0.1
+1
+10
+100
+1K
+10K
+1
+10 1001K 10K100K1M 10MAll
+Full
+Ns10
+NS5
+UER
+NrtInc
+Runtime (s)
+(d) Response time of ODEC with
+ varying query vertices
+ 0
+ 5
+ 10
+ 15
+ 20
+AX PT
+RT TW PR
+FS
+Ripple
+InkStream
+NeutronRT
+Normalized Speedup
+(e) Comparison with Ripple and InkStream 
+ on varying graphs
+Fig. 12: Performance incremental RTEC and ODEC with varying factors.
+under different query sizes, we vary |VQ| from 1 to the full
+set of affected vertices (Figure 12.d), considering an extreme
+case where all queries are drawn from the affected set. Since
+NrtInc incurs no overhead on unaffected vertices, we exclude
+other baselines in this setting. When |VQ| < 100, all methods
+show similar performance due to the small computation
+graphs. As |VQ| increases, the advantage of NrtInc becomes
+more pronounced. When all affected vertices are queried
+(ALL), ODEC reduces to RTEC and achieves the same
+performance gains. Although the runtime of NrtInc does
+not increase monotonically with |VQ| due to varying overlap
+with affected subgraphs, it consistently delivers competitive
+performance when |VQ| ≥1K.
+TABLE VII: Performance of NrtInc with various layers.
+Data
+Normalized Speedup
+Full
+NS5
+NS10
+UER
+Layer
+2
+3
+2
+3
+2
+3
+2
+3
+Reddit
+3.3x
+1.8
+0.5x
+0.3x
+0.5x
+0.3x
+2.6x
+1.5x
+Product
+8.4x
+3.5x
+4.5x
+2.2x
+4.2x
+2.0x
+4.6x
+2.4x
+Paper
+122.6x
+20.4x
+26.2x
+5.3x
+17.1x
+3.4x
+35.9x
+6.6x
+Performance with varying layers. Table VII reports the
+performance improvement of NrtInc over other baselines.
+As the number of GNN layers increases from 2 to 3, the
+speedup generally decreases, since the size of the affected sub-
+graph expands rapidly with depth. This trend is consistently
+observed across graphs with diverse structural properties,
+including ogbn-products (power-law), Reddit (high average
+degree), and ogbn-papers (large-scale, power-law). On dense
+graphs such as Reddit, sampling-based methods become more
+competitive at larger depths by uniformly reducing compu-
+tation at each layer. In practice, GNN models are typically
+configured with 2 or 3 layers, as deeper models not only
+incur higher training costs [56], [36], but also suffer from
+accuracy degradation due to over-smoothing [33]. Despite
+the reduced speedup at greater depths, the performance gains
+accumulated in earlier layers remain substantial, allowing
+NrtInc to consistently outperform RTEC-Full and RTEC-UER.
+Comparison with InkStream and Ripple.
+We com-
+pare NeutronRT with InkStream [48], a CPU–GPU hybrid
+incremental RTEC system, and Ripple [29], a CPU-based
+RTEC system. Due to the lack of a public implementation,
+we implement Ripple’s execution logic using DGL’s CPU
+backend in NeutronRT. To ensure a fair comparison, we
+focus on the GraphSAGE model, which is supported by all
+three systems. More complex models, such as GCN and
+GAT are excluded because they are not supported by the
+computation model of either Ripple or InkStream. Accuracy
+evaluation are omitted due to space constraints, as all three
+systems produce similar results. As shown in Figure 12.e,
+NeutronRT and InkStream achieve similar performance on
+small graphs where all data fits in memory, with speedups
+ranging from 7.8× to 12.3× over Ripple. On large graphs,
+NeutronRT outperforms InkStream by 5.3×–7.7×, because
+InkStream executes graph propagation on the CPU, whereas
+NeutronRT performs the entire computation on the GPU.
+VII. Related WoRK
+GNNs for dynamic Graphs.
+Temporal Graph Learning
+focuses on capturing temporal dependencies and structural
+evolution in dynamic graphs, typically modeled as either
+discrete-time snapshots or continuous event streams [22],
+[37], [41], [59], [18]. They generally employ encoder-decoder
+framework [20] and recursive neural networks with various
+temporal-spatial encoding approaches [53], [59].
+Incremental graph processing.
+Recent work on incre-
+mental graph processing explores fixed-point semantics and
+monotonicity in iterative graph analytics to avoid compu-
+tation on converged vertices [40], [24], [4], [15]. However,
+these techniques do not naturally extend to GNNs, as the
+redundancy in GNNs primarily stems from accessing unaf-
+fected edges, rather than recomputing already converged ver-
+tices. Furthermore, GNN computations generally lack mono-
+tonicity due to the non-linear nature of neural networks.
+VIII. Conclusion
+We present NeutronRT, an efficient and general frame-
+work for incrementalizing GNN RTEC on streaming graphs.
+By fully reusing historical computation results, NeutronRT
+transforms expensive full-neighbor propagation into an
+equivalent yet far more efficient incremental form through
+fine-grained operator decoupling and reorganization. This de-
+sign enables broad generalization across diverse GNN models
+while rigorously preserving correctness. A lightweight CPU–
+GPU co-processing framwwork further enhances computa-
+tion efficiency on billion-scale graphs. Extensive evaluations
+demonstrate that NeutronRT delivers substantial speedups
+over existing RTEC solutions without compromising model
+accuracy, making real-time GNN inference both practical and
+reliable.
+AcKnowledgements
+We thank the anonymous reviewers for their constructive
+comments and suggestions. This work is supported in part
+by the Ministry of Education AcRF Tier 2 grant, Singapore
+(T2EP20224-0038), National Natural Science Foundation of
+China (U2241212, 62461146205), Distinguished Youth Foun-
+dation of Liaoning Province (2024021148-JH3/501)
+
+
+--- Page 13 ---
+RefeRences
+[1] M. Besta and T. Hoefler. Parallel and distributed graph neural networks:
+An in-depth concurrency analysis.
+IEEE Trans. Pattern Anal. Mach.
+Intell., 46(5):2584–2606, 2024.
+[2] D. Busbridge, D. Sherburn, P. Cavallo, and N. Y. Hammerla. Relational
+graph attention networks. CoRR, abs/1904.05811, 2019.
+[3] G. Feng, Z. Ma, D. Li, S. Chen, X. Zhu, W. Han, and W. Chen. Risgraph:
+A real-time streaming system for evolving graphs to support sub-
+millisecond per-update analysis at millions ops/s.
+In SIGMOD ’21:
+International Conference on Management of Data, Virtual Event, China,
+June 20-25, 2021, pages 513–527. ACM, 2021.
+[4] S. Gong, C. Tian, Q. Yin, W. Yu, Y. Zhang, L. Geng, S. Yu, G. Yu,
+and J. Zhou. Automating incremental graph processing with flexible
+memoization. Proc. VLDB Endow., 14(9):1613–1625, 2021.
+[5] M. Guan, A. P. Iyer, and T. Kim. Dynagraph: dynamic graph neural
+networks at scale. In V. Kalavri and S. Salihoglu, editors, GRADES-NDA
+’22: Proceedings of the 5th ACM SIGMOD Joint International Workshop on
+Graph Data Management Experiences & Systems (GRADES) and Network
+Data Analytics (NDA), Philadelphia, Pennsylvania, USA, 12 June 2022,
+pages 6:1–6:10. ACM, 2022.
+[6] J. Halcrow, A. Mosoi, S. Ruth, and B. Perozzi.
+Grale: Designing
+networks for graph learning.
+In R. Gupta, Y. Liu, J. Tang, and
+B. A. Prakash, editors, KDD ’20: The 26th ACM SIGKDD Conference on
+Knowledge Discovery and Data Mining, Virtual Event, CA, USA, August
+23-27, 2020, pages 2523–2532. ACM, 2020.
+[7] W. L. Hamilton, Z. Ying, and J. Leskovec.
+Inductive representation
+learning on large graphs. In Advances in Neural Information Processing
+Systems 30: Annual Conference on Neural Information Processing Systems
+2017, 4-9 December 2017, Long Beach, CA, USA, pages 1024–1034, 2017.
+[8] W. L. Hamilton, Z. Ying, and J. Leskovec.
+Inductive representation
+learning on large graphs. In Advances in Neural Information Processing
+Systems 30: Annual Conference on Neural Information Processing Systems
+2017, December 4-9, 2017, Long Beach, CA, USA, pages 1024–1034, 2017.
+[9] H. Hu, F. Liu, Q. Pei, Y. Yuan, Z. Xu, and L. Wang.
+λgrapher: A
+resource-efficient serverless system for GNN serving through graph
+sharing. In T. Chua, C. Ngo, R. Kumar, H. W. Lauw, and R. K. Lee,
+editors, Proceedings of the ACM on Web Conference 2024, WWW 2024,
+Singapore, May 13-17, 2024, pages 2826–2835. ACM, 2024.
+[10] W. Hu, M. Fey, M. Zitnik, Y. Dong, H. Ren, B. Liu, M. Catasta, and
+J. Leskovec. Open graph benchmark: Datasets for machine learning on
+graphs, 2020.
+[11] A. A. R. Islam, D. Dai, and D. Cheng. VCSR: mutable CSR graph format
+using vertex-centric packed memory array. In 22nd IEEE International
+Symposium on Cluster, Cloud and Internet Computing, CCGrid 2022,
+Taormina, Italy, May 16-19, 2022, pages 71–80. IEEE, 2022.
+[12] IVM Development Group. pg_ivm: Incremental view maintenance ex-
+tension for postgresql. https://github.com/sraoss/pg_ivm, 2023. Version
+1.7; accessed 2025-06-14.
+[13] Z. Jia, S. Lin, M. Gao, M. Zaharia, and A. Aiken. Improving the accuracy,
+scalability, and performance of graph neural networks with roc. In
+Proceedings of Machine Learning and Systems 2020, MLSys 2020, Austin,
+TX, USA, March 2-4, 2020, 2020.
+[14] T. N. Kipf and M. Welling. Semi-supervised classification with graph
+convolutional networks. In 5th International Conference on Learning
+Representations, ICLR 2017, Toulon, France, April 24-26, 2017, Conference
+Track Proceedings, 2017.
+[15] S. Ko, T. Lee, K. Hong, W. Lee, I. Seo, J. Seo, and W. Han. iturbograph:
+Scaling and automating incremental graph analytics. In SIGMOD ’21:
+International Conference on Management of Data, Virtual Event, China,
+June 20-25, 2021, pages 977–990. ACM, 2021.
+[16] H. Kwak, C. Lee, H. Park, and S. B. Moon. What is twitter, a social
+network or a news media?
+In Proceedings of the 19th International
+Conference on World Wide Web, WWW 2010, Raleigh, North Carolina,
+USA, April 26-30, 2010, pages 591–600, 2010.
+[17] J. Leskovec and R. Sosič. Snap: A general-purpose network analysis
+and graph-mining library. ACM Transactions on Intelligent Systems and
+Technology (TIST), 8(1):1, 2016.
+[18] Y. Li, Y. Shen, L. Chen, and M. Yuan. Zebra: When temporal graph
+neural networks meet temporal personalized pagerank.
+Proc. VLDB
+Endow., 16(6):1332–1345, 2023.
+[19] Y. Li, D. Tarlow, M. Brockschmidt, and R. S. Zemel.
+Gated graph
+sequence neural networks. In 4th International Conference on Learning
+Representations, ICLR 2016, San Juan, Puerto Rico, May 2-4, 2016,
+Conference Track Proceedings, 2016.
+[20] Y. Li, R. Yu, C. Shahabi, and Y. Liu. Diffusion convolutional recurrent
+neural network: Data-driven traffic forecasting.
+In 6th International
+Conference on Learning Representations, ICLR 2018, Vancouver, BC,
+Canada, April 30 - May 3, 2018, Conference Track Proceedings. Open-
+Review.net, 2018.
+[21] Z. Liu, C. Chen, X. Yang, J. Zhou, X. Li, and L. Song. Heterogeneous
+graph neural networks for malicious account detection. In Proceedings
+of the 27th ACM International Conference on Information and Knowledge
+Management, CIKM 2018, Torino, Italy, October 22-26, 2018, pages 2077–
+2085. ACM, 2018.
+[22] Y. Ma, Z. Guo, Z. Ren, J. Tang, and D. Yin. Streaming graph neural
+networks. In Proceedings of the 43rd International ACM SIGIR Conference
+on Research and Development in Information Retrieval, pages 719–728,
+2020.
+[23] M. Mariappan and K. Vora.
+Graphbolt: Dependency-driven syn-
+chronous processing of streaming graphs.
+In Proceedings of the
+Fourteenth EuroSys Conference 2019, Dresden, Germany, March 25-28,
+2019, pages 25:1–25:16. ACM, 2019.
+[24] M. Mariappan and K. Vora.
+Graphbolt: Dependency-driven syn-
+chronous processing of streaming graphs.
+In Proceedings of the
+Fourteenth EuroSys Conference 2019, Dresden, Germany, March 25-28,
+2019, pages 25:1–25:16. ACM, 2019.
+[25] Meituan technical report, 2020. https://tech.meituan.com/2024/03/29/large-
+scale-graph-application.html.
+[26] N. Merkel, P. Toussing, R. Mayer, and H. Jacobsen.
+Can graph
+reordering speed up graph neural network training? an experimental
+study. Proc. VLDB Endow., 18(2):293–307, 2024.
+[27] S. Min, V. S. Mailthody, Z. Qureshi, J. Xiong, E. Ebrahimi, and W. Hwu.
+EMOGI: efficient memory-access for out-of-memory graph-traversal in
+gpus. Proc. VLDB Endow., 14(2):114–127, 2020.
+[28] S. Min, K. Wu, S. Huang, M. Hidayetoglu, J. Xiong, E. Ebrahimi,
+D. Chen, and W. W. Hwu.
+Large graph convolutional network
+training with gpu-oriented data communication architecture.
+Proc.
+VLDB Endow., 14(11):2087–2100, 2021.
+[29] P. Naman and Y. Simmhan. Ripple: Scalable incremental GNN infer-
+encing on large streaming graphs. CoRR, abs/2505.12112, 2025.
+[30] M. Nikolic, M. Elseidy, and C. Koch.
+LINVIEW: incremental view
+maintenance for complex analytical queries. In C. E. Dyreson, F. Li,
+and M. T. Özsu, editors, International Conference on Management of
+Data, SIGMOD 2014, Snowbird, UT, USA, June 22-27, 2014, pages 253–
+264. ACM, 2014.
+[31] M. Nikolic and D. Olteanu. Incremental view maintenance with triple
+lock factorization benefits.
+In Proceedings of the 2018 International
+Conference on Management of Data, SIGMOD ’18, page 365–380, New
+York, NY, USA, 2018. Association for Computing Machinery.
+[32] A. Pansari, R. Sumbaly, T. Liu, J. Johnson, S. Gollapudi, S. Roy, A. Agar-
+wal, J. Ko, E. Chamberlin, S. Sharma, and A. Soni. System architectures
+for personalization and recommendation, May 2025. Netflix Tech Blog.
+[33] T. K. Rusch, M. M. Bronstein, and S. Mishra. A survey on oversmooth-
+ing in graph neural networks. CoRR, abs/2303.10993, 2023.
+[34] M. S. Schlichtkrull, T. N. Kipf, P. Bloem, R. van den Berg, I. Titov,
+and M. Welling. Modeling relational data with graph convolutional
+networks. In A. Gangemi, R. Navigli, M. Vidal, P. Hitzler, R. Troncy,
+L. Hollink, A. Tordai, and M. Alam, editors, The Semantic Web - 15th
+International Conference, ESWC 2018, Heraklion, Crete, Greece, June 3-7,
+2018, Proceedings, volume 10843 of Lecture Notes in Computer Science,
+pages 593–607. Springer, 2018.
+[35] S. Sukhbaatar, A. Szlam, and R. Fergus. Learning multiagent commu-
+nication with backpropagation. In Advances in Neural Information Pro-
+cessing Systems 29: Annual Conference on Neural Information Processing
+Systems 2016, December 5-10, 2016, Barcelona, Spain, pages 2244–2252,
+2016.
+[36] J. Sun, Z. Shi, L. Su, W. Shen, Z. Wang, Y. Li, W. Yu, W. Lin, F. Wu, B. He,
+and J. Zhou. Helios: Efficient distributed dynamic graph sampling for
+online gnn inference. PPoPP ’25, page 2–15, New York, NY, USA, 2025.
+Association for Computing Machinery.
+[37] R. S. Trivedi, M. Farajtabar, P. Biswal, and H. Zha. Dyrep: Learning
+representations over dynamic graphs. In ICLR, 2019.
+[38] P. Vaziri and K. Vora.
+Controlling memory footprint of stateful
+streaming graph processing.
+In I. Calciu and G. Kuenning, editors,
+2021 USENIX Annual Technical Conference, USENIX ATC 2021, July 14-
+16, 2021, pages 269–283. USENIX Association, 2021.
+
+
+--- Page 14 ---
+[39] P. Velickovic, G. Cucurull, A. Casanova, A. Romero, P. Liò, and
+Y. Bengio. Graph attention networks. In 6th International Conference
+on Learning Representations, ICLR 2018, Vancouver, BC, Canada, April
+30 - May 3, 2018, Conference Track Proceedings, 2018.
+[40] K. Vora, R. Gupta, and G. Xu. Kickstarter: Fast and accurate computa-
+tions on streaming graphs via trimmed approximations. In Proceedings
+of the Twenty-Second International Conference on Architectural Support
+for Programming Languages and Operating Systems, ASPLOS 2017, Xi’an,
+China, April 8-12, 2017, pages 237–251. ACM, 2017.
+[41] L. Wang, Y. Shen, and L. Chen.
+Te-dyge: Temporal evolution-
+enhanced dynamic graph embedding network.
+In Database Systems
+for Advanced Applications: 28th International Conference, DASFAA 2023,
+Tianjin, China, April 17–20, 2023, Proceedings, Part III, pages 183–198.
+[42] L. Wang, Q. Yin, C. Tian, J. Yang, R. Chen, W. Yu, Z. Yao, and J. Zhou.
+Flexgraph: a flexible and efficient distributed framework for GNN
+training. In A. Barbalace, P. Bhatotia, L. Alvisi, and C. Cadar, editors,
+EuroSys ’21: Sixteenth European Conference on Computer Systems, Online
+Event, United Kingdom, April 26-28, 2021, pages 67–82. ACM, 2021.
+[43] M. Wang, L. Yu, D. Zheng, Q. Gan, Y. Gai, Z. Ye, M. Li, J. Zhou,
+Q. Huang, C. Ma, Z. Huang, Q. Guo, H. Zhang, H. Lin, J. Zhao, J. Li,
+A. J. Smola, and Z. Zhang. Deep graph library: Towards efficient and
+scalable deep learning on graphs. CoRR, abs/1909.01315, 2019.
+[44] Q. Wang, Y. Chen, W. Wong, and B. He. Hongtu: Scalable full-graph
+GNN training on multiple gpus. Proc. ACM Manag. Data, 1(4):246:1–
+246:27, 2023.
+[45] Q. Wang, Y. Yan, H. Tan, C. Chen, C. Zhao, J. Tian, J. Jiang, X. Cong,
+Y. Zhang, G. Yu, W. Wong, and B. He. Efficient graph data access for
+out-of-memory GPU streaming graph processing. Proc. VLDB Endow.,
+18(11):3854–3867, 2025.
+[46] Q. Wang, Y. Zhang, H. Wang, C. Chen, X. Zhang, and G. Yu. Neutron-
+star: Distributed GNN training with hybrid dependency management.
+In SIGMOD ’22: International Conference on Management of Data,
+Philadelphia, PA, USA, June 12 - 17, 2022, pages 1301–1315. ACM, 2022.
+[47] Q. Wang, Y. Zhang, H. Wang, L. Geng, R. Lee, X. Zhang, and G. Yu.
+Automating incremental and asynchronous evaluation for recursive
+aggregate data processing. In In Proceedings of the 2020 International
+Conference on Management of Data, pages 2439–2454, 2020.
+[48] D. Wu, Z. Li, and T. Mitra. Inkstream: Real-time GNN inference on
+streaming graphs via incremental update. CoRR, abs/2309.11071, 2023.
+[49] Z. Wu, S. Pan, F. Chen, G. Long, C. Zhang, and P. S. Yu.
+A com-
+prehensive survey on graph neural networks. CoRR, abs/1901.00596,
+2019.
+[50] D. Xin, S. Macke, L. Ma, J. Liu, S. Song, and A. G. Parameswaran. Helix:
+Holistic optimization for accelerating iterative machine learning. Proc.
+VLDB Endow., 12(4):446–460, 2018.
+[51] K. Xu, W. Hu, J. Leskovec, and S. Jegelka.
+How powerful are
+graph neural networks? In 7th International Conference on Learning
+Representations, ICLR 2019, New Orleans, LA, USA, May 6-9, 2019, 2019.
+[52] R. Ying, R. He, K. Chen, P. Eksombatchai, W. L. Hamilton, and
+J. Leskovec.
+Graph convolutional neural networks for web-scale
+recommender systems.
+In Proceedings of the 24th ACM SIGKDD
+International Conference on Knowledge Discovery & Data Mining, KDD
+2018, London, UK, August 19-23, 2018, pages 974–983. ACM, 2018.
+[53] J. You, T. Du, and J. Leskovec. ROLAND: graph learning framework
+for dynamic graphs. In A. Zhang and H. Rangwala, editors, KDD ’22:
+The 28th ACM SIGKDD Conference on Knowledge Discovery and Data
+Mining, Washington, DC, USA, August 14 - 18, 2022, pages 2358–2366.
+ACM, 2022.
+[54] Smt solver, 2020.
+[55] D. Zhang, X. Song, Z. Hu, Y. Li, M. Tao, B. Hu, L. Wang, Z. Zhang, and
+J. Zhou. Inferturbo: A scalable system for boosting full-graph inference
+of graph neural network over huge graphs. In 39th IEEE International
+Conference on Data Engineering, ICDE 2023, Anaheim, CA, USA, April
+3-7, 2023, pages 3235–3247. IEEE, 2023.
+[56] W. Zhang, C. Chen, Q. Wang, W. Wang, S. Yang, B. Zhou, H. Zhu,
+C. Chen, Y. Zhao, Y. Hu, M. Cheng, M. Li, H. Tan, M. Liu, H. Lin,
+S. Zhang, and L. Zhang. BG3: A cost effective and I/O efficient graph
+database in bytedance. In P. Barceló, N. Sánchez-Pi, A. Meliou, and
+S. Sudarshan, editors, Companion of the 2024 International Conference
+on Management of Data, SIGMOD/PODS 2024, Santiago AA, Chile, June
+9-15, 2024, pages 360–372. ACM, 2024.
+[57] C. Zheng, H. Chen, Y. Cheng, Z. Song, Y. Wu, C. Li, J. Cheng, H. Yang,
+and S. Zhang.
+Bytegnn: Efficient graph neural network training at
+large scale. Proc. VLDB Endow., 15(6):1228–1242, 2022.
+[58] H. Zhou, A. Srivastava, H. Zeng, R. Kannan, and V. K. Prasanna. Ac-
+celerating large scale real-time GNN inference using channel pruning.
+Proc. VLDB Endow., 14(9):1597–1605, 2021.
+[59] H. Zhou, D. Zheng, I. Nisa, V. N. Ioannidis, X. Song, and G. Karypis.
+TGL: A general framework for temporal GNN training onbillion-scale
+graphs. Proc. VLDB Endow., 15(8):1572–1580, 2022.

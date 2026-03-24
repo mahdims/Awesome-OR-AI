@@ -1,0 +1,2970 @@
+--- Page 1 ---
+StreamTGN: A GPU-Efficient Serving System for Streaming
+Temporal Graph Neural Networks
+Lingling Zhang
+Capital Normal
+University
+7089@cnu.edu.cn
+Pengpeng Qiao
+Institute of Science
+Tokyo
+peng2qiao@gmail.com
+Zhiwei Zhang
+Beijing Institute of
+Technology
+zwzhang@bit.edu.cn
+Ye Yuan
+Beijing Institute of
+Technology
+yuan-ye@bit.edu.cn
+Guoren Wang
+Beijing Institute of
+Technology
+wanggr@bit.edu.cn
+ABSTRACT
+Temporal Graph Neural Networks (TGNs) achieve state-of-the-art per-
+formance on dynamic graph tasks, yet existing systems focus exclu-
+sively on accelerating training—at inference time, every new edge trig-
+gers 𝑂(|𝑉|) embedding updates even though only a small fraction of
+nodes are affected. We present StreamTGN, the first streaming TGN
+inference system exploiting the inherent locality of temporal graph up-
+dates: in an 𝐿-layer TGN, a new edge affects only nodes within 𝐿hops of
+the endpoints, typically less than 0.2% on million-node graphs. StreamTGN
+maintains persistent GPU-resident node memory and uses dirty-flag
+propagation to identify the affected set A, reducing per-batch complex-
+ity from 𝑂(|𝑉|) to 𝑂(|A|) with zero accuracy loss. Drift-aware adap-
+tive rebuild scheduling and batched streaming with relaxed ordering
+further maximize throughput. Experiments on eight temporal graphs
+(2K–2.6M nodes) show 4.5×–739× speedup for TGN and up to 4,207×
+for TGAT, with identical accuracy. StreamTGN is orthogonal to train-
+ing optimizations: combining SWIFT with StreamTGN yields 24× end-
+to-end speedup across three architectures (TGN, TGAT, DySAT).
+1
+INTRODUCTION
+Temporal Graph Neural Networks (TGNs) have achieved state-of-the-
+art performance on dynamic graph tasks such as link prediction [33]
+and node classification [10, 18, 32]. However, existing TGN systems
+process graphs in batch mode, recomputing embeddings for all nodes
+whenever the graph changes [12]. This approach is fundamentally in-
+efficient for streaming applications where edges arrive continuously—
+a single new edge triggers 𝑂(|𝑉|) recomputation even though only a
+small fraction of nodes are actually affected.
+A growing body of work has sought to accelerate TGN training. TGL [1,
+30, 42] designed a unified framework with parallel temporal sampling
+for large-scale training. ETC [5] introduced adaptive batching and a
+three-step data access policy to reduce redundant data transfer. SIM-
+PLE [6] proposed dynamic GPU data placement to alleviate the CPU–
+GPU loading bottleneck. SWIFT [8] developed a secondary-memory
+pipeline to distribute data efficiently across GPU, main memory, and
+disk. While these systems substantially reduce training time, they all
+share the same limitation: at inference time, they execute the same full-
+recomputation pipeline as TGL, because their optimizations target backward-
+pass scheduling, data loading, or batch construction, none of which ap-
+ply during online serving [23]. As illustrated in Figure 1, even a modest
+reduction in per-query inference latency has massive cumulative im-
+pact in production systems.
+We make a key observation: the influence of a new edge is inherently
+local. In an 𝐿-layer TGN, only nodes within 𝐿hops of the newly arrived
+edge have their embeddings changed; all other node embeddings re-
+main mathematically identical to their previous values. On sparse real-
+world graphs, this affected set A typically constitutes less than 1–5%
+of the total node population—and on large-scale graphs with millions
+of nodes, the fraction drops below 0.2%. This locality creates a massive
+optimization opportunity, particularly because inference dominates the
+computational budget in production systems. As illustrated in Figure 1,
+training runs offline and infrequently (daily or weekly), consuming only
+Figure 1: Overview of TGN training and inference. Training runs
+offline and infrequently; inference runs continuously at scale.
+Even a small improvement in inference latency yields enormous
+savings: (10 ms −5 ms) × 108 queries/day ≈106 seconds/day.
+∼4% of total compute time, while inference runs continuously at 103–
+106 queries per second, accounting for ∼96% of compute time. Even a
+modest 5 ms reduction in per-query latency translates to ∼106 seconds
+of saved compute per day at 108 daily queries—yet existing systems
+(TGL, ETC, SIMPLE, SWIFT) optimize exclusively for the 4%, leaving
+the dominant 96% untouched.
+Consider, for example, a financial institution processing 10,000 trans-
+actions per second across 10 million accounts. To detect fraud in real
+time, the system must evaluate each transaction within milliseconds. A
+traditional TGN implementation recomputes embeddings for all 10 mil-
+lion accounts per transaction—requiring ∼100 ms and achieving only 10
+transactions per second, far below the required throughput. Yet each
+transaction affects only the accounts within 𝐿hops of the involved
+parties—typically fewer than 0.001% of all accounts.
+This observation motivates StreamTGN, the first streaming TGN
+inference system that achieves provably optimal incremental updates,
+recomputing only the mathematically necessary nodes while guaran-
+teeing identical results to full recomputation. StreamTGN makes three
+technical contributions:
+• Persistent GPU-resident memory with dirty-flag tracking.
+StreamTGN maintains node memory states persistently on the
+GPU across batches. When new edges arrive, a lightweight prop-
+agation mechanism marks only the affected nodes—those within
+𝐿hops of the updated edges as dirty. Inference then recomputes
+embeddings exclusively for dirty nodes, reusing cached embed-
+dings for the remainder. This reduces per-batch inference com-
+plexity from𝑂(|𝑉|) to𝑂(|A|), where |A| ≪|𝑉| on large graphs.
+• Drift-aware adaptive rebuild scheduling. Over time, accumu-
+lated incremental updates may cause cached embeddings to drift
+from their full-recomputation values due to higher-order neigh-
+borhood effects. StreamTGN monitors the divergence between
+incremental and full-rebuild outputs and triggers a partial or full
+rebuild at the optimal moment. Our experiments show that this
+adaptive strategy reduces rebuild cost by an order of magnitude
+compared to naive periodic rebuilding, while maintaining predic-
+tion accuracy within a provable bound.
+• Batched streaming with relaxed ordering. Strict sequential
+processing of one edge at a time severely limits throughput. StreamTGN
+arXiv:2603.21090v1  [cs.DB]  22 Mar 2026
+
+
+--- Page 2 ---
+Conference’17, July 2017, Washington, DC, USA
+, Lingling Zhang, Pengpeng Qiao, Zhiwei Zhang, Ye Yuan, and Guoren Wang
+groups incoming edges into batches and processes them in par-
+allel under a bounded-staleness model: edges within the same
+batch share a logical timestamp, and the system guarantees that
+the resulting embeddings differ from the strictly sequential out-
+put by at most 𝛿. This relaxation enables an order-of-magnitude
+throughput improvement over strict sequential processing while
+preserving accuracy within a provable bound.
+We evaluate StreamTGN on eight real-world temporal graphs span-
+ning four orders of magnitude in scale. On the streaming inference
+task, StreamTGN achieves 4.5×–739× speedup over TGL for the TGN
+model, and up to 4,207× for the non-memory TGAT model, with zero
+accuracy degradation. When combined with the best training-phase
+system (SWIFT for training, StreamTGN for inference), the end-to-end
+pipeline achieves up to 24× total speedup on Stack-Overflow. Crucially,
+StreamTGN is orthogonal to all existing training-phase optimizations:
+it can be deployed on top of any training system to accelerate the infer-
+ence phase that none of them address.
+2
+PRELIMINARIES
+This section introduces the foundations of Temporal Graph Neural Net-
+works (TGNNs). We first define temporal graphs, then formulate the
+TGNN problem, describe the architecture, present the mathematical for-
+mulation, discuss training and inference, and finally identify the sequen-
+tial bottleneck that motivates our work.
+2.1
+Temporal Graph Definition
+Definition 2.1 (Temporal Graph). A temporal graph denoted 𝐺𝑡is de-
+fined as a sequence of time-stamped edges:
+𝐺𝑡= {(𝑢1, 𝑣1,𝑡1, e1), (𝑢2, 𝑣2,𝑡2, e2), . . . , (𝑢𝐸, 𝑣𝐸,𝑡𝐸, e𝐸)}
+where each tuple (𝑢𝑖, 𝑣𝑖,𝑡𝑖, e𝑖) represents an interaction between two
+nodes 𝑢𝑖and 𝑣𝑖at timestamp 𝑡𝑖, with edge features e𝑖∈R𝑑𝑒. The edges
+are ordered chronologically: 𝑡1 ≤𝑡2 ≤· · · ≤𝑡𝐸.
+Definition 2.2 (Node Set and Features). The node set𝑉= {𝑣1, 𝑣2, . . . , 𝑣𝑁}
+contains 𝑁nodes. Each node 𝑣may have static features x𝑣∈R𝑑𝑛.
+Definition 2.3 (Temporal Neighborhood). The temporal neighborhood
+of node 𝑣before time 𝑡is defined as:
+N <𝑡
+𝑣
+= {(𝑢,𝑡′, e) : (𝑢, 𝑣,𝑡′, e) ∈𝐺∧𝑡′ < 𝑡}
+.This captures all historical interactions involving node 𝑣up to (but not
+including) time 𝑡.
+A Temporal Graph Neural Network (TGNN) learns to generate node
+representations that capture both structural and temporal patterns [9,
+34], thereby supporting downstream tasks such as node classification
+and link prediction [13, 21].
+Definition 2.4 (TGNN Learning Problem). Given a temporal graph 𝐺𝑡
+containing all edges up to time 𝑡, a Temporal Graph Neural Network
+(TGNN) learns a mapping function Φ : 𝐺𝑡→𝐻𝑡that transforms the
+temporal graph into a set of node embeddings 𝐻𝑡= {h𝑣(𝑡) : 𝑣∈𝑉},
+where h𝑣(𝑡) ∈R𝑑ℎdenotes the embedding vector of node 𝑣at time 𝑡.
+where R𝑑ℎrepresents the 𝑑ℎ-dimensional real-valued vector space, and
+𝑑ℎis the hidden dimension that determines the expressiveness of the
+learned representations [27, 31].
+2.2
+TGNN Architecture
+As a variation of graph neural networks, TGNNs iteratively execute neu-
+ral update and aggregation operations[25, 29], where the former primar-
+ily features dense matrix multiplication and the latter is characterized
+by the SpMM operation [37]. Specifically, a TGNN performs these two
+operations over temporal graphs through a pipeline of five stages, as
+exemplified by TGN [7, 18]: time encoding, message computation, mes-
+sage aggregation, memory update, and embedding generation. Figure 2
+illustrates the architecture. We explain the five modules along with the
+two types of operations as follows.
+Message Aggregator 
+m’i
+Neural (Update) Computation
+Aggregation Computation
+Memory State
+s11,…, s1d
+sN1,…, sNd
+Message Function 
+si1,…, sid
+sj1,…, sjd
+mi1,…, mid
+mk1,…, mkd
+Memory Updater 
+Embedding 
+h11,…, h1d
+hN1,…, hNd
+eij
+mi
+mj
+fi
+m’i
+si
+si
+‘
+k11,…, k1d
+kN1,…, kNd
+z1
+zN
+m=msg(si,sj,eij,ф)
+mi’=agg(mi(1),…,mi(k))
+si’=GRU(mi’,si)
+zi=emb(si’,{sj’}j∈N,ф)
+s∈RNⅹd
+BⅹDin
+DinⅹDout
+X
+W
+ⅹ
+=
+BⅹDout
+Y
+Y=XW(Dense ⅹ Dense)
+濔濡熺濡
+…
+…
+…
+…
+…
+ⅹ
+NⅹD
+V
+=
+NⅹD
+H
+H=AV(Sparse ⅹ Dense)
+Figure 2: Overview of TGNN architecture including five modules
+with interleaved neural update and aggregation operations.
+2.2.1
+Stage 1: Time Encoding. Before processing edges, TGN encodes
+temporal information using a learnable time encoding function that cap-
+tures both short-term and long-term temporal patterns:
+𝜙(𝑡) =
+r
+1
+𝑑𝑡
+
+cos(𝜔1𝑡), sin(𝜔1𝑡), . . . , cos(𝜔𝑑𝑡/2𝑡), sin(𝜔𝑑𝑡/2𝑡)
+⊤
+(1)
+where 𝜔𝑖are learnable frequency parameters and 𝑑𝑡is the time encod-
+ing dimension. This encoding is used throughout the subsequent stages
+to incorporate temporal information[15].
+2.2.2
+Stage 2: Message Computation. When a new edge (𝑢, 𝑣,𝑡, e) ar-
+rives, the message function computes messages for both the source and
+destination nodes (labeled as 𝑀𝑆𝐺𝑠and 𝑀𝑆𝐺𝑑) based on their current
+memory states, edge features, and time information:
+m𝑢(𝑡) = MSG𝑠
+
+s𝑢(𝑡−), s𝑣(𝑡−), e,𝜙(𝑡−𝑡last
+𝑢)
+
+m𝑣(𝑡) = MSG𝑑
+
+s𝑣(𝑡−), s𝑢(𝑡−), e,𝜙(𝑡−𝑡last
+𝑣
+)
+
+(2)
+where s𝑢(𝑡−) denotes the memory state of node 𝑢immediately before
+time𝑡,𝑡last
+𝑢
+is the timestamp of node𝑢’s most recent interaction, and𝜙(·)
+is the time encoding function. A common implementation concatenates
+the inputs and applies a linear transformation:
+m𝑢(𝑡) =𝑊𝑚· [s𝑢(𝑡−)∥s𝑣(𝑡−)∥e∥𝜙(Δ𝑡)] + b𝑚
+(3)
+where ∥denotes concatenation, 𝑊𝑚∈R𝑑𝑚×(2𝑑𝑠+𝑑𝑒+𝑑𝑡), and b𝑚∈R𝑑𝑚.
+This stage focuses on the neural update operation of dense matrix mul-
+tiplication.
+2.2.3
+Stage 3: Message Aggregation. When multiple edges involving
+the same node arrive simultaneously (within a batch), the aggregator
+combines their messages into a single aggregated message:
+¯m𝑣(𝑡) = AGG
+n
+m(𝑖)
+𝑣(𝑡) : 𝑖∈B𝑣(𝑡)
+o
+(4)
+
+
+--- Page 3 ---
+StreamTGN: A GPU-Efficient Serving System for Streaming Temporal Graph Neural Networks
+Conference’17, July 2017, Washington, DC, USA
+where B𝑣(𝑡) is the set of edges involving node 𝑣in the current batch.
+Common aggregation functions include:
+Mean:
+¯m𝑣(𝑡) =
+1
+|B𝑣(𝑡)|
+Õ
+𝑖∈B𝑣(𝑡)
+m(𝑖)
+𝑣(𝑡)
+Last:
+¯m𝑣(𝑡) = m(latest)
+𝑣
+(𝑡)
+Sum:
+¯m𝑣(𝑡) =
+Õ
+𝑖∈B𝑣(𝑡)
+m(𝑖)
+𝑣(𝑡)
+(5)
+This stage focuses on the aggregation operation in terms of sparse-dense
+matrix multiplication.
+2.2.4
+Stage 4: Memory Update. The memory module maintains a mem-
+ory state s𝑣(𝑡) ∈R𝑑𝑠for each node 𝑣, serving as a compressed repre-
+sentation of node 𝑣’s historical interactions up to time 𝑡. The memory
+is initialized to zero, i.e., s𝑣(0) = 0, ∀𝑣∈𝑉. After message aggregation,
+the memory state is updated using a Gated Recurrent Unit (GRU):
+s𝑣(𝑡) = GRU ( ¯m𝑣(𝑡), s𝑣(𝑡−))
+(6)
+The GRU computes:
+z𝑣= 𝜎(𝑊𝑧¯m𝑣(𝑡) + 𝑈𝑧s𝑣(𝑡−) + b𝑧)
+r𝑣= 𝜎(𝑊𝑟¯m𝑣(𝑡) + 𝑈𝑟s𝑣(𝑡−) + b𝑟)
+˜s𝑣= tanh (𝑊ℎ¯m𝑣(𝑡) + 𝑈ℎ(r𝑣⊙s𝑣(𝑡−)) + bℎ)
+s𝑣(𝑡) = (1 −z𝑣) ⊙˜s𝑣+ z𝑣⊙s𝑣(𝑡−)
+(7)
+where z𝑣∈R𝑑𝑠is the update gate controlling how much of the old
+state to retain, r𝑣∈R𝑑𝑠is the reset gate controlling how much of the
+old state to use in computing the candidate, ˜s𝑣is the candidate new
+state, 𝜎is the sigmoid function, and ⊙denotes element-wise multiplica-
+tion. This stage focuses on the neural update operation of dense matrix
+multiplication.
+2.2.5
+Stage 5: Embedding Generation. The embedding module gener-
+ates the final node embedding by aggregating information from the
+node’s temporal neighborhood using multi-head temporal attention:
+h𝑣(𝑡) = MultiHead  q𝑣, {k𝑢, v𝑢: 𝑢∈N <𝑡
+𝑣}
+(8)
+For each attention head, the query, key, and value are computed as:
+q𝑣= [s𝑣(𝑡−)∥x𝑣∥𝜙(0)]𝑊𝑄
+k𝑢=
+
+s𝑢(𝑡−
+𝑒)∥x𝑢∥e𝑢𝑣∥𝜙(𝑡−𝑡𝑒)
+
+𝑊𝐾
+v𝑢=
+
+s𝑢(𝑡−
+𝑒)∥x𝑢∥e𝑢𝑣∥𝜙(𝑡−𝑡𝑒)
+
+𝑊𝑉
+𝛼𝑢𝑣=
+exp
+
+q⊤
+𝑣k𝑢/√𝑑𝑘
+
+Í
+𝑤∈N<𝑡
+𝑣
+exp
+
+q⊤𝑣k𝑤/√𝑑𝑘
+
+h𝑣(𝑡) =
+Õ
+𝑢∈N<𝑡
+𝑣
+𝛼𝑢𝑣v𝑢
+(9)
+where 𝑡𝑒is the timestamp of edge (𝑢, 𝑣), 𝑊𝑄,𝑊𝐾,𝑊𝑉are learnable pro-
+jection matrices, and 𝑑𝑘is the dimensionality of the key vectors. This
+stage involves both the neural update operation for computing queries,
+keys, and values via dense matrix multiplication, and the aggregation
+operation for the weighted summation over neighbors via sparse-dense
+matrix multiplication.
+2.3
+Training and Inference Flow
+A TGNN operates through two tasks: training and inference [34, 39],
+both of which execute the same five-stage pipeline described above. The
+key distinction lies in their time spans, processed data, and computa-
+tional requirements.
+During training, the model processes historical edges over a long
+time span covering the majority of the temporal graph (e.g., 70% for
+Table 1: Mapping between TGN architectural components and
+profiling stages.
+Profiling Stage
+Architectural Component(s)
+x Neighbor Sampling
+Embedding Module (neighbor lookup)
+y Feature Retrieval
+Message Function + Embedding Module
+z Memory Read
+Message Function + Embedding Module
+{ Memory Update
+Message Function + Aggregator + Memory Updater
+| Embedding
+Embedding Module (attention computation)
+training and 15% for validation) to learn model parameters [36, 43].
+Edges are processed in temporal order within each batch: (1) embed-
+dings are generated using the current memory states, (2) predictions are
+made and loss is computed, (3) gradients are backpropagated to update
+model parameters, (4) messages are computed and aggregated, and (5)
+memory states are updated for the next batch. The key constraint is that
+memory updates must respect temporal causality—a node’s memory at
+time 𝑡can only depend on interactions before 𝑡[21].
+During inference, the model processes unseen edges over a shorter
+time span (e.g., the remaining 15% of the temporal graph) to evaluate
+prediction performance [20, 22, 38]. The same five-stage pipeline exe-
+cutes but without loss computation or backpropagation, making it com-
+putationally lighter. The memory states accumulated during training
+carry over to inference, enabling the model to make predictions that
+account for the full interaction history. As new edges arrive, the mem-
+ory continues to be updated, allowing the model to adapt to evolving
+interaction patterns in real time [16, 44].
+2.4
+Performance Analysis
+2.4.1
+From Logical Components to Profiling Stages. Since inference de-
+mands real-time processing while training can tolerate longer process-
+ing times [2, 14], this paper primarily focuses on optimizing inference
+performance by analyzing the data processing characteristics of each of
+the five modules as follows.
+The architectural view presented in §2.2 organizes TGN by logical
+components—message function, aggregator, memory updater, and em-
+bedding module [26, 40]. However, to understand performance bottle-
+necks, we must analyze TGN from a systems perspective based on data
+access patterns. We decompose TGN execution into five profiling stages,
+as summarized in Table 1, and analyze how existing methods handle
+each stage along with their inherent drawbacks.
+This decomposition reveals that the architectural components are
+interleaved in execution: the embedding module spans three profiling
+stages (x, z, |), while the memory update pipeline ({) combines three
+architectural components. The profiling view exposes the true perfor-
+mance characteristics—particularly the memory access patterns that dom-
+inate execution time.
+Let 𝐵denote the batch size, 𝑁the number of nodes, 𝑑𝑠the memory
+dimension, 𝑑𝑒the edge feature dimension, 𝑑𝑥the node feature dimen-
+sion, 𝐾the number of attention heads, and 𝐿the number of sampled
+neighbors per node.
+2.4.2
+Stage-wise Analysis of Existing Methods.
+x Neighbor Sampling. For each of the 𝐵edges in a batch, the model
+samples 𝐿temporal neighbors for both endpoints, with complexity𝑇sample =
+𝑂(2𝐵· 𝐿· 𝐶lookup), where 𝐶lookup is the cost of querying the temporal
+neighbor list.
+Existing approach and drawback. Existing methods such as TGN [18]
+and TGAT [32] perform neighbor sampling from scratch for every batch
+by traversing per-node adjacency lists stored in non-contiguous mem-
+ory regions. For example, consider a batch of 𝐵= 200 edges on the
+WIKI dataset, where each node samples 𝐿= 10 temporal neighbors.
+
+
+--- Page 4 ---
+Conference’17, July 2017, Washington, DC, USA
+, Lingling Zhang, Pengpeng Qiao, Zhiwei Zhang, Ye Yuan, and Guoren Wang
+This requires 200 × 2 × 10 = 4,000 random lookups into the adjacency
+structure. Due to the power-law degree distribution common in real-
+world graphs, cache performance is highly variable: a high-degree node
+such as a popular Wikipedia page may have thousands of neighbors
+stored contiguously, benefiting from spatial locality, while the majority
+of low-degree nodes incur cache misses as their short adjacency lists are
+scattered across memory. Consequently, this stage suffers from random
+graph traversal with unpredictable memory access latency.
+y Feature Retrieval. After sampling, node and edge features are gath-
+ered for 𝑂(𝐵·𝐿) neighbors, with complexity𝑇feature = 𝑂(𝐵·𝐿· (𝑑𝑥+𝑑𝑒)).
+Existing approach and drawback. Existing methods retrieve features
+by indexing into global feature tensors using node/edge IDs produced
+by the sampling stage. Since these IDs follow no particular order, the re-
+sulting memory accesses are non-coalesced on GPUs. For example, sup-
+pose the sampled neighbor IDs for a batch are {3, 1027, 58, 4521, 12, . . .}.
+On a GPU, threads in the same warp would attempt to load feature vec-
+tors at these widely separated addresses, resulting in multiple cache-line
+fetches instead of a single coalesced transaction. Profiling on represen-
+tative datasets shows that the gather operation achieves only 10–30% of
+peak memory bandwidth, making this stage bottlenecked by irregular
+memory access.
+z Memory Read. Memory states are read for: (1) source and desti-
+nation nodes of each edge (for message computation), and (2) sampled
+neighbors (for embedding), with complexity𝑇mem_read = 𝑂((2𝐵+𝐵·𝐿) ·
+𝑑𝑠).
+Existing approach and drawback. Existing methods maintain a sin-
+gle memory tensor on the CPU or GPU and read s𝑣(𝑡−) through in-
+dexed lookups similar to feature retrieval. However, unlike static fea-
+tures, memory states are mutable—they change after every batch as new
+interactions are processed. For example, consider node 𝑣that appears
+in both batch 𝑖and batch 𝑖+ 1. When processing batch 𝑖+ 1, the system
+must ensure that s𝑣(𝑡−) reflects the update from batch 𝑖. This tempo-
+ral dependency prevents prefetching or reordering optimizations that
+could improve memory access efficiency. The result is scattered reads
+with temporal dependencies, where correctness constraints further de-
+grade an already irregular access pattern.
+{ Memory Update. This stage executes the coupled pipeline of mes-
+sage computation, aggregation, and GRU update:
+𝑇msg = 𝑂(𝐵· 𝑑𝑚· (2𝑑𝑠+ 𝑑𝑒+ 𝑑𝑡))
+𝑇agg = 𝑂(𝐵· 𝑑𝑚)
+𝑇gru = 𝑂(|V𝐵| · 𝑑𝑠· 𝑑𝑚)
+𝑇mem_update = 𝑇msg +𝑇agg +𝑇gru
+(10)
+where |V𝐵| denotes the number of unique nodes in the batch.
+Existing approach and drawback. Existing methods process the tem-
+poral graph in a strict batch-by-batch manner, where each batch must
+complete its entire memory update pipeline before the next batch can
+begin. This is because the memory state s𝑣(𝑡) depends on s𝑣(𝑡−), creat-
+ing a chain of dependencies that serializes execution:
+𝑇total
+mem_update =
+|B|
+Õ
+𝑖=1
+𝑇(𝑖)
+mem_update
+(11)
+For example, consider processing 1,000 batches on the REDDIT dataset.
+Even though each batch involves only 𝐵= 200 edges with a small set
+of unique nodes |V𝐵|, the GRU computation for batch 𝑖+ 1 cannot start
+until batch 𝑖finishes updating all affected memory states. On a GPU
+with thousands of cores, each batch’s GRU update occupies only a small
+fraction of the available parallelism, yet no two batches can overlap.
+Profiling reveals that this stage achieves only 15–25% GPU occupancy,
+making sequential dependency across batches the critical bottleneck
+that fundamentally limits GPU utilization.
+| Embedding. The temporal attention computation processes 𝐵tar-
+get nodes, each attending to 𝐿neighbors with 𝐾attention heads:
+𝑇emb = 𝑂(𝐵· 𝐾· 𝐿· (𝑑𝑠+ 𝑑𝑥+ 𝑑𝑒+ 𝑑𝑡))
+(12)
+Existing approach and drawback. Existing methods recompute embed-
+dings entirely from scratch for every batch, performing the full pipeline
+of neighbor sampling, feature gathering, and attention computation re-
+gardless of whether the underlying data has changed. For example, sup-
+pose node 𝑣is a highly active user on the REDDIT dataset that appears
+in 𝑘= 20 consecutive batches, but only 2 out of its 𝐿= 10 sampled
+neighbors change between adjacent batches. Existing methods still re-
+sample all 10 neighbors and re-compute all attention scores 20 times.
+With 𝐾= 2 attention heads, this results in 20 × 2 × 10 = 400 at-
+tention computations, whereas an incremental approach would need
+to update only the 2 changed neighbors per batch, requiring roughly
+20×2×2 = 80 computations—an 80% reduction. Profiling confirms that
+60–70% of neighbor sets overlap between consecutive batches, indicat-
+ing substantial redundant computation.
+0
+20
+40
+60
+80
+100
+Percentage (%)
+WIKI
+REDDIT
+MOOC
+LASTFM
+23%
+15%
+14%
+45%
+1.5s
+26%
+18%
+11%
+41%
+6.0s
+25%
+15%
+12%
+44%
+3.4s
+23%
+23%
+15%
+36%
+11.0s
+TGN
+0
+20
+40
+60
+80
+100
+Percentage (%)
+20%
+31%
+50%
+1.9s
+19%
+30%
+51%
+7.0s
+20%
+30%
+50%
+4.4s
+29%
+26%
+46%
+23.4s
+TGAT
+Neighbor Sampling
+Feature Retrieval
+Memory Read
+Memory Update
+Embedding
+Figure 3: The distributions of processing time across the five pro-
+filing stages for TGN and TGAT on four datasets.
+2.4.3
+Profiling Results and Optimization Opportunities. We profile TGN
+and TGAT on four representative datasets to validate the bottleneck
+analysis above. Figure 3 shows the execution time breakdown across
+the five profiling stages. We make the following observations.
+Embedding (|) dominates execution time for both models. The
+embedding stage is the most time-consuming for both TGN and TGAT
+across all datasets, accounting for 36.3–45.1% of TGN’s runtime and
+45.5–51.1% of TGAT’s runtime. This confirms that the temporal atten-
+tion computation over sampled neighbors, combined with the redun-
+dant recomputation across consecutive batches, constitutes the primary
+performance bottleneck.
+Neighbor Sampling (x) and Feature Retrieval (y) exhibit dif-
+ferent profiles between the two models. For TGN, neighbor sam-
+pling accounts for 22.5–25.7% and feature retrieval accounts for 15.1–
+23.3% of total runtime. In contrast, TGAT spends a disproportionately
+higher fraction on feature retrieval (26.0–30.9%) because, lacking a mem-
+ory module, it must gather richer feature sets to compensate. Notably,
+on LASTFM—the largest dataset—feature retrieval becomes the second-
+largest cost for TGN at 23.3%, reflecting the increasing impact of irreg-
+ular memory access as graph size grows.
+Memory Read (z) and Memory Update ({) are unique to TGN.
+Since TGAT is a memory-less model, it incurs zero cost for memory read
+and memory update. For TGN, memory update accounts for 11.5–14.9%
+and memory read accounts for 2.4–3.9% across all datasets. Although
+memory update is not the single largest stage, its sequential batch de-
+pendency creates a serialization barrier that fundamentally limits GPU
+
+
+--- Page 5 ---
+StreamTGN: A GPU-Efficient Serving System for Streaming Temporal Graph Neural Networks
+Conference’17, July 2017, Washington, DC, USA
+Table 2: Bottleneck summary and optimization opportunities.
+Stage
+Bottleneck
+StreamTGN Solution
+x Neighbor Sampling
+Random traversal
+Cached neighbor lists
+y Feature Retrieval
+Irregular access
+Coalesced batching
+z Memory Read
+Scattered reads
+Persistent memory
+{ Memory Update
+Sequential dependency
+Incremental update
+| Embedding
+Redundant computation
+Incremental embedding
+occupancy to only 15–25%, amplifying its impact beyond what the raw
+percentage suggests.
+Optimization opportunities. Table 2 summarizes the bottlenecks
+identified above and their corresponding optimization opportunities in
+StreamTGN. Across both models, the embedding stage and the data
+access stages (neighbor sampling and feature retrieval) collectively ac-
+count for over 80% of total runtime. The critical insight is that stages {
+and | present the most significant optimization opportunities: by main-
+taining persistent memory states and incrementally updating embed-
+dings, StreamTGN eliminates the batch-by-batch recomputation that
+dominates execution time.
+3
+STREAMTGN DESIGN
+3.1
+Design Overview
+This section presents StreamTGN, a temporal graph neural network ar-
+chitecture designed to achieve high throughput through incremental
+computation by addressing two critical bottlenecks: (1) the sequential
+memory update dependency ({) that serializes batch processing, and
+(2) the redundant embedding computation (|) that recomputes atten-
+tion from scratch for each batch.
+As illustrated in Figure 4, the StreamTGN architecture consists of
+two parts: GPU-resident hybrid data structure and incremental computa-
+tion stages. The hybrid data structure (§3.2) organizes all intermediate
+state on the GPU, comprising both persistent components (adjacency
+list, embedding cache, and node memory) that survive across batches
+to enable incremental computation, and a transient edge queue that
+buffers streaming input. The incremental computation (§3.3) defines
+five stages— neighborhood sampling, feature retrieval, memory read,
+embedding generation, and memory update—each with a dedicated in-
+cremental strategy so that only the portions affected by new edges are
+recomputed. Section 3.4 provides a unified complexity analysis charac-
+terizing the theoretical speedup.
+Edge 
+Batch
+① Neighborhood 
+Sampling
+② Feature 
+Retrieval
+③ Memory 
+Read
+④ Memory 
+Update
+⑤ Embedding 
+Generation
+Embedding 
+Cache
+Prediction
+Neighbor 
+Cache
+GPU Memory Bus (High Bandwidth)
+...
+...
+t2
+t1
+t4
+t3
+Incremental 
+Update
+read
+read
+write
+N nodes ⅹ ds  dimensions
+Memory 
+Tensor S
+Feature 
+Tensor X
+GPU Memory
+Computation Stages
+Figure 4: Overview of StreamTGN. The architecture comprises
+a GPU-resident hybrid data structure (left) and five incremental
+computation stages (right) that operate directly on the persistent
+state.
+3.2
+GPU-Resident Hybrid Data Structure
+StreamTGN’s incremental computation relies on maintaining interme-
+diate state persistently on the GPU, so that each new batch of edges up-
+dates only the affected portions rather than reconstructing everything
+from scratch. This section presents the concrete realization: a hybrid
+data structure comprising four GPU-resident components with comple-
+mentary roles.
+The key design principle is as follows. All state required for tempo-
+ral graph neural network computation—graph topology, node embed-
+dings, and node temporal memory—resides on the GPU across batches.
+Among the four components, three are persistent: (1) the Temporal Ad-
+jacency List accumulates graph topology, (2) the Embedding Cache re-
+tains valid node embeddings, and (3) the Node Memory maintains evolv-
+ing temporal states. The fourth component, the Edge Queue, is tran-
+sient: it buffers streaming arrivals and flushes them into the adjacency
+list at each batch boundary. Together, these components achieve 𝑂(1)
+edge insertion and 𝑂(deg) neighbor queries while minimizing redun-
+dant recomputation. Figure 5 illustrates the architecture and data flow
+among the four components.
+3.2.1
+Edge Queue (Transient Buffer). The edge queue is a GPU-resident
+ring buffer that absorbs streaming edge arrivals and stages them for
+batch processing. Unlike the other three components, its contents are
+transient: they are flushed into the adjacency list at each batch boundary
+and do not persist. This design decouples the ingestion rate from the
+computation rate without requiring host–device transfers.
+Definition. Each entry records a source node 𝑢, a destination node
+𝑣, a timestamp 𝑡, and edge features e ∈R𝑑𝑒:
+Q = {(𝑢𝑖, 𝑣𝑖,𝑡𝑖, e𝑖)}| Q|
+𝑖=1
+(13)
+The ring buffer provides 𝑂(1) write complexity with fixed memory
+footprint (no dynamic allocation), 𝑂(batch) flush cost to amortize GPU
+launch overhead, and a configurable time window to support temporal
+locality.
+3.2.2
+Temporal Adjacency List (Persistent). The temporal adjacency list
+is the first persistent component. It accumulates graph topology incre-
+mentally on the GPU: when a batch is flushed from the edge queue,
+new edges are appended in 𝑂(1) amortized time without rebuilding the
+structure. This persistence enables the neighborhood sampling stage
+(§3.3.2) to query up-to-date topology directly on the GPU, avoiding re-
+peated host-to-device edge transfers.
+Definition. For a node 𝑣, its temporal neighborhood up to the cur-
+rent time 𝑡now is:
+N (𝑣) = {(𝑢,𝑡, e) | (𝑢, 𝑣,𝑡, e) ∈E, 𝑡≤𝑡now}
+(14)
+For temporal queries within a window [𝑡start,𝑡end]:
+N (𝑣,𝑡start,𝑡end) = {(𝑢,𝑡, e) ∈N (𝑣) | 𝑡start ≤𝑡≤𝑡end}
+(15)
+The supported operations are: InseRt(𝑢, 𝑣,𝑡, e) in 𝑂(1) amortized
+time, GetNeighboRs(𝑣) in𝑂(deg(𝑣)), and GetTempoRalNeighboRs(𝑣,𝑡)
+in 𝑂(deg(𝑣)).
+3.2.3
+Embedding Cache (Persistent). The embedding cache is the sec-
+ond persistent component. It stores previously computed node embed-
+dings on the GPU so that the embedding generation stage (§3.3.5) can
+skip unaffected nodes entirely, reading their valid embeddings directly
+from GPU memory rather than recomputing temporal attention. In stream-
+ing scenarios, only a small fraction of nodes—those within the 𝐾-hop
+neighborhood of new edges—are affected by each batch, making caching
+highly effective.
+
+
+--- Page 6 ---
+Conference’17, July 2017, Washington, DC, USA
+, Lingling Zhang, Pengpeng Qiao, Zhiwei Zhang, Ye Yuan, and Guoren Wang
+Edge Queue
+(Transient 
+Buffer)
+1
+Temporal 
+Adjacency  List
+(Persistent)
+Embedding 
+Cache
+(Persistent)
+Node 
+Memory 
+(Persistent)
+2
+3
+4
+O(1) insert
+O(deg) query
+O(1) lookup
+O(d2) update
+In-place temporal 
+state evolution
+Skip unaffected 
+node recomputation
+Incremental topology 
+maintenance
+Decouple ingestion 
+from computation
+batch flush
+invalidate
+read/write
+Streaming 
+Edges
+next batch
+Figure 5: Overview of the GPU-resident hybrid data structure. Three persistent components—Temporal Adjacency List, Embedding
+Cache, and Node Memory—reside on the GPU across batches to enable incremental computation. The transient Edge Queue (dashed
+border) buffers streaming input and flushes at batch boundaries.
+Cache State. Each entry stores a node 𝑣, its embedding h𝑣∈R𝑑, and
+the timestamp 𝑡valid
+𝑣
+at which the embedding was computed:
+C = {(𝑣, h𝑣,𝑡valid
+𝑣
+) | 𝑣∈𝑉cached}
+(16)
+Invalidation Rule. When an edge (𝑢, 𝑣,𝑡) arrives, all nodes whose
+embeddings may be affected are invalidated:
+I(𝑢, 𝑣, 𝐾) =
+𝐾
+Ø
+ℓ=0
+N (ℓ) ({𝑢, 𝑣})
+(17)
+where N (ℓ) denotes ℓ-hop neighbors and 𝐾is the number of attention
+layers. Only invalidated nodes are recomputed in the subsequent em-
+bedding generation stage.
+3.2.4
+Node Memory (Persistent). The node memory is the third persis-
+tent component, maintaining per-node temporal states that evolve via
+learned update functions. Because these states reside on the GPU across
+batches, the memory update stage (§3.3.6) performs in-place updates
+only for nodes involved in the current batch, avoiding the costly pat-
+tern of transferring all node states between host and device.
+Memory State. Each node 𝑣maintains a state vector m𝑣∈R𝑑𝑚:
+M = {m𝑣∈R𝑑𝑚| 𝑣∈𝑉}
+(18)
+Memory Update (GRU-based). The state is updated by a GRU cell:
+m′
+𝑣= GRU(m𝑣, msg𝑣)
+(19)
+where msg𝑣aggregates messages from recent interactions:
+msg𝑣= Aggregate({m𝑢∥e𝑢𝑣∥𝜙(𝑡−𝑡𝑢𝑣) | (𝑢, 𝑣,𝑡𝑢𝑣) ∈Erecent})
+(20)
+3.2.5
+Summary. The four components of the hybrid data structure play
+distinct but complementary roles. The edge queue is the only transient
+component, buffering pending edges with 𝑂(1) write cost and smooth-
+ing bursty streaming input into regular batches for GPU processing.
+The remaining three components are persistent across batches and col-
+lectively enable incremental computation. The temporal adjacency list
+stores graph topology with 𝑂(1) amortized insertion, providing up-to-
+date neighbor information for the sampling stage without rebuilding
+the structure. The embedding cache retains computed node embeddings
+with 𝑂(1) lookup, allowing the system to skip recomputation for unaf-
+fected nodes and focus exclusively on those invalidated by new edges.
+The node memory maintains per-node temporal state updated via GRU
+cells at 𝑂(𝑑2
+𝑚) cost, supporting in-place evolution of long-term tem-
+poral patterns. Together, the persistent components ensure that each
+batch only touches the minimal set of affected nodes, while the tran-
+sient queue decouples ingestion from computation.
+3.3
+Incremental Computation
+With the GPU-resident hybrid data structure in place (§3.2), StreamTGN
+performs five computation stages per batch, each with a dedicated incre-
+mental strategy so that only nodes affected by new edges are processed.
+We first define the affected set that drives all stages, then describe each
+stage’s optimization in turn. Figure 6 illustrates the end-to-end pipeline,
+and Algorithm 1 at the end of this section presents the complete execu-
+tion flow.
+3.3.1
+Preliminary: Affected Set Detection. When a batch of temporal
+edges E𝐵= {(𝑢𝑖, 𝑣𝑖,𝑡𝑖)}𝐵
+𝑖=1 arrives, StreamTGN first identifies the set of
+affected nodes Vaff that require recomputation. A node 𝑤is affected if
+it satisfies either of two conditions:
+(1) Direct involvement: 𝑤is a source or destination of some edge
+in E𝐵.
+(2) Neighborhood dependency:𝑤lies within the 𝐾-hop neighbor-
+hood of a directly involved node, where 𝐾is the number of at-
+tention layers.
+Formally, let Vdirect = {𝑢𝑖, 𝑣𝑖| (𝑢𝑖, 𝑣𝑖,𝑡𝑖) ∈E𝐵}. The full affected set is:
+Vaff =
+𝐾
+Ø
+𝑘=0
+N (𝑘) (Vdirect)
+(21)
+where N (𝑘) denotes 𝑘-hop neighbors in the current adjacency list.
+In practice, propagation is bounded by the sampling fanout 𝐿at each
+layer, so the affected set size satisfies:
+|Vaff| ≤2𝐵· 𝐿𝐾
+(22)
+where 𝐵is the batch size, 𝐿is the per-layer sampling fanout, and 𝐾is
+the number of attention layers. The detection cost is 𝑂(𝐵· 𝐿𝐾).
+The affected set partitions all nodes into two groups: affected nodes
+whose states must be recomputed, and unaffected nodes whose cached
+results remain valid. This partition drives every subsequent stage.
+3.3.2
+Stage 1: Incremental Neighborhood Sampling. Conventional TGN
+systems resample the entire𝐾-hop neighborhood for every node in each
+batch, performing redundant graph traversals for nodes whose local
+topology has not changed. StreamTGN maintains a temporal neighbor
+cache on the GPU that stores, for each active node 𝑣, its most recent 𝐿
+sampled neighbors:
+NeighboRCache[𝑣] =
+
+(𝑢1,𝑡1, e1), (𝑢2,𝑡2, e2), . . . , (𝑢𝐿,𝑡𝐿, e𝐿)
+
+(23)
+where entries are sorted by descending timestamp.
+When a new batch arrives, the cache is updated incrementally only
+for affected nodes 𝑣∈Vaff:
+(1) Insert: Append new neighbors from E𝐵to the front (most recent
+first).
+
+
+--- Page 7 ---
+StreamTGN: A GPU-Efficient Serving System for Streaming Temporal Graph Neural Networks
+Conference’17, July 2017, Washington, DC, USA
+Stream 
+Queue
+Adjacency 
+Insert Edges
+Cache Invalidate 
+Affected
+Temporal 
+Attention 
+Kernel
+Edge Queue
+Adjacency List
+Embedding Cache
+Cache + Node Memory
+Step 1: INSERT
+Cache+
+Memory
+Write Back
+Affected nodes only
+Step 2: UPDATE
+Step 3: INVALIDATE
+Step 4: COMPUTE
+Step 5: COMMIT
+Figure 6: Batch processing pipeline. At each batch boundary, streaming edges flow through five stages: (1) ingest into the edge queue,
+(2) insert into the adjacency list, (3) invalidate affected cache entries, (4) recompute embeddings for affected nodes only, and (5) commit
+results back to cache and node memory. Italic labels indicate the hybrid data structure component involved at each stage.
+(2) Evict: Remove the oldest entries if the cache exceeds capacity 𝐿.
+(3) Invalidate: Mark entries whose timestamps fall outside the tem-
+poral window [𝑡−𝑇𝑤, 𝑡].
+For all unaffected nodes, the cached neighbor list is reused directly. This
+reduces the sampling cost from 𝑂(|V| ·𝐿) to 𝑂(|Vaff| ·𝐿), achieving 70–
+90% cache hit rates on real-world datasets.
+3.3.3
+Stage 2: Coalesced Feature Retrieval. After sampling, the system
+retrieves node and edge features for the affected set. The conventional
+approach gathers features by:
+Xbatch = X[node_ids, :]
+(24)
+where node_ids are scattered across the feature matrix, causing non-
+coalesced GPU memory accesses that utilize only 10–30% of peak band-
+width.
+StreamTGN applies sorted batching: node IDs are sorted before re-
+trieval, and the original order is restored afterward via an inverse per-
+mutation:
+sorted_ids, inv_idx = SoRt(node_ids)
+Xsorted = X[sorted_ids, :]
+(25)
+The sorted access pattern enables coalesced memory reads, improving
+bandwidth utilization to 60–80% of peak. Since only affected nodes re-
+quire fresh features, the retrieval volume is further reduced by the factor
+|Vaff|/|V|.
+3.3.4
+Stage 3: Incremental Memory Read. The memory read stage gath-
+ers the persistent node memory states m𝑣(from the Node Memory com-
+ponent in §3.2.4) for all nodes involved in the current computation.
+In conventional systems, this requires reading memory states for ev-
+ery node in the computational graph—all sampled nodes across all 𝐾
+layers—even when most states have not changed since the previous
+batch.
+StreamTGN exploits the observation that only nodes in Vaff have
+modified memory states. For all other nodes, memory states are already
+resident on the GPU and remain valid from the previous batch. The
+memory read therefore proceeds in two steps:
+(1) For 𝑣∈Vaff: read the updated memory state m𝑣from the persis-
+tent GPU tensor.
+(2) For 𝑣∉Vaff: reuse the previously read value with zero additional
+cost.
+Combined with the sorted access pattern from Stage 2, the memory read
+achieves 70–85% of peak GPU memory bandwidth for the affected sub-
+set.
+3.3.5
+Stage 4: Incremental Embedding Generation. Embedding genera-
+tion is the most compute-intensive stage, applying temporal attention
+over each node’s sampled neighborhood:
+h(𝑙)
+𝑣(𝑡) = Attn
+
+q𝑣, {k𝑢, v𝑢}𝑢∈N<𝑡
+𝑣
+
+(26)
+Conventional systems recompute this from scratch for every node in
+every batch. StreamTGN instead maintains cached attention states and
+applies a delta update formulation.
+Neighborhood stability. We observe that temporal neighborhoods ex-
+hibit high stability across consecutive batches. For a node 𝑣with 𝐿sam-
+pled neighbors, the expected number of changes is:
+E
+
+|ΔN𝑣|
+
+= |new edges involving 𝑣|
+|N𝑣|
+· 𝐿≪𝐿
+(27)
+Our profiling shows that 60–70% of neighbor sets remain identical be-
+tween consecutive batches, and the average change rate is only 5–15%.
+Delta embedding. For each affected node 𝑣∈Vaff, StreamTGN com-
+putes the embedding incrementally:
+h𝑣(𝑡) = hcached
+𝑣
++ Δh𝑣(𝑡)
+(28)
+where the delta term decomposes into three parts corresponding to
+added, expired, and updated neighbors:
+Δh𝑣(𝑡) =
+Õ
+𝑢∈Nnew
+𝑣
+𝛼new
+𝑢𝑣vnew
+𝑢
+−
+Õ
+𝑢∈Nexp
+𝑣
+𝛼old
+𝑢𝑣vold
+𝑢
++
+Õ
+𝑢∈Nupd
+𝑣
+ 𝛼new
+𝑢𝑣vnew
+𝑢
+−𝛼old
+𝑢𝑣vold
+𝑢
+
+(29)
+Here, Nnew
+𝑣
+contains newly added neighbors, Nexp
+𝑣
+contains neighbors
+that have fallen outside the temporal window, and Nupd
+𝑣
+contains exist-
+ing neighbors whose memory states changed in the current batch.
+Attention score caching. To support the delta formulation, StreamTGN
+maintains a per-node attention cache:
+AttnCache[𝑣] =
+
+(𝑢, 𝛼𝑢𝑣, v𝑢, 𝑡𝑒) : 𝑢∈N <𝑡
+𝑣
+	
+(30)
+Entries are invalidated lazily when the corresponding neighbor’s mem-
+ory state changes, and recomputed only when needed for the next pre-
+diction. For unaffected nodes, the entire cache entry remains valid, and
+the embedding is read directly from the Embedding Cache (§3.2.3) at
+𝑂(1) cost.
+This reduces the per-node embedding cost from𝑂(|N𝑣|·𝑑) to𝑂(|ΔN𝑣|·
+𝑑), yielding approximately 10× reduction at a typical 10% change rate.
+
+
+--- Page 8 ---
+Conference’17, July 2017, Washington, DC, USA
+, Lingling Zhang, Pengpeng Qiao, Zhiwei Zhang, Ye Yuan, and Guoren Wang
+3.3.6
+Stage 5: Incremental Memory Update. The final stage commits
+all state changes to the persistent GPU-resident data structures. Con-
+ventional systems update memory for all nodes or perform bulk host–
+device transfers; StreamTGN instead performs targeted, in-place up-
+dates for affected nodes only. The update consists of three parallel op-
+erations.
+Adjacency list append. New edges from E𝐵are appended to the tem-
+poral adjacency list (§3.2.2) using an append-only log structure that
+avoids expensive array reallocation. The cost is 𝑂(𝐵), independent of
+graph size.
+Memory state writeback. Updated node memory states are written
+back to the persistent tensor in place:
+M[𝑣, :] ←m′
+𝑣
+∀𝑣∈Vaff
+(31)
+The writeback applies the sorted access pattern from Stage 2 to achieve
+coalesced writes. Only |Vaff| entries are touched, leaving all other mem-
+ory states undisturbed.
+Cache and time encoding update. The embedding cache (§3.2.3) is up-
+dated with newly computed embeddings for affected nodes, and stale
+entries are invalidated according to Equation (17). Temporal encodings
+𝜙(Δ𝑡) for new timestamps are computed in a batched kernel and stored
+alongside the adjacency list for reuse in subsequent batches.
+The total synchronization cost is𝑂(|E𝐵|+|Vaff|), compared to𝑂(|E|+
+|V|) for full writeback.
+3.3.7
+Overall Algorithm. Algorithm 1 summarizes the complete StreamTGN
+execution flow for processing a single batch. The algorithm highlights
+how each stage operates on the hybrid data structure: the neighbor
+cache and adjacency list support Stage 1, sorted indexing optimizes
+Stages 2–3, the embedding and attention caches enable the delta com-
+putation in Stage 4, and the persistent memory tensor receives in-place
+updates in Stage 5.
+3.4
+Complexity Analysis
+This section provides a formal analysis of StreamTGN’s computational
+complexity, proves correctness conditions for incremental computation,
+and establishes convergence guarantees for incremental training. We
+use consistent notation throughout: 𝑛is the number of nodes, 𝐵the
+batch size, 𝐿the sampling fanout per layer, 𝐾the number of attention
+layers, 𝑑the embedding dimension, 𝑑𝑚the memory dimension, and ¯𝑑
+the average temporal degree.
+3.4.1
+Full vs. Incremental Complexity. We first characterize the cost of
+full recomputation and then the cost of StreamTGN’s incremental ap-
+proach.
+TheoRem 3.1 (Full Computation Complexity). For a TGN with 𝐾
+attention layers and sampling fanout 𝐿, computing embeddings for all 𝑛
+nodes over 𝑚temporal edges costs:
+𝑇full = 𝑂 𝑛· 𝐿· 𝐾· 𝑑2 + 𝑛· 𝑑2
+𝑚
+
+(32)
+where the first term accounts for 𝐾-layer temporal attention (each node
+attends over 𝐿neighbors per layer with 𝑂(𝑑2) per attention head) and the
+second term accounts for GRU-based memory updates.
+TheoRem 3.2 (IncRemental Computation Complexity). For a batch
+E𝐵with affected set A (Equation 21), StreamTGN’s per-batch cost is:
+𝑇incr = 𝑂 |A| · 𝐿· 𝐾· 𝑑2 + |A| · 𝑑2
+𝑚
+ + 𝑂(𝑐detect)
+(33)
+where 𝑐detect = 𝑂(𝐵· 𝐿𝐾) is the cost of affected set detection (§3.3.1).
+PRoof. The cost decomposes across the five computation stages. Let
+|A| denote the affected set size.
+Algorithm 1: StreamTGN Batch Processing
+Input
+:Batch E𝐵= {(𝑢𝑖, 𝑣𝑖,𝑡𝑖, e𝑖)}
+Input
+:Persistent state: memory S, neighbor cache, embedding
+cache, adjacency list
+Output:Predictions ˆ𝑦and updated persistent state
+/* Preliminary: Affected set detection (§3.3.1)
+*/
+1 Vaff ←Ð𝐾
+𝑘=0 N (𝑘) ({𝑢𝑖, 𝑣𝑖})
+/* Stage 1: Neighborhood sampling (§3.3.2)
+*/
+2 foreach 𝑣∈Vaff do
+3
+if NeighborCache[𝑣] is valid then
+4
+N𝑣←NeighborCache[𝑣]
+5
+else
+6
+N𝑣←SampleNeighbors(𝑣, 𝐿)
+7
+NeighborCache[𝑣] ←N𝑣
+8
+end
+9 end
+/* Stage 2: Feature retrieval (§3.3.3)
+*/
+10 sorted_ids, inv_idx ←Sort(all node IDs in Vaff)
+11 Xbatch ←X[sorted_ids, :][inv_idx]
+/* Stage 3: Memory read (§3.3.4)
+*/
+12 Sbatch ←S[sorted_ids, :][inv_idx]
+/* Stage 4: Embedding generation (§3.3.5)
+*/
+13 foreach 𝑣∈Vaff do
+14
+if EmbeddingCache[𝑣] is valid then
+15
+h𝑣←EmbeddingCache[𝑣] +Δh𝑣
+// Eq. 29
+16
+else
+17
+h𝑣←ComputeAttention(𝑣, N𝑣, Sbatch)
+18
+end
+19
+EmbeddingCache[𝑣] ←h𝑣
+20 end
+/* Link prediction
+*/
+21 ˆ𝑦←Predict(h𝑢, h𝑣) for each (𝑢, 𝑣) ∈E𝐵
+/* Stage 5: Memory update (§3.3.6)
+*/
+22 foreach 𝑣∈Vdirect do
+// in parallel
+23
+msg𝑣←ComputeMessage(𝑣, E𝐵)
+24
+S[𝑣, :] ←GRUUpdate(S[𝑣, :], msg𝑣)
+// Eq. 31
+25 end
+26 return ˆ𝑦
+(1) Neighbor sampling (§3.3.2): Only affected nodes require cache
+updates; unaffected nodes reuse cached neighbor lists. Cost:𝑂(|A|·
+𝐿).
+(2) Feature retrieval (§3.3.3): Sorted batching over the affected set.
+Cost: 𝑂(|A| · 𝑑).
+(3) Memory read (§3.3.4): Read persistent states for affected nodes
+only. Cost: 𝑂(|A| · 𝑑𝑚).
+(4) Embedding generation (§3.3.5): Temporal attention over 𝐾lay-
+ers with fanout 𝐿. Cost: 𝑂(|A| · 𝐿· 𝐾· 𝑑2).
+(5) Memory update (§3.3.6): GRU update and writeback for affected
+nodes. Cost: 𝑂(|A| · 𝑑2
+𝑚).
+Summing and noting that Stage 4 dominates yields Equation (33). The
+additional 𝑂(𝑐detect) term covers 𝐾-hop propagation from 2𝐵directly
+involved nodes with fanout 𝐿at each hop.
+□
+Table 3 summarizes the stage-wise comparison.
+
+
+--- Page 9 ---
+StreamTGN: A GPU-Efficient Serving System for Streaming Temporal Graph Neural Networks
+Conference’17, July 2017, Washington, DC, USA
+Table 3: Per-batch complexity: full recomputation vs. incremen-
+tal.
+Stage
+Full Recomp.
+Incremental
+Affected detection
+—
+𝑂(𝐵· 𝐿𝐾)
+Neighbor sampling
+𝑂(𝑛· 𝐿)
+𝑂(|A| · 𝐿)
+Feature retrieval
+𝑂(𝑛· 𝑑)
+𝑂(|A| · 𝑑)
+Memory read
+𝑂(𝑛· 𝑑𝑚)
+𝑂(|A| · 𝑑𝑚)
+Embedding generation
+𝑂(𝑛· 𝐿· 𝐾· 𝑑2)
+𝑂(|A| · 𝐿· 𝐾· 𝑑2)
+Memory update
+𝑂(𝑛· 𝑑2
+𝑚)
+𝑂(|A| · 𝑑2
+𝑚)
+3.4.2
+Speedup Analysis.
+TheoRem 3.3 (End-to-End Speedup). The speedup of incremental over
+full computation is:
+𝑆= 𝑇full
+𝑇incr
+=
+𝑛
+|A| ·
+1
+1 + 𝑐detect/(|A| · 𝐿· 𝐾· 𝑑2)
+(34)
+Since |A| ≤2𝐵· 𝐿𝐾(Equation 22), this simplifies for large 𝑛to:
+𝑆≥
+𝑛
+2𝐵· 𝐿𝐾
+(35)
+PRoof. From Theorems 3.1 and 3.2, keeping only the dominant em-
+bedding generation term:
+𝑆=
+𝑛· 𝐿· 𝐾· 𝑑2
+|A| · 𝐿· 𝐾· 𝑑2 + 𝑐detect
+=
+𝑛
+|A| ·
+1
+1 + 𝑐detect/(|A| · 𝐿· 𝐾· 𝑑2)
+(36)
+For large 𝑛, the detection overhead 𝑐detect = 𝑂(𝐵· 𝐿𝐾) is dominated by
+the computation cost𝑂(|A|·𝐿·𝐾·𝑑2), so the denominator approaches 1.
+Substituting the upper bound |A| ≤2𝐵· 𝐿𝐾yields Equation (35).
+□
+TheoRem 3.4 (Optimality Condition). Incremental computation is
+strictly faster than full recomputation when the affected ratio satisfies:
+|A|
+𝑛
+< 𝑐batch
+𝑐kernel
+−
+𝑐detect
+𝑛· ¯𝑑· 𝐾· 𝑑2 · 𝑐kernel
+(37)
+where 𝑐batch is the per-operation cost of batched full computation and
+𝑐kernel is the per-operation cost of incremental kernel launches. For large
+𝑛, this simplifies to:
+|A|
+𝑛
+<
+1
+𝑟overhead
+(38)
+where 𝑟overhead = 𝑐kernel/𝑐batch is the relative kernel overhead.
+PRoof. The condition 𝑇incr < 𝑇full requires:
+𝑐detect + |A| · ¯𝑑· 𝐾· 𝑑2 · 𝑐kernel < 𝑛· ¯𝑑· 𝐾· 𝑑2 · 𝑐batch
+(39)
+Rearranging:
+|A| < 𝑛· ¯𝑑· 𝐾· 𝑑2 · 𝑐batch −𝑐detect
+¯𝑑· 𝐾· 𝑑2 · 𝑐kernel
+(40)
+Dividing both sides by 𝑛:
+|A|
+𝑛
+< 𝑐batch
+𝑐kernel
+−
+𝑐detect
+𝑛· ¯𝑑· 𝐾· 𝑑2 · 𝑐kernel
+(41)
+For large 𝑛the second term vanishes, yielding Equation (38).
+□
+CoRollaRy 3.5. For sparse temporal graphs ( ¯𝑑< 50) and shallow
+TGNs (𝐾≤2), incremental computation is faster whenever the affected
+ratio |A|/𝑛< 20–50%. In typical streaming scenarios with localized edge
+arrivals, the affected ratio is 𝑂(𝐵· 𝐿𝐾/𝑛) ≪1, well within this regime.
+Table 4: Theoretical speedup under different parameter regimes.
+𝑛
+𝐵
+𝐿
+𝐾
+|A| (bound)
+Speedup
+106
+200
+10
+1
+4 × 103
+250×
+106
+200
+10
+2
+4 × 104
+25×
+106
+200
+20
+1
+8 × 103
+125×
+107
+200
+10
+1
+4 × 103
+2500×
+Parameter sensitivity. Table 4 instantiates Equation (35) under repre-
+sentative parameter settings to illustrate the achievable speedup range.
+Three observations follow. First, the speedup grows linearly with 𝑛:
+larger graphs benefit more because the affected fraction 𝜌= |A|/𝑛
+shrinks. Second, the speedup degrades exponentially with model depth
+𝐾, since each layer expands the affected set by a factor of 𝐿. Third,
+smaller batch sizes yield higher speedups, reflecting that sparse, local-
+ized updates are most amenable to incremental processing.
+3.4.3
+Lower Bound and Optimality. We now show that StreamTGN’s
+incremental complexity is near-optimal by establishing a lower bound
+on any correct incremental algorithm.
+TheoRem 3.6 (LoweR Bound). Any correct incremental algorithm for
+𝐾-layer temporal attention must perform at least:
+Ω(|Eaff| · 𝐾· 𝑑)
+(42)
+computation per batch, where Eaff = {(𝑢, 𝑣,𝑡) ∈E | 𝑢∈A or 𝑣∈A}
+denotes the edges incident to the affected set.
+PRoof. Each edge (𝑢, 𝑣,𝑡) incident to an affected node contributes
+to at least one node’s embedding through the message-passing mecha-
+nism. Computing the message for a single edge at a single layer requires
+Ω(𝑑) operations (the inner product in the attention score and the value
+projection). Since each affected edge must be processed at every layer
+where it participates, the total cost is at least Ω(|Eaff| · 𝐾· 𝑑).
+No algorithm can avoid this cost: skipping any affected edge would
+yield an incorrect embedding for some node in A, since the attention
+output depends on the complete set of messages from the node’s tem-
+poral neighborhood.
+□
+TheoRem 3.7 (NeaR-Optimality of StReamTGN). StreamTGN’s in-
+cremental computation achieves complexity within a constant factor of the
+lower bound:
+𝑇StreamTGN = 𝑂 |Eaff| · 𝐾· 𝑑2 + 𝑂(𝑐detect)
+(43)
+The gap between the lower bound Ω(𝑑) per edge and StreamTGN’s 𝑂(𝑑2)
+per edge arises from the matrix multiplications in the attention mecha-
+nism (query, key, and value projections of dimension 𝑑× 𝑑).
+PRoof. StreamTGN processes each affected edge exactly once per
+layer in the embedding generation stage (Stage 4, §3.3.5). For each edge,
+the attention computation involves:
+• Query/key projection: 𝑂(𝑑2)
+• Attention score: 𝑂(𝑑)
+• Value projection and aggregation: 𝑂(𝑑2)
+Summing over |Eaff| edges and 𝐾layers yields 𝑂(|Eaff| · 𝐾· 𝑑2). The
+additional detection cost 𝑂(𝑐detect) is subsumed for large graphs.
+No affected edge is processed more than once per layer (ensured by
+the cache invalidation rule in Equation 17), and no unaffected edge
+is processed at all (ensured by the embedding cache in §3.2.3). Thus
+StreamTGN touches the minimum set of edges required for correct-
+ness.
+□
+
+
+--- Page 10 ---
+Conference’17, July 2017, Washington, DC, USA
+, Lingling Zhang, Pengpeng Qiao, Zhiwei Zhang, Ye Yuan, and Guoren Wang
+3.4.4
+Correctness of Incremental Computation. A critical question is
+whether incremental computation produces the same result as full re-
+computation. We establish this for each stage.
+TheoRem 3.8 (Eivalence of IncRemental Computation). For
+Stages 1–3 and 5, StreamTGN’s incremental output is identical to full re-
+computation. For Stage 4 (embedding generation), the output is identical
+when exact recomputation is used for affected nodes, and bounded-error
+when the delta approximation (Equation 29) is applied.
+PRoof. We verify each stage:
+Stages 1, 2, 3 (Sampling, Retrieval, Memory Read). For unaffected nodes
+𝑣∉A: no edge in E𝐵involves 𝑣or its 𝐾-hop neighbors, so 𝑣’s sampled
+neighborhood, features, and memory state are unchanged from the pre-
+vious batch. The cached values are therefore identical to what full re-
+computation would produce.
+For affected nodes 𝑣∈A: StreamTGN performs the same operations
+as full recomputation (re-sample, re-fetch, re-read), producing identical
+results.
+Stage 4 (Embedding Generation) — Exact mode. For 𝑣∉A: 𝑣’s embed-
+ding depends on its 𝐾-hop neighborhood, none of which has changed
+(by definition of A in Equation 21). The cached embedding hcached
+𝑣
+equals
+the full recomputation result.
+For 𝑣∈A: StreamTGN recomputes temporal attention over 𝑣’s com-
+plete neighborhood N𝑣, which is identical to full recomputation.
+Stage 4 (Embedding Generation) — Delta mode. The delta formulation
+(Equation 29) introduces approximation error because softmax atten-
+tion has a global normalization constant. When a neighbor is added or
+removed, the denominator 𝑍𝑣= Í
+𝑢′ exp(q⊤
+𝑣k𝑢′) changes, affecting all
+attention weights. The approximation error for node 𝑣is bounded by:
+∥hdelta
+𝑣
+−hexact
+𝑣
+∥≤|ΔN𝑣|
+|N𝑣| · max
+𝑢
+∥v𝑢∥·
+1 −𝑍old
+𝑣
+𝑍new
+𝑣
+
+(44)
+When the change rate |ΔN𝑣|/|N𝑣| is small (5–15% in practice), this error
+is negligible. We validate empirically in §4 that the delta mode incurs
+< 0.5% accuracy degradation.
+Stage 5 (Memory Update). Memory updates are applied only to di-
+rectly involved nodes 𝑣∈Vdirect, which is identical to full recomputa-
+tion since GRU updates are triggered only by new edges.
+□
+3.4.5
+Convergence of Incremental Training. When StreamTGN is used
+for online training (as opposed to inference only), the delta approxima-
+tion in Stage 4 introduces gradient staleness. We show that convergence
+is preserved under mild conditions.
+TheoRem 3.9 (IncRemental TRaining ConveRgence). Let 𝜃∗be the
+optimal parameters from full-batch training and ˜𝜃𝑇the parameters after
+𝑇incremental updates with maximum staleness 𝑆(batches since the last
+full refresh). Assume the loss L is 𝛽-smooth and the stochastic gradients
+have bounded variance 𝜎2. Then:
+∥˜𝜃𝑇−𝜃∗∥≤𝑂
+
+𝜀·
+√
+𝑇
+
++ 𝑂
+
+𝜀· 𝑆· 𝑇·
+¯𝑑𝐾
+𝑛
+
+(45)
+where 𝜀is the learning rate.
+PRoof. Standard SGD convergence on 𝛽-smooth functions gives:
+∥𝜃𝑇−𝜃∗∥≤𝑂(𝜀·
+√
+𝑇)
+(46)
+With staleness 𝑆, each gradient ˜∇L𝑡is computed using embeddings
+that may be up to 𝑆batches stale. The gradient error decomposes as:
+∥∇L𝑡−˜∇L𝑡∥≤𝛽·
+Õ
+𝑣∈A𝑡
+∥hexact
+𝑣
+−hstale
+𝑣
+∥
+(47)
+From the affected set analysis, at each step 𝑡the expected fraction of
+nodes with stale embeddings is:
+E
+ |A𝑡|
+𝑛
+
+≤𝑂
+ ¯𝑑𝐾
+𝑛
+
+(48)
+Substituting into the standard delayed-SGD bound:
+∥˜𝜃𝑇−𝜃∗∥≤𝑂(𝜀·
+√
+𝑇) + 𝑂
+ 
+𝜀· 𝑆·
+𝑇Õ
+𝑡=1
+∥∇L𝑡−˜∇L𝑡∥
+!
+≤𝑂(𝜀·
+√
+𝑇) + 𝑂
+
+𝜀· 𝑆· 𝑇·
+¯𝑑𝐾
+𝑛
+
+(49)
+□
+CoRollaRy 3.10 (PRactical ConveRgence GuaRantee). For sparse
+temporal graphs where ¯𝑑𝐾≪𝑛, the staleness term in Equation (45) van-
+ishes relative to the standard SGD term. With periodic full refreshes every
+𝑆batches, incremental training converges to the same solution as full train-
+ing up to 𝑂(𝜀·
+√
+𝑇) error. In particular, setting 𝑆= 𝑂(
+p
+𝑛/ ¯𝑑𝐾) ensures
+the staleness contribution does not exceed the baseline SGD error.
+3.4.6
+Summary. The analysis establishes three key results. First, StreamTGN
+achieves a speedup of 𝑛/|A| over full recomputation (Theorem 3.3),
+which ranges from 25× to 2500× depending on graph size, batch size,
+and model depth (Table 4). Second, this speedup is near-optimal: StreamTGN’s
+complexity is within an 𝑂(𝑑) factor of the information-theoretic lower
+bound (Theorems 3.6 and 3.7), and the incremental output is either iden-
+tical to or within bounded error of full recomputation (Theorem 3.8).
+Third, incremental training converges to the same solution as full train-
+ing on sparse graphs (Theorem 3.9), with the staleness error controlled
+by periodic full refreshes.
+3.5
+Drift-Aware Adaptive Rebuild Scheduling
+The incremental computation described in §3.3 recomputes embeddings
+only for nodes in the affected set A. While Theorem 3.8 guarantees
+correctness in exact mode, practical deployments may use the delta ap-
+proximation (Equation 29) for higher throughput. Over many consecu-
+tive batches, the accumulated approximation error —which we call em-
+bedding drift—can grow unboundedly if left unchecked. A periodic full
+rebuild eliminates all drift, but rebuilding too frequently wastes com-
+putation, while rebuilding too infrequently risks accuracy degradation.
+This section presents an adaptive scheduling mechanism that monitors
+drift in real time and triggers rebuilds only when necessary.
+3.5.1
+Drift Definition and Monitoring. We define the embedding drift
+of node 𝑣at time 𝑡as the ℓ2 distance between its incrementally main-
+tained embedding and the embedding that a full recomputation would
+produce:
+𝛿𝑣(𝑡) = ∥hincr
+𝑣
+(𝑡) −hfull
+𝑣(𝑡)∥2
+(50)
+Computing 𝛿𝑣(𝑡) exactly requires full recomputation, which defeats the
+purpose. Instead, StreamTGN maintains a lightweight drift estimator
+based on accumulated neighborhood changes.
+Definition 3.11 (Drift Estimator). For each node 𝑣, the estimated drift
+after processing 𝜏batches since the last rebuild is:
+ˆ𝛿𝑣(𝜏) =
+𝜏Õ
+𝑗=1
+|ΔN (𝑗)
+𝑣
+|
+|N𝑣|
+· 𝛾𝜏−𝑗
+(51)
+where |ΔN (𝑗)
+𝑣
+| is the number of neighbor changes at batch 𝑗and 𝛾∈
+(0, 1) is a decay factor that discounts older changes (since their effect
+diminishes as subsequent updates partially correct the drift).
+
+
+--- Page 11 ---
+StreamTGN: A GPU-Efficient Serving System for Streaming Temporal Graph Neural Networks
+Conference’17, July 2017, Washington, DC, USA
+The global drift metric aggregates over all nodes:
+ˆΔ(𝜏) =
+1
+|A𝜏|
+Õ
+𝑣∈A𝜏
+ˆ𝛿𝑣(𝜏)
+(52)
+where A𝜏is the cumulative affected set over the last 𝜏batches. Com-
+puting ˆΔ(𝜏) requires only a running sum and counter per node—𝑂(|A|)
+additional work per batch, which is negligible compared to the embed-
+ding computation.
+3.5.2
+Adaptive Rebuild Policy. StreamTGN triggers a rebuild when the
+estimated drift exceeds a user-specified threshold 𝛿max:
+Rebuild if ˆΔ(𝜏) > 𝛿max
+(53)
+Upon triggering, the system performs one of two actions depending on
+the drift distribution:
+Partial rebuild. If drift is concentrated in a small subset Vdrift = {𝑣:
+ˆ𝛿𝑣> 𝛿max} with |Vdrift| < 𝛼·𝑛(where 𝛼is a configurable threshold, e.g.,
+10%), then only Vdrift is fully recomputed. Cost: 𝑂(|Vdrift| · 𝐿· 𝐾· 𝑑2).
+Full rebuild. If |Vdrift| ≥𝛼· 𝑛, the system recomputes all node embed-
+dings from scratch. Cost: 𝑂(𝑛· 𝐿· 𝐾· 𝑑2).
+After either rebuild, all drift estimators are reset to zero and the em-
+bedding cache is fully refreshed.
+TheoRem 3.12 (DRift Bound). Under the adaptive rebuild policy with
+threshold 𝛿max and decay 𝛾, the maximum embedding drift for any node
+𝑣at any time 𝑡is bounded by:
+𝛿𝑣(𝑡) ≤𝛿max
+1 −𝛾· max
+𝑢∈N𝑣∥v𝑢∥
+(54)
+PRoof. Between consecutive rebuilds, the drift accumulates accord-
+ing to Equation (51). The rebuild is triggered when ˆΔ(𝜏) > 𝛿max, so the
+maximum accumulated estimator value before a rebuild is𝛿max. The geo-
+metric series Í∞
+𝑗=0 𝛾𝑗= 1/(1 −𝛾) bounds the total accumulated weight.
+From Equation (44), each unit of estimated drift translates to at most
+max𝑢∥v𝑢∥embedding error. Combining these yields Equation (54).
+□
+3.5.3
+Comparison with Fixed Scheduling. A naive alternative is to re-
+build every 𝑅batches regardless of drift. This approach either wastes
+computation (if drift is low and the rebuild was unnecessary) or allows
+drift to exceed acceptable levels (if the graph is evolving faster than
+expected).
+PRopeRty 1 (Adaptive vs. Fixed Scheduling). Let 𝑇be the total
+number of batches and 𝑅adaptive the average rebuild interval under the
+adaptive policy. If edge arrival rates vary by a factor 𝜌across the stream
+(i.e., some periods have 𝜌× more edges than others), then:
+𝑅adaptive ≥𝑅fixed · 𝜌+ 1
+2𝜌
+(55)
+In the common case where 𝜌≥3 (bursty traffic), the adaptive policy re-
+duces the total number of rebuilds by ≥33% compared to the fixed policy
+while maintaining the same drift bound.
+Our ablation study (§4.3) empirically validates this result: StreamTGN’s
+speedup and accuracy remain remarkably stable across rebuild inter-
+vals from “per-batch” to “never,” confirming that the drift accumulates
+slowly on real-world temporal graphs and that adaptive scheduling can
+defer rebuilds significantly without accuracy loss.
+3.6
+Batched Streaming with Relaxed Ordering
+Temporal GNN computation is inherently sequential: the memory state
+m𝑣after processing edge (𝑢, 𝑣,𝑡𝑖) depends on the state after processing
+all edges with 𝑡< 𝑡𝑖. Strict sequential processing—one edge at a time—
+respects this dependency perfectly but achieves poor GPU utilization,
+as each edge’s computation cannot overlap with others. This section
+presents a relaxed ordering scheme that groups edges into batches and
+processes them in parallel, trading a bounded amount of temporal pre-
+cision for substantially higher throughput.
+3.6.1
+Batch Formation and Logical Timestamps. StreamTGN groups in-
+coming edges into batches of size 𝐵based on arrival order. All edges
+within a batch are assigned the same logical timestamp 𝑡batch, defined as
+the maximum timestamp in the batch:
+𝑡batch =
+max
+(𝑢,𝑣,𝑡)∈E𝐵
+𝑡
+(56)
+This means that edges within the same batch are treated as concur-
+rent events, and their relative ordering is relaxed. The ordering between
+batches is strictly maintained.
+Definition 3.13 (Staleness). An edge (𝑢, 𝑣,𝑡𝑖) in batch E𝐵has staleness
+𝑠𝑖= 𝑡batch −𝑡𝑖
+(57)
+which measures the temporal imprecision introduced by batching. The
+maximum staleness within a batch is bounded by:
+𝑠max = 𝑡batch −
+min
+(𝑢,𝑣,𝑡)∈E𝐵
+𝑡
+(58)
+3.6.2
+Parallel Batch Processing. Within a batch, StreamTGN processes
+all 𝐵edges in parallel using three key optimizations:
+Parallel memory read. All source and destination nodes in the batch
+read their memory states simultaneously from the persistent GPU ten-
+sor. Since edges within a batch share a logical timestamp, no edge de-
+pends on another edge’s memory update within the same batch.
+Parallel embedding generation. The temporal attention computation
+for all affected nodes is launched as a single batched GPU kernel. For
+memory-based models (TGN), the intra-batch memory dependency is
+resolved by using the pre-batch memory state for all edges:
+h𝑣(𝑡batch) = Attn q𝑣(mpre
+𝑣), {k𝑢(mpre
+𝑢), v𝑢(mpre
+𝑢)}𝑢∈N𝑣
+
+(59)
+where mpre
+𝑣
+is 𝑣’s memory state before the current batch. This is equiv-
+alent to the “batch staleness” model used by TGL [42], but StreamTGN
+applies it only to the affected set rather than the full graph.
+Parallel memory update. After prediction, memory updates for all di-
+rectly involved nodes are computed in parallel:
+mpost
+𝑣
+= GRU mpre
+𝑣, Aggregate({msg𝑢𝑣| (𝑢, 𝑣,𝑡) ∈E𝐵})
+(60)
+When multiple edges in the same batch involve the same node 𝑣, their
+messages are aggregated before the GRU update, ensuring a single atomic
+state transition per batch.
+3.6.3
+Accuracy Bound under Relaxed Ordering. The relaxed ordering in-
+troduces prediction error compared to strict sequential processing. We
+bound this error as a function of the batch size 𝐵.
+TheoRem 3.14 (Bounded PRediction ERRoR). Let ˆ𝑦seq
+𝑖
+be the predic-
+tion for edge 𝑖under strict sequential processing and ˆ𝑦batch
+𝑖
+the prediction
+under batched processing with batch size 𝐵. If the temporal attention func-
+tion is 𝜆-Lipschitz with respect to node memory states and the memory
+update function has bounded step size 𝜂, then:
+| ˆ𝑦batch
+𝑖
+−ˆ𝑦seq
+𝑖
+| ≤𝜆· 𝜂· 𝐵· 𝐾
+(61)
+PRoof. Under strict sequential processing, edge 𝑖in the batch uses
+memory state m(𝑖)
+𝑣, which incorporates updates from edges 1, . . . ,𝑖−1.
+Under batched processing, edge 𝑖uses mpre
+𝑣, which does not incorporate
+any intra-batch updates. The memory difference is:
+∥m(𝑖)
+𝑣
+−mpre
+𝑣∥≤𝑖· 𝜂≤𝐵· 𝜂
+(62)
+where 𝜂bounds the per-edge memory step size. Through 𝐾layers of 𝜆-
+Lipschitz attention, this memory difference translates to an embedding
+
+
+--- Page 12 ---
+Conference’17, July 2017, Washington, DC, USA
+, Lingling Zhang, Pengpeng Qiao, Zhiwei Zhang, Ye Yuan, and Guoren Wang
+Table 5: Strict sequential vs. batched streaming processing.
+Property
+Sequential
+Batched (𝐵)
+Edges per kernel
+1
+𝐵
+GPU utilization
+Low (<10%)
+High (>80%)
+Memory consistency
+Exact
+Bounded error
+Max prediction error
+0
+𝑂(𝜆𝜂𝐵𝐾)
+Throughput
+Θ(1)
+Θ(𝐵)
+difference of at most 𝜆𝐾·𝐵·𝜂. For the link prediction output (which is a
+linear function of the concatenated source and destination embeddings),
+the prediction error is bounded by 𝜆·𝜂·𝐵·𝐾, where we use the simplified
+bound with 𝜆·𝐾replacing 𝜆𝐾under the assumption 𝜆≤1 (which holds
+for attention with softmax normalization).
+□
+CoRollaRy 3.15 (ThRoughput–AccuRacy TRadeoff). The batch size
+𝐵controls the tradeoff between throughput and prediction accuracy. Through-
+put scales linearly: 𝐵edges are processed in parallel per GPU kernel launch,
+yielding throughput Θ(𝐵) edges per kernel. Accuracy degrades linearly:
+the maximum prediction error grows as 𝑂(𝐵) per Theorem 3.14. In prac-
+tice, the error bound is loose because (1) most edges in a batch involve dis-
+tinct nodes, so intra-batch memory conflicts are rare, and (2) the temporal
+locality of real-world graphs means consecutive edges are often minutes
+or hours apart, not milliseconds. Our evaluation (§4.3) shows that batch
+sizes up to 𝐵=1000 incur negligible accuracy degradation (AP drops by
+less than 1%).
+3.6.4
+Comparison with Strict Sequential Processing. Table 5 summarizes
+the tradeoff between strict sequential and batched processing.
+The key insight is that batched streaming is not an approximation
+unique to StreamTGN—it is the same batching model used by TGL, ETC,
+SIMPLE, and SWIFT for training. StreamTGN’s contribution is applying
+it to the incremental inference pipeline in combination with the affected
+set optimization: within each batch, only |A| nodes (rather than all 𝑛)
+undergo the parallel computation, achieving both high GPU utilization
+and minimal redundant work.
+4
+EVALUATION
+We evaluate StreamTGN on eight real-world temporal graphs spanning
+four orders of magnitude in scale, from Bitcoin (6K nodes, 60K edges) to
+Stack-Overflow (2.6M nodes, 48M edges), as summarized in Table 6. All
+experiments are conducted on a single server equipped with an NVIDIA
+RTX 4090 GPU (24 GB VRAM) and 102 GB system memory.
+Our evaluation is organized into three parts. First, we compare StreamTGN
+with four state-of-the-art temporal graph learning systems—TGL [42],
+ETC [5], SIMPLE [6], and SWIFT [8], by combining training-phase and
+inference-phase optimizations into end-to-end pipelines. Second, we
+evaluate StreamTGN across three representative T-GNN architectures:
+TGN, TGAT, and DySAT—on five datasets to demonstrate its generality
+across model designs. Third, we analyze StreamTGN’s sensitivity to key
+parameters (batch size, neighbor count, rebuild interval) and profile its
+per-stage pipeline breakdown.
+4.1
+Comparison with Existing Systems
+We conduct two sets of comparisons. The first compares StreamTGN
+against existing T-GNN optimization systems. Since prior systems (TGL,
+ETC, SIMPLE, SWIFT) target training throughput while StreamTGN tar-
+gets inference efficiency, we combine them to form end-to-end pipelines
+(e.g., SWIFT for training + StreamTGN for inference) and report both
+training time per epoch and inference time per batch across four datasets.
+Table 6: Dataset statistics. |𝑉|: number of nodes; |𝐸|: number of
+temporal edges; 𝑑𝑒: edge feature dimension.
+Dataset
+|𝑉|
+|𝐸|
+𝑑𝑒
+Domain
+Bitcoin
+6,263
+59,778
+1
+Trust network
+LastFM
+1,980
+1,293,103
+0
+Music streaming
+MOOC
+7,047
+411,749
+4
+Online education
+WIKI
+9,228
+157,474
+172
+Encyclopedia
+REDDIT
+10,985
+672,447
+172
+Social forum
+GDELT
+16,682
+191,290,882
+186
+Global events
+Wiki-Talk
+1,094,018
+6,100,538
+0
+Discussion
+Stack-Overflow
+2,584,164
+47,903,266
+0
+Q&A forum
+The second evaluates StreamTGN across different T-GNN model architectures—
+including memory-based (TGN) and non-memory (TGAT, DySAT) models—
+to demonstrate that our incremental refresh mechanism generalizes across
+model designs.
+Comparison with training-phase systems. Figure 7 reports the per-
+epoch training time and per-batch inference time for six pipeline con-
+figurations across four datasets. Existing systems—ETC, SIMPLE, and
+SWIFT—optimize the training phase through techniques such as adap-
+tive batching, dynamic data placement, and secondary-memory pipelin-
+ing, respectively. However, none of them modify the inference pipeline
+of TGL; consequently, all four training systems exhibit identical infer-
+ence cost on every dataset (e.g., 33,984 ms per batch on Stack-Overflow).
+By replacing TGL’s full-recomputation inference with StreamTGN’s in-
+cremental refresh, the inference time drops by orders of magnitude (e.g.,
+from 33,984 ms to 54 ms on Stack-Overflow, a 626× reduction), while
+training time remains unaffected. The best end-to-end configuration,
+SWIFT + StreamTGN, combines the fastest training system with our in-
+ference optimization, achieving the lowest total time on all four datasets.
+This result confirms that StreamTGN is orthogonal to training-phase op-
+timizations: it addresses a complementary bottleneck that no existing
+system can reduce.
+Comparison across T-GNN architectures. To verify that StreamTGN
+generalizes beyond a single model, we deploy it on three representative
+T-GNN architectures—TGN, TGAT, and DySAT—across five datasets
+ranging from 7K to 2.6M nodes. Table 7 reports the per-batch infer-
+ence time and speedup for each combination. StreamTGN achieves con-
+sistent speedups across all architectures: 4.5×–739× for TGN, 18.2×–
+4,207× for TGAT, and 18.2×–56.0× for DySAT. Two trends are evident.
+First, speedup increases with graph size because the affected ratio |A|/|𝑉|
+decreases on larger graphs—on Stack-Overflow (|𝑉|=2.6M), fewer than
+0.14% of nodes are dirty per batch, yielding speedups of 739× (TGN) and
+4,207× (TGAT). Second, non-memory models (TGAT, DySAT) achieve
+higher speedups than memory-based models (TGN) because they lack
+the memory-update mechanism that propagates dirty flags to neighbor-
+ing nodes, resulting in a smaller affected set. Importantly, the Average
+Precision (AP) is identical between TGL and StreamTGN for every con-
+figuration, confirming that StreamTGN is a lossless optimization—it re-
+computes exactly the same embeddings for dirty nodes without any ap-
+proximation.
+4.2
+Streaming Inference Performance
+We evaluate StreamTGN’s streaming inference performance from three
+perspectives: per-batch inference latency, global index refresh cost, and
+stage-level breakdown. All measurements use the TGN model with batch
+size 𝐵=600 on a single NVIDIA RTX 4090.
+Per-batch inference. Table 8 compares the per-batch inference latency
+between TGL and StreamTGN. TGL recomputes embeddings for all root
+nodes in each batch regardless of whether their memory states have
+
+
+--- Page 13 ---
+StreamTGN: A GPU-Efficient Serving System for Streaming Temporal Graph Neural Networks
+Conference’17, July 2017, Washington, DC, USA
+Figure 7: The performance of existing training methods with our proposed inferencing method.
+Table 7: Per-batch inference time (ms) and speedup of StreamTGN over TGL across three T-GNN models and five datasets. All mea-
+surements on a single NVIDIA RTX 4090, batch size 𝐵= 600. StreamTGN achieves consistent speedups across all model architectures,
+ranging from 4.5× to 4,216×.
+WIKI (9K)
+REDDIT (11K)
+MOOC (7K)
+GDELT (17K)
+Stack-OF (2.6M)
+Model
+System
+Time
+(ms)
+Spd.
+AP
+(%)
+Time
+(ms)
+Spd.
+AP
+(%)
+Time
+(ms)
+Spd.
+AP
+(%)
+Time
+(ms)
+Spd.
+AP
+(%)
+Time
+(ms)
+Spd.
+AP
+(%)
+TGN
+TGL
+109.4
+5.8
+97.4
+126.6
+4.5
+99.6
+59.4
+8.6
+99.4
+195.2
+12.6
+98.2
+30004
+739
+97.9
+StreamTGN
+19.0
+97.4
+28.1
+99.6
+6.9
+99.4
+15.5
+98.2
+40.6
+97.9
+TGAT
+TGL
+210.3
+26.6
+89.5
+294.5
+18.2
+98.9
+178.2
+38.7
+96.3
+492.4
+56.0
+95.6
+57641
+4207
+97.1
+StreamTGN
+7.9
+89.5
+16.2
+98.9
+4.6
+96.3
+8.8
+95.6
+13.7
+97.1
+DySAT
+TGL
+211.0
+26.7
+95.4
+264.1
+18.2
+98.2
+301.6
+39.2
+98.7
+571.1
+56.0
+96.1
+—
+—
+—
+StreamTGN
+7.9
+95.4
+14.5
+98.2
+7.7
+98.7
+10.2
+96.1
+—
+—
+DySAT on Stack-Overflow: out of memory (OOM).
+AP is identical because StreamTGN recomputes exact same embeddings.
+Table 8: Per-batch streaming inference latency (ms). TGL recom-
+putes all root node embeddings; StreamTGN only recomputes
+dirty root nodes. AP/AUC identical (same trained model, 𝐵=600).
+Dataset
+TGL
+STGN
+Spd.
+AP
+AUC
+MOOC
+19.16
+5.65
+3.4×
+.994
+.997
+WIKI
+20.95
+7.43
+2.8×
+.973
+.976
+REDDIT
+24.79
+10.63
+2.3×
+.981
+.986
+GDELT
+21.90
+7.93
+2.8×
+.983
+.986
+Stack-OF
+22.98
+6.24
+3.7×
+.979
+.971
+Table 9: Global embedding index refresh cost per batch (ms). TGL
+refreshes all |𝑉| nodes; StreamTGN refreshes only the dirty set
+|D|. Speedup ≈|𝑉|/|D|.
+Dirty Set
+Refresh Time (ms)
+Dataset
+| D|
+Aff. (%)
+TGL
+STGN
+Spd.
+MOOC
+814
+11.5
+71.6
+8.27
+8.7×
+WIKI
+1,607
+17.4
+102.7
+17.89
+5.7×
+REDDIT
+2,442
+22.2
+140.4
+31.22
+4.5×
+GDELT
+1,326
+8.0
+185.0
+14.71
+12.6×
+Stack-OF
+3,497
+0.1
+31,625
+42.79
+739×
+changed; StreamTGN identifies the dirty root nodes—those whose mem-
+ory was modified by recent edges—and only recomputes their embed-
+dings, reusing cached results for the remainder. StreamTGN achieves
+2.3×–3.7× speedup across all five datasets. Notably, the speedup on
+Stack-Overflow (3.7×) is higher than on REDDIT (2.3×) because its larger
+node population results in a lower fraction of dirty root nodes per batch.
+The AP and AUC are identical between TGL and StreamTGN in all cases,
+confirming that selective recomputation is lossless.
+Global index refresh. Table 9 evaluates the cost of maintaining an
+up-to-date embedding index over the entire graph. After each batch
+Table 10: TGL per-batch inference stage breakdown (ms). Sam-
+pling and embedding dominate (>80%), which StreamTGN elim-
+inates for unaffected nodes.
+Dataset
+Sam-
+ple
+MFG Mail Em-
+bed
+Pre-
+dict
+Up-
+date Total
+MOOC
+7.27
+3.02
+0.98
+7.02
+0.25
+0.62 19.16
+WIKI
+9.93
+5.16
+0.28
+4.67
+0.24
+0.67 20.95
+REDDIT
+10.21
+3.47
+1.10
+8.23
+0.74
+1.04 24.79
+GDELT
+10.59
+2.00
+0.24
+7.13
+0.29
+1.65 21.90
+Stack-OF
+9.75
+3.66
+0.20
+8.42
+0.25
+0.70 22.98
+Table 11: StreamTGN performance summary. Batch: per-batch
+streaming inference; Index: global embedding refresh. 𝐵=600,
+RTX 4090. AP/AUC identical (lossless).
+Batch (ms)
+Index Refresh
+Accuracy
+Dataset
+TGL
+Spd. Aff. % TGL (ms)
+Spd.
+AP
+AUC
+MOOC
+19.2
+3.4×
+11.5
+71.6
+8.7× .994
+.997
+WIKI
+21.0
+2.8×
+17.4
+102.7
+5.7× .973
+.976
+REDDIT
+24.8
+2.3×
+22.2
+140.4
+4.5× .981
+.986
+GDELT
+21.9
+2.8×
+8.0
+185.0 12.6× .983
+.986
+Stack-OF
+23.0
+3.7×
+0.1
+31,625
+739× .979
+.971
+of new edges, a serving system must refresh node embeddings to an-
+swer nearest-neighbor or link prediction queries. TGL refreshes all |𝑉|
+nodes; StreamTGN refreshes only the |D| dirty nodes whose memory
+states were updated. The speedup is determined by the affected ratio
+|D|/|𝑉|: on small graphs (WIKI, 17.4% affected), StreamTGN achieves
+5.7×; on Stack-Overflow (0.14% affected), it achieves 739×. This demon-
+strates that StreamTGN’s advantage scales with graph size—on million-
+node graphs, fewer than 0.2% of nodes are affected per batch, yielding
+
+
+--- Page 14 ---
+Conference’17, July 2017, Washington, DC, USA
+, Lingling Zhang, Pengpeng Qiao, Zhiwei Zhang, Ye Yuan, and Guoren Wang
+three orders of magnitude speedup. The index refresh speedup repre-
+sents StreamTGN’s primary contribution, as global refresh is the dom-
+inant cost in production serving systems that must maintain fresh em-
+beddings for all nodes.
+Stage-level breakdown. Table 10 decomposes TGL’s per-batch infer-
+ence pipeline into six stages. Sampling and embedding generation to-
+gether account for over 80% of total latency across all datasets—these
+are precisely the stages that StreamTGN eliminates for unaffected nodes.
+The remaining stages (predict and update) are lightweight (typically
+<10% combined) and must be executed regardless of the refresh strategy.
+This breakdown explains why StreamTGN’s batch-level speedup (2.3×–
+3.7×) is moderate: even dirty nodes must still pass through the full
+pipeline, and the fixed-cost stages (predict, update) cannot be skipped.
+In contrast, the index refresh speedup (4.5×–739×) is much larger be-
+cause it operates over the entire node set, where the ratio of skippable
+to total work is governed by the affected ratio rather than the per-batch
+root node composition.
+Summary. Table 11 consolidates the key results. StreamTGN provides
+two complementary speedups: a moderate batch-level speedup (2.3×–
+3.7×) that benefits real-time per-query inference, and a substantial in-
+dex refresh speedup (4.5×–739×) that benefits systems maintaining up-
+to-date embeddings for serving. Both speedups are achieved with zero
+accuracy degradation, as StreamTGN recomputes the exact same em-
+beddings for affected nodes without any approximation.
+4.3
+Parameter Sensitivity and System Analysis
+Since StreamTGN recomputes the exact same embeddings for all af-
+fected nodes—differing from TGL only in which nodes are recomputed—
+the prediction accuracy is identical to full recomputation (as confirmed
+in Table 7). We therefore focus on how key parameters affect StreamTGN’s
+speedup and where the computation time is spent. Figure 8 reports the
+index speedup and affected ratio under three parameter sweeps across
+five datasets; Table 12 profiles the per-stage latency breakdown. Batch
+size (𝐵). Figures 8(a) show that speedup decreases monotonically as 𝐵
+increases from 200 to 1,000. A larger batch introduces more new edges
+per step, which dirties more nodes and raises the affected ratio. On
+WIKI, the affected ratio grows from 8.0% (𝐵=200) to 24.3% (𝐵=1000), re-
+ducing the speedup from 12.5× to 4.1×. On large graphs, however, the
+affected ratio remains negligible regardless of 𝐵—Stack-Overflow stays
+below 0.2% across all batch sizes—yielding consistently high speedups
+(515×–1,614×). Moreover, measured latency scales linearly with 𝐵(ap-
+proximately 2× when 𝐵doubles), confirming the 𝑂(|A| · 𝐿· 𝐾· 𝑑2)
+complexity bound.
+Number of neighbors (𝐾). Figures 8(b) show a similar inverse trend:
+increasing 𝐾from 5 to 30 enlarges each node’s sampled neighborhood,
+which expands the affected set. On WIKI, the affected ratio rises from
+15.0% (𝐾=5) to 23.1% (𝐾=30), and the speedup decreases from 6.8× to
+4.3×. The impact is more pronounced on medium-scale graphs (REDDIT,
+MOOC) where the expanded neighborhood represents a larger fraction
+of the total graph. On Stack-Overflow, the affected ratio remains near
+zero across all 𝐾values, sustaining speedups above 367×.
+Rebuild interval. Figures 8(c) examine the tradeoff between index fresh-
+ness and rebuild cost. Across all datasets, both the speedup and affected
+ratio remain remarkably stable from “per-batch” through “12K,” indicat-
+ing that the dirty set does not accumulate significantly over time. Even
+with the “never” policy (no periodic rebuild), the speedup degrades only
+marginally—for example, WIKI stays at 5.7× and Stack-Overflow re-
+mains at 739×. This stability suggests that StreamTGN can operate with
+infrequent or no rebuilds in practice, reducing the amortized overhead
+of index maintenance. Pipeline breakdown. Table 12 decomposes StreamTGN’s
+per-batch latency into four stages. Memory update (GRU computation)
+Table 12: Per-stage latency breakdown of StreamTGN’s incre-
+mental inference pipeline (𝐵=200, averaged over 20 batches).
+Memory update (GRU) dominates at 53–67%; incremental-
+specific stages (affected detection + neighbor sampling) con-
+tribute only 7–11%.
+Affected Det.
++ Nbr. Samp.
+Feature Ret.
++ Mem. Read
+Embed.
+Gen.
+Mem.
+Upd.
+Dataset
+ms
+%
+ms
+%
+ms
+%
+%
+Bitcoin
+0.52
+6.4
+1.36
+16.8
+1.32
+16.4
+60.5
+LastFM
+0.91
+11.1
+0.20
+2.4
+1.86
+22.7
+63.8
+Wiki-Talk
+0.76
+9.9
+0.19
+2.5
+1.82
+23.6
+64.0
+Stack-OF
+0.99
+9.3
+0.23
+2.1
+3.81
+35.6
+53.0
+GDELT
+0.50
+6.8
+0.95
+12.8
+1.00
+13.5
+66.9
+dominates at 53–67% of total latency—the same operation required by
+all TGN implementations including TGL, ETC, and SWIFT. Embedding
+generation accounts for 13–36%, varying with graph structure. Crucially,
+the stages unique to incremental computation—affected node detection
+and neighbor sampling—contribute only 7–11% overhead, confirming
+that StreamTGN adds minimal cost beyond what is inherently required
+by the memory architecture. This breakdown also explains why StreamTGN’s
+speedup is robust to parameter changes: the dominant cost (GRU up-
+date) is fixed per affected node, so total latency is determined primarily
+by |A|, not by system-level tuning.
+Summary. The results reveal two consistent patterns. First, speedup is
+inversely proportional to the affected ratio, validating the theoretical
+relationship Speedup ≈|𝑉|/|A|. Second, large graphs benefit dispro-
+portionately: because |A|/|𝑉| is inherently small on graphs with mil-
+lions of nodes, StreamTGN delivers order-of-magnitude speedups that
+are robust to parameter choices.
+5
+RELATED WORK
+We review related work along three dimensions: temporal GNN models,
+training system optimizations, and inference optimizations for graph
+neural networks.
+5.1
+Temporal Graph Neural Networks
+Temporal GNN models extend static GNNs to dynamic graphs by in-
+corporating temporal information into message passing. TGAT [32] ap-
+plies self-attention over time-stamped neighbors with temporal encod-
+ing. TGN [18] introduces a memory module that maintains per-node
+state vectors updated via GRU cells, capturing long-term temporal pat-
+terns beyond the immediate neighborhood. DySAT [19] uses structural
+and temporal self-attention over graph snapshots. JODIE [10] and DyRep [24]
+model evolving node representations through coupled recurrent net-
+works. APAN [28] proposes asynchronous propagation to reduce re-
+dundant computation during training. These models define the com-
+putational patterns that training and inference systems must support;
+StreamTGN is designed to be model-agnostic and currently supports
+TGN, TGAT, and DySAT.
+5.2
+Training System Optimizations
+A series of systems have been proposed to accelerate temporal GNN
+training on large-scale dynamic graphs. TGL [42] designed the first uni-
+fied framework with a Temporal-CSR data structure and parallel tempo-
+ral sampler, achieving 13× training speedup over individual model im-
+plementations. Orca [11] reuses historical embeddings during training
+with theoretical convergence guarantees, achieving 2–4× speedup over
+TGL. Zebra [12] replaces standard neighborhood aggregation with tem-
+poral personalized PageRank, reducing the computation graph while
+
+
+--- Page 15 ---
+StreamTGN: A GPU-Efficient Serving System for Streaming Temporal Graph Neural Networks
+Conference’17, July 2017, Washington, DC, USA
+200
+400
+600
+800
+1000
+Batch Size (B)
+101
+102
+103
+Index Speedup (×)
+12.5
+7.6
+5.7
+4.7
+4.1
+8.8
+5.7
+4.5
+3.8
+3.4
+16.7
+11.3
+8.7
+7.1
+6.0
+26.6
+16.4
+12.5
+10.3
+8.9
+1614
+978
+739
+605
+515
+(a) Batch Size (B) 
+ Speedup
+WIKI
+REDDIT
+MOOC
+GDELT
+StackOF
+5
+10
+20
+30
+Num Neighbors (K)
+101
+102
+103
+Index Speedup (×)
+6.7
+5.7
+4.8
+4.3
+5.8
+4.5
+3.4
+2.9
+9.2
+8.7
+7.8
+7.1
+14.5
+12.6
+10.6
+9.6
+1129
+738
+472
+367
+(b) Num Neighbors (K) 
+ Speedup
+WIKI
+REDDIT
+MOOC
+GDELT
+StackOF
+per-batch
+3K
+6K
+12K
+never
+Rebuild Interval
+101
+102
+Index Speedup (×)
+5.7
+5.7
+5.7
+5.8
+5.7
+4.5
+4.5
+4.5
+4.5
+4.5
+8.7
+8.6
+8.7
+8.6
+8.7
+12.6
+12.6
+12.5
+12.6
+12.6
+738
+739
+739
+739
+738
+(c) Rebuild Interval 
+ Speedup
+WIKI
+REDDIT
+MOOC
+GDELT
+StackOF
+200
+400
+600
+800
+1000
+Batch Size (B)
+0
+5
+10
+15
+20
+25
+30
+Affected Ratio (%)
+8.0
+13.1
+17.5
+21.1
+24.3
+11.4
+17.6
+22.2
+26.1
+29.7
+6.0
+8.9
+11.6
+14.0
+16.6
+3.8
+6.1
+8.0
+9.7
+11.3
+0.1
+0.1
+0.1
+0.2
+0.2
+(a) Batch Size (B) 
+ Affected Ratio
+WIKI
+REDDIT
+MOOC
+GDELT
+StackOF
+5
+10
+20
+30
+Num Neighbors (K)
+0
+5
+10
+15
+20
+25
+30
+35
+Affected Ratio (%)
+15.0
+17.4
+20.7
+23.1
+17.3
+22.2
+29.3
+34.4
+10.9
+11.6
+12.9
+14.2
+6.9
+8.0
+9.4
+10.5
+0.1
+0.1
+0.2
+0.3
+(b) Num Neighbors (K) 
+ Affected Ratio
+WIKI
+REDDIT
+MOOC
+GDELT
+StackOF
+per-batch
+3K
+6K
+12K
+never
+Rebuild Interval
+0
+5
+10
+15
+20
+Affected Ratio (%)
+17.5
+17.5
+17.4
+17.4
+17.4
+22.2
+22.2
+22.2
+22.2
+22.2
+11.6
+11.6
+11.5
+11.6
+11.6
+8.0
+8.0
+8.0
+8.0
+8.0
+0.1
+0.1
+0.1
+0.1
+0.1
+(c) Rebuild Interval 
+ Affected Ratio
+WIKI
+REDDIT
+MOOC
+GDELT
+StackOF
+Figure 8: Parameter sensitivity analysis across five datasets. Top row: index refresh speedup (log scale); bottom row: affected ratio (%).
+(a) Batch size 𝐵: larger batches dirty more nodes, reducing speedup from 12.5× to 4.1× on WIKI, while Stack-Overflow maintains 515×+
+due to its low affected ratio (<0.2%). (b) Neighbor count 𝐾: more neighbors expand the affected set, with similar inverse trend. (c) Rebuild
+interval: both speedup and affected ratio remain stable from per-batch to never, confirming that periodic rebuilds are unnecessary in
+practice. Speedup is inversely proportional to affected ratio across all settings, validating Speedup ≈|𝑉|/|A|.
+preserving accuracy. ETC [5] introduces adaptive batching to enlarge
+training batches without exceeding information loss bounds, and a three-
+step data access policy that eliminates redundant CPU–GPU data trans-
+fers, achieving 1.6–3.3× speedup over TGL. SIMPLE [6] proposes dy-
+namic GPU data placement that caches frequently accessed features
+in GPU memory, reducing data loading cost by 80–97% and achieving
+1.8–3.8× training speedup. SWIFT [8] develops a secondary-memory-
+based pipeline that distributes data across GPU, main memory, and disk,
+achieving up to 4.3× speedup with 7.9× memory reduction.
+All of these systems share a common limitation: they optimize the
+training loop (backward pass, gradient synchronization, data loading)
+but do not modify the inference pipeline. At serving time, they all exe-
+cute the same full-recomputation procedure as TGL—recomputing em-
+beddings for all |𝑉| nodes per batch regardless of how few nodes are ac-
+tually affected. StreamTGN addresses this complementary bottleneck:
+it is the first system to optimize the inference phase of temporal GNNs,
+and is orthogonal to all training-phase systems above.
+5.3
+Inference Optimizations for Graph Neural
+Networks
+Inference optimization has been studied for static GNNs but remains
+largely unexplored for temporal GNNs.
+Static GNN inference. Several works accelerate static GNN serving
+through caching and incremental computation. GNNAutoScale [3] main-
+tains historical embeddings and updates only a mini-batch of nodes
+per forward pass, enabling training and inference on graphs that ex-
+ceed GPU memory. LazyGNN [35] caches intermediate embeddings and
+selectively recomputes stale entries, reducing inference cost by avoid-
+ing redundant neighborhood aggregation. IGLU [17] proposes instant
+graph learning for dynamic node classification by maintaining approxi-
+mate embeddings that are updated incrementally. GAS [4] precomputes
+multi-hop aggregations to enable scalable inference without neighbor
+sampling. These methods exploit the fact that, in static or slowly evolv-
+ing graphs, most node embeddings remain stable across prediction re-
+quests.
+Dynamic/temporal GNN inference. For temporal GNNs, inference
+optimization is significantly more challenging because the memory mod-
+ule introduces sequential dependencies: each edge updates the mem-
+ory states of its endpoints, which may in turn affect the embeddings
+of their neighbors in subsequent predictions. To our knowledge, no
+prior system provides incremental inference for continuous-time tem-
+poral GNNs with formal correctness guarantees. The closest work is
+DistTGL [43], which distributes TGL’s computation across multiple GPUs
+but still performs full recomputation within each partition. GNNFlow [41]
+supports continuous temporal graph learning on multi-GPU machines
+but focuses on training throughput rather than inference latency.
+StreamTGN fills this gap by providing the first incremental infer-
+ence system for temporal GNNs. Unlike static GNN caching approaches,
+StreamTGN must handle the cascading dirty-flag propagation caused by
+temporal memory updates —a challenge absent in memoryless archi-
+tectures. Unlike distributed training systems, StreamTGN targets per-
+batch inference latency on a single GPU, which is the deployment sce-
+nario for most real-time serving applications.
+6
+CONCLUSION
+Existing temporal graph neural network systems focus on accelerating
+training while leaving the inference pipeline unchanged—every new
+edge triggers 𝑂(|𝑉|) recomputation even though only a small fraction
+of nodes are affected. This paper presents StreamTGN, a streaming
+inference system that exploits the inherent locality of temporal graph
+
+
+--- Page 16 ---
+Conference’17, July 2017, Washington, DC, USA
+, Lingling Zhang, Pengpeng Qiao, Zhiwei Zhang, Ye Yuan, and Guoren Wang
+updates. StreamTGN maintains persistent GPU-resident node memory
+and uses lightweight dirty-flag propagation to identify the affected set
+A after each batch of new edges, recomputing embeddings only for
+A at 𝑂(|A|) cost while producing results identical to full recomputa-
+tion. A drift-aware adaptive rebuild mechanism triggers rebuilds only
+when accumulated approximation error exceeds a provable bound, and
+batched streaming with relaxed ordering improves throughput by pro-
+cessing edges in parallel under bounded staleness.
+Experiments on eight real-world temporal graphs (2K–2.6M nodes)
+demonstrate that StreamTGN achieves 4.5×–739× inference speedup
+for TGN and up to 4,207× for TGAT, with zero accuracy degradation.
+The system generalizes across three architectures (TGN, TGAT, DySAT)
+and is orthogonal to training-phase optimizations: combining SWIFT
+for training with StreamTGN for inference yields up to 24× end-to-end
+speedup.
+For future work, we plan to extend StreamTGN to distributed multi-
+GPU settings for billion-scale graphs and to explore predictive dirty-set
+estimation that anticipates affected nodes before edges arrive, enabling
+preemptive embedding refresh for even lower latency.
+REFERENCES
+[1] Chaoyi Chen, Dechao Gao, Yanfeng Zhang, Qiange Wang, Zhenbo Fu, Xuecang Zhang,
+Junhua Zhu, Yu Gu, and Ge Yu. 2023. NeutronStream: A Dynamic GNN Training Frame-
+work with Sliding Window for Graph Streams. Proceedings of the VLDB Endowment
+17, 3 (2023), 455–468.
+[2] Yue Dai, Xulong Tang, and Youtao Zhang. 2025. Cascade: A dependency-aware effi-
+cient training framework for temporal graph neural network. In Proceedings of the 30th
+ACM International Conference on Architectural Support for Programming Languages and
+Operating Systems, Volume 2. 95–110.
+[3] Matthias Fey, Jan E Lenssen, Frank Weichert, and Jure Leskovec. 2021. Gnnautoscale:
+Scalable and expressive graph neural networks via historical embeddings. In Interna-
+tional conference on machine learning. PMLR, 3294–3304.
+[4] Fabrizio Frasca, Emanuele Rossi, Davide Eynard, Ben Chamberlain, Michael Bronstein,
+and Federico Monti. 2020.
+Sign: Scalable inception graph neural networks.
+arXiv
+preprint arXiv:2004.11198 (2020).
+[5] Shihong Gao, Yiming Li, Yanyan Shen, Yingxia Shao, and Lei Chen. 2024. Etc: Efficient
+training of temporal graph neural networks over large-scale dynamic graphs. Proceed-
+ings of the VLDB Endowment 17, 5 (2024), 1060–1072.
+[6] Shihong Gao, Yiming Li, Xin Zhang, Yanyan Shen, Yingxia Shao, and Lei Chen. 2024.
+Simple: Efficient temporal graph neural network training at scale with dynamic data
+placement. Proceedings of the ACM on Management of Data 2, 3 (2024), 1–25.
+[7] Alessio Gravina and Davide Bacciu. 2024. Deep learning for dynamic graphs: models
+and benchmarks. IEEE Transactions on Neural Networks and Learning Systems 35, 9
+(2024), 11788–11801.
+[8] Rui Guo, Zezhong Ding, Xike Xie, and Jianliang Xu. 2025. Swift: Enabling large-scale
+temporal graph learning on a single machine. Proceedings of the ACM on Management
+of Data 3, 4 (2025), 1–27.
+[9] Shenyang Huang, Farimah Poursafaei, Jacob Danovitch, Matthias Fey, Weihua Hu,
+Emanuele Rossi, Jure Leskovec, Michael Bronstein, Guillaume Rabusseau, and Rei-
+haneh Rabbany. 2023. Temporal graph benchmark for machine learning on temporal
+graphs. Advances in Neural Information Processing Systems 36 (2023), 2056–2073.
+[10] Srijan Kumar, Xikun Zhang, and Jure Leskovec. 2019. Predicting dynamic embedding
+trajectory in temporal interaction networks. In Proceedings of the 25th ACM SIGKDD
+international conference on knowledge discovery & data mining. 1269–1278.
+[11] Yiming Li, Yanyan Shen, Lei Chen, and Mingxuan Yuan. 2023. Orca: Scalable temporal
+graph neural network training with theoretical guarantees. Proceedings of the ACM on
+Management of Data 1, 1 (2023), 1–27.
+[12] Yiming Li, Yanyan Shen, Lei Chen, and Mingxuan Yuan. 2023. Zebra: When temporal
+graph neural networks meet temporal personalized pagerank. Proceedings of the VLDB
+Endowment 16, 6 (2023), 1332–1345.
+[13] Shaohua Liu, Yu Qi, Gen Li, Mingjian Chen, Teng Zhang, Jia Cheng, and Jun Lei. 2023.
+STGIN: Spatial-temporal graph interaction network for large-scale POI recommenda-
+tion. In Proceedings of the 32nd ACM international conference on information and knowl-
+edge management. 4120–4124.
+[14] Yuhong Luo and Pan Li. 2022. Neighborhood-aware scalable temporal network repre-
+sentation learning. In Learning on Graphs Conference. PMLR, 1–1.
+[15] Amin Milani Fard, Ebrahim Bagheri, and Ke Wang. 2019. Relationship prediction in
+dynamic heterogeneous information networks. In European conference on information
+retrieval. Springer, 19–34.
+[16] Alireza Namazi, Haiying Shen, Tanmoy Sen, and Minjia Zhang. 2025. Degree-Based
+Scheduling and Memory Management for Large-Scale Exact Online GNN Inference. In
+2025 IEEE International Conference on Big Data (BigData). IEEE, 1–10.
+[17] S Deepak Narayanan, Aditya Sinha, Prateek Jain, Purushottam Kar, and SUNDARARA-
+JAN SELLAMANICKAM. [n. d.]. IGLU: Efficient GCN Training via Lazy Updates. In
+International Conference on Learning Representations.
+[18] Emanuele Rossi, Ben Chamberlain, Fabrizio Frasca, Davide Eynard, Federico Monti,
+and Michael Bronstein. 2020. Temporal graph networks for deep learning on dynamic
+graphs. arXiv preprint arXiv:2006.10637 (2020).
+[19] Aravind Sankar, Yanhong Wu, Liang Gou, Wei Zhang, and Hao Yang. 2020. Dysat:
+Deep neural representation learning on dynamic graphs via self-attention networks.
+In Proceedings of the 13th international conference on web search and data mining. 519–
+527.
+[20] Rishov Sarkar, Stefan Abi-Karam, Yuqi He, Lakshmi Sathidevi, and Cong Hao. 2023.
+FlowGNN: A dataflow architecture for real-time workload-agnostic graph neural net-
+work inference. In 2023 IEEE International Symposium on High-Performance Computer
+Architecture (HPCA). IEEE, 1099–1112.
+[21] Guangming Sheng, Junwei Su, Chao Huang, and Chuan Wu. 2024. Mspipe: Efficient
+temporal gnn training via staleness-aware pipeline. In Proceedings of the 30th ACM
+SIGKDD Conference on Knowledge Discovery and Data Mining. 2651–2662.
+[22] Jie Sun, Zuocheng Shi, Li Su, Wenting Shen, Zeke Wang, Yong Li, Wenyuan Yu, Wei
+Lin, Fei Wu, Bingsheng He, et al. 2025. Helios: Efficient distributed dynamic graph
+sampling for online gnn inference. In Proceedings of the 30th ACM SIGPLAN Annual
+Symposium on Principles and Practice of Parallel Programming. 2–15.
+[23] Jie Sun, Mo Sun, Zheng Zhang, Zuocheng Shi, Jun Xie, Zihan Yang, Jie Zhang, Zeke
+Wang, and Fei Wu. 2025. Hyperion: Co-Optimizing SSD Access and GPU Computation
+for Cost-Efficient GNN Training. In 2025 IEEE 41st International Conference on Data
+Engineering (ICDE). IEEE, 321–335.
+[24] Rakshit Trivedi, Mehrdad Farajtabar, Prasenjeet Biswal, and Hongyuan Zha. 2019.
+Dyrep: Learning representations over dynamic graphs. In International conference on
+learning representations.
+[25] Jana Vatter, Ruben Mayer, and Hans-Arno Jacobsen. 2023. The evolution of distributed
+systems for graph neural networks and their origin in graph processing and deep learn-
+ing: A survey. Comput. Surveys 56, 1 (2023), 1–37.
+[26] Chunyang Wang, Desen Sun, and Yuebin Bai. 2023. PiPAD: Pipelined and parallel
+dynamic GNN training on GPUs. In Proceedings of the 28th ACM SIGPLAN Annual
+Symposium on Principles and Practice of Parallel Programming. 405–418.
+[27] Rui Wang, Weixu Zong, Shuibing He, Xinyu Chen, Zhenxin Li, and Zheng Dang. 2024.
+Efficient large graph processing with {Chunk-Based} graph representation model. In
+2024 USENIX annual technical conference (USENIX ATC 24). 1239–1255.
+[28] Xuhong Wang, Ding Lyu, Mengjian Li, Yang Xia, Qi Yang, Xinwen Wang, Xinguang
+Wang, Ping Cui, Yupu Yang, Bowen Sun, et al. 2021. Apan: Asynchronous propagation
+attention network for real-time temporal graph embedding. In Proceedings of the 2021
+international conference on management of data. 2628–2638.
+[29] Yuke Wang, Boyuan Feng, Gushu Li, Shuangchen Li, Lei Deng, Yuan Xie, and Yufei
+Ding. 2021. {GNNAdvisor}: An adaptive and efficient runtime system for {GNN}
+acceleration on {GPUs}. In 15th USENIX symposium on operating systems design and
+implementation (OSDI 21). 515–531.
+[30] Yufeng Wang and Charith Mendis. 2024. Tglite: A lightweight programming frame-
+work for continuous-time temporal graph neural networks. In Proceedings of the 29th
+ACM International Conference on Architectural Support for Programming Languages and
+Operating Systems, Volume 2. 1183–1199.
+[31] Yaqi Xia, Zheng Zhang, Donglin Yang, Chuang Hu, Xiaobo Zhou, Hongyang Chen,
+Qianlong Sang, and Dazhao Cheng. 2024. Redundancy-free and load-balanced tgnn
+training with hierarchical pipeline parallelism. IEEE Transactions on Parallel and Dis-
+tributed Systems 35, 11 (2024), 1904–1919.
+[32] Da Xu, Chuanwei Ruan, Evren Korpeoglu, Sushant Kumar, and Kannan Achan. 2020.
+Inductive representation learning on temporal graphs. arXiv preprint arXiv:2002.07962
+(2020).
+[33] Yuanyuan Xu, Wenjie Zhang, Xuemin Lin, and Ying Zhang. 2025. Unidyg: a unified and
+effective representation learning approach for large dynamic graphs. IEEE Transactions
+on Knowledge and Data Engineering (2025).
+[34] Yuanyuan Xu, Wenjie Zhang, Ying Zhang, Maria Orlowska, and Xuemin Lin. 2024.
+TimeSGN: Scalable and effective temporal graph neural network. In 2024 IEEE 40th
+International Conference on Data Engineering (ICDE). IEEE, 3297–3310.
+[35] Rui Xue, Haoyu Han, MohamadAli Torkamani, Jian Pei, and Xiaorui Liu. 2023.
+Lazygnn: Large-scale graph neural networks via lazy propagation. In International Con-
+ference on Machine Learning. PMLR, 38926–38937.
+[36] Hongxia Yang. 2019. Aligraph: A comprehensive graph neural network platform. In
+Proceedings of the 25th ACM SIGKDD international conference on knowledge discovery
+& data mining. 3165–3166.
+[37] Jianbang Yang, Dahai Tang, Xiaoniu Song, Lei Wang, Qiang Yin, Rong Chen, Wenyuan
+Yu, and Jingren Zhou. 2022. GNNLab: a factored system for sample-based GNN training
+over GPUs. In Proceedings of the Seventeenth European Conference on Computer Systems.
+417–434.
+[38] Dalong Zhang, Xianzheng Song, Zhiyang Hu, Yang Li, Miao Tao, Binbin Hu, Lin Wang,
+Zhiqiang Zhang, and Jun Zhou. 2023. InferTurbo: A scalable system for boosting full-
+graph inference of graph neural network over huge graphs. In 2023 IEEE 39th Interna-
+tional Conference on Data Engineering (ICDE). IEEE, 3235–3247.
+[39] Yao Zhang, Yun Xiong, Yongxiang Liao, Yiheng Sun, Yucheng Jin, Xuehao Zheng, and
+Yangyong Zhu. 2023. Tiger: Temporal interaction graph embedding with restarts. In
+Proceedings of the ACM web conference 2023. 478–488.
+[40] Da Zheng, Xiang Song, Qi Zhu, Jian Zhang, Theodore Vasiloudis, Runjie Ma, Houyu
+Zhang, Zichen Wang, Soji Adeshina, Israt Nisa, et al. 2024. GraphStorm: all-in-one
+graph machine learning framework for industry applications. In Proceedings of the 30th
+ACM SIGKDD Conference on Knowledge Discovery and Data Mining. 6356–6367.
+[41] Yuchen Zhong, Guangming Sheng, Tianzuo Qin, Minjie Wang, Quan Gan, and Chuan
+Wu. 2023. Gnnflow: A distributed framework for continuous temporal gnn learning
+on dynamic graphs. arXiv preprint arXiv:2311.17410 (2023).
+[42] Hongkuan Zhou, Da Zheng, Israt Nisa, Vasileios Ioannidis, Xiang Song, and George
+Karypis. 2022. TGL: a general framework for temporal GNN training on billion-scale
+graphs. Proceedings of the VLDB Endowment 15, 8 (2022), 1572–1580.
+
+
+--- Page 17 ---
+StreamTGN: A GPU-Efficient Serving System for Streaming Temporal Graph Neural Networks
+Conference’17, July 2017, Washington, DC, USA
+[43] Hongkuan Zhou, Da Zheng, Xiang Song, George Karypis, and Viktor Prasanna. 2023.
+Disttgl: Distributed memory-based temporal graph neural network training. In Pro-
+ceedings of the International Conference for High Performance Computing, Networking,
+Storage and Analysis. 1–12.
+[44] Qiqi Zhou, Yanyan Shen, and Lei Chen. 2025. Faster Convergence in Mini-batch Graph
+Neural Networks Training with Pseudo Full Neighborhood Compensation. Proceedings
+of the VLDB Endowment 18, 11 (2025), 4309–4322.
