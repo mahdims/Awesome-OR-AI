@@ -1,10 +1,21 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-03-24
+**Last Updated:** 2026-03-26
 
 ---
 
 ## Recent Papers
+
+#### 2026-03-26 (1 papers)
+
+### [cuGenOpt: A GPU-Accelerated General-Purpose Metaheuristic Framework for Combinatorial Optimization](https://arxiv.org/abs/2603.19163)
+
+**2026-03-19** | Independent Researcher, Shenzhen, China | M=5 P=6 I=7 *discuss*
+
+*Method:* GPU-accelerated metaheuristic framework with 'one block evolves one solution' CUDA architecture, two-level adaptive operator selection (AOS), and hardware-aware resource management. | *LLM role:* modeling_assistant
+
+> cuGenOpt is a GPU-accelerated metaheuristic framework that uses a 'one block evolves one solution' CUDA architecture and JIT compilation to solve combinatorial optimization problems. The results are rigorously backed by hardware benchmarks, showing it matches OR-Tools on small instances and vastly outperforms MIP solvers, though it struggles with large-scale VRP (>200 nodes) due to memory limits. WHAT WE LEARNED: The framework allows user-defined search operators (CUDA snippets) to be JIT-compiled and evaluated massively in parallel on the GPU. For us, this is highly actionable: we could use cuGenOpt as the high-throughput fitness evaluation backend for AlgoEvo, taking our LLM-generated ALNS operators, compiling them via their JIT pipeline, and evaluating them across thousands of instances in seconds to solve our scalability bottlenecks.
+
 
 #### 2026-03-22 (5 papers)
 
