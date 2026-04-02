@@ -1,10 +1,21 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-03-31
+**Last Updated:** 2026-04-02
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-02 (1 papers)
+
+### [Execution-Verified Reinforcement Learning for Optimization Modeling](https://arxiv.org/abs/2604.00442)
+
+**2026-04-01** | Chinese Academy of Sciences, Nanjing University, Nanjing University of Science and Technology | M=7 P=8 I=7 **MUST-READ** *discuss*
+
+*Method:* Execution-Verified Reinforcement Learning (EVOM) with GRPO and DAPO for solver-conditioned code generation | *LLM role:* code_writer
+
+> EVOM trains LLMs for operations research modeling using execution-verified reinforcement learning (GRPO/DAPO) based solely on solver outcomes, bypassing expensive process-level supervision. The results are backed by solid empirical evaluations on OptiBench, NL4OPT, and IndustryOR, demonstrating that it matches or beats process-supervised SFT (ORLM) and enables zero-shot transfer to new solvers (e.g., Gurobi to OR-Tools). The key takeaway is that outcome-only RL prevents the model from overfitting to solver-specific syntax (a major flaw in SFT), forcing it to learn invariant mathematical structures; additionally, their two-stage cold-start trick (LLM-translate 100 samples -> SFT -> RL) is a highly stealable technique for adapting to new environments. This is highly relevant for our OR-Bench project, and we should consider implementing execution-verified RL baselines and leveraging their cold-start adaptation trick when targeting new solvers in our evolutionary search pipelines.
+
 
 #### 2026-03-01 (1 papers)
 

@@ -1,10 +1,29 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-03-31
+**Last Updated:** 2026-04-02
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-02 (2 papers)
+
+### [Rocks, Pebbles and Sand: Modality-aware Scheduling for Multimodal Large Language Model Inference](https://arxiv.org/abs/2603.26498)
+
+**2026-03-27** | IMDEA Software Institute, Universidad Politécnica de Madrid | M=5 P=8 I=7 **MUST-READ** *discuss*
+
+*Method:* Modality-aware dynamic priority scheduling with aging mechanism | *LLM role:* target_of_optimization
+
+> RPS-Serve introduces a modality-aware scheduler for multimodal LLMs that classifies requests into 'rocks' (video), 'pebbles' (image), and 'sand' (text) based on predicted prefill latency and memory, using dynamic priorities and aging to prevent head-of-line blocking. The results are real and backed by solid systems experiments on vLLM, showing a 78.5% reduction in time-to-first-token for latency-critical text requests compared to FCFS and EDF baselines. The core takeaway is that multimodal workloads completely break standard text-only LLM serving assumptions because video/image prefill times and KV-cache footprints are orders of magnitude larger. This matters directly for our GPUSched project: any OR formulation we develop for LLM inference scheduling must now explicitly model this extreme multimodal variance rather than assuming homogeneous text workloads.
+
+### [DFLOP: A Data-driven Framework for Multimodal LLM Training Pipeline Optimization](https://arxiv.org/abs/2603.25120)
+
+**2026-03-26** | Microsoft Gray Systems Lab, SK Telecom, Yonsei University | M=6 P=5 I=7 *discuss*
+
+*Method:* Data-driven co-optimization of 3D parallelism configuration and runtime microbatch scheduling using empirical profiling, an expected makespan minimization algorithm, and a hybrid ILP/LPT scheduler. | *LLM role:* none
+
+> DFLOP optimizes distributed 3D parallelism for multimodal LLM training by combining offline profiling with an online ILP-based microbatch scheduler to minimize pipeline bubbles caused by heterogeneous data inputs. The results are real and backed by extensive hardware experiments, showing up to 3.6x throughput improvements over Megatron-LM. The single most useful takeaway for us is their hybrid online scheduling architecture: running an ILP solver asynchronously on the CPU to schedule the next batch while the GPU processes the current one, with a strict time limit that falls back to a fast Longest Processing Time (LPT) heuristic. Although this targets training, this exact asynchronous OR-based scheduling architecture and their adaptive throughput correction mechanism are directly stealable for our GPUSched project on LLM serving optimization.
+
 
 #### 2026-03-26 (1 papers)
 

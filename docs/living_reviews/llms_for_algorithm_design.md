@@ -1,10 +1,37 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-03-31
+**Last Updated:** 2026-04-02
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-02 (3 papers)
+
+### [CliffSearch: Structured Agentic Co-Evolution over Theory and Code for Scientific Algorithm Discovery](https://arxiv.org/abs/2604.01210)
+
+**2026-04-01** | IBM Research | M=8 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* LLM-agent-instantiated evolutionary computation over structured scientific artifacts (theory+code or code_only) | *LLM role:* evolutionary_search
+
+> CliffSearch is an LLM-based evolutionary framework that co-evolves algorithm theory and code, using specialized agents for crossover, two-path mutation (exploration vs. repair), and explicit reviewer gating. The results are backed by concrete empirical runs on nanoGPT optimizer discovery and transformer hyper-connection search, demonstrating the discovery of genuinely novel geometric routing and optimizer variants rather than trivial hyperparameter tweaks. The single most useful takeaway is the 'reviewer-gated selection' where an LLM explicitly scores candidates on originality and correctness as a hard survival gate before benchmark scores are considered. This is highly relevant for our AlgoEvo project; we should immediately steal the two-path mutation (novelty vs repair) and the originality hard-gate to prevent our populations from converging on unoriginal benchmark-hacking.
+
+### [COvolve: Adversarial Co-Evolution of Large-Language-Model-Generated Policies and Environments via Two-Player Zero-Sum Game](https://arxiv.org/abs/2603.28386)
+
+**2026-03-30** | Örebro University | M=8 P=6 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Co-evolutionary framework leveraging LLMs to generate environments and policies as executable Python code, modeled as a two-player zero-sum game, and solved using Policy Space Response Oracles (PSRO) to compute a mixed-strategy Nash equilibrium (MSNE) over policy populations. | *LLM role:* llm_evolutionary_agent
+
+> COvolve uses LLMs to adversarially co-evolve Python code for both environments (tasks) and policies (agents), using Policy Space Response Oracles (PSRO) to compute a mixed-strategy Nash equilibrium (MSNE) that prevents catastrophic forgetting. The results are backed by solid empirical data across MiniGrid, PyGame, and CARLA, demonstrating that the MSNE approach maintains robust performance across a growing historical archive of environments much better than greedy retention. WHAT WE LEARNED: The use of an empirical payoff matrix and MSNE to evaluate new code against an archive of past opponents/environments is a powerful memory and evaluation mechanism for LLM evolution. This matters immensely for us: we can steal this exact architecture for AlgoEvo or EvoCut by co-evolving hard OR instances (environments) alongside our solver heuristics (policies), using MSNE to ensure our heuristics do not overfit to specific instance types.
+
+### [Evolutionary Discovery of Reinforcement Learning Algorithms via Large Language Models](https://arxiv.org/abs/2603.28416)
+
+**2026-03-30** | Machine Perception and Interaction Lab, Örebro University, Sweden | M=8 P=7 I=8 **MUST-READ** *discuss*
+
+*Method:* Evolutionary search over executable learning update rules using LLM-guided macro mutation and diversity-aware crossover | *LLM role:* evolutionary_search
+
+> This paper evolves executable reinforcement learning update rules using LLMs as macro-mutation and crossover operators, explicitly forbidding standard RL mechanisms to force the discovery of novel algorithms. The results are backed by solid empirical evaluations on Gymnasium benchmarks, showing the evolved algorithms match or beat standard baselines like PPO and SAC on several tasks, though they struggle on a few complex continuous control environments. The single most useful takeaway for us is their diversity-aware crossover, which uses normalized Levenshtein distance to penalize recombining near-duplicate parents, alongside a post-evolution step where the LLM proposes bounds for internal scalar parameters before a final sweep. We should immediately test the Levenshtein-penalized crossover in AlgoEvo to prevent diversity collapse, and adopt the LLM-bounded HPO step to ensure we aren't discarding good heuristics simply because of bad default scalar parameters.
+
 
 #### 2026-03-22 (2 papers)
 
