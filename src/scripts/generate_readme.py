@@ -31,7 +31,9 @@ JSON_GITPAGE = REPO_ROOT / "docs" / "or-llm-daily-web.json"
 README_PATH  = REPO_ROOT / "README.md"
 INDEX_PATH   = REPO_ROOT / "docs" / "index.md"
 
-TOP_N = 5            # papers shown in Most Recent and Best Papers
+TOP_N = 5            # papers shown in Most Recent
+TOP_N_BEST = 7       # papers shown in Best Papers
+BEST_PAPERS_DAYS = 62  # ~2 months lookback for Best Papers
 MAX_FULL_LIST = 500  # safety cap for the full collapsible list
 
 # ── Category display order ────────────────────────────────────────────────────
@@ -322,19 +324,25 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
         shown += 1
     lines.append("")
 
-    # ── Best Papers (top N by M+I+P, L1-analyzed papers only) ────────────────
+    # ── Best Papers (top N by M+I+P, L1-analyzed papers only, last 2 months) ──
+    cutoff = datetime.date.today() - datetime.timedelta(days=BEST_PAPERS_DAYS)
     lines.append("### ⭐ Best Papers\n")
     scored = []
     for _, content in sorted_papers:
         date, title, authors, json_affil, json_venue, aid, json_code = _parse(content)
         if aid in l1 and _is_visible(l1[aid]):
-            scored.append((date, title, authors, json_affil, json_venue, aid, json_code, l1[aid]))
+            try:
+                paper_date = datetime.date.fromisoformat(date)
+            except (ValueError, TypeError):
+                paper_date = datetime.date.min
+            if paper_date >= cutoff:
+                scored.append((date, title, authors, json_affil, json_venue, aid, json_code, l1[aid]))
     scored.sort(key=lambda x: x[7]["score"], reverse=True)
 
     if scored:
         lines.append("| Score | Date | Title | Authors | Affiliation | Links |")
         lines.append("|-------|------|-------|---------|-------------|-------|")
-        for date, title, authors, json_affil, json_venue, aid, json_code, info in scored[:TOP_N]:
+        for date, title, authors, json_affil, json_venue, aid, json_code, info in scored[:TOP_N_BEST]:
             affil = info.get("affiliations") or json_affil
             links = _links_cell(aid, json_code, info.get("code_url", ""))
             lines.append(
