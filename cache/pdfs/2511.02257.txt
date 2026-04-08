@@ -1,0 +1,1384 @@
+--- Page 1 ---
+Fast Algorithms for Scheduling Many-body
+Correlation Functions on Accelerators
+Oguz Selvitopi∗, Emin Ozturk†, Jie Chen§, Ponnuswamy Sadayappan†, Robert G. Edwards§, Aydın Buluc¸∗‡
+∗Applied Mathematics and Computational Research Division, Lawrence Berkeley National Laboratory
+†School of Computing, University of Utah
+‡Department of Electrical Engineering and Computer Sciences, University of California
+§Jefferson Lab, Newport News
+Abstract—Computation of correlation functions is a key opera-
+tion in Lattice quantum chromodynamics (LQCD) simulations to
+extract nuclear physics observables. These functions involve many
+binary batch tensor contractions, each tensor possibly occupying
+hundreds of MBs of memory. Performing these contractions on
+GPU accelerators poses the challenge of scheduling them as
+to optimize tensor reuse and reduce data traffic. In this work
+we propose two fast novel scheduling algorithms that reorder
+contractions to increase temporal locality via input/intermediate
+tensor reuse. Our schedulers take advantage of application-
+specific features, such as contractions being binary and locality
+within contraction trees, to optimize the objective of minimizing
+peak memory. We integrate them into the LQCD analysis soft-
+ware suite Redstar and improve time-to-solution. Our schedulers
+attain upto 2.1x improvement in peak memory, which is reflected
+by a reduction of upto 4.2x in evictions, upto 1.8x in data traffic,
+resulting in upto 1.9x faster correlation function computation
+time.
+Index Terms—Lattice QCD, Correlation functions, Tensor
+contraction, Directed acyclic graph, Scheduling
+I. INTRODUCTION
+Calculations of many-particle correlation functions play an
+important role in producing observables in scientific physics
+systems such as Lattice quantum chromodynamics (LQCD)
+simulations [1]. Correlation function computations for LQCD
+simulations involve contractions of quark propagations that
+describe the interactions between hadrons. Hadronic systems
+consist of mesons and/or baryons, which are subatomic par-
+ticles consisting of quarks held together by gluons. These
+computations include the evaluation of quark propagation
+diagrams, whose number has factorial growth in the number
+of quarks and degrees of freedom of the hadronic system,
+making it computationally challenging to compute even simple
+systems such as two mesons.
+A natural way to represent the evaluation of hadronic
+correlation functions is through graphs, for which vertices
+are used to represent the quarks in hadrons and edges are
+used to represent the quark propagations. In order to evaluate
+the function, a series of quark contractions is performed by
+eliminating one edge at a time until there are two hadrons
+left. Each quark contraction necessitates a batched tensor
+contraction, where the dimension of the tensors (N) in the
+contraction are typically in hundreds but it is desirable to have
+the dimension as large as possible. Moreover, terms of the
+summation used to evaluate the correlation function can be in
+the scale of tens of thousands. Hence, from a computational
+perspective, we have thousands of graphs, each of which
+contain considerable amount of batched tensor contractions
+with individual contraction sizes reaching up to 1024, and with
+some of the contractions appearing in multiple graphs.
+Computing tensor contractions is both compute- and
+memory-intensive. To give an example, storing a single hadron
+node may require hundreds or thousands of MBs: a single
+baryon node with 64 spin components and dimension of
+N = 128 will need 2 GB to store. On an accelerator with
+32 GB of memory, this will result in fewer than 16 hadron
+nodes that can be stored on device memory at any point
+of the execution. Moreover, since the same hadron nodes
+appear in different graphs, data reuse becomes critical in
+optimizing the memory footprint. Throughout the execution
+many intermediate tensors are produced, which are released as
+soon as there are no contractions depending on them. Hence,
+it is important to perform the contractions that depend on the
+same tensors in a short window of time frame as to improve
+data reuse. In this regard, scheduling of contractions becomes
+critical for efficient computation of correlation functions.
+In this work, we address the problem of scheduling ten-
+sor contractions needed by hadronic correlation functions on
+accelerators. Although there are several works that optimize
+tensor contractions [2]–[6], few focus on scheduling. Due to
+the limited device memory, intermediate tensors may need to
+be moved in and out of the device memory using the PCIe
+link between the host and the device. As same tensors may
+be needed by different contractions, an important objective
+of the scheduling should be maximizing tensor reuse (i.e.,
+temporal locality) to reduce the data traffic between host and
+the device. This data traffic can be a big bottleneck preventing
+efficient computation of correlation functions on accelerators,
+especially for large N. When we consider the architectural
+trend that time to process data is reduced faster than the time
+to move the data, designing algorithms that focus on the latter
+becomes more important in performance.
+We propose two novel and fast algorithms for schedul-
+ing contractions that are needed by the correlation function
+computations in LQCD simulations. Both of the proposed
+schedulers take advantage of the specific properties that stem
+from the application. Our first scheduler is called the sibling
+scheduler and it exploits the property that each contraction
+arXiv:2511.02257v1  [cs.DC]  4 Nov 2025
+
+
+--- Page 2 ---
+is binary. Our second scheduler is called the tree scheduler
+and it exploits the locality found within contraction trees to
+schedule them as a whole. Sibling scheduler is faster but
+makes localized decisions. On the other hand, tree scheduler
+is more involved and takes into account the entire state of the
+memory in making scheduling decisions with a well-defined
+gain definition. Both schedulers make use of the contraction
+directed acyclic graph (DAG), which is constructed from the
+individual graphs that represent the correlation functions.
+We realize the proposed schedulers in the LQCD analysis
+software suite Redstar. Redstar solves correlation functions to
+obtain phsyics observables of many-particle systems. It is ca-
+pable of running on shared-memory systems and accelerators
+involving GPUs. With our experiments, we demonstrate that
+the proposed schedulers greatly benefit the computation of
+correlation functions on GPUs within Redstar by optimizing
+data movement. Our contributions are summarized as follows:
+• We propose a scheduler, called the sibling scheduler, that
+exploits the property that each contraction is binary and the
+contraction DAG is shallow.
+• We propose another scheduler, called the tree scheduler, that
+utilizes the locality inherent in contraction trees and uses the
+global state of the memory to make scheduling decisions.
+• We integrate the proposed schedulers into the LQCD anal-
+ysis software Redstar.
+• We validate the proposed schedulers by assessing how well
+they optimize their target objective on the contraction DAGs
+corresponding to the hadronic correlation functions.
+• We conduct extensive experiments within Redstar on six
+different correlation functions to demonstrate their effec-
+tiveness in reducing data traffic between CPU and GPU and
+improving time-to-solution of correlation functions.
+The rest of the paper is organized as follows. In Section II,
+we introduce the notation and define the problem addressed.
+We describe the proposed schedulers and analyze them in
+Section III. We present the obtained results in Section IV.
+We provide the related work in Section V and conclude in
+Section VI.
+II. PRELIMINARIES
+A. Redstar software suite
+Redstar1 is a Lattice QCD analysis software suite developed
+for the purpose of constructing and evaluating correlation
+functions on shared-memory and many-core architectures. It
+manages a workflow that consists of several stages and makes
+use of different libraries. A unique feature and central to
+the design of Redstar is the graph representation of quark
+propagations [7] in which hadron nodes and quarks in them are
+represented by vertices and quark propagations are represented
+by edges. Redstar’s input is a list of correlation functions that
+describe a physics system, from which it produces hadron
+nodes and associated graphs. Using these graphs, it forms a
+general directed acyclic graph (DAG) that encompasses all
+correlation functions, and performs graph-based optimizations
+1https://github.com/JeffersonLab/redstar
+to efficiently generate execution queues to perform hundreds
+of thousands of tensor contractions. Redstar is capable of
+performing contractions in parallel on CPUs and GPUs.
+Among some of the libraries Redstar uses are Hadron and
+Colorvec, the former mainly responsible for performing tensor
+contractions and the latter construction of hadron nodes.
+Data reuse and scheduling. In order to increase data reuse
+and reduce memory footprint, in determining a contraction
+path for a correlation function Redstar first pre-processes edges
+to compute the occurrence of each edge in all contraction
+trees. Then, it assigns a value to each edge in a contrac-
+tion tree using the computed frequencies and the computa-
+tional complexity of the respective contraction (which can
+be O(N 3), O(N 4), O(N 5)). Hence, in selecting a contraction
+path, it prefers edges that occur across different contraction
+trees and contractions that are expensive. By doing so, it can
+avoid repeated computation of expensive contractions. Redstar
+also exploits data reuse by processing contraction trees that
+share common contractions successively. To do so, it sorts
+the contraction trees based on their similarity. In this way,
+a shared tensor can be released as soon as the contraction
+trees that need this tensor are processed. However, such a
+static and localized approach may still suffer high memory
+footprint because reordering of the trees does not consider
+the entire state of the memory, but rather similarity to another
+contraction tree. In our work, we propose schedulers that aims
+to find contraction orders that improves data reuse and reduce
+peak memory. Redstar has another scheduler [8] for multiple
+GPUs but this is not focus of our work.
+GPU memory management. Tensor contractions require
+large amount of memory. Each tensor can occupy hundreds
+of MBs of memory and computation of the correlation func-
+tions can produce hundreds of thousands of intermediate
+tensors. Limited amount of GPU memory necessitates efficient
+management of memory resources on the device. For this
+purpose, Redstar relies on a custom memory management
+framework called MemHC [9]. MemHC includes several op-
+timizations specifically targeting correlation functions such
+as duplication-aware management, lazily-released memory
+blocks, pre-protected LRU eviction policy, etc. When there is
+not enough memory on the device for a contraction, MemHC
+evicts memory blocks to host memory. If the scheduling order
+of contractions has poor tensor reuse, this will result in a lot
+of data movement between the host and the device due to
+evictions. The data moved from host to device can go up to a
+few TBs, making the PCI bus a bottleneck. For example, the
+default sorting-based contraction scheduler in Redstar causes
+more than 7 TB of data traffic between host and device on the
+roper dataset for the tensor dimension of 64. The proposed
+schedulers in this work aim to overcome this bottleneck.
+B. Notation
+The input to the computations of correlation functions is a
+set of k contraction trees, denoted with T = {T1, T2, · · · , Tk},
+which are rooted and directed. The node sets of a pair of trees
+in T need not be disjoint except the roots of these trees. Each
+
+
+--- Page 3 ---
+Fig. 1: The contraction DAG formed from three contraction
+trees. Nodes that appear in multiple trees are shown in green
+color. The edges that appear in multiple trees are shown with
+dashed arrows.
+tree constructed for the computation of correlation functions
+in our application typically has a few nodes in it, usually no
+more than 10 or 15, and there are many contraction trees
+whose number can range from a few thousand to hundreds
+of thousands, depending on the type and parameters of LQCD
+simulations.
+From T , a contraction DAG G = (V, E) is formed, in
+which each node u ∈V
+represents a tensor contraction
+and/or a tensor, and each directed edge (u, v) ∈E represents
+the dependency of the contraction represented by v to the
+tensor represented by u. The leaf nodes in V represent only
+a tensor, while the non-leaf nodes represent both a tensor
+contraction and the output tensor produced by that contraction.
+Fig. 1 shows an example contraction DAG formed from three
+contraction trees. We have the following fields for each node
+u:
+• u.child: Inputs of a tensor contraction (for non-leaf nodes).
+We also use u.left and u.right to refer to the specific child
+of a node as in context as there are only two children of a
+non-leaf node u.
+• u.parents: The contractions that depend on this tensor. For
+the roots of trees in T , u.parents = ∅.
+• u.type: The type of a node can be one of the following:
+LEAF, INTERIOR, ROOT. The nodes that do not have any
+input edges are of type LEAF, whereas the nodes that do
+not have any output edges are of type ROOT and there
+is one root for every contraction tree Ti, i.e., there are k
+ROOT nodes. The remaining set of nodes are INTERIOR
+nodes that correspond to the contractions which need to be
+scheduled and their outputs need to be stored as long as
+they are needed. The total number of contractions hence is
+given by the number of INTERIOR and ROOT nodes, i.e.,
+number of non-leaf nodes.
+• u.cost: The computational cost of the binary contraction.
+• u.size: The size of the tensor represented by u in memory.
+Finally, there is a weight associated with each edge (u, v),
+denoted with w(u, v), which is equal to the size of the tensor
+needed by the contraction represented by v, i.e., w(u, v) =
+u.size.
+Finally, the proposed algorithms are easily generalized to the
+general case where each node has arbitrary number children
+without affecting their runtime complexity. We use the notation
+TABLE I: Memory used in two different schedules on the
+contraction DAG in Fig. 1.
+Memory contents
+Schedule
+Contraction
+Before
+After
+Size
+S1
+e
+∅
+{b, e}
+2
+g
+{b, e}
+{a, b, e}
+3
+h
+{a, b, e}
+{a, b}
+2
+f
+{a, b}
+∅
+0
+S2
+f
+∅
+{a, b}
+2
+e
+{a, b}
+{a, e}
+2
+g
+{a, e}
+{a}
+1
+h
+{a}
+∅
+0
+u.left and u.right when the scheduler exploits the property
+that each node has two children (i.e., sibling scheduler in
+Section III-A), and the notation u.child otherwise (i.e, tree
+scheduler in Section III-B).
+C. Problem definition
+We first describe the memory model we use for scheduling
+the nodes of the contraction DAG. A tensor remains in memory
+as long as it is needed by a contraction that is not yet
+performed. At the beginning, we assume the tensors that
+correspond to the leaf nodes reside in the host memory and
+not in device memory. Hence, a tensor corresponding to a
+leaf node is not considered to be consuming memory until
+the first contraction that depends on that leaf is performed.
+Consider a sequence of n contractions c1, c2, · · · , cn and let
+Mi−1 be the amount of memory used before performing ci,
+where M0 = 0. Processing ci has the following steps: (i) bring
+any tensor that correspond to leaf nodes that ci depends on to
+memory, if any, (ii) perform ci and produce its output tensor,
+and (iii) release the tensors that do not have any contractions
+depending on them, including the one produced by ci. Note
+that the tensors that correspond to interior nodes that ci depend
+on are already in memory before performing ci. After these
+steps, the used memory is Mi. The peak memory in this
+sequence of contractions is given by maxi Mi and the memory
+change due to performing ci is Mi−Mi−1. Note that Mn = 0.
+Table I presents the contents of the memory for two different
+contraction schedules S1 and S2 on the contraction DAG in
+Fig. 1.
+We address the problem of finding a sequential schedule of
+the contraction DAG that minimizes the peak memory, i.e., that
+minimizes maxi Mi. A good scheduler should intuitively max-
+imize data reuse in order to reduce peak memory. Reducing the
+peak memory should reduce the evictions in Redstar described
+earlier, resulting in reduced data transfers between host and
+device, and hence improved runtime for the computation of
+correlation functions.
+III. SCHEDULING HEURISTICS
+In this section propose two schedulers, sibling scheduler and
+tree scheduler, to solve the problem defined in Section II-C.
+A. Sibling scheduler
+The sibling scheduler aims to exploit the structural property
+of the contraction DAG that each contraction is binary. As
+
+
+--- Page 4 ---
+Algorithm 1 SB-SCHEDULER (G = (V, E))
+1: Let Q1, Q2, · · · , Qq be empty queues
+2: while There are contractions to schedule do
+3:
+if All queues are empty then
+4:
+Let u be a random leaf with u.state = WAITING
+5:
+else
+6:
+Let i be the largest integer such that Qi ̸= ∅
+7:
+u = DEQUEUE(Qi)
+8:
+SB-PROCESS(u)
+soon as the contraction represented by u is complete and
+its output is produced, it strives to complete the contractions
+represented by each node v that are sibling of u as to enable
+the parent contractions. The scheduler gives a higher priority
+to the available contractions that are further in the topological
+ordering of G and in this manner aims to achieve a depth-first
+scheduling of the contractions to reduce the memory footprint
+of the stored intermediate tensors.
+The sibling-based scheduler computes and/or maintains the
+following information associated with each vertex u:
+• u.rank: Rank of each node in the contraction DAG, where
+u.rank =
+(
+0
+if u is LEAF,
+max
+v∈u.child (v.rank) + 1
+otherwise.
+(1)
+Ranks are computed prior to scheduling and does not change
+throughout the scheduling of the contractions.
+• u.rs: Number of contractions that depend on the tensor
+represented by u and that are not yet performed, i.e., number
+of remaining successors to enable the release of u. Initially,
+u.rs = |u.parents|.
+• u.rp: Number of tensors that the contraction represented by
+u depends on and that are not yet available, i.e., number of
+remaining predecessors to enable u for contracting. Initially,
+u.rp = |u.child|.
+• u.state: There are four states that may be associated with
+nodes: WAITING, QUEUED, INMEM, and RELEASED. Ini-
+tially, all nodes are in state WAITING.
+The field u.rs is maintained to check whether the tensor
+represented by u is releasable from memory upon completing
+a contraction that depends on it, i.e., it becomes releasable
+when u.rs = 0 where there is not any contraction task that
+depends on this tensor. On the other hand, the field u.rp
+is maintained to see whether we can enqueue the respective
+contraction operation upon a child of u being contracted and
+hence an input tensor for u being available.
+The state field has different semantics depending on whether
+node is leaf or not. A leaf node is in state (i) WAITING if the
+respective tensor is not brought to memory yet, (ii) INMEM
+if the respective tensor is in memory, and (iii) RELEASED
+if the respective tensor is not needed any more and released
+from memory. A non-leaf node, on the other hand, is in state
+(i) WAITING if the respective contraction is not yet available
+for computing, (ii) QUEUED if the respective contraction can
+be scheduled and is in one of the queues, (iii) INMEM if the
+output tensor generated by the respective contraction resides
+in memory, and (iv) RELEASED if the respective tensor is
+not needed any more and released from memory. The state
+Algorithm 2 SB-PROCESS (u)
+1: if u.type ̸= LEAF then
+2:
+Perform the contraction corresponding to u
+3: else
+4:
+Bring the tensor represented by u to memory
+5: u.state = INMEM
+// Check for releasable nodes
+6: if u.type ̸= LEAF then
+7:
+for v ∈u.child do
+8:
+v.rs = v.rs −1
+9:
+if v.rs == 0 then
+10:
+v.state = RELEASED
+11:
+if u.type == ROOT then
+12:
+u.state = RELEASED
+// Process siblings or enqueue parents
+13: for v ∈u.parents do
+14:
+v.rp = v.rp −1
+15:
+if v.rp == 1 then
+16:
+Let w with parent v be the sibling of u
+17:
+if w.state == WAITING then
+18:
+SB-PROP-DOWN(w)
+19:
+else if v.rp == 0 then
+20:
+ENQUEUE(Qv.rank, v)
+21:
+v.state = QUEUED
+QUEUED cannot be used by leaf nodes as it is for the nodes
+that signify a contraction, i.e., non-leaf nodes.
+The sibling-based scheduler maintains a number of queues
+throughout the scheduling process to distinguish between
+contractions of different ranks. Excluding the leaf nodes, we
+maintain q = maxu∈V u.rank queues Q1, Q2, · · · , Qq, where
+Qi contains the nodes v.rank = i. The higher the rank of a
+contraction, the higher its priority, i.e., the contractions in Qi
+has a higher priority than the contractions in Qj, where i > j.
+The sibling scheduler given in Alg. 1 utilizes two helper
+routines SB-PROCESS and SB-PROP-DOWN, presented in
+Alg. 2 and Alg. 3, respectively. In each iteration of the
+scheduler in Alg. 1, we select a contraction task from the
+highest level queue available. If all the queues are empty
+yet there are still contraction tasks that need to be scheduled
+(which may happen at the beginning of the scheduling process
+or due to the structure of the contraction DAG), we select a
+random leaf node. Then we perform some operations triggered
+by the selection of that node by calling SB-PROCESS.
+The SB-PROCESS in Alg. 2 performs the operations after
+a tensor becomes available in memory, which can happen
+either by bringing a tensor that corresponds to a leaf in the
+contraction DAG (line 4 of Alg. 2) or completing a contraction
+task represented by a non-leaf node (line 2 of Alg. 2). These
+operations can be classified into two. In the first (lines 6-
+12 of Alg. 2), we first check for any releasable tensors from
+memory after completing a contraction task u corresponding
+to a non-leaf node by traversing u’s children, and updating and
+checking their rs field. Note that the nodes with ROOT type are
+immediately releasable after being contracted as there are no
+contraction tasks that depend on them (line 11-12 of Alg. 2).
+The second kind of operations involve processing siblings or
+enqueueing parent nodes of u (lines 13-21 of Alg. 2). For
+parent v of u, if u’s respective sibling w is not yet contracted
+and hence the corresponding output tensor is not available, we
+
+
+--- Page 5 ---
+Algorithm 3 SB-PROP-DOWN (u)
+1: if u.state ̸= WAITING then
+2:
+return
+3: if u.type == LEAF then
+4:
+SB-PROCESS(u)
+5:
+return
+6: SB-PROP-DOWN(u.left)
+7: SB-PROP-DOWN(u.right)
+try to make this sibling available by propagating down all the
+nodes in the sub-tree whose root is w (line 18 of Alg. 2) by
+calling SB-PROP-DOWN. Otherwise, both tensors represented
+by u and w are available and in memory, hence the contraction
+represented by parent v can now be performed. Thus, we
+enqueue the corresponding contraction task to the respective
+queue (line 20 of Alg. 2). The operations ENQUEUE and
+DEQUEUE on the queues are self-explanatory.
+The SB-PROP-DOWN in Alg. 3 aims to make the sibling
+of a node available as to enable their parent contraction as
+soon as possible. For this purpose, the leaf descendants of
+the sibling are brought to memory if they are not already in
+memory. The call to SB-PROP-DOWN is done only if there
+is one remaining predecessor of the parent node (line 15 of
+Alg. 2). This is expected to be more effective especially when
+each contraction is binary.
+Runtime complexity. In the sibling scheduler, the routine
+SB-PROCESS can be called on leaf nodes whose state is
+WAITING and for the non-leaf nodes whose state is QUEUED.
+Once SB-PROCESS is called for node u, its state permanently
+changes to either INMEM or RELEASED. Hence SB-PROCESS
+is called only once for each node. Once called for u, this
+routine traverses incoming and outgoing edges of u. Hence,
+runtime complexity of sibling scheduler is O(V + E).
+B. Tree scheduler
+Contraction trees harbor a certain degree of locality within
+themselves as all the tensors produced within a tree will
+be needed by the contractions in that tree. Hence, we can
+take advantage of this specific feature provided by the input
+trees to schedule contractions on a coarse-grain level by
+scheduling contraction trees as a whole. To this end, we
+propose a scheduler based on selecting contraction trees as
+a whole that utilizes the global information about the most
+recent state of the memory. A contraction operation may
+require its input tensors brought to memory which can stay
+in memory after the contraction if there are other contractions
+depending on them, increasing the utilized memory; or it
+may cause its input tensors to be released from memory if
+they are already in memory and do not depend on any other
+contraction, decreasing the utilized memory. The proposed tree
+scheduler efficiently maintains how much increase the subset
+of contractions in a tree will cause in memory and selects
+the next tree based on this information. Note that the memory
+increase can be negative, which means a reduction in memory
+consumption.
+The tree scheduler does not rely upon each non-leaf node
+having two children and can handle contraction DAGs in
+which nodes have arbitrary number of children. Moreover,
+Fig. 2: At each iteration, tree scheduler selects a contraction
+tree (shown on the right), then processes the nodes in that
+contraction tree, and then either keeps tensors in memory
+if they are needed by other contraction trees (shown in the
+middle) or releases them from memory if they are not needed
+by any other contractions (shown on the left).
+although we describe our algorithms for contraction trees, our
+scheduler also works where each Ti is not a tree but a DAG.
+Fig. 2 illustrates the high-level concepts of the tree scheduler.
+The tree scheduler maintains information on both node and
+tree level. For each vertex u, we have the following:
+• u.ctree: The set of trees node u is in.
+• u.state: There are three states that may be associated with
+nodes: AVAIL, INMEM, and RELEASED. All nodes are
+initially in state AVAIL.
+• u.outAv: The set of outgoing neighbors of u that is in state
+AVAIL, i.e., {v : v ∈u.parents and v.state = AVAIL}.
+• τ(u, Ti): Number of outgoing neighbors of u that are in state
+AVAIL and in Ti, i.e., |{v : v ∈u.parents and v.state =
+AVAIL and v ∈Ti}|.
+• δ(u, Ti): Number of outgoing neighbors of u that are
+in
+state
+AVAIL
+and
+not
+in
+Ti,
+i.e.,
+|{v
+:
+v
+∈
+u.parents and v.state = AVAIL and v /∈Ti}|.
+A node is in state (i) AVAIL if the respective tensor has not
+been brought to memory yet or the respective contraction has
+not been performed yet, (ii) INMEM if the respective tensor
+is in memory, and (iii) RELEASED if the respective tensor is
+not needed any more and released from memory. We maintain
+u.ctree as u may appear in more than one contraction tree.
+Observe that τ(u, Ti) + δ(u, Ti) = |u.outAv|. The purpose
+of these will be clear later, but in brief the functions τ and
+δ allow us to perform necessary updates efficiently. Among
+these fields, u.ctree is used for nodes in state AVAIL and the
+rest of them are used for nodes in state INMEM.
+We introduce the concept of gain, which is used to signify
+the change in memory if a contraction or subset of contractions
+were to be performed. Gain is positive if memory consumption
+decreases and negative if memory consumption increases. If
+the utilized memory space before contracting Ti is M, and it
+becomes M ′ after contracting Ti, the gain of Ti is given by
+M −M ′. We do not include temporary memory that might be
+needed while processing the contractions in Ti. We associate
+gains with nodes as well as trees. However, the choices are
+made on the gain values of trees. For each tree Ti, we maintain
+
+
+--- Page 6 ---
+Algorithm
+4
+TR-SCHEDULER (G
+=
+(V, E), T
+=
+{T1, T2, · · · , Tk})
+1: TR-INIT(G, T )
+2: A = T
+3: while A ̸= ∅do
+4:
+T ′ = maxTi∈A Ti.tgain
+5:
+PROCESS-CTREE(T ′)
+6:
+A = A −T ′
+the following:
+• Ti.pred: The set of vertices that have an outgoing neighbor
+in Ti and in state INMEM, i.e., {u : ∃v ∈Ti and (u, v) ∈
+E and u.state = INMEM}.
+• Ti.u.igain: The individual gain signifying the memory
+increase or decrease if the contraction represented by u ∈Ti
+were performed.
+• Ti.cgain: The coarse gain (i.e., Ti as a whole) due to the
+amount of tensors released from memory if contractions in
+Ti were performed.
+• Ti.tgain: The overall gain signifying the memory increase
+or decrease if contractions in Ti were performed. This is
+equal to the summation of individual gains and coarse gain,
+i.e., Ti.cgain + P
+u∈Ti Ti.u.igain.
+Ti.u indicates node u in Ti. We maintain the predecessors
+of Ti, Ti.pred, in order to determine whether performing the
+contractions in Ti enables release of any tensor corresponding
+to a node in Ti.pred. Among the gains associated with each
+tree, only the overall gain, i.e., Ti.tgain, is used in choosing
+the trees for contracting. The rest of the gain fields are kept
+in order to make the description of the algorithms easier.
+The tree scheduler selects the contraction tree Ti with the
+highest gain (using the field Ti.tgain) at each iteration among
+the trees that are not yet contracted (Alg. 4). In that sense, we
+determine a scheduling order for the contraction trees. After
+processing the nodes in Ti, some of the tensors produced
+may remain in memory and some of them may be released
+depending on whether there are contractions in other trees that
+depend on them. The processing of Ti may necessitate gain
+updates of other trees that are not yet contracted. This can
+be done by computing all gains from scratch. However, this is
+prohibitively expensive. We show that the proposed algorithms
+can perform the updates much faster with the help of the fields
+maintained and described above.
+Tree scheduler first initializes the described fields with the
+routine TR-INIT (Alg. 5) and then repeatedly selects a tree
+whose contraction leads to minimum increase (or maximum
+decrease) in memory. Processing of a contraction tree may lead
+to gain updates of other contraction trees. This is handled with
+the routine PROCESS-CTREE (Alg. 6) along with necessary
+field changes due to the operations that result from performing
+contractions in the selected tree.
+Initialization. In Alg. 5 we initialize the fields for nodes
+and contraction trees besides the initial contraction tree gains.
+For the initialization of gains for Ti, we only have individual
+node gains because contracting Ti will not cause any tensor
+that is in memory to be released as the memory is empty
+at the beginning. Hence, Ti.cgain = 0. Recall that the
+Algorithm 5 TR-INIT (G = (V, E), T = {T1, T2, · · · , Tk})
+1: for u ∈V do
+2:
+u.outAv = u.parents
+3:
+u.ctree = ∅
+4:
+u.state = AVAIL
+5: for Ti ∈T do
+6:
+Ti.pred = ∅
+7:
+Ti.cgain = 0, Ti.tgain = 0
+8:
+for u ∈Ti do
+9:
+u.ctree = u.ctree ∪Ti
+// Initialize individual gains
+10: S = ∅
+11: for Ti ∈T do
+12:
+for u ∈Ti do
+13:
+g(u, Ti) = |outAv(u)|
+14:
+S = S ∪g(u, Ti)
+15: for (u, v) ∈E do
+16:
+for Ti ∈u.ctree do
+17:
+if Ti ∈v.ctree then
+18:
+g(u, Ti) = g(u, Ti) −1
+19: for g(u, Ti) ∈S do
+20:
+if g(u, Ti) == 0 then
+21:
+Ti.u.igain = 0
+22:
+else
+23:
+Ti.u.igain = −u.size
+24:
+Ti.tgain = Ti.tgain + g(u, Ti)
+individual gain of a node u ∈Ti determines whether the tensor
+represented by u will remain in memory after processing Ti.
+The tensor represented by u will be kept in memory if there
+are contractions in other trees that depend on this tensor, in
+which case this individual gain is equal to −u.size; otherwise
+it is 0. The individual gains are computed between lines 10-
+24 of Alg. 5 and the initial gain Ti.tgain of Ti is set to the
+summation of these individual gains.
+Fig. 3 illustrates the individual gains of various nodes in
+three trees after initialization. Initial Ti.tgain values are equal
+to the summation of individual gains of these nodes.
+Processing a selected contraction tree. After selecting
+a contraction tree T, Alg. 6 processes the nodes in T in
+topologically sorted order from left to right. It makes use of
+two helper routines for processing a node u ∈T, PROCESS-
+CHILD and PROCESS-NODE, the former for updates related
+to child v of u and the latter for u itself. Processing a node u
+in Alg. 6 changes u’s state from AVAIL to either INMEM or
+RELEASED after making necessary fields updates and possible
+gain updates due to its children. The topological order utilized
+to process nodes in T ensures that upon calling PROCESS-
+Fig. 3: Individual gains of nodes in trees after initialization,
+indicated with the numbers near the nodes. The example
+assumes the nodes have unit sizes.
+
+
+--- Page 7 ---
+Algorithm 6 PROCESS-CTREE (T)
+1: for u ∈T in topologically sorted order do
+2:
+if u.type ̸= LEAF then
+3:
+for v ∈u.child do
+4:
+PROCESS-CHILD(u, v)
+5:
+PROCESS-NODE(u)
+Algorithm 7 PROCESS-CHILD (u, x)
+1: for Ti : x ∈Ti.pred do
+2:
+if u ∈Ti then
+3:
+if τ(x, Ti) == 1 and δ(x, Ti) == 0 then
+4:
+Ti.cgain = Ti.cgain −x.size
+5:
+Ti.tgain = Ti.tgain −x.size
+6:
+τ(x, Ti) = τ(x, Ti) −1
+7:
+if τ(x, Ti) = 0 then
+8:
+Ti.pred = Ti.pred −x
+9:
+else
+10:
+if δ(x, Ti) == 1 then
+11:
+Ti.cgain = Ti.cgain + x.size
+12:
+Ti.tgain = Ti.tgain + x.size
+13:
+δ(x, Ti) = δ(x, Ti) −1
+14: x.outAv = v.outAv −u
+15: if x.outAv == ∅then
+16:
+x.state = RELEASED
+CHILD for child v of u, the state of v is INMEM while the
+state of u is AVAIL.
+Updates due to child x of a node u being processed in
+the selected contraction tree. Contracting a node u ∈Ti
+may trigger gain updates due to its child x as u’s state
+changes from AVAIL to INMEM. Observe that x.state =
+INMEM, otherwise u could not have been processed due to
+the topological ordering used in Alg. 6. In order to handle
+such cases, we present Alg. 7, which makes the necessary
+gain updates for each successor tree of x, i.e., the set of trees
+which has x as their predecessor. To perform these updates
+efficiently, we make use of the functions τ and δ. There are
+a total of five cases of interest, two of which trigger a gain
+update. We consider each Ti where x ∈Ti.pred. Note that
+u may or may not be in Ti and that τ(x, Ti) > 0 as x is
+a predecessor of Ti. We categorize these five cases into two,
+where in three of them u ∈Ti and in two of them u /∈Ti.
+These cases are also illustrated in Fig. 4. Among these five
+cases, the cases (1.b), (1.c), and (2.b) do not cause any gain
+updates, while the case (1.a) causes decrease in Ti’s gain by
+an amount of x.size (lines 3-5 in Alg. 7) and the case (2.a)
+causes an increase in Ti’s gain by an amount of x.size (lines
+10-12 in Alg. 7).
+Apart from the gain updates, Alg. 7 may also update
+functions τ and δ as well as Ti’s predecessor information. At
+the end of Alg. 7 x’s outgoing neighbors with state AVAIL
+excludes u as u’s state is not AVAIL any more (line 14). If
+nothing depends on x, we can release the tensor represented
+by x from memory (line 15-16).
+Updates due to node u being processed in the selected
+contraction tree. After the gain updates due to u’s children
+have been completed (lines 3-4 in Alg. 6), the final task is
+to perform the updates due to node u’s state change from
+AVAIL to either INMEM or RELEASED. These are presented
+in Alg. 8 and consist of gain updates stemming from individual
+Algorithm 8 PROCESS-NODE (u)
+// Individual gain updates
+1: for Ti ∈u.ctree do
+2:
+Ti.tgain = Ti.tgain −Ti.u.igain
+// Setup functions τ(u, ·) and δ(u, ·)
+3: S = ∅
+4: for v ∈u.outAv do
+5:
+for Ti ∈v.ctree do
+6:
+if Ti /∈S then
+7:
+τ(u, Ti) = 0
+8:
+δ(u, Ti) = |u.outAv|
+9:
+S = S ∪Ti
+10:
+Ti.pred = Ti.pred ∪u
+11:
+δ(u, Ti) = δ(u, Ti) −1
+12:
+τ(u, Ti) = τ(u, Ti) + 1
+// Coarse gain updates
+13: for Ti ∈S do
+14:
+if δ(u, Ti) == 0 then
+15:
+Ti.cgain = Ti.cgain + u.size
+16:
+Ti.tgain = Ti.tgain + u.size
+17: if u.outAv == ∅then
+18:
+u.state = RELEASED
+19: else
+20:
+u.state = INMMEM
+and coarse gains as well as setting of functions τ and δ for u.
+Note that we process the nodes in T ′, of which u is one, but u
+may also appear in other trees. After processing u, it will not
+be an element of these trees, hence we exclude the individual
+gains contributed by u (lines 1-2). Then, we set up functions τ
+and δ for each tree u was in (lines 3-12). For this purpose we
+visit the trees for which u has at least one outgoing edge, i.e.,
+S
+v∈u.outAv v.ctree. Contraction of a tree Ti of which u is a
+predecessor would cause release of the tensor represented by
+u from memory if u’s all outgoing connections are only in Ti,
+which is when δ(u, Ti) = 0. To find such trees, we go over all
+the trees u is a predecessor of and update the respective gains
+due to coarse gains (lines 13-16). We finally check whether we
+can release the tensor represented by u (lines 17-20), which
+happens in the case u has no outgoing vertex neighbors whose
+state is AVAIL, i.e., when u.outAv is empty.
+Runtime complexity. We define Fv and Fe to aid the
+runtime complexity analysis. Fv is defined as the average
+number of times a vertex appears in a contraction tree, i.e.,
+(P
+u∈V |u.ctree|)/|V |. Similarly, Fe is defined as the average
+number of times an edge appears in a contraction tree, i.e.,
+Fig. 4: Various cases that may trigger a gain update regarding
+node x whose parent u is being processed.
+
+
+--- Page 8 ---
+TABLE II: Properties of the correlation functions.
+Contraction DAG
+Corr. Func.
+Type
+#Trees
+Complexity
+N
+#Vertices
+#Edges
+Fv
+Fe
+a0-111
+MxM
+19041
+O(N3)
+1024
+18552
+36120
+5.09
+4.09
+a0-d3
+MxM
+3921
+O(N3)
+1536
+3826
+7232
+4.83
+3.83
+f0
+MxMxM
+27999
+O(N3)
+768
+30473
+59416
+4.95
+3.96
+roper
+BxM
+84894
+O(N4)
+64
+90378
+180008
+5.67
+4.67
+deuteron
+BxB
+109444
+O(N4)
+64
+156508
+312720
+7.00
+6.00
+tritium
+BxBxB
+6085
+O(N5)
+32
+7597
+15178
+10.11
+9.75
+(P
+(u,v)∈E |{Ti : u ∈Ti and v ∈Ti}|)/|E|. Although in
+theory Fv and Fe can be as large as number of all contraction
+trees, k, in practice it is constant (see Table II).
+The routine TR-INIT takes O(Fv(V + E)) since for the
+source node of an edge in E, it traverses all the trees that
+source node is in, which on the average is Fv. We next analyze
+on the runtime complexity of all PROCESS-CHILD calls.
+Observe that this routine is called for each edge in E and
+not for each replicated edge in trees. When it is called for an
+edge (x, u) it traverses the successor trees of x and makes
+necessary updates, each of which takes constant time. Hence,
+it takes O(kE). We next focus on the runtime complexity of
+all PROCESS-NODE calls. Observe that PROCESS-NODE is
+called once for each node, and once it is called for node u, u’s
+outgoing edges are checked in line 4 of Alg. 8. Hence, each
+edge in E is checked once in all calls. When making this check
+for edge (u, v), each tree in which the target node v appears
+needs to be processed (line 5 of Alg. 8). The number of such
+trees is on the average Fv. Hence, all PROCESS-NODE calls
+take a total of O(FvE).
+As a result, tree scheduler takes a total of O(FvV +FvE +
+kE). Since, Fv ≤k and in practice |E| > |V |, resulting in
+O(kE).
+IV. EXPERIMENTS
+A. Setting
+We conduct our experiments on six correlation functions
+consisting of different meson and baryon configurations. For
+these function computations we construct the contraction DAG
+as described in Section II. As it is challenging to evaluate the
+correlation functions for larger distillation space basis N and
+Redstar can run out of memory for large N, we select a large
+enough value for N that does not go out of memory. We
+test hadron nodes with different N for our experiments. The
+properties of the tested correlation functions are presented in
+Table II. The columns on the left of the table summarize the
+properties of the correlation functions while the columns under
+“Contraction DAG” summarize the properties of the formed
+contraction DAG for the computation of these functions.
+We evaluate the schedulers on a system that consists of
+a NVIDIA A100 GPU (Ampere architecture), which has 40
+GB HBM2 memory with 1215 MHz clock rate and 6912
+cores with 1.41 GHz clock rate, and a 64-core AMD EPYC
+7763 (Milan) CPU with 2.45 GHz clock rate and a total of
+256 GB DDR4 memory. The CPU and GPU is connected
+with PCIe 4.0. The host codes are compiled with GNU gcc
+13.2 and the device codes use CUDA Toolkit version 12.4.
+We integrated our schedulers into Redstar software suite,
+(a) a0-111
+(b) a0-d3
+(c) f0
+(d) roper
+(e)
+deuteron
+(f) tritium
+Fig. 5: Structures of the contraction DAGs.
+specifically the component that is responsible for managing
+correlation function computations.
+B. Assessment of peak memory on the contraction DAGs
+We compare the peak memory obtained by the schedulers in
+terms of the metric described in Section II-C on the contraction
+DAGs. The purpose of this section is to assess the effectiveness
+of the schedulers in terms of the objective. To do so, we utilize
+execution queues produced in Redstar using the schedulers.
+Each operation in this queue may be one of three operations:
+(i) exterior contract for interior nodes, (ii) contract all for root
+nodes, and (iii) tensor deletion. The tensors corresponding
+to the leaf nodes and that are required by a contraction are
+brought to memory if they are not in memory. After each
+operation in the queue, we record the total sum of sizes of
+the nodes that are in memory. The nodes sizes are divided
+by the greatest common divisor of all distinct sizes to make
+the plots more presentable. Recall that node sizes correspond
+to sizes of the tensors they represent, which may be one
+of {O(N 2), O(N 3), O(N 4)}. Not all of them appear in a
+specific correlation function: in a0-111 (a MxM system) only
+O(N 2) sizes exist while in tritium (a BxBxB system) all
+of them exist. We plot the memory utilization obtained by the
+schedulers in Fig. 6, where the x axis is the operation id in the
+queue and y axis is the memory occupied after that operation.
+The compared schedulers are Redstar’s graph sorting ordering
+of the contractions, abbreviated as RS-GS (Section II), sibling
+scheduler, abbreviated as Sibling (Section III-A), and tree
+scheduler, abbreviated as Tree (Section III-B).
+When we compare the schedulers in the plots in Fig. 6,
+it is seen that the proposed schedulers do a good job of
+addressing the target metric compared to RS-GS. In all six
+datasets, one of the two proposed schedulers achieves smaller
+peak memory than RS-GS. In datasets a0-111, a0-d3, f0,
+roper, deuteron, and tritium, the best of the Sibling
+and Tree attains 2.1x, 1.8x, 1.7x, 1.4x, 1.4x, and 2.0x peak
+memory improvement over RS-GS, respectively. In relatively
+smaller instances a0-111, a0-d3, and f0, Sibling per-
+forms the best, though Tree attains close values to it. In the
+larger instances roper, deuteron, and tritium, Tree
+is clearly the best performing scheduler, while Sibling’s
+performance drops below RS-GS in two of the instances. The
+
+
+--- Page 9 ---
+Fig. 6: Memory utilization of the schedulers for the six different correlation functions. Black dots indicate the peak memory.
+worse performance of Sibling in larger instances can be
+attributed to its disregard of the node sizes and locality of the
+scheduling decisions. Tree on the other hand, attains superior
+peak memory, which validates the design motivation of it:
+having global view of the state of the memory and making
+scheduling decisions dynamically based on this information
+results in better memory optimization. Overall, it can be said
+that Tree is preferable over Sibling and RS-GS.
+C. Effect of scheduling algorithms in Redstar
+In this section we evaluate the performance of the schedulers
+in the LQCD analysis software Redstar. After forming the con-
+traction DAG in Redstar, prior to performing the contractions
+we run schedulers to determine an order. From this order,
+an execution queue is produced and it is used to perform
+contractions or remove tensors that are not needed as the
+operations take place. We use four different metrics to assess
+the schedulers: (i) overall time spent in contractions, (ii)
+total number of evictions, (iii) total number of data transfers
+between host and device, and (iv) total size of data transfers
+between host and device. Recall that an eviction happens when
+a contraction is to be performed on the device but there is not
+enough device memory for performing that contraction. We
+present the time spent for the contractions, which consists
+of allocation, transfer, and deletion of tensors as well as
+performing the contraction. Hence, it is a direct measure of the
+effectiveness of the schedulers within the application. There
+are other components of the Redstar, but those are not of
+interest to our work, and contractions constitute a big portion
+of the overall application time. We also present more detailed
+metrics number and size of transfer operations between host
+and device to assess the reduction in data movement. Among
+these four metrics, reducing the number of evictions is a direct
+consequence of reducing the peak memory (which is the goal
+of the proposed schedulers), and the remaining metrics follow
+from it.
+We present the values obtained by the three schedulers
+regarding the four described metrics on six correlation func-
+tions in Fig. 7. The four metrics time spent in contractions,
+number of evictions, number of data transfers, and size of data
+transfers described above are presented in charts as “Run-
+TABLE III: Total size of data movement (TB).
+Corr. Func.
+RS-GS
+Sibling
+Tree
+a0-111
+2.00
+1.12
+1.11
+a0-d3
+1.12
+0.84
+0.88
+f0
+1.01
+0.55
+0.55
+roper
+7.35
+4.91
+5.47
+deuteron
+0.21
+0.29
+0.20
+tritium
+0.53
+1.34
+0.74
+time”, “#Evictions”, “#Transfers”, and “Size”, respectively.
+The values obtained by Sibling and Tree in each metric
+are normalized with respect to the values obtained by RS-GS
+at that metric. For the bars in the figures, a bar lower than
+1.0 indicates better performance in that metric. For example,
+a value 0.5 for a bar in metric “Size” indicates a 2x reduction
+in amount of data transferred over RS-GS.
+When we compare the number of evictions attained by
+the schedulers in Fig. 7, it can be seen that in all instances
+Sibling and Tree lead to significant reductions. In smaller
+three datasets (a0-111, a0-d3, f0), Sibling performs
+slightly better than Tree in this metric and as the datasets
+get bigger Tree gets to perform the best. Observe that the
+values attained by the schedulers are in agreement with our
+assessment in Section IV-B, validating the effectiveness of
+the target objective of minimizing peak memory utilization.
+When we consider the best of the two proposed schedulers,
+the improvements over RS-GS in the number of evictions are
+1.7x, 1.3x, 1.9x, 1.5x, 4.2x, and 2.4x for a0-111, a0-d3,
+f0, roper, deuteron, and tritium, respectively. The ef-
+fectiveness of Tree is especially noteworthy in larger datasets
+deuteron and tritium.
+The proposed scheduling algorithms often reduce the num-
+ber and size of data transfers, which are presented with bars
+“#Transfers” and “Size” in Fig. 7. In a0-111, a0-d3, f0,
+and roper, our schedulers are able to reduce data movement
+on the PCIe link, while in deuteron they attain similar
+numbers with RS-GS, and in tritium they increase size
+of data movement despite Tree scheduler reduced both the
+number of evictions and data transfers. We present the amount
+of data moved in Table III, with the lowest entry in each row
+is indicated in bold. As seen from the table, the proposed
+schedulers are able to reduce the amount of data moved
+significantly with improvements up to 1.84x. In deuteron
+
+
+--- Page 10 ---
+Fig. 7: Comparison of schedulers in terms of four different metrics within the LQCD analysis software Redstar on six different
+correlation functions. The bars below 1.0 signify an improvement over the baseline scheduler RS-GS.
+TABLE IV: Time spent in computing a schedule (msec).
+Corr. Func.
+RS-GS
+Sibling
+Tree
+a0-111
+3.5
+29.5
+189.1
+a0-d3
+0.5
+3.8
+19.2
+f0
+5.9
+50.0
+295.2
+roper
+26.0
+234.3
+3095.9
+deuteron
+38.4
+451.0
+17005.5
+tritium
+1.5
+25.0
+212.5
+and tritium, the proposed schedulers are not able to make
+gains. This can be attributed to hadron nodes having varying
+sizes, which may prevent the reductions obtained in theory to
+be reflected in practice.
+We finally compare the contraction time in Redstar that
+results from the schedules computed by the schedulers in
+Fig. 7. As seen from the metric “Runtime”, the improvements
+obtained in data transfers reflected in the execution time of the
+contractions. In four of the six correlation functions, we ob-
+serve significant reduction in computing correlation functions,
+while in the remaining two (deuteron and tritium), the
+proposed scheduler Tree is slightly worse than the baseline.
+These runtime results validate the claim that our scheduler
+Tree is a safe and sound alternative for scheduling hadronic
+correlation function computations.
+D. Scheduling overhead
+We compare the time spent by the schedulers to find a
+contraction order for six different systems. Table IV presents
+the runtime of the schedulers in milliseconds. As seen from
+the table, proposed schedulers run slower than the sorting
+used by the Redstar for scheduling. The higher scheduling
+runtime of Tree is in agreement with the runtime com-
+plexity of it. Overall, the time to find a schedule is usually
+negligible compared to the time for performing contractions.
+For example, for roper dataset the overall time spent for
+performing contractions using Tree 631.1 seconds, whereas
+the scheduler overhead is 3.1 seconds. The overhead of Tree
+is somewhat higher for deuteron dataset. However, the
+scheduling overhead stays the same irrespective of the tensor
+dimension: once a good schedule is found, it can reused in
+correlation function computations of any size and while the
+contraction time increases with increasing tensor dimension,
+the scheduling overhead stays the same.
+V. RELATED WORK
+Scheduling of task graphs under memory or I/O constraints
+is an old problem starting with the study of register allocation
+for evaluating expressions [10], with several variants after-
+wards [11]–[13]. In some applications the task graph may be
+a tree and in this case the problem gets easier [14], [15].
+Several memory-aware schedulers have been proposed for
+such cases [16], [17].
+The problem of minimization of peak memory has been
+recently studied for the dataflow graphs [18]. The authors
+focus on two variants of the dataflow graphs, task graphs and
+synchronous dataflow graphs, and propose transformations to
+apply classical algorithms such as branch and bound. The
+memory model utilized in that work, shared buffer model,
+largely differs from the memory model used in our work.
+Another work [19] that aims to reduce peak memory focuses
+on series-parallel task graphs and introduces a new model that
+is based on graphs with weighted vertices. The authors propose
+a polynomial-time algorithm, however it is not feasible in
+practice for large graphs.
+There is also another study [20] that tackles the memory
+footprint of workflows represented by task graphs in order to
+avoid schedules that exceed available memory. Authors’ goal
+is to find the schedule with minimum makespan among a set
+of schedules that do not exceed memory. For this purpose they
+extend the graph with fictitious edges to restrict the concurrent
+execution of memory-intensive tasks. The described work
+focuses on and uses DAGs for parallel applications on shared-
+memory platforms, whereas in our case temporal locality and
+data reuse are the main concerns in finding a good schedule.
+VI. CONCLUSIONS
+We proposed two schedulers to optimize tensor reuse in
+batch contractions produced by the correlation functions in
+
+
+--- Page 11 ---
+LQCD simulations. Our approaches aim to optimize the peak
+memory of the contractions and in this way reduce evictions
+from device memory. We realized and validated our schedulers
+in the LQCD analysis software Redstar. We demonstrated
+the proposed schedulers are able to reduce time-to-solution
+in several tested correlation functions. In future, we aim to
+develop a general node-based scheduler that uses the gain
+concept used by the proposed tree scheduler. We plan to apply
+this scheduler to the contraction DAGs as well as general
+DAGs to demonstrate its efficiency. We also plan to develop
+partitioning models to schedule contractions for multi-GPU
+systems.
+REFERENCES
+[1] M. Peardon, J. Bulava, J. Foley, C. Morningstar, J. Dudek, R. G.
+Edwards, B. Joo, H.-W. Lin, D. G. Richards, and K. J. Juge, “A Novel
+quark-field creation operator construction for hadronic physics in lattice
+QCD,” Phys. Rev. D, vol. 80, p. 054506, 2009.
+[2] A. Abdelfattah, M. Baboulin, V. Dobrev, J. Dongarra, C. Earl,
+J. Falcou, A. Haidar, I. Karlin, T. Kolev, I. Masliah, and S. Tomov,
+“High-performance tensor contractions for gpus,” Procedia Computer
+Science, vol. 80, pp. 108–118, 2016, international Conference on
+Computational Science 2016, ICCS 2016, 6-8 June 2016, San Diego,
+California, USA. [Online]. Available: https://www.sciencedirect.com/
+science/article/pii/S1877050916306536
+[3] A. Bibireata, S. Krishnan, G. Baumgartner, D. Cociorva, C.-C. Lam,
+P. Sadayappan, J. Ramanujam, D. E. Bernholdt, and V. Choppella,
+“Memory-constrained data locality optimization for tensor contractions,”
+in Languages and Compilers for Parallel Computing, L. Rauchwerger,
+Ed.
+Berlin, Heidelberg: Springer Berlin Heidelberg, 2004, pp. 93–108.
+[4] J. Kim, A. Sukumaran-Rajam, C. Hong, A. Panyala, R. K. Srivastava,
+S. Krishnamoorthy, and P. Sadayappan, “Optimizing tensor contractions
+in ccsd(t) for efficient execution on gpus,” in Proceedings of the 2018
+International Conference on Supercomputing, ser. ICS ’18.
+New York,
+NY, USA: Association for Computing Machinery, 2018, p. 96–106.
+[Online]. Available: https://doi.org/10.1145/3205289.3205296
+[5] J. Liu, D. Li, R. Gioiosa, and J. Li, “Athena: high-performance sparse
+tensor contraction sequence on heterogeneous memory,” ser. ICS ’21.
+New York, NY, USA: Association for Computing Machinery, 2021, p.
+190–202. [Online]. Available: https://doi.org/10.1145/3447818.3460355
+[6] Y. Shi, U. N. Niranjan, A. Anandkumar, and C. Cecka, “Tensor con-
+tractions with extended blas kernels on cpu and gpu,” in 2016 IEEE
+23rd International Conference on High Performance Computing (HiPC),
+2016, pp. 193–202.
+[7] J. Chen, R. G. Edwards, and W. Mao, “Graph contractions for
+calculating correlation functions in lattice qcd,” in Proceedings of the
+Platform for Advanced Scientific Computing Conference, ser. PASC
+’23.
+New York, NY, USA: Association for Computing Machinery,
+2023. [Online]. Available: https://doi.org/10.1145/3592979.3593409
+[8] Q. Wang, B. Ren, J. Chen, and R. G. Edwards, “Micco: An enhanced
+multi-gpu scheduling framework for many-body correlation functions,”
+in 2022 IEEE International Parallel and Distributed Processing Sympo-
+sium (IPDPS), 2022, pp. 135–145.
+[9] Q. Wang, Z. Peng, B. Ren, J. Chen, and R. G. Edwards, “Memhc:
+An optimized gpu memory management framework for accelerating
+many-body correlation,” ACM Trans. Archit. Code Optim., vol. 19,
+no. 2, Mar. 2022. [Online]. Available: https://doi.org/10.1145/3506705
+[10] R. Sethi, “Complete register allocation problems,” ser. STOC ’73.
+New York, NY, USA: Association for Computing Machinery, 1973, p.
+182–195. [Online]. Available: https://doi.org/10.1145/800125.804049
+[11] J. R. Gilbert, T. Lengauer, and R. E. Tarjan, “The pebbling problem is
+complete in polynomial space,” in Proceedings of the Eleventh Annual
+ACM Symposium on Theory of Computing, ser. STOC ’79.
+New York,
+NY, USA: Association for Computing Machinery, 1979, p. 237–248.
+[Online]. Available: https://doi.org/10.1145/800135.804418
+[12] P. van Emde Boas and J. van Leeuwen, “Move rules and trade-offs in
+the pebble game,” in Theoretical Computer Science 4th GI Conference,
+K. Weihrauch, Ed.
+Berlin, Heidelberg: Springer Berlin Heidelberg,
+1979, pp. 101–112.
+[13] H. Jia-Wei and H. T. Kung, “I/o complexity: The red-blue pebble
+game,” in Proceedings of the Thirteenth Annual ACM Symposium
+on Theory of Computing, ser. STOC ’81.
+New York, NY, USA:
+Association for Computing Machinery, 1981, p. 326–333. [Online].
+Available: https://doi.org/10.1145/800076.802486
+[14] C.-C. Lam, T. Rauber, G. Baumgartner, D. Cociorva, and P. Sadayappan,
+“Memory-optimal evaluation of expression trees involving large objects,”
+Computer Languages, Systems and Structures, vol. 37, no. 2, pp. 63–
+75, 2011. [Online]. Available: https://www.sciencedirect.com/science/
+article/pii/S1477842410000278
+[15] J. W. H. Liu, “An application of generalized tree pebbling to
+sparse matrix factorization,” SIAM Journal on Algebraic Discrete
+Methods, vol. 8, no. 3, pp. 375–395, 1987. [Online]. Available:
+https://doi.org/10.1137/0608031
+[16] E.
+Agullo,
+P.
+R.
+Amestoy,
+A.
+Buttari,
+A.
+Guermouche,
+J.-Y.
+L’Excellent,
+and
+F.-H.
+Rouet,
+“Robust
+memory-aware
+mappings
+for parallel multifrontal factorizations,” SIAM Journal on Scientific
+Computing, vol. 38, no. 3, pp. C256–C279, 2016. [Online]. Available:
+https://doi.org/10.1137/130938505
+[17] L. Eyraud-Dubois, L. Marchal, O. Sinnen, and F. Vivien, “Parallel
+scheduling of task trees with limited memory,” vol. 2, no. 2, Jun. 2015.
+[Online]. Available: https://doi.org/10.1145/2779052
+[18] P. Fradet, A. Girault, and A. Honorat, “Sequential scheduling of
+dataflow graphs for memory peak minimization,” in Proceedings of the
+24th ACM SIGPLAN/SIGBED International Conference on Languages,
+Compilers, and Tools for Embedded Systems, ser. LCTES 2023.
+New
+York, NY, USA: Association for Computing Machinery, 2023, p.
+76–86. [Online]. Available: https://doi.org/10.1145/3589610.3596280
+[19] E. Kayaaslan, T. Lambert, L. Marchal, and B. Uc¸ar, “Scheduling
+series-parallel task graphs to minimize peak memory,” Theoretical
+Computer Science, vol. 707, pp. 1–23, 2018. [Online]. Available:
+https://www.sciencedirect.com/science/article/pii/S0304397517307053
+[20] L. Marchal, B. Simon, and F. Vivien, “Limiting the memory footprint
+when dynamically scheduling dags on shared-memory platforms,”
+Journal of Parallel and Distributed Computing, vol. 128, pp. 30–
+42, 2019. [Online]. Available: https://www.sciencedirect.com/science/
+article/pii/S0743731518305112

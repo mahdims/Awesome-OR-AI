@@ -1,0 +1,1535 @@
+--- Page 1 ---
+OPTIMIZING ATTENTION ON GPUS BY EXPLOITING GPU ARCHITECTURAL
+NUMA EFFECTS
+Mansi Choudhary1 * Karthik Sangaiah2 Sonali Singh2 Muhammad Osama2 Lisa Wu Wills3 Ganesh Dasika2
+1Department of ECE, Duke University, Durham, USA
+2Advanced Micro Devices Inc., Santa Clara, USA
+3Department of Computer Science, Duke University, Durham, USA
+ABSTRACT
+The rise of disaggregated AI GPUs has exposed a critical bottleneck in large-scale attention workloads: non-
+uniform memory access (NUMA). As multi-chiplet designs become the norm for scaling compute capabilities,
+memory latency and bandwidth vary sharply across compute regions, undermining the performance of traditional
+GPU kernel scheduling strategies that assume uniform memory access. We identify how these NUMA effects
+distort locality in multi-head attention (MHA) and present Swizzled Head-first Mapping, a spatially-aware
+scheduling strategy that aligns attention heads with GPU NUMA domains to exploit intra-chiplet cache reuse. On
+AMD’s MI300X architecture, our method achieves up to 50% higher performance over state-of-the-art attention
+algorithms using conventional scheduling techniques and sustains consistently high L2 cache hit rates of 80-97%.
+These results demonstrate that NUMA-aware scheduling is now fundamental to achieving full efficiency on
+next-generation disaggregated GPUs, offering a path forward for scalable AI training and inference.
+1
+INTRODUCTION
+The growth of machine learning and generative AI has cre-
+ated unprecedented demand for highly efficient compute
+systems. As models scale to billions of parameters, train on
+increasingly large datasets, and handle massive inference
+workloads, the computational requirements have grown ex-
+ponentially, driving the need for more powerful and effi-
+cient AI accelerators. This relentless scaling pressure has
+fundamentally reshaped how ML accelerator architectures,
+including GPUs, are designed and manufactured.
+To meet these scaling demands while managing manufactur-
+ing costs and yields, AI accelerator architectures, including
+AI GPUs, have evolved toward increasingly disaggregated
+designs. Modern AI GPUs feature distributed memory hier-
+archies with multiple memory controllers and cache struc-
+tures spread across large die areas or multiple chiplets. This
+disaggregation, whether through larger monolithic dies with
+distributed resources or chiplet-based multi-die integration,
+fundamentally alters the organization of the memory sub-
+system. Unlike earlier GPU generations with relatively
+uniform memory access patterns, these scaled architectures
+introduce non-uniform memory access (NUMA) effects,
+*Work
+completed
+during
+an
+internship
+at
+Ad-
+vanced Micro Devices Inc.
+Correspondence to:
+Mansi
+Choudhary
+<mc846@duke.edu>,
+Karthik
+Sangaiah
+<karthik.sangaiah@amd.com>.
+where memory access latencies and bandwidth character-
+istics vary significantly based on the spatial relationship
+between compute units and memory resources. Chiplet-
+based designs represent a natural evolution in this trajectory,
+offering improved manufacturing yields and enhanced scala-
+bility while making NUMA effects particularly pronounced
+due to inter-die communication overhead.
+The Transformer architecture (Vaswani et al., 2017) has
+enabled remarkable advances in large language mod-
+els (LLMs) and generative AI. The Attention mechanism,
+the fundamental component of Transformers, has become
+a primary bottleneck in generative AI workloads due to its
+quadratic time and memory complexity as sequence lengths
+grow. This bottleneck has fueled extensive optimization
+efforts over recent years (Dao et al., 2022; Dao, 2024; Shah
+et al., 2025; Sanovar et al., 2025), with approaches rang-
+ing from algorithmic improvements (Dao et al., 2022; Dao,
+2024; Sanovar et al., 2025) to hardware-specific optimiza-
+tions (Shah et al., 2025).
+However, existing attention optimizations largely assume
+uniform memory access patterns and do not account for the
+NUMA effects present in modern scaled GPU architectures.
+Rather than viewing NUMA characteristics as obstacles to
+overcome, we recognize them as creating new opportuni-
+ties for performance optimization through spatially-aware
+kernel design. To demonstrate this approach, we focus our
+study on AMD’s MI300X architecture, which represents
+arXiv:2511.02132v1  [cs.AR]  3 Nov 2025
+
+
+--- Page 2 ---
+HBMs
+(b) Dual-Die GPUs
+L2
+Die 0
+HBMs
+Mem Controller
+CU
+Shared L2
+HBMs
+Memory Controller
+(a) Single-Die GPUs
+Interconnect
+Die 0
+(c) Quad-Die GPUs
+Die 1
+Memory 
+Disaggregation 
+Multi-Die Chiplet 
+Architecture 
+CU
+CU
+CU
+CU
+CU
+CU
+CU
+CU
+CU
+CU
+CU
+CU CU
+Mem Controller
+Interconnect
+HBMs
+Mem Controller
+Mem Controller
+L2
+CU
+CU
+CU
+CU
+CU
+CU
+L2
+Interconnect
+Die 2
+Die 3
+L2
+CU
+CU
+CU
+CU
+CU
+CU
+L2
+CU
+CU
+CU
+CU
+CU
+CU
+Interconnect
+Interconnect
+CU
+CU
+CU
+CU
+CU
+CU
+Mem Controller
+Mem Controller
+CU
+CU CU
+CU
+CU CU
+CU
+L2
+CU CU
+CU
+CU CU
+CU
+CU CU
+CU
+Die 1
+Figure 1. Evolution of GPU architectures toward disaggregated memory hierarchies. (a) Traditional single-die GPU (e.g., NVIDIA
+A100 (NVIDIA, 2020), H100 (NVIDIA, 2022); AMD MI200 series (AMD, 2021)) with unified L2 cache shared across all compute units
+(CUs), providing uniform memory access. (b) Dual-die chiplet architecture (e.g., NVIDIA Blackwell (NVIDIA, 2024a), Rubin (NVIDIA,
+2024b)) with interconnects between dies. (c) Quad-die chiplet architecture (e.g., NVIDIA Rubin Ultra (NVIDIA, 2024c), AMD
+MI300 (AMD, 2023) series) with further disaggregation. Each die has dedicated compute units, L2 cache, and memory controllers
+connected to HBM stacks. While AMD and NVIDIA both employ multi-die designs, the degree to which NUMA effects are exposed to
+software varies by implementation. NVIDIA’s Blackwell maintains full cache coherency between the dies, abstracting the NUMA effects
+at the hardware level, whereas AMD’s MI300X explicitly exposes NUMA characteristics, enabling architecture-aware optimizations.
+one of the most advanced implementations of chiplet-based
+design in current-generation AI accelerators. The MI300X
+features eight XCDs (Accelerator Complex Dies), each with
+dedicated compute units, L2 cache, and memory controllers
+connected to independent HBM stacks. This multi-chiplet
+configuration with distributed memory subsystems makes
+NUMA effects particularly pronounced, providing an ideal
+testbed for developing and validating spatially-aware opti-
+mization techniques. As disaggregated and chiplet-based
+architectures become increasingly prevalent across the in-
+dustry for scaling AI workloads, insights gained from op-
+timizing for such designs will have broad applicability to
+future generations of GPUs and other AI accelerators.
+This focus on NUMA-aware optimization builds upon prior
+work demonstrating significant benefits from architecture-
+aware kernel design. For instance, spatially-aware mapping
+strategies for GEMM operations on the MI300X have shown
+dramatic improvements in cache utilization, with L2 cache
+hit rates increasing from 43% to 92% when accounting for
+NUMA characteristics (AMD, 2025c). These results under-
+score the critical importance of architecture-aware optimiza-
+tion and motivate our investigation of similar techniques for
+attention kernels, which represent another critical bottleneck
+in modern AI workloads.
+In this paper, we introduce Swizzled Head-first Mapping,
+a novel, spatially-aware technique that exploits the inher-
+ent spatial locality patterns in Attention computations to
+mitigate NUMA effects and maximize cache utilization in
+chiplet-based GPU architectures. Our approach builds upon
+the success of spatially-aware GEMM optimizations by iden-
+tifying and exploiting analogous locality patterns within the
+Attention mechanism.
+In this work, we present the following contributions:
+• Analysis of NUMA effects in chiplet-based multi-die
+GPU architectures and their implications for kernel
+performance
+• Characterization of spatial locality patterns inherent
+in attention mechanisms (forward and backward vari-
+ants) and identification of opportunities for memory
+hierarchy optimization
+• Design and implementation of Swizzled Head-first
+Mapping, a novel spatially-aware attention optimiza-
+tion technique that aligns computational work with
+NUMA boundaries to maximize cache efficiency
+• Comprehensive performance evaluation comparing
+spatially-unaware approaches to our proposed map-
+ping, demonstrating up to 50% higher performance
+over state-of-the-art attention algorithms using conven-
+tional scheduling techniques and consistently sustain-
+ing high L2 cache hit rates of 80-97%.
+2
+BACKGROUND
+2.1
+NUMA Effects in Modern GPU Architectures
+Modern GPU architectures designed for AI workloads have
+increasingly adopted disaggregated memory hierarchies to
+achieve the necessary scale in compute capacity and mem-
+ory bandwidth. Whether through large monolithic designs
+with distributed resources or chiplet-based multi-die inte-
+gration, these architectures depart from traditional unified
+cache designs in which all compute units share common
+cache structures. This disaggregation introduces NUMA
+2
+
+
+--- Page 3 ---
+effects, where memory access latencies and bandwidth char-
+acteristics vary based on the spatial relationship between
+compute units and the memory resources they access.
+NUMA effects manifest as a hierarchy of memory access
+costs within the GPU. Local accesses, where compute units
+access memory resources physically proximate to them, ben-
+efit from high-bandwidth, low-latency paths through nearby
+private caches. In contrast, remote accesses that must tra-
+verse longer distances or cross interconnect boundaries ex-
+perience substantially higher latencies and reduced effective
+bandwidth. Furthermore, distributed cache hierarchies mean
+that data cached in one region provides no benefit to com-
+pute units in other regions, effectively fragmenting the total
+cache capacity. Workloads that fail to account for these
+spatial characteristics suffer from reduced cache hit rates
+and poor memory bandwidth utilization.
+This transition from unified to distributed memory hier-
+archies fundamentally changes optimization priorities for
+GPU kernels. In traditional architectures with uniform ac-
+cess patterns, temporal locality was the primary optimiza-
+tion target, with the focus on when work is scheduled to
+maximize cache reuse over time. Architectures with NUMA
+effects introduce spatial dimensions to this optimization
+space, where both when and where work is scheduled be-
+come equally critical. Performance becomes highly sensi-
+tive to the spatial distribution of computational work and
+data placement, requiring kernel designers to explicitly con-
+sider the physical topology of the underlying hardware to
+achieve optimal performance.
+2.2
+Current Mitigations for Spatial NUMA Effects
+Modern multi-die chiplet GPUs schedule workgroups
+(WGs) across compute dies using a chunked round-robin
+policy, where each die (or NUMA domain) receives a small,
+contiguous batch of WGs before the scheduler advances to
+the next. On current hardware, this chunk size is set to one
+(see Figure 2), ensuring load balance and full utilization of
+aggregate HBM bandwidth. However, this default policy
+can inadvertently fragment spatial locality when adjacent
+WGs operate on neighboring regions of the same tensor but
+are dispatched to different dies.
+Because this mapping strategy is implemented in the driver
+and subject to change across GPU generations, programmers
+cannot rely on fixed scheduling behavior. Instead, kernels
+must incorporate mutable, algorithmic mapping logic that
+adapts at runtime. One widely adopted technique to address
+this challenge is swizzling, which refers to the deliberate
+reordering of how computational work is mapped to hard-
+ware execution units to improve memory locality and cache
+utilization. As illustrated in Figure 3, swizzling remaps
+workgroup IDs so that spatially adjacent tiles are assigned
+to the same die, thereby exploiting per-die L2 caches and
+HBMs + Last Level Cache (LLC)
+L2
+Die 0
+CU0
+CU1
+Tile
+L2
+Die 1
+CU2
+CU3
+Tile
+CU0 warms up 
+the cache with 
+ﬁrst-touch
+CUs on Die 1 get 
+no reuse out of 
+Die 0’s L2 cache 
+and need to load 
+again from HBM
+Figure 2. Impact of workgroup scheduling on cache reuse in the
+multi-die chiplet architecture of AMD MI300XTM. When work-
+groups processing related tiles that share input data are sched-
+uled to different dies (left: CU0 on Die 0, right: CU2 on Die 1),
+they cannot benefit from each other’s cached data. This cross-die
+scheduling forces redundant memory fetches from HBM through
+the shared last-level cache (LLC), as L2 caches are private to each
+Accelerator Complex Die or XCD. The NUMA effects inherent to
+this disaggregated architecture make spatially aware workgroup
+placement critical for maximizing cache efficiency and minimizing
+memory bandwidth consumption.
+improving locality.
+This remapping approach generalizes the cooperative thread
+array (CTA) or workgroup swizzling techniques widely
+used in high-performance GEMM libraries such as Ten-
+sile (AMD, 2025c), hipBLASLt (AMD, 2025b), and Tri-
+ton (Triton Developers, 2025). In these libraries, swizzling
+transforms the default linear workgroup assignment into
+patterns that better align with memory layouts or hardware
+topology. For instance, matrices may be tiled into 2D blocks
+to maximize data reuse within shared caches. When ap-
+plied to workloads on multi-die architectures, such remap-
+ping aligns the logical computation order with the physical
+NUMA topology, mitigating scheduler-induced inefficien-
+cies while maintaining portability across future hardware
+schedulers. In this work, we extend these techniques to
+implement spatially-aware mapping patterns for Attention
+on Instinct GPUs.
+2.3
+The Attention Mechanism
+Attention (Vaswani et al., 2017) is the central component in
+the Transformer architecture that has enabled the remarkable
+capabilities of modern generative AI models. The attention
+mechanism allows models to selectively focus on the most
+relevant parts of an input sequence when generating each
+output token. This capability enables language models to
+maintain coherent context across long sequences and pro-
+duce high-quality, contextually appropriate outputs.
+The core attention computation involves three key matrices
+derived from the input: queries (Q), keys (K), and values
+3
+
+
+--- Page 4 ---
+1 @triton.jit()
+2 def swizzle_chiplet(wgid, grid, NUM_XCD:
+t1_constexpr):
+3
+# Number of wgids/XCD in the new config
+4
+wgids_per_xcd = grid // NUM_XCD
+5
+6
+# Compute local wgid within the XCD
+7
+xcd = wgid % NUM_XCD
+8
+local_wgid = wgid // NUM_XCD
+9
+10
+# New wgid based on the new grouping
+11
+new _wgid = xcd * wgids_per_xcd +
+local_wgid
+12
+return new_wgid
+Figure 3. Chiplet-aware workgroup ID remapping in Triton. The
+function transforms the original workgroup ID by determining
+the target XCD and calculating the new global workgroup ID to
+achieve spatial locality within chiplet memory domains.
+(V ). Given these input sequences and head dimension d, the
+attention output O is computed through a three-step process:
+S = QKT , P = softmax( S
+√
+d
+), O = PV.
+(1)
+In Equation 1, the first step computes attention scores S by
+taking the dot product between queries and keys, measuring
+the relevance of each key to each query. These scores are
+then normalized using the softmax function to produce at-
+tention weights P, which represent the relative importance
+of each input position. Finally, these weights are used to
+compute a weighted average of the value vectors, producing
+the final output O.
+During training, gradients must be computed with respect to
+all inputs. Given the gradient of the loss with respect to the
+output dO, the backward pass computes gradients through
+the attention computation in reverse order:
+dV = P T dO ∈RN×d,
+dP = dOV T ∈RN×N,
+dS = dsoftmax(dP) ∈RN×N,
+dQ = dSK ∈RN×d,
+dK = dST Q ∈RN×d.
+(2)
+In practice, Transformer models use multi-head attention
+(MHA), which splits the model dimension (d) across mul-
+tiple attention heads. Each head operates on a portion of
+the full dimensionality with separate query, key, and value
+projections, allowing different heads to capture distinct rela-
+tionships and attend to various aspects of the input sequence.
+More recent models have adopted grouped query attention
+(GQA) (Ainslie et al., 2023), which reduces memory re-
+quirements by sharing key and value projections across
+multiple query heads while maintaining separate query pro-
+jections. This significantly reduces the memory footprint
+during inference. Both MHA and GQA create computa-
+tional grids spanning multiple attention heads and batch
+items. Each grid cell operates independently with no data
+reuse between heads or batch items. Figure 5 shows this
+grid, where each head spans a query length (N CTX) and
+head dimension (HEAD DIM).
+A key limitation of traditional attention is its quadratic
+time and memory complexity, especially as sequence length
+grows. This becomes a bottleneck due to the need to store
+intermediate tensors (S, P) in global memory.
+2.3.1
+Flash Attention
+FlashAttention (FA) (Dao et al., 2022) addresses this limi-
+tation by using an online softmax approach, enabling tiled
+computation where intermediate blocks of S and P reside in
+local memory rather than global memory. A cross-tile “fix-
+up” step ensures numerical correctness while significantly
+reducing memory overhead. This tiling strategy applies to
+both the forward pass, which computes attention outputs,
+and the backward pass, which computes gradients with re-
+spect to Q, K, and V during training.
+FlashAttention2 (FA2) (Dao, 2024) further improves per-
+formance by parallelizing WGs across the context length
+for both forward and backward computations. As shown
+in Figure 4, Q is partitioned into row blocks processed in
+parallel, one row block per WG, with each accessing the
+full K and V tensors. During the backward pass, the gradi-
+ent computation follows a similar tiling pattern, with each
+WG computing gradients for its assigned Q block while
+accessing the complete K and V tensors. This data reuse
+pattern across both forward and backward passes is central
+to our optimization for chiplet-based GPUs, as detailed in
+Section 3.
+3
+FA2 SPATIAL LOCALITY AND MAPPING
+PATTERNS
+This section explores the spatial locality inherent in the
+FlashAttention2 algorithm and demonstrates how it can be
+leveraged to optimize performance on chiplet-based GPU
+architecture, specifically AMD’s chiplet-based Instint GPU
+- MI300X. We first analyze FA2’s computational grid struc-
+ture and examine current methods for mapping this grid
+to distributed compute dies or XCDs. We then introduce
+a novel optimization, Swizzled Head-first Mapping, that
+improves data reuse by aligning computational work with
+the NUMA characteristics of chiplet architectures, thereby
+enhancing per-XCD cache utilization and overall perfor-
+mance.
+4
+
+
+--- Page 5 ---
+N_CTX
+BLOCK_N
+N_CTX
+BLOCK_M
+HEAD_DIM
+HEAD_DIM
+BLOCK_M
+HEAD_DIM
+N_CTX
+pid 0
+pid 1
+pid 2
+pid 3
+KT
+P = softmax(S)
+O = P.V
+S = QKT
+Q
+V
+x
+x
+=
+Softmax
+Global
+(N_CTX, N_CTX)
+(N_CTX, N_CTX)
+(N_CTX, HEAD_DIM)
+HEAD_DIM
+Figure 4. FlashAttention2 Tiled Compute Partitioning Across Workgroups for a Single Attention Head. Query matrix Q is partitioned
+into row blocks (BLOCK M), with each workgroup (pid0-pid3) processing one row block. Each workgroup accesses the complete key
+matrix KT and value matrix V to compute attention scores S = QKT , apply softmax to obtain attention weights P, and produce output
+O = PV . All workgroups within the same attention head share access to the same K and V tensors, creating natural spatial locality
+patterns. Matrix dimensions are shown in parentheses, where N CTX is the context length and HEAD DIM is the head dimension.
+1
+2
+H
+1
+2
+H
+HEAD_DIM
+N_CTX
+Batch 1
+Batch Z
+...
+....
+...
+Figure 5. Attention Algorithm Grid for Q, K, V , O tensors.
+Z=batch size, H=# of attention heads, sized by query context
+length (N CTX) and head dimension (HEAD DIM).
+3.1
+Spatial Locality in FlashAttention2
+FlashAttention2 exhibits inherent spatial locality patterns in
+both forward and backward passes, creating opportunities
+for cache optimization in chiplet-based architectures. As
+illustrated in Figure 4, during the forward pass, within a
+single attention head, each row block of the query matrix
+Q must access the complete key (K) and value (V ) tensors
+to compute attention outputs. This access pattern creates
+natural data-sharing opportunities, as multiple workgroups
+processing different row blocks of the same attention head
+(e.g., pid0 to pid3 in Figure 4) require the same K and V
+data.
+The backward pass follows a similar spatial locality pattern.
+During gradient computation, each workgroup computing
+different row blocks of the gradients dQ, dK, and dV may
+share the same Q, K, V , and dO tensors within the same
+attention head. This consistent data sharing pattern across
+both forward and backward passes amplifies the benefits of
+cache-aware mapping strategies.
+The extent of this data sharing in both the forward and the
+backward pass depends on the specific attention mechanism
+employed. In MHA, each attention head maintains its own
+distinct K and V tensors, meaning workgroups within a
+HQ 0
+HQ 1
+HQ 2
+HQ 3
+HQ 0
+HQ 1
+HQ 2
+HQ 3
+ACC0
+K0, V0
+K1, V1
+K2, V2
+K3, V3
+K0, V0
+ACC1
+ACC2
+ACC3
+ACC0
+(a) Multi Head Attention
+(b) Grouped Query Attention
+Figure 6. Attention compute cluster (ACC) organization in trans-
+former attention mechanisms. Operations involving the same K
+and V tensors are co-located within a single ACC for optimal
+cache utilization. (a) In multi-head attention, each head maintains
+distinct K, V tensors (e.g., DeepSeek-V3), requiring one ACC per
+head. (b) In a grouped query attention, multiple heads (four in this
+figure) share K, V tensors within a group (e.g., Llama, Mistral),
+requiring one ACC per group.
+single head share data during both forward and backward
+computation, but workgroups across different heads oper-
+ate on entirely separate tensors. In contrast, GQA extends
+this sharing pattern by having multiple query heads share
+the same key and value tensors, effectively creating larger
+groups of workgroups that all access the same K and V data
+during both forward and backward passes.
+From a spatial locality perspective, workgroups that share
+the same input tensors during either forward or backward
+computation naturally form what we term an Attention
+Compute Cluster (ACC). In MHA, each ACC corresponds
+to all workgroups within a single attention head for both
+passes. In GQA, each ACC encompasses all workgroups
+across the grouped heads that share the same key-value ten-
+sors during training. The key optimization insight is that
+co-locating all workgroups within an ACC on the same
+XCD maximizes L2 cache utilization through two mecha-
+5
+
+
+--- Page 6 ---
+nisms: first, shared tensor data of an ACC is loaded into a
+single XCD’s L2 cache and reused across multiple work-
+groups, preventing cache fragmentation while increasing
+data reuse; second, this reduces the total number of memory
+fetches from HBM, as each shared tensor is loaded only once
+per device rather than redundantly across multiple XCDs.
+This approach mirrors successful tiling strategies used in
+GEMM optimizations, where co-locating workgroups that
+share input data significantly improves memory bandwidth
+utilization and compute throughput.
+3.2
+Current FA2 Grid-to-XCD Mapping Patterns
+FA2 supports multiple strategies for mapping WGs to XCDs.
+We categorize existing approaches based on their iteration
+order and XCD assignment strategy.
+3.2.1
+Naive Block-first
+The Naive Block-first strategy iterates through all attention
+heads for each row block before moving to the next block
+(i.e., completes block0 across all heads, then block1 across
+all heads, etc.). WGs are assigned to XCDs in round-robin
+fashion (e.g., XCD0 gets block0 of HQ0 (Query Head 0),
+XCD1 gets Block 0 of HQ 1, etc). This splits ACCs across
+XCDs, reducing cache efficiency. This scheme is a baseline,
+un-swizzled version of the mapping in section 3.2.2.
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 1
+Block 0 
+Block 1
+XCD0
+HQ 0
+HQ 4
+L2
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 1
+Block 0 
+Block 1
+XCD0
+HQ 1
+HQ 5
+L2
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 1
+Block 0 
+Block 1
+XCD0
+HQ 2
+HQ 6
+L2
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 1
+Block 0 
+Block 1
+XCD0
+HQ 3
+HQ 7
+L2
+XCD0: HQ 0,4
+XCD1: HQ 1,5
+XCD2: HQ 2,6
+XCD3: HQ 3,7
+Figure 7. Naive Block-first mapping (illustrated with eight qheads,
+128 row blocks, four XCDs): WGs are dispatched block-by-block
+across all heads in round-robin fashion, splitting ACCs across
+XCDs. Each unique color corresponds to a unique attention head.
+3.2.2
+Swizzled Block-first
+The Swizzled Block-first approach retains the block-first
+iteration order but applies a swizzling technique to co-locate
+grouped heads in GQA within the same XCD, preserving
+locality (Figure 8). However, this only maintains local-
+ity when the number of GQA groups matches the number
+of XCDs. For MHA, used in the prefill stage of models
+like DeepSeek-V3 (Team, 2024), this strategy causes multi-
+ple ACCs per XCD to be served simultaneously, reducing
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 1
+Block 0 
+Block 1
+XCD0
+HQ 0
+HQ 1
+L2
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 1
+Block 0 
+Block 1
+XCD0
+HQ 2
+HQ 3
+L2
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 1
+Block 0 
+Block 1
+XCD0
+HQ 4
+HQ 5
+L2
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 1
+Block 0 
+Block 1
+XCD0
+HQ 6
+HQ 7
+L2
+XCD0: HQ 0,1
+XCD1: HQ 2,3
+XCD2: HQ 4,5
+XCD3: HQ 6,7
+Figure 8. Swizzled Block-first mapping (eight qheads, 128 row
+blocks, four XCDs): Block-first iteration with GQA-aware swiz-
+zling to co-locate grouped heads within XCDs. This scheme works
+best when GQA groups match XCD count. Each unique color
+corresponds to a unique attention head.
+L2 cache efficiency. This scheme is deployed by AMD’s
+AITER (AMD, 2025a) repository of high-performance AI
+operators.
+3.2.3
+Naive Head-first
+The Naive Head-first strategy iterates through all row blocks
+of a single attention head before moving to the next head
+(i.e., completes all blocks of HQ 0, then all blocks of HQ
+1, etc.). With round-robin XCD assignment, each head’s
+blocks are striped across all XCDs (Figure 9). While this
+maintains head-level coherence during iteration, it still splits
+individual ACCs across XCDs. This scheme is implemented
+in Triton’s default FlashAttention kernel (Tillet et al., 2019).
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 8
+Block 4 
+Block 12
+XCD0
+HQ 0
+L2
+Block0
+Block2
+Block1
+Block4
+Block 1
+Block 9
+Block 5 
+Block 13
+XCD0
+HQ 0
+L2
+Block0
+Block2
+Block1
+Block4
+Block 2
+Block 10
+Block 6 
+Block 14
+XCD0
+HQ 0
+L2
+Block0
+Block2
+Block1
+Block4
+Block 3
+Block 11
+Block 7 
+Block 15
+XCD0
+HQ 0
+L2
+XCD0: HQ0-7
+XCD1: HQ0-7
+XCD1: HQ0-7
+XCD2: HQ0-7
+Figure 9. Naive Head-first mapping (eight qheads, 128 row blocks,
+four XCDs): WGs iterate through all blocks of each head sequen-
+tially, but round-robin XCD assignment spreads each head across
+all XCDs. All blocks correspond to the same attention head in this
+figure.
+For illustration, Figures 7–9 show these strategies for a
+simplified example with eight query heads, 128 row blocks
+per head, and four XCDs.
+6
+
+
+--- Page 7 ---
+3.3
+Swizzled Head-first Mapping
+To maximize spatial locality on AMD GPUs with disag-
+gregated L2 caches, we leverage a key insight: all blocks
+within the same attention head and batch share K and V
+tensors. Co-locating these blocks within an XCD improves
+data reuse and reduces cross-device traffic.
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 2
+Block 1 
+Block 3
+XCD0
+HQ 0
+L2
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 2
+Block 1 
+Block 3
+XCD0
+HQ 2
+L2
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 2
+Block 1 
+Block 3
+XCD0
+HQ 4
+L2
+Block0
+Block2
+Block1
+Block4
+Block 0
+Block 2
+Block 1 
+Block 3
+XCD0
+HQ 6
+L2
+XCD0: HQ 0,1
+XCD1: HQ 2,3
+XCD2: HQ 4,5
+XCD3: HQ 6,7
+Figure 10. Swizzled Head-first mapping (eight qheads, 128 row
+blocks, four XCDs): Head-first iteration with spatial swizzling
+confines each attention head to a single XCD, maximizing cache
+locality and ensuring each XCD services one ACC at a time. Each
+unique color corresponds to a unique attention head.
+We introduce a novel mapping strategy, Swizzled Head-
+first, that uses spatial swizzling to assign all blocks of an
+attention head to the same XCD before moving to the next
+head. This approach uses spatial swizzling to ensure that
+workgroups within an ACC access shared data from one
+local cache, and XCDs service one ACC at a time. This
+strategy addresses the limitations of existing approaches by
+combining head-first iteration with spatial swizzling to co-
+locate all blocks of an attention head within a single XCD
+(Figure 10 and corresponding swizzling code in Figure 11).
+Remarkably, this intuitive strategy requires minimal code
+modifications, as shown in Figure 11, yet proves highly
+effective at exploiting spatial locality. The head-first map-
+ping consistently delivers improved L2 cache hit rates and
+substantial performance improvements, demonstrating the
+significant impact of NUMA-aware kernel design on multi-
+die chiplet-based GPUs.
+4
+EVALUATION
+4.1
+Experimental Setup
+We evaluate our spatial locality optimizations for FlashAt-
+tention2 forward pass on an AMD MI300X GPU, a chiplet-
+based architecture specifically designed for AI workloads.
+Table 1 summarizes the key architectural characteristics rel-
+evant to our NUMA-aware optimizations. The MI300X
+features eight XCDs or Accelerator Complex Dies, with
+each XCD containing its own compute units, L2 cache, and
+1 # Grid definition
+2 grid = lambda META: (batch * num_q_heads *
+(seqlen_q/META["BLOCK_M"]))
+3
+4 # Swizzling
+5 wid = t1.program_id(0)
+# workgroup id
+6 wid_per_batch = wid // BATCH
+7 heads_per_xcd = NUM_Q_HEADS // NUM_XCD
+8 blocks_per_head = (SEQLEN_Q + BLOCK_M - 1)
+// BLOCK_M
+9 chunk_size = NUM_XCD * blocks_per_head
+10
+11 # Calculate offsets
+12 head_offset = ((wid_per_batch % NUM_XCD) *
+heads_per_xcd + wid_per_batch // (
+NUM_XCD * blocks_per_head))
+13 block_offset = (wid_per_batch % chunk_size)
+// NUM_XCD
+14 batch_offset = (wid // (blocks_per_head *
+NUM_Q_HEADS)) % BATCH
+Figure 11. Workgroup ID swizzling logic for Swizzled Head-first
+Mapping. The swizzling scheme maps the linear workgroup ID
+(wid) to batch, head, and block offsets, ensuring attention heads
+from different ACCs are distributed across XCDs while sequence
+blocks within each ACC maintain locality on the same XCD.
+Table 1. AMD MI300X Architecture Specifications
+Component
+Specification
+Compute Architecture
+Number of XCDs
+8
+Compute Units per XCD
+38 (304 total)
+Stream Processors per CU
+64
+Memory Hierarchy
+L1 Cache per CU
+16 KB
+L2 Cache per XCD
+4 MB (32 MB total)
+HBM3 Capacity
+192 GB
+HBM3 Bandwidth
+5.3 TB/s
+memory controllers. This disaggregated memory hierarchy
+creates the NUMA effects that our optimization targets.
+All kernels are implemented in Triton (Tillet et al., 2019).
+We use ROCProfiler v3 (Advanced Micro Devices, Inc.,
+2025) to measure L2 cache hit rates via hardware perfor-
+mance counters, specifically by monitoring the aggregated
+L2 cache hit rate across all XCDs.
+4.2
+Evaluation Methodology
+Our experimental methodology comprises three compo-
+nents: (1) a sensitivity analysis across MHA model hyper-
+parameters to understand how sequence length, head count,
+and head dimension affect the benefits of our approach; (2)
+performance validation on GQA configurations to demon-
+7
+
+
+--- Page 8 ---
+0.70
+0.80
+0.90
+1.00
+Performance
+1 2 4 8 1 2 4 8 1 2 4 8 1 2 4 8 1 2 4 8 1 2 4 8 1 2 4 8 1 2 4 8 1 2 4 8 1 2 4 8 1 2 4 8 1 2 4 8 1 2 4 8 1 2 4 8 1 2 4 8
+8K
+32K
+128K
+8K
+32K
+128K
+8K
+32K
+128K
+8K
+32K
+128K
+8K
+32K
+128K
+8
+16
+32
+64
+128
+Batch
+N_CTX
+H_Q
+Naive Block-first
+Swizzled Block-first
+Naive Head-first
+Swizzled Head-first
+Figure 12. MHA Performance relative to Swizzled Head-first baseline across varying batch sizes (1-8) and sequence lengths (8K-128K).
+Block-first approaches show significant performance gaps that widen at higher head counts (H Q ≥64), longer sequences, and larger
+batch sizes.
+0
+20
+40
+60
+80
+100
+Hitrate (%)
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+8K
+32K
+128K
+8K
+32K
+128K
+8K
+32K
+128K
+8
+32
+128
+Batch
+N_CTX
+H_Q
+Naive Block-first
+Swizzled Block-first
+Naive Head-first
+Swizzled Head-first
+Figure 13. L2 Cache hit rates for MHA across varying batch sizes (1-8) and sequence lengths (2K-128K). The Swizzled Head-first
+approach consistently achieves high L2 hit rates across all configurations, whereas the other approaches exhibit drastic drops in hit rates at
+higher numbers of heads, longer sequence lengths, and higher batch sizes.
+strate generalization beyond MHA; and (3) a focused case
+study on the prefill stage of the DeepSeekV3 forward pass,
+representing a real-world deployment scenario with 128
+attention heads.
+We compare all four mapping strategies introduced in Sec-
+tion 3: Naive Block-first (Figure 7), Swizzled Block-first
+(Figure 8), Naive Head-first (Figure 9), and our proposed
+Swizzled Head-first (Figure 10). For each experiment, per-
+formance metrics are normalized to the Swizzled Head-first
+approach, which represents the best-performing configu-
+ration across our experiments, enabling direct assessment
+of performance degradation in alternative approaches. Ad-
+ditionally, for the MHA sensitivity study, we measure L2
+cache hit rates to validate the impact of improved cache
+locality on performance.
+4.3
+Multi-Head Attention Sensitivity Study
+We evaluated the four MHA mapping schemes across vary-
+ing configurations to assess the impact of spatial locality
+on performance and L2 cache utilization. Our experiments
+sweep across number of attention heads (8 to 128), sequence
+lengths (2K to 128K tokens), batch sizes (1 to 8), and used
+Table 2. Experimental configuration for Multi-Head Attention
+(MHA) Sensitivity Study
+Parameter
+Values
+Context Length (N CTX)
+8K, 32K, 128K
+Batch Size
+1, 2, 4, 8
+Number of Heads (H Q = H K)
+8, 16, 32, 64, 128
+Head Dimension (D HEAD)
+128
+Block Size (M × N)
+128 × 64
+fixed BLOCK M = 128 and BLOCK N = 64 (Table 2).
+Figure 12 demonstrates that the Swizzled Head-first ap-
+proach, our proposed method, serves as the performance
+baseline. For a smaller number of heads, all approaches
+perform similarly. The block-first approaches show sig-
+nificant performance degradation across most configura-
+tions, with the gap widening as the number of heads and
+sequence length increase. The performance disadvantage
+is most pronounced at HQ ≥64 with longer sequences
+(NCT X ≥32K), where Block-first approaches achieve
+only 64-70% the efficiency of our Swizzled Head-first
+8
+
+
+--- Page 9 ---
+0.75
+0.80
+0.85
+0.90
+0.95
+1.00
+Performance
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+8K
+32K
+128K
+8K
+32K
+128K
+8K
+32K
+128K
+32
+64
+128
+Batch
+N_CTX
+H_Q
+Naive Block-first
+Swizzled Block-first
+Naive Head-first
+Swizzled Head-first
+Figure 14. Performance comparison for Grouped Query Attention with eight KV heads, normalized to Swizzled Head-first baseline.
+Results for H Q = 32, 64, 128 (corresponding to Llama 3 8B, 70B, 405B models) across sequence lengths 8K-128K and batch sizes 1-8.
+Both swizzled approaches achieve similar performance, while Naive Block-first mapping shows substantial degradation at higher attention
+head counts and longer sequences.
+Table 3. Model configurations for Llama Models (GQA) and
+DeepSeek-V3 (MHA)
+Model
+Attn. Type
+H Q
+H K
+D HEAD
+Llama-3 8B
+GQA
+32
+8
+128
+Llama-3 70B
+GQA
+64
+8
+128
+Llama-3 405B
+GQA
+128
+8
+128
+DeepSeek-v3
+MHA
+128
+128
+56
+method. At HQ = 128 with NCT X = 128K, the Swiz-
+zled Head-first approach achieves up to 50% higher perfor-
+mance than Block-first mappings. Interestingly, the Naive
+Head-first mapping’s performance closely matches our swiz-
+zled approach for most cases, except at very high sequence
+lengths, where it drops to ∼90% relative efficiency. This
+observation aligns with our theory that the Naive Head-first
+approach still benefits from cache locality by having the rel-
+evant ACC’s data in the caches, even if it’s replicated across
+all caches, except at very high sequence lengths, where
+cache splitting with different ACC’s data and redundant
+memory fetches degrade performance.
+The L2 cache hit rate analysis in Figure 13 reveals the under-
+lying cause of these performance differences. With fewer
+heads and shorter sequences, all approaches maintain high
+L2 hit rates (∼90%). However, cache behavior diverges
+dramatically as workload complexity increases. At H Q =
+128 with N CTX = 128K, the Swizzled Head-first mapping
+sustains 90-96% hit rates across all batch sizes, the hit-rate
+of Naive Head-first falls to 40-60%, while block-first ap-
+proaches collapse to approximately 1% hit rates. Even the
+Swizzled Block-first method, which is deployed in current
+GPU kernels, almost always misses in cache at these ex-
+treme configurations, despite performing better at moderate
+scales. This catastrophic cache degradation directly explains
+the 45-50% performance gap observed in Figure 12.
+This substantial difference in cache utilization directly trans-
+lates to the observed performance benefits, as reduced cache
+misses minimize expensive off-chip memory accesses. The
+Swizzled Head-first strategy’s ability to maintain high cache
+utilization under extreme conditions directly translates to
+sustained computational throughput, making it essential for
+scaling attention mechanisms to large head counts and long
+context lengths.
+4.4
+Grouped Query Attention Sensitivity Study
+We evaluated the four mapping schemes on GQA configura-
+tions with a fixed eight KV heads and varying query heads
+(H Q = 32, 64, 128), corresponding to the Llama 3 model
+family sizes (8B, 70B, and 405B parameters, respectively).
+As multiple query heads share the same KV heads, GQA
+creates different memory access patterns and cache pressure
+characteristics compared to MHA.
+Figure 14 demonstrates that the Swizzled Head-first and
+Swizzled Block-first approaches maintain robust perfor-
+mance across all GQA configurations. At H Q = 32, all
+mapping schemes achieve similar performance. The Naive
+Block-first method exhibits significant degradation at higher
+query heads, sequence lengths, and batch sizes, since the L2
+cache in each XCD is split across different ACCs’ data.
+The Swizzled Block-first approach performs well with GQA,
+as the eight KV heads match the number of XCDs in the
+MI300X architecture, avoiding any cache splits. In the case
+of Swizzled Head-first, each ACC, which is now a group
+of all query heads sharing the KV data, is mapped to one
+XCD, achieving similarly strong performance. The Naive
+Head-first approach shows instability at higher sequence
+lengths and batches, with performance dipping to about
+90-95% of the Swizzled Head-first approach in some cases,
+indicating non-ideal cache utilization and higher redundant
+memory accesses. These results confirm that spatial locality
+optimizations remain effective for GQA workloads.
+9
+
+
+--- Page 10 ---
+0.70
+0.80
+0.90
+1.00
+Performance
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+1
+2
+4
+8
+2K
+4K
+8K
+16K
+32K
+64K
+128K
+Batch
+N_CTX
+Naive Block-first
+Swizzled Block-first
+Naive Head-first
+Swizzled Head-first
+Figure 15. DeepSeekV3 prefill performance with 128 attention heads, normalized to Swizzled Head-first baseline, across sequence
+lengths 2K-128K and batch sizes 1-8. Block-first approaches show significant performance degradation at longer sequences, with Naive
+Block-first dropping below 0.65× relative efficiency at 128K tokens.
+0.92
+0.94
+0.96
+0.98
+1.00
+Performance
+1
+2
+1
+2
+1
+2
+8K
+32K
+128K
+Batch
+N_CTX
+Naive Block-first
+Swizzled Block-first
+Naive Head-first
+Swizzled Head-first
+Figure 16. Backward pass speedup comparison of mapping
+schemes with 128 query heads versus the Naive Block-first ap-
+proach. Results shown across context lengths from 8K to 128K
+tokens and batch sizes 1 to 8. The Swizzled Head-first approach
+demonstrates increasing speedup with longer sequences, achieving
+1.10× at 128K tokens.
+4.5
+Case Study: Optimizing DeepSeekV3 Prefill
+DeepSeekV3’s prefill phase uses MHA with 128 query
+heads and 128 key-value heads, making it an ideal can-
+didate for evaluating our Swizzled Head-first optimization,
+as the number of attention heads (128) significantly exceeds
+the number of XCDs (8) available on the MI300X GPU.
+As shown in Figure 15, the Swizzled Head-first approach
+achieves superior performance across most configurations,
+particularly at longer sequence lengths. At extreme se-
+quence lengths, the Naive Block-first method shows the
+worst performance, degrading to under 65% relative perfor-
+mance at 128K tokens. The Swizzled Block-first method
+also degrades substantially to 76% of the Swizzled Head-
+first method at 128K tokens with a batch size of eight. The
+Naive Head-first approach also shows instability at extreme
+lengths, with performance varying significantly. The smaller
+head dimension in this configuration (D HEAD=56) reduces
+overall arithmetic intensity, thereby lowering absolute per-
+formance across all methods.
+These results confirm that the Swizzled Head-first optimiza-
+tion provides substantial and scalable performance benefits
+for DeepSeekV3’s high-head-count MHA configuration.
+4.6
+FlashAttention2 Backward Pass
+We evaluated the four mapping schemes for the FlashAt-
+tention2 backward pass kernel in AMD’s AITER (AMD,
+2025a) repository with H Q = 128 attention heads across
+varying context lengths (8K, 32K, 128K) and batch sizes
+(1, 2). Figure 16 shows that the Swizzled Head-first ap-
+proach consistently outperforms other mapping schemes,
+with the performance of the Swizzled Block-first approach
+degrading to about 0.94× and the performance of the Naive
+Block-first and Naive Head-first approaches degrading to
+0.91× at 128K tokens. Given the additional complexity and
+scalar operations required in the FlashAttention2 backward
+pass, we suspect that further gains may be constrained by
+emerging bottlenecks introduced by the Swizzled Head-first
+optimization. This behavior aligns with our observations
+across other kernels, where performance improvements of
+up to 50% were achieved. We leave further optimization to
+future work.
+5
+CONCLUSION
+This work demonstrates that spatial locality in attention
+workloads can be strategically exploited to mitigate NUMA
+effects in chiplet-based GPUs with disaggregated memory.
+We identify inherent spatial locality patterns in the attention
+mechanism and introduce the Swizzled Head-first Mapping
+strategy, which aligns computation with the NUMA do-
+mains of multi-die GPU architectures. On AMD’s MI300X
+architecture, our approach achieves up to 50% performance
+improvement over state-of-the-art attention algorithms us-
+ing conventional scheduling techniques in multi-head at-
+tention while maintaining consistently high L2 cache hit
+rates of 80-97%. These results, achieved with minimal code
+changes, demonstrate that significant performance gains can
+10
+
+
+--- Page 11 ---
+be obtained via architecture-aware kernel design. Our find-
+ings underscore the necessity of hardware-aware algorithm
+design as chiplet-based architectures become increasingly
+prevalent in AI accelerators.
+REFERENCES
+Advanced Micro Devices, Inc. ROCm Profiler (rocprofv3)
+Documentation. https://rocm.docs.amd.com/
+projects/rocprofiler-sdk/en/latest/
+how-to/using-rocprofv3.html, 2025.
+Ac-
+cessed: 14-October-2025.
+Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y.,
+Lebr´on, F., and Sanghai, S. Gqa: Training generalized
+multi-query transformer models from multi-head check-
+points, 2023.
+URL https://arxiv.org/abs/
+2305.13245.
+AMD.
+AMD Instinct MI200 Series Accelerators.
+https://www.amd.com/en/products/
+accelerators/instinct/mi200.html, 2021.
+AMD.
+AMD Instinct MI300 Series Accelerators.
+https://www.amd.com/en/products/
+accelerators/instinct/mi300.html, 2023.
+AMD. Ai tensor engine for rocm, 2025a. URL https:
+//github.com/ROCm/aiter. Accessed: 2025-07-
+19.
+AMD.
+hipBLASlt,
+2025b.
+URL
+https:
+//github.com/ROCm/rocm-libraries/
+tree/develop/projects/hipblaslt.
+Ac-
+cessed: 2025-07-19.
+AMD.
+Tensile, 2025c.
+URL https://github.
+com/ROCm/rocm-libraries/tree/develop/
+shared/tensile. Accessed: 2025-07-19.
+Dao, T. FlashAttention-2: Faster attention with better paral-
+lelism and work partitioning. In International Conference
+on Learning Representations (ICLR), 2024.
+Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and R´e, C. FlashAt-
+tention: Fast and memory-efficient exact attention with
+IO-awareness. In Advances in Neural Information Pro-
+cessing Systems (NeurIPS), 2022.
+NVIDIA.
+NVIDIA A100 Tensor Core GPU Ar-
+chitecture.
+https://www.nvidia.com/en-us/
+data-center/a100/, 2020.
+NVIDIA.
+NVIDIA H100 Tensor Core GPU Ar-
+chitecture.
+https://www.nvidia.com/en-us/
+data-center/h100/, 2022.
+NVIDIA.
+NVIDIA Blackwell Architecture.
+https:
+//www.nvidia.com/en-us/data-center/
+technologies/blackwell-architecture/,
+2024a.
+NVIDIA.
+NVIDIA Rubin Platform.
+https://www.
+nvidia.com/gtc/keynote/, 2024b. Announced
+at NVIDIA GTC 2024.
+NVIDIA. NVIDIA Rubin Ultra Platform. https://www.
+nvidia.com/gtc/keynote/, 2024c. Announced
+at NVIDIA GTC 2024.
+Sanovar, R., Bharadwaj, S., Amant, R. S., R¨uhle, V., and
+Rajmohan, S. Lean Attention: Hardware-aware scalable
+attention mechanism for the decode-phase of transform-
+ers, 2025. URL https://arxiv.org/abs/2405.
+10480.
+Shah, J., Bikshandi, G., Zhang, Y., Thakkar, V., Ramani, P.,
+and Dao, T. FlashAttention-3: fast and accurate attention
+with asynchrony and low-precision. In Proceedings of
+the 38th International Conference on Neural Information
+Processing Systems, NIPS ’24, Red Hook, NY, USA,
+2025. Curran Associates Inc. ISBN 9798331314385.
+Team, D. A.
+DeepSeek-V3: A mixture-of-experts lan-
+guage model with multi-head latent attention.
+arXiv
+preprint arXiv:2412.19437, 2024.
+URL https://
+arxiv.org/abs/2412.19437.
+Tillet, P., Kung, H. T., and Cox, D.
+Triton: an inter-
+mediate language and compiler for tiled neural net-
+work computations.
+In Proceedings of the 3rd ACM
+SIGPLAN International Workshop on Machine Learn-
+ing and Programming Languages, MAPL 2019, pp.
+10–19, New York, NY, USA, 2019. Association for Com-
+puting Machinery.
+ISBN 9781450367196.
+doi: 10.
+1145/3315508.3329973. URL https://doi.org/
+10.1145/3315508.3329973.
+Triton Developers.
+triton.language.swizzle2d, 2025.
+URL
+https://triton-lang.org/main/
+python-api/generated/triton.language.
+swizzle2d.html.
+Triton documentation (version:
+main).
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+L., Gomez, A. N., Kaiser, L., and Polosukhin, I. Attention
+is all you need. In Proceedings of the 31st International
+Conference on Neural Information Processing Systems,
+NIPS’17, pp. 6000–6010, Red Hook, NY, USA, 2017.
+Curran Associates Inc. ISBN 9781510860964.
+11

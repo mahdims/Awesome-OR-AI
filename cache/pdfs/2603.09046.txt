@@ -1,0 +1,2126 @@
+--- Page 1 ---
+FlexServe: A Fast and Secure LLM Serving System for Mobile Devices with
+Flexible Resource Isolation
+Yinpeng Wu
+Yitong Chen
+Lixiang Wang
+Jinyu Gu
+Zhichao HuaB
+Yubin Xia
+Institute of Parallel and Distributed Systems, Shanghai Jiao Tong University
+{wyp1536481268,yitongcheng,2042567212,gujinyu,xiayubin,zchua}@sjtu.edu.cn
+Abstract
+Device-side Large Language Models (LLMs) have wit-
+nessed explosive growth, offering higher privacy and avail-
+ability compared to cloud-side LLMs. During LLM inference,
+both model weights and user data are valuable, and attackers
+may even compromise the OS kernel to steal them. ARM
+TrustZone is the de facto hardware-based isolation technology
+on mobile devices, used to protect sensitive applications from
+a compromised OS. However, protecting LLM inference with
+TrustZone incurs significant overhead due to its inflexible
+isolation of memory and the NPU.
+To address these challenges,
+this paper introduces
+FlexServe, a fast and secure LLM serving system for mo-
+bile devices. It first introduces a Flexible Resource Isolation
+mechanism to construct Flexible Secure Memory (Flex-Mem)
+and Flexible Secure NPU (Flex-NPU). Both memory pages
+and the NPU can be efficiently switched between unprotected
+and protected modes. Based on these mechanisms, FlexServe
+designs a fast and secure LLM inference framework within
+TrustZone’s secure world. The LLM-Aware Memory Man-
+agement and Secure Inference Pipeline are introduced to ac-
+celerate inference. A Multi-Model Scheduler is proposed to
+optimize multi-model workflows. We implement a prototype
+of FlexServe and compare it with two TrustZone-based straw-
+man designs. The results show that FlexServe achieves an
+average 10.05× speedup in Time to First Token (TTFT) com-
+pared to the strawman, and an average 2.44× TTFT speedup
+compared to an optimized strawman with pipeline and secure
+NPU enabled. For multi-model agent workflows, the end-
+to-end speedup is up to 24.30× and 4.05× compared to the
+strawman and optimized strawman, respectively.
+1
+Introduction
+Device-side Large Language Models (LLMs) have witnessed
+explosive growth [5, 13, 20, 41, 60, 68], which can achieve
+higher privacy and availability compared with cloud-side
+LLMs. Furthermore, device-side LLMs can be trained or
+fine-tuned with specific datasets, making them more suitable
+for specific tasks [23, 43, 66, 67, 69, 74], and mobile AI ap-
+plications can achieve high intelligence by invoking multiple
+LLMs [11,37,42,73,75,76]. Model vendors have released
+small-scale models for mobile devices [5, 13, 20, 60], and
+developers are also trying to integrate device-side LLMs into
+their applications [1,2,24,37,50,53,75].
+Deploying LLMs on mobile devices introduces new secu-
+rity challenges. First, the LLM model itself has high value,
+costing millions of dollars to train [18,34]. Second, the LLM
+service handles various types of data on mobile devices, in-
+cluding chat history, screen content, and more. These factors
+make LLM inference an attractive target for attackers. Given
+that the existing OS kernel is large and prone to bugs [3,4],
+attackers may even compromise the kernel to steal model
+weights or user data during LLM inference.
+ARM TrustZone [7] is a hardware isolation technol-
+ogy to protect sensitive applications from a compromised
+OS [26,39,40,45,54] on mobile devices. It provides a Trusted
+Execution Environment (TEE) called the secure world. A
+strawman approach is to run LLM inference in the secure
+world. However, it has high performance overhead due to
+the inflexible isolation of TrustZone. First, TrustZone’s se-
+cure memory is inflexible; the number of regions is limited
+and must be contiguous physical memory. LLM inference
+requires a large amount of secure memory. Allocating such
+a large contiguous memory region is slow, especially for
+memory-constrained mobile devices where most memory
+is allocated to caching data and code for commonly-used
+applications [9, 10, 49]. In our evaluation, allocating 8GB
+contiguous memory for a Llama3.1-8B model takes about
+6.44 seconds, which is much longer than the prefill time
+(Section 2.3). State-of-the-art (SOTA) mobile agent appli-
+cations [11, 37, 42, 73, 75, 76] even use multiple LLMs to
+achieve high intelligence, which further complicates secure
+memory management. Second, TrustZone’s device protection
+is inflexible, meaning the NPU cannot be efficiently switched
+between the normal and secure worlds. In practice, existing
+mobile devices always configure the NPU as a normal device,
+1
+arXiv:2603.09046v1  [cs.CR]  10 Mar 2026
+
+
+--- Page 2 ---
+and it cannot be used in the secure world. Using only the
+CPU for LLM inference significantly hurts performance.
+To address these challenges, this paper introduces a fast and
+secure LLM inference system called FlexServe. FlexServe
+first introduces a Flexible Resource Isolation mechanism to
+construct Flexible Secure Memory (Flex-Mem) and Flexible
+Secure NPU (Flex-NPU). It allows any memory page and
+NPU to be efficiently switched between protected and unpro-
+tected modes. If the resource is protected, only the secure-
+world application can access it. Specifically, FlexServe uses
+a lightweight secure hypervisor to protect the flexible secure
+resource, and employs On-demand Protection to minimize
+the virtualization overhead. Based on Flex-Mem and Flex-
+NPU, FlexServe further designs a fast secure LLM inference
+framework in TrustZone’s secure world. The TrustZone se-
+cure memory is used to store the framework code and data,
+while Flex-Mem is used to store the runtime data, includ-
+ing model weights, KV caches, and intermediate tensors.
+Flex-NPU is used to accelerate the computation. With Flex-
+Mem, FlexServe further introduces an LLM-Aware Mem-
+ory Management and Secure Inference Pipeline to accelerate
+LLM inference. A Multi-Model Scheduler is introduced to
+speed up the multi-model workflow. We implemented a pro-
+totype of FlexServe on a Rockchip RK3588, equipped with
+an 8-core CPU and an NPU. We compare the performance
+of FlexServe with two TrustZone-based strawman designs.
+The results show that FlexServe achieves an average 10.05×
+speedup in TTFT compared to the strawman, and an average
+2.44× TTFT speedup compared with an optimized straw-
+man with pipeline and secure NPU enabled. For multi-model
+agent workflows, the end-to-end speedup is up to 24.30× and
+4.05× compared with the strawman and optimized strawman
+respectively. In summary, this paper makes the following
+contributions:
+• The Flexible Resource Isolation mechanism to construct
+Flex-Mem and Flex-NPU, which can be switched be-
+tween protected and unprotected modes efficiently.
+• The fast and secure LLM inference framework based on
+Flex-Mem and Flex-NPU, including efficient memory
+management for multi-model workflow.
+• A prototype implementation of FlexServe and a detailed
+evaluation with two TrustZone-based strawman designs.
+The results show that FlexServe can achieve an average
+10.05× speedup on TTFT compared to the strawman.
+2
+Backgrounds and Motivations
+2.1
+LLMs in Mobile Device
+Device-side LLMs [5, 13, 20, 41, 60, 68] are deployed on
+mobile devices, so users do not need to upload their data
+to the cloud, which reduces the risk of data leakage. It also
+removes the network connection to the cloud and improves the
+availability. Model vendors have released small-scale models
+suitable for mobile deployment, such as Llama [20], Phi-4 [5],
+Qwen3 [13] and Gemma [60], and developers are also trying
+to integrate device-side LLMs into their applications [1,2,24,
+37,50,53,75].
+Multiple Models in One Device: Unlike cloud-side LLMs
+which have large model size and provide general intelligence,
+device-side LLMs are small-scale models and can be trained
+or fine-tuned with specific datasets, which makes them more
+suitable for specific tasks, such as financial analysis, UI nav-
+igation, and more [23, 43, 66, 67, 69, 74]. State-of-the-art
+(SOTA) mobile agent applications also use multiple LLMs to
+achieve high intelligence [11,37,42,73,75,76].
+Security Challenges of Device-side LLMs: First, the
+LLM model weights are valuable, which are trained with
+a large amount of data and computation resources [18, 34].
+Second, AI applications send various types of data, including
+chat history and screen content, as input to the LLM. Com-
+promising the LLM inference system can steal a significant
+amount of sensitive user information. Unfortunately, existing
+mobile OS kernels have a large code base and are prone to
+bugs, which makes them vulnerable to attacks. For example,
+Android relies on the Linux kernel, which has 40 million lines
+of code [4] and 9756 CVEs [3]. Attackers can compromise
+the kernel to steal the model weights and user data during the
+LLM inference procedure.
+2.2
+ARM TrustZone and Its Limitations
+ARM TrustZone [7] is a hardware security extension, which
+divides the processor into a normal world and a secure world.
+All hardware resources can be divided into normal and secure
+modes. The normal world cannot access secure resources,
+while the secure world can access all resources. The com-
+modity OS and normal applications are running in the normal
+world. The secure world is a Trusted Execution Environment
+(TEE), which is used to run secure applications. Even a mali-
+cious OS kernel cannot compromise the confidentiality and
+integrity of secure-world applications.
+Inflexible Resource Isolation of TrustZone: Switching
+the resources between the normal and secure worlds is inflex-
+ible. For the physical memory, TrustZone manages it with
+several contiguous regions (e.g., 8), and each of them can be
+configured as normal or secure. To allocate a secure mem-
+ory region, the system must merge fragmented free memory
+pages into a continuous region, which is slow. Peripherals can
+be dynamically configured as normal or secure. However, the
+device driver manages the status of each device, and switch-
+ing this status is complex. As a result, existing mobile devices
+choose to statically partition the hardware resources. Only
+a limited amount of physical memory and security-related
+devices are configured as secure, during the system boot. It
+is enough for traditional secure applications, such as the key
+2
+
+
+--- Page 3 ---
+ 0
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+0.5 1
+2
+3
+4
+5
+6
+7
+8
+9
+MMAP
+CMA
+Latency (s)
+Allocation Memory Size (GB)
+ 0
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+0.5 1
+2
+3
+4
+5
+6
+7
+8
+9
+MMAP
+CMA
+Latency (s)
+Allocation Memory Size (GB)
+(a) Different allocation Size
+ 0
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+ 9
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9 10
+MMAP
+CMA
+Latency (s)
+Background Memory Usage (GB)
+ 0
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+ 9
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9 10
+MMAP
+CMA
+Latency (s)
+Background Memory Usage (GB)
+(b) Different Background Load
+Figure 1: Latency of allocating memory with different sizes
+(a) and allocating 8GB memory with different workloads (b).
+0
+10
+20
+30
+40
+Time (s)
+Strawman
+NW-Infer
+Alloc Time
+Load Time
+Decrypt Time
+Comp Time
+Other Time
+Figure 2: Breakdown of the TTFTs of normal-world inference
+and the TrustZone-based strawman.
+management and kernel integrity protection [26,39,40,45,54].
+2.3
+Challenges of Protecting LLM with
+TrustZone
+A strawman approach is to run the LLM inference in the se-
+cure world, defending against the untrusted OS kernel. How-
+ever, it faces three main challenges, which significantly hurt
+the inference performance.
+Challenge-1: Inflexible Secure Memory. Even with 8-
+bit quantization, a Llama3-8B model still requires almost
+7.5GB memory only for the model weights. Unfortunately,
+the memory resources are extremely constrained even for
+modern mobile devices, because most of memory is already
+allocated to cache the data and code for commonly-used ap-
+plications [9, 10, 49]. It is impossible to statically partition
+8GB memory as secure. However, dynamically allocating
+8GB secure memory needs to allocate 8GB of contiguous
+physical memory, which is very slow. As shown in Figure 1,
+even using the Linux Contiguous Memory Allocator (CMA),
+allocating contiguous memory is much slower than normal
+mmap, especially when the memory is used by other appli-
+cations For a 16GB device with 8GB memory usage, CMA
+takes 6.44s to allocate 8GB memory, while mmap takes 0.56s.
+Note that 8GB memory usage is not high for a 16GB modern
+mobile device.
+Challenge-2: Unavailable Secure NPU. NPU is widely
+used to accelerate the model inference, which is also required
+by the normal-world applications. It cannot be statically
+partitioned to the secure world. The secure world cannot use
+the NPU, and CPU inference is much slower. As shown in
+Figure 2.3, the computation time of the strawman (using CPU)
+is 30.06s while the normal-world inference (using NPU) only
+takes 1.94s.
+Challenge-3: Complex Workloads. Modern mobile de-
+vices are memory-constrained, using most memory to cache
+the data and code for commonly-used applications [9,10,49].
+In our evaluation, for a OnePlus 12 of ColorOS 16.0.3 (based
+Android 16) with 16GB memory, 8.83GB memory is used
+immediately after the system boot, even when no application
+is open. Meanwhile, mobile LLM applications invoke differ-
+ent LLM models for different tasks [11,37,42,73,75,76]. It
+is challenging to manage the constrained memory resources
+for the secure invocations of different LLM models.
+2.4
+ARM Virtualization
+ARM virtualization extension supports running Virtual Ma-
+chines (VMs) on the ARM platform. It introduces a new
+hypervisor mode (EL2) to run the hypervisor which manages
+resources and traps critical operations from VMs. A two-
+stage address translation mechanism is introduced to support
+the memory virtualization. The Stage-1 Page Table (S1PT)
+is controlled by the OS kernel which translates the virtual
+address (VA) to intermediate physical address (IPA) for each
+VM. Then, the Stage-2 Page Table (S2PT), controlled by
+the hypervisor, translates the IPA to physical address (PA)
+for each VM. The System MMU (SMMU) is introduced to
+perform the access control for DMA operations. FlexServe
+leverages the virtualization extension to implement the Flexi-
+ble Resource Isolation.
+3
+Overview
+3.1
+Design Goals
+FlexServe aims to provide a fast and secure LLM inference
+system for mobile devices. The detailed goals are:
+• Security: The confidentiality and integrity of model
+weights and input/output are protected during LLM in-
+ference against a compromised OS kernel.
+• High-Performance: Both the Time to First Token
+(TTFT) and the Time Between Tokens (TBT) should
+be minimized, as well as the overhead to normal-world
+applications.
+• Multi-Model Support: High performance is maintained
+when different models are invoked, especially for multi-
+model agent workflows.
+3.2
+Threat Model
+FlexServe aims to protect LLM inference from attackers with
+kernel privileges. Both the confidentiality and integrity of the
+3
+
+
+--- Page 4 ---
+APPs
+Flexible 
+Memory Isolation
+Flex-Monitor
+Normal World
+Secure World
+LLM APP2
+Untrusted OS
+Flexible 
+NPU Protection
+On-demand Protection
+EL0
+EL1
+EL2
+EL3
+Memory 
+Management
+NPU Driver
+APPs
+Trusted OS
+S-EL0
+S-EL1
+FlexServe Framework
+Secure
+LLM APP1
+LLM-Aware Memory 
+Management
+Secure Inference Pipeline
+Multi-Model 
+Scheduler
+Invoke ModelA
+Invoke ModelB
+APPs
+APPs
+Figure 3: System overview of FlexServe: The Flex-Monitor constructs the Flex-Mem and Flex-NPU, and the FlexServe
+Framework provides a fast and secure LLM inference framework.
+model weights and input/output are protected. All normal-
+world applications are considered untrusted. FlexServe as-
+sumes the initial kernel code is benign and that secure boot
+protects its integrity. However, the kernel may contain bugs
+and could be compromised after system boot. Consequently,
+an attacker could access or modify any memory pages or pe-
+ripherals with kernel privileges to compromise the LLM infer-
+ence system. Secure-world components and the lightweight
+Flex-Monitor are trusted.
+The inference request may be sent by a normal-world
+application. Similar to existing TrustZone-based systems,
+FlexServe cannot prevent attackers from directly stealing in-
+put/output from normal-world clients. However, the model
+weights remain protected. Side-channel attacks, physical at-
+tacks, and DoS attacks are considered out of scope. Section 8
+gives the detailed security analysis.
+3.3
+System Overview
+The design of FlexServe consists of a Flex-Monitor and a
+FlexServe Framework (Figure 3). The former constructs the
+Flexible Secure Memory (Flex-Mem) and Flexible Secure
+NPU (Flex-NPU), allowing FlexServe to allocate secure re-
+sources efficiently. Building on these, the FlexServe Frame-
+work provides a fast and secure LLM inference environment.
+The Flex-Monitor provides the Flexible Resource Isolation
+mechanism, running across normal EL2 (hypervisor mode)
+and secure EL3 (monitor mode). It introduces Flexible Mem-
+ory Isolation to construct Flex-Mem, a page-granular and
+flexible secure memory abstraction (Section 4.1). Flex-Mem
+pages can be recalled and managed by the normal-world
+kernel along with unprotected memory. Meanwhile, the Flex-
+Monitor introduces Flexible NPU Protection to construct Flex-
+NPU, a secure NPU abstraction which can switch between
+protected and unprotected modes efficiently (Section 4.3).
+The normal-world NPU driver is reused to facilitate efficient
+switching. Flex-Monitor leverages two-stage address transla-
+tion to implement protection, which may introduce runtime
+overhead. An On-demand Protection mechanism is intro-
+duced to eliminate this overhead when no secure inference
+tasks are active (Section 4.4).
+Based on Flex-Mem and Flex-NPU, FlexServe further con-
+structs the FlexServe Framework within the TrustZone secure
+world. It reuses the existing secure-world software stack to
+execute the inference framework. Flex-Mem is used to protect
+the runtime data, including the model weights and KV caches.
+Flex-NPU is used to accelerate the inference. A Secure In-
+ference Pipeline is introduced to hide the latency overhead
+of secure loading and cryptographic operations (Section 5.1).
+Benefiting from the page-granular and flexible protection of
+Flex-Mem, an LLM-Aware Memory Management mecha-
+nism is introduced to optimize memory usage (Section 5.2).
+A Multi-Model Scheduler manages memory resources for
+different LLM models (Section 5.3). The FlexServe Frame-
+work can handle requests from both normal-world and secure-
+world applications. The lifecycle of FlexServe is detailed in
+Section 5.4.
+4
+Flexible Resource Isolation
+4.1
+Flexible Secure Memory
+FlexServe divides all memory resources into three types: un-
+protected memory, Flexible Secure Memory (Flex-Mem) and
+TrustZone’s secure memory (Figure 4). Both the unprotected
+memory and Flex-Mem are the normal memory of TrustZone.
+The previous one is used by the untrusted OS and applications.
+The Flex-Mem is a flexible, page-granular secure-memory
+abstraction designed for secure LLM inference. Any un-
+protected memory page can be switched to Flex-Mem page,
+which can later be recalled back to the unprotected memory
+when memory pressure rises or the Flex-Mem is unused.
+4
+
+
+--- Page 5 ---
+APPs
+Normal World
+Secure World
+Kernel
+EL0
+EL1
+APPs
+IPA
+PA
+VA
+Flex-Mem
+Unprotected Memory
+TrustZone
+Normal Memory
+TrustZone
+Secure Memory
+FlexServe Framework
+S-EL0
+S-EL1
+Trusted OS
+EL2
+Flex-Monitor
+Process
+Code 
+& Data
+Flex-Mem Daemon
+LLM 
+Models
+KV 
+Cache
+Intermediate 
+Results
+mmap/
+munmap
+Linux Memory Manager
+Figure 4: Memory Protection of FlexServe.
+As shown in Figure 4, a Flex-Monitor, running in the
+EL2, isolates all Flex-Mem from the untrusted OS kernel by
+leveraging Stage-2 Page Table (S2PT). During the Flex-Mem
+pages allocation, the untrusted kernel first allocates a set of
+free unprotected pages. Details about the Flex-Mem manage-
+ment is shown in Section 4.2. Then, the Flex-Monitor unmaps
+the intermediate physical address (IPA) to physical address
+(PA) mapping for these pages by configuring the S2PT. And
+these pages are switched to Flex-Mem pages. Both the un-
+trusted kernel and applications cannot access them. After the
+allocation, the secure-world trusted OS maps the Flex-Mem
+pages to the FlexServe Framework’s address space (details
+in Section 5). During Flex-Mem recall, the Flex-Monitor
+remaps these pages in the normal world’s S2PT, and returns
+them to the normal-world kernel.
+DMA Protection: Direct memory access (DMA) may be
+abused to access the Flex-Mem pages. The Flex-Monitor pre-
+vents it by removing the VA-to-PA mapping for the Flex-Mem
+pages in the SMMU, which performs the address translation
+for DMA operations. Flex-Monitor first unmaps the MMIO
+region for the SMMU in the S2PT, to hook the modifications
+to the SMMU base address registers. Then it gets the en-
+abled SMMU page table and can unmap the Flex-Mem pages
+from it. The SMMU base address registers are rare-access
+registers, the hooking only triggers very small overhead. The
+On-demand Protection mechanism can further reduce the
+protection overhead (Section 4.4).
+4.2
+Flex-Mem Management
+FlexServe introduces a Flex-Mem Daemon process in the
+normal world to manage the Flex-Mem. The daemon co-
+ordinates with the untrusted kernel to allocate and reclaim
+pages, relying on the Flex-Monitor to enable or disable Flex-
+Mem protection. By leveraging the daemon process and the
+page-granular protection of Flex-Mem, the kernel can man-
+age Flex-Mem alongside unprotected memory. Specifically,
+it manages Flex-Mem indirectly by managing the daemon
+process’s memory; for example, it reclaims Flex-Mem by
+revoking memory from the daemon process.
+Flex-Mem Allocation: The secure-world trusted OS sends
+the allocation request to the Flex-Mem Daemon process. The
+daemon then allocates and pins the required memory from the
+untrusted kernel by invoking mmap interfaces. All allocated
+pages are transferred to the Flex-Monitor, and their IPA-to-PA
+mappings are removed. Consequently, the kernel loses access
+to these pages. Finally, the allocated Flex-Mem pages are
+transferred to the secure world.
+Flex-Mem Reclaim: The untrusted kernel can reclaim
+Flex-Mem, for instance, when memory pressure rises. It
+first notifies the Flex-Mem Daemon, specifying the number
+of pages to reclaim. The daemon then requests the secure
+world to release a sufficient number of Flex-Mem pages. The
+FlexServe Framework determines which pages to release (Sec-
+tion 5.2) and clears their content if necessary. Subsequently,
+the Flex-Monitor remaps these released pages into the normal
+world’s S2PT. Finally, the daemon process unpins these pages
+and returns them to the kernel. Additionally, the FlexServe
+Framework can voluntarily release unused Flex-Mem pages
+to the normal world.
+Lazy Reclaim: Since Flex-Mem stores sensitive data, its
+content must be cleared before being returned to the un-
+trusted kernel. However, the kernel often overwrites the en-
+tire page immediately after reallocation. For example, when
+a page is allocated via mmap with MAP_ANONYMOUS |
+MAP_PRIVATE flags or backed by a file descriptor, the ker-
+nel overwrites the page immediately. To avoid redundant
+clearing, the Flex-Monitor delays this operation until the
+freed Flex-Mem page is actually reused. Specifically, during
+reclamation, the page is not cleared immediately, though the
+Flex-Monitor still unmaps it from the S2PT. The daemon pro-
+cess unpins the page, and the kernel marks it as a lazy reclaim
+page. Upon reallocating such a page, the kernel invokes the
+Flex-Monitor to overwrite the page with new content and map
+it into the S2PT. The Flex-Monitor ensures the page is cleared
+even if the kernel does not modify it.
+4.3
+Flexible NPU Protection
+FlexServe introduces the Flexible Secure NPU (Flex-NPU)
+to efficiently enable the NPU for secure LLM inference. Flex-
+NPU operates on a time-multiplexing model: the NPU is
+either in unprotected mode, accessible by the normal world,
+or switched into Flex-NPU mode, where it is exclusively
+available to the secure world.
+When the NPU is in Flex-NPU mode, the Flex-Monitor
+prevents the untrusted kernel from accessing it. The ARM
+architecture uses Memory-Mapped IO (MMIO) to access
+devices, including the NPU. Therefore, the Flex-Monitor
+removes the NPU’s MMIO region from the normal world’s
+S2PT, effectively blocking kernel access.
+5
+
+
+--- Page 6 ---
+Subsequently, FlexServe reuses the normal-world NPU
+driver to control the Flex-NPU. The Flex-Monitor constructs
+an isolated Flex-NPU sandbox to protect the NPU driver
+when the NPU is in Flex-NPU mode. Specifically, the Flex-
+Monitor maintains an additional S2PT for this sandbox. When
+the secure world invokes the protected NPU driver, the Flex-
+Monitor switches to the sandbox’s S2PT. The NPU’s MMIO
+region is mapped within the sandbox’s S2PT, allowing the
+driver to access the NPU. Both the driver’s code and data
+are mapped in the sandbox’s S2PT but unmapped from the
+kernel’s S2PT. This prevents the kernel from tampering with
+the protected NPU driver’s code and data. Although the driver
+retains residual state from the unprotected mode, NPU task
+launching is a stateless operation. Thus, the remaining state
+does not influence Flex-NPU task execution.
+Furthermore, the Flex-Monitor enforces that the Flex-NPU
+can access only Flex-Mem pages by restricting the Flex-
+NPU’s SMMU page table mappings. Unprotected memory
+pages are unmapped, ensuring that private data cannot be
+leaked to unprotected memory by the Flex-NPU. Note that,
+since different devices use distinct SMMU page tables, the
+Flex-Monitor still ensures that no other devices can access
+Flex-Mem pages.
+When the Flex-NPU switches back to unprotected mode,
+the Flex-Monitor remaps the NPU’s MMIO region and the
+driver’s code and data to the kernel’s S2PT. The NPU’s
+SMMU page table is also reverted to map only unprotected
+memory pages.
+4.4
+On-demand Protection
+Flex-Monitor leverages the S2PT to protect the Flex-Mem
+and Flex-NPU, which may introduce performance overhead
+for normal-world applications. On-demand Protection is in-
+troduced to minimize this overhead. This mechanism disables
+protection when both the Flex-Mem and Flex-NPU are fully
+released, and re-enables it when either is allocated. The key
+challenge lies in preserving the integrity of the Flex-Monitor
+itself, as its code and data are stored in normal memory. Once
+the S2PT is disabled, the untrusted kernel could potentially
+modify the Flex-Monitor and compromise the protection.
+To address this, Flex-Monitor is divided into an EL2 com-
+ponent and an EL3 component. The EL2 component imple-
+ments the main protection mechanisms, including Flexible
+Secure Memory and Flexible Secure NPU. The EL3 compo-
+nent freezes the EL2 component to eliminate virtualization
+overhead and protect its integrity. The EL3 component exe-
+cutes within TrustZone’s secure memory. It calculates and
+stores a hash of the EL2 component, covering both its code
+and data. Subsequently, it disables the S2PT. To re-enable
+protection, the EL3 component restores the S2PT and verifies
+the EL2 component using the stored hash. The S2PT is also
+verified as part of the EL2 component’s data. The entire EL2
+component is placed in a contiguous memory region to sim-
+plify hash calculation. Note that the EL2 component does not
+contain any private data (e.g., model weights), so FlexServe
+only protects its integrity.
+5
+FlexServe Framework
+The FlexServe Framework is implemented as a secure-world
+Trusted Application (TA). It utilizes secure memory to store
+code and data, including global variables and the stack. Task
+data, including model weights and the KV cache, are placed
+in Flex-Mem, while the Flex-NPU accelerates the inference.
+5.1
+Secure Inference Pipeline
+Mobile devices lack sufficient memory to keep LLM weights
+resident continuously. Consequently, on-device inference suf-
+fers from cold starts, necessitating on-demand weight loading.
+This issue is exacerbated in confidential computing settings,
+where encrypted weights require decryption, further increas-
+ing the TTFT.
+FlexServe leverages pipeline parallelism to mitigate cold-
+start overhead by overlapping different steps. The decode
+stage can directly use the in-memory weights loaded by the
+prefill stage. Therefore, FlexServe focuses on the prefill and
+partitions it into four steps: 1) Memory allocation: Allo-
+cating memory for model weights and KV cache. 2) Model
+loading: Loading encrypted weights from storage. 3) Model
+decryption: Decrypting the weights. 4) Forward compu-
+tation: Executing the prefill stage using the Flex-NPU and
+CPU.
+The prefill stage processes a sequence of layers, where
+each layer depends solely on the output of the previous layers.
+Within each layer, different steps are constrained only by their
+in-layer dependency (allocate →load →decrypt →compute)
+and do not rely on results from preceding layers. FlexServe
+overlaps the allocation, loading, and decryption of layer i+1
+with the computation of layer i.
+Pipeline Bottleneck: Overall latency is determined by the
+longest steps on the critical path. While NPU/CPU computa-
+tion time scales with prompt length, allocation, loading, and
+decryption are largely input-independent. Figure 2.3 shows
+that contiguous memory allocation (CMA) dominates these
+auxiliary stages, limiting end-to-end latency. By leveraging
+Flex-Mem, FlexServe avoids heavyweight CMA allocation.
+Consequently, the prefill pipeline becomes bottlenecked pri-
+marily by model loading time, allowing for greater speedup.
+Secure Loading: During the allocation-loading-decryption
+process, memory pages are not immediately transitioned to
+Flex-Mem after allocation. Instead, the untrusted kernel uses
+DMA to load encrypted model weights into these initially
+unprotected pages. Once loading is complete, the memory is
+transitioned to Flex-Mem, followed by decryption performed
+by a secure-world process.
+6
+
+
+--- Page 7 ---
+5.2
+LLM-Aware Memory Management
+FlexServe categorizes the memory footprint of on-device
+LLM inference into three types: model weights, KV cache,
+and activations. Leveraging the flexible Flex-Mem, FlexServe
+can manage the memory footprint of these data in a fine-
+grained and workload-aware manner, expanding the optimiza-
+tion space.
+Model Weights: Model weights are accessed layer-by-
+layer during inference. FlexServe therefore reorganizes the
+on-disk model into a layered layout and manages the model
+weight cache in a layer-aware manner within Flex-Mem. This
+ordering naturally defines caching and eviction priorities.
+When additional memory is available, FlexServe keeps the
+earlier layers of a model in Flex-Mem to reduce the cold-start
+overhead. Under memory pressure, it releases later layers
+first. Combined with the pipelined loading strategy (§5.1),
+caching a prefix of layers can shift the bottleneck from weight
+loading to forward computation.
+KV Cache: The size of KV cache grows with the (un-
+known) output length during the inference. A naive approach
+is to pre-allocate the secure memory for the maximum token
+length, which causes the fragmentation problem and wastes
+space. Leveraging the Flex-Mem, FlexServe adopts a paged
+design that groups the KV cache of a fixed number of consecu-
+tive tokens into a single allocation unit, similar to PagedAtten-
+tion [35]. The FlexServe Framework allocates new Flex-Mem
+pages for saving the KV cache of the new generated tokens.
+Meanwhile, caching the KV cache across inference re-
+quests can avoid redundant prefill computation, e.g., for the
+multi-turn chat and agent workflows. However, KV cache
+still takes a significant memory space. Taking Qwen3-8B as
+an example, when the token length exceeds 7K, KV cache
+can reach GB. Leveraging Flex-Mem, FlexServe implements
+a flexible cache of KV cache. When the normal-world OS
+requests memory reclamation, FlexServe can selectively of-
+fload cold KV pages. They are encrypted and spilled to flash.
+Our current implementation uses LRU policy to identify cold
+KV pages.
+Activations: Activation tensors are short-lived and their
+peak size is mainly determined by batch size (or chunk size)
+in prefill. FlexServe Framework allocates activations from
+dedicated Flex-Mem regions and treats them as volatile. They
+can be reclaimed aggressively once a request completes.
+5.3
+Multi-Model Scheduler
+Mobile devices host different LLM models for different
+tasks [23,43,66,67,69,74]. Even a single LLM application
+may invoke multiple models [11, 37, 42, 73, 75, 76]. Mean-
+while, the available memory budget fluctuates rapidly due to
+the dynamic memory usage of mobile applications. FlexServe
+Framework introduces a multi-model scheduler to manage
+the memory for different LLM models, leveraging the flexible
+Flex-Mem. It coordinates 1) which model(s) remain resi-
+dent; 2) which layers are kept in Flex-Mem, and 3) when to
+proactively prefetch or evict layers.
+Zero-stall Cache Line for a Single Model: Due to the
+large model loading time, the pipeline may stall for waiting
+for the model weights. Caching some prefix of layers can
+eliminate most pipeline stalls. FlexServe defines the zero-
+stall cache line as the minimum number of earliest layers
+that must remain resident so that, for a target prompt-length
+distribution, prefill can proceed without waiting for weight
+loading/decryption in the critical path. In practice, FlexServe
+caches these layers in Flex-Mem. When memory pressure
+increases, the scheduler preferentially reclaims layers from
+the tail, while keeping the cache line intact whenever possible.
+Workflow-aware Scheduling across Multiple Models:
+Many on-device agents invoke multiple models (e.g., a re-
+triever, a planner, an executor or a generator) in a relatively
+stable order [11,37,42,73,75,76]. When the workflow reveals
+(or can predict) the next model to be invoked, the scheduler
+prefetches the next model to the Flex-Mem in the background.
+The prefetch is pipelined with the decode stage of the pre-
+vious model. Similarly, when switching from model A to
+model B, the scheduler reclaims model A’s tail layers first
+and overlaps model B loading with ongoing computation,
+reducing end-to-end latency for the entire agent pipeline.
+Prediction-based Caching for General Workloads: For
+unknown workloads, the scheduler maintains a model-level
+cache using standard replacement policies such as LRU. It
+dynamically adjusts the percentage of the cached weights for
+each model based on the observed request frequency, prompt-
+length statistics, and the current memory watermark. This
+enables the system to trade off between keeping multiple
+models partially resident (fast switching) and keeping one
+model deeper (better cold-start performance).
+5.4
+Lifecycle of FlexServe
+The lifecycle of FlexServe can be divided into three phases:
+secure boot, session establishment, and confidential inference.
+Secure Boot and Initialization: With secure boot technology,
+the firmware can verify the integrity of the Flex-Monitor and
+the secure-world trusted OS (T-OS). The FlexServe Frame-
+work is implemented as a TA, which is signed by the device
+vendor’s private key. When the FlexServe Framework is
+started, the T-OS 1) allocates a secure memory region for
+it; 2) loads the encrypted binary from the file system and
+verifies its signature; and then 3) decrypts the binary into the
+secure memory and jumps to the FlexServe Framework’s en-
+try point. This process ensures the integrity of the FlexServe
+Framework’s code.
+Secure Session and Channel Establishment: To protect
+the input/output for the secure LLM inference, the LLM
+application and FlexServe Framework establish an end-to-
+end secure channel. It is implemented following the stan-
+7
+
+
+--- Page 8 ---
+dard GlobalPlatform TEE specifications, by invoking the
+TEEC_OpenSession function. During this phase, the client
+can attest the framework to verify 1) it runs in the secure
+world and 2) its integrity is guaranteed. Note that, FlexServe
+also allows another secure-world TA or a remote application
+to invoke the FlexServe Framework. The secure session and
+attestation are also performed.
+Confidential Inference Transaction: The runtime interac-
+tion follows a strict request-response model.
+1. Request Generation: The client encrypts the user’s
+prompt and target model index using the session key.
+The request is sent to the FlexServe Framework, by
+invoking the TEEC_InvokeCommand function. Then the
+CPU switches to the secure world.
+2. Secure Execution: The FlexServe Framework gets the
+request, decrypts it and verifies its integrity. It then
+triggers the Secure Inference Pipeline (Section 5.1) to
+load the target model and run the inference task, using
+Flex-Mem and Flex-NPU.
+3. Result Commitment: The output tokens are encrypted
+and returned to the client during the secure session. A
+response proof is generated for the output, including the
+request hash, output hash, and a signature.
+4. Response Verification: The client decrypts the response
+and verifies it with the proof. The response proof is
+signed by the framework’s private key, which enforces
+the response is generated by the trusted FlexServe Frame-
+work with specified input and model.
+6
+Implementation
+We implement a prototype of FlexServe on the Rockchip
+RK3588 platform, which provides an open-source NPU
+driver [72] alongside a closed-source NPU runtime [71]. The
+software stack is built upon Linux Kernel 6.1.57 serving as
+the normal-world OS kernel and OP-TEE 4.5.0 [44] as the
+secure-world trusted OS.
+The system architecture comprises two primary compo-
+nents: Flex-Monitor and the FlexServe Framework. Flex-
+Monitor consists of approximately 4.5K lines of code (LoC).
+It implements essential virtualization primitives, including
+S2PT management and SMMU configuration, which form
+the foundation for our Flex-Mem and Flex-NPU mechanisms.
+The FlexServe Framework is a lightweight LLM inference
+engine implemented in C/C++ as a Trusted Application (TA).
+Spanning 3.3K LoC, it currently supports representative open-
+source LLMs, such as the Llama3 and Qwen3 series models.
+The vendor’s closed-source NPU runtime executes spec-
+ified LLM models as a black box, preventing the integra-
+tion of our framework’s optimizations.
+To address this,
+FlexServe leverages a community-driven reverse-engineering
+project [48], which utilizes the NPU for INT8 Matrix Mul-
+tiplication and the CPU for inverse quantization operations
+during GEMM. Building upon this foundation, we integrate
+critical optimizations for GEMM, such as automatic matrix
+blocking, fine-grained CPU/NPU cache coherence control,
+and CPU/NPU pipelined block matrix GEMM, to accelerate
+the inference engine. Moreover, ARM Neon instructions are
+utilized for other non-GEMM operations.
+7
+Evaluation
+7.1
+Experimental Setup
+We use the prototype of FlexServe (Section 6) in the evalua-
+tion. The evaluation is conducted on a NanoPC-T6 developing
+board with the Rockchip RK3588 SoC. It has an octa-core
+CPU, 16GB memory and a 6TOPS NPU. We try to answer the
+following questions in the evaluation: Q-1) How about the la-
+tency of the critical operations of FlexServe? Q-2) How about
+the performance of FlexServe for single-model inference? Q-
+3) How about the performance of FlexServe for multi-model
+inference? Q-4) How does FlexServe’s protection affect the
+normal-world applications?
+To demonstrate the efficacy of our design, we compare our
+system (FlexServe) with three baselines:
+• NW-Base: The unprotected LLM inference baseline
+running in the normal world. It uses pipeline optimiza-
+tions and the NPU to accelerate GEMM. It represents
+the upper bound of performance without any protection
+overhead.
+• Strawman: A secure baseline that runs the LLM infer-
+ence in existing TrustZone’s secure world. It uses CMA
+to allocate secure memory and CPU for the secure com-
+putation. It represents the secure inference performance
+with existing TrustZone.
+• Strawman-OPT: An optimized version of Strawman
+which enabled with the pipelining and secure NPU to
+accelerate the inference. It still uses CMA to allocate
+secure memory.
+We evaluate these systems under real-world edge sce-
+narios.
+To mimic background interference, we employ
+stress-ng [6] to generate background load. Our exper-
+iments primarily configure stress-ng to occupy resident
+memory while avoiding additional contention for CPU cy-
+cles or memory bandwidth, isolating the impact of memory
+pressure. Unless otherwise indicated, all evaluations are con-
+ducted with a background memory usage of 8GB, which is
+a medium memory usage for modern mobile devices. The
+evaluation mainly focuses on the TTFT, because 1) it is one
+of the most important metrics in device-side LLM inference;
+8
+
+
+--- Page 9 ---
+Table 1: Latency of critical operations (ms).
+Operation
+FlexServe
+Baseline
+Memory Alloc (8GB)
+568.58
+6440.67
+Memory Reclaim (8GB)
+80.50
+732.85
+NPU SMMU Setup (8GB)
+435.48
+429.74
+NPU Task Launch
+1.28
+1.26
+Critical FlexServe Operations
+Flex-NPU Mode Switch
+0.21
+S2PT Boot
+0.13
+Hash Check
+2.83
+File Load (8GB)
+3265.34
+Memory Decrypt (8GB)
+1319.16
+and 2) it is significantly affected by the protection. The de-
+code stage does not need to allocate secure memory or load
+weights, which is almost unaffected by the protection.
+7.2
+Micro-benchmarks
+To answer question-1, we test the latency of critical opera-
+tions of FlexServe. Performance of Flex-Mem: As shown
+in top-half of Table 1, Flex-Mem significantly outperforms
+the CMA-based approach in both allocation and reclama-
+tion. For memory allocation, Flex-Mem achieves a 11.33×
+speedup over CMA. Notably, Flex-Mem reclamation is 12.6×
+faster than CMA, attributed to our Lazy Reclaim optimiza-
+tion, whereas CMA necessitates a full, eager memory zeroing
+operation upon release.
+Performance of Flexible Secure NPU (Flex-NPU): The
+mode switch latency of Flex-NPU is minimal (0.21 ms). Re-
+garding SMMU mapping and NPU task launching, the over-
+head introduced by Flex-NPU is negligible. Note that the
+"Task Launch" metric excludes the actual NPU computation
+time to represent the latency of atomic NPU command sub-
+mission.
+On-demand Protection Overhead: The bottom-half of
+Table 1 shows that the latencies for S2PT boot and hash
+checking are kept within the millisecond range.
+7.3
+Single-Model Performance
+To answer question 2, we evaluate the TTFT and token gen-
+eration throughput of FlexServe using different models. The
+model cache is disabled, and we test the cold-start perfor-
+mance of all systems. For the decode stage, the weights have
+already been loaded during the prefill stage.
+Prefill Performance: To provide a comprehensive eval-
+uation of the prefill phase, different LLM models ranging
+from 1.7B to 8B parameters are evaluated. All models were
+NW-NPU-Pipe
+RS-Infer   
+Strawman-OPT
+Strawman  
+NW-NPU-Pipe
+RS-Infer   
+Strawman-OPT
+Strawman  
+ 25
+ 50
+ 75
+ 0
+ 3
+ 6
+ 9
+ 12
+64
+128
+256
+512
+TTFT (s)
+(a) Llama3.2 3B
+ 30
+ 80
+ 130
+ 0
+ 5
+ 10
+ 15
+ 20
+64
+128
+256
+512
+(b) Llama3.1 8B
+ 10
+ 15
+ 20
+ 25
+ 0
+ 2
+ 4
+ 6
+64
+128
+256
+512
+TTFT (s)
+(c) Qwen3 1.7B
+ 40
+ 90
+ 140
+ 190
+ 0
+ 5
+ 10
+ 15
+ 20
+ 25
+64
+128
+256
+512
+(d) Qwen3 8B
+Figure 5: TTFT with different input lengths and models.
+ 0
+ 5
+ 10
+ 15
+ 20
+ 25
+Llama-3.2-3B
+Llama-3.1-8B
+Qwen3-0.6B
+Qwen3-1.7B
+NW-NPU-Pipe
+RS-Infer
+Strawman-OPT
+Strawman
+Throughput (token/s)
+ 0
+ 5
+ 10
+ 15
+ 20
+ 25
+Llama-3.2-3B
+Llama-3.1-8B
+Qwen3-0.6B
+Qwen3-1.7B
+NW-NPU-Pipe
+RS-Infer
+Strawman-OPT
+Strawman
+Throughput (token/s)
+Figure 6: Decode throughput with different models.
+quantized to INT8 precision. Figure 5 illustrates the TTFT
+performance across different prompt lengths.
+Relative to the CPU-only Strawman, FlexServe achieves
+a substantial speedup 7.15× on average with maximum up
+to 14.44×. Against Strawman-OPT, which utilizes secure
+NPU and pipeline optimziation, FlexServe delivers a speedup
+between 1.43× and 2.42× (1.85× on average). This per-
+formance gain stems from two factors: (1) the reduced la-
+tency of memory allocation via Flex-Mem, and (2) mini-
+mized resource contention. We observe that as prompt length
+increases, the pipeline bottleneck shifts from I/O to com-
+putation, resulting in a slightly narrower performance gap.
+Currently, the evaluated platform does not enable a SOTA
+NPU. FlexServe will have a larger speedup if using a faster
+NPU, which makes the computation time shorter.
+Compared to the insecure baseline NW-Base running in
+the normal world, FlexServe incurs a negligible overhead of
+only 4.41% on average. Consequently, FlexServe provides
+strong security guarantees while performing near the upper
+bound performance.
+9
+
+
+--- Page 10 ---
+REE-Pipe
+RS-Infer
+Strawman-OPT
+Strawman
+ 10
+ 15
+ 0
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9 10
+TTFT (s)
+Background Load (GB)
+(a) Llama3.2 3B
+ 30
+ 40
+ 50
+ 0
+ 2.5
+ 5
+ 7.5
+ 10
+ 12.5
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9 10
+TTFT (s)
+Background Load (GB)
+(b) Llama3.1 8B
+ 1.5
+ 2.5
+ 3.5
+ 0
+ 0.2
+ 0.4
+ 0.6
+ 0.8
+ 1
+ 1.2
+ 1.4
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9 10
+TTFT (s)
+Background Load (GB)
+(c) Qwen3 0.6B
+ 5
+ 7.5
+ 0
+ 1
+ 2
+ 3
+ 4
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9 10
+TTFT (s)
+Background Load (GB)
+(d) Qwen3 1.7B
+Figure 7: TTFT under varying background memory pressure.
+FlexServe   
+Strawman-OPT
+Strawman  
+FlexServe   
+Strawman-OPT
+Strawman  
+ 10
+ 30
+ 50
+ 0
+ 2
+ 4
+ 6
+ 8
+UC
+OA
+DD
+AD
+TTFT (s)
+(a) Qwen3 1.7B + Llama3.1 8B
+ 8
+ 10
+ 0
+ 1
+ 2
+ 3
+ 4
+UC
+OA
+DD
+AD
+TTFT (s)
+(b) Qwen3 0.6B + Qwen3 1.7B
+ 10
+ 40
+ 70
+ 0
+ 3
+ 6
+ 9
+UC
+OA
+DD
+AD
+TTFT (s)
+(c) Qwen3 0.6B + Qwen3 8B
+ 10
+ 20
+ 30
+ 0
+ 2
+ 4
+ 6
+ 8
+UC
+OA
+DD
+AD
+TTFT (s)
+(d) Qwen3 1.7B + Llama3.2 3B
+Figure 8:
+TTFT of different model groups on real-world benchmarks with a 4GB model cache. UC: UltraChat, OA:
+OpenAssistant, DD: Dolly Dataset, AD: Alpaca Data.
+Decode Performance: While our primary optimizations
+target the prefill phase, we also evaluate the decoding phase to
+ensure minimal overhead during token generation. As shown
+in Figure 6, FlexServe improves throughput by 24.14% on
+average compared to Strawman due to NPU acceleration.
+FlexServe, Strawman-OPT and NW-Base all have similar
+throughput, because the model weights are already in memory,
+and all of them uses pipelining and NPU. Relative to the
+insecure NW-Base, FlexServe experiences a minor throughput
+reduction of 0.57%–6.29% (3.01% on average).
+Impact of Memory Pressure: Figure 7 evaluates sys-
+tem resilience to memory pressure ranging from 0GB to
+10GB with prompt length of 128. When memory is abun-
+dant (0GB background load), the performance of all NPU-
+enabled systems is comparable. However, as memory pres-
+sure increases, the performance of the systems diverges sig-
+nificantly. FlexServe maintains low TTFT across varying
+background loads. It has the similar performance with the
+insecure NW-Base baseline. In contrast, both Strawman and
+Strawman-OPT use CMA to allocate secure memory. Their
+TTFT increase rapidly as background usage increases.
+For the Llama3.1 8B model, the TTFT of FlexServe in-
+creases when background load reaches 10GB, as the system
+begins swapping memory to disk. Overall, FlexServe achieves
+an average 1.87× speedup with maximum up to 3.05× over
+Strawman-OPT across memory conditions ranging from 0GB
+to 10GB.
+7.4
+Multi-Model Performance
+To answer question-3, we test the performance of FlexServe
+with different groups of models and agent workflows.
+Multi-model Performance on Real Benchmarks: We se-
+lected four model groups with varying series and sizes using
+real-world benchmarks, including UltraChat, OpenAssistant,
+Dolly Dataset and Alpaca Data. Requests are dispatched ran-
+domly to models within each group. FlexServe dynamically
+adjusts the cache proportion to maximize the utility of the
+limited cache size. We evaluate performance under a 4GB
+cache constraint, a realistic limit for mobile devices, whereas
+Strawman cannot dynamically adjust its cache allocation due
+to the inflexibility of CMA-based secure memory. Generally,
+FlexServe achieves an average TTFT speedup of 8.84× over
+Strawman and 2.53× over Strawman-OPT, demonstrating the
+effectiveness of the cache scheduler.
+Agent Workflow: We evaluate FlexServe across ten rep-
+resentative agent workflow scenarios on mobile devices. De-
+pending on the task characteristics, we select appropriate
+model combinations with varying sizes for each workflow.
+For instance, we employ Qwen3-8B and Llama3.2-3B for the
+GUI agent, and Llama3.1-8B paired with Qwen3-8B for the
+Meeting Assistant.
+Figure 9 reports the response latency, defined as the sum of
+the first model’s full generation time and the second model’s
+Time-To-First-Token (TTFT). FlexServe improves the re-
+sponse latency of agent workflows up to 24.30× and 4.05×
+compared to the Strawman and Strawman-OPT. Some work-
+flows have a long decode stage (e.g., the Email Polisher and
+10
+
+
+--- Page 11 ---
+ 20
+ 120
+ 220
+ 320
+ 0
+ 2.5
+ 5
+ 7.5
+ 10
+ 12.5
+ 15
+ 17.5
+Fact
+Checking
+Privacy
+Guard
+Notification
+Clear
+Voice
+Routing
+GUI
+Agent
+Smart
+Alarm
+Home
+Assistant
+Logic
+Critique
+Email
+Polisher
+Meeting
+Assistant
+Response Latency (s)
+RS-Infer   
+Strawman-OPT
+Strawman  
+RS-Infer   
+Strawman-OPT
+Strawman  
+Figure 9: Response latency of real-world agent workflows.
+ 10
+ 30
+ 50
+ 10
+ 30
+ 50
+ 0
+ 2
+ 4
+ 6
+Llama3.2-1B
+Llama3.2-3B
+Llama3.1-8B
+Qwen3-0.6B
+Qwen3-1.7B
+Qwen3-8B
+RS-Infer
+RS-Infer-NP
+Strawman-OPT
+Strawman
+TTFT (s)
+ 0
+ 2
+ 4
+ 6
+Llama3.2-1B
+Llama3.2-3B
+Llama3.1-8B
+Qwen3-0.6B
+Qwen3-1.7B
+Qwen3-8B
+RS-Infer
+RS-Infer-NP
+Strawman-OPT
+Strawman
+TTFT (s)
+Figure 10: Impact of prefetching on TTFT.
+Meeting Assistant), which hides FlexServe’s performance
+speedup of the prefill stage. However, FlexServe still outper-
+forms Strawman by 14.15× and Strawman-OPT by 2.94×,
+averagely.
+7.5
+Prefetching Machanism
+To show the benefits of FlexServe’s prefetching mechanism,
+we evaluate the TTFT of different models with a prompt
+length of 128 tokens. A new FlexServe baseline which dis-
+able the prefetching (FlexServe-NP) is evaluated. FlexServe
+is configured to use enough cache to prefetch the whole
+model weights. Figure 10 shows the results. FlexServe
+achieves an average speedup of 9.33× against Strawman and
+3.50× against Strawman-OPT. Compared to the FlexServe-
+NP, FlexServe achieves an average speedup of 1.63×.
+7.6
+Overhead to Normal-World Application
+To answer question-4, we first test the overhead of FlexServe
+and Strawman to the SQLite [27] running in the normal world.
+In this setup, SQLite operates in an in-memory mode storing
+a 3GB key-value dataset. A test process repeatedly accesses a
+1GB subset of keys and evaluates the latency. Both FlexServe
+and Strawman allocates 8GB memory at the background. To
+eliminate CPU contention, SQLite is pinned to distinct CPU
+ 200
+ 400
+ 600
+ 800
+ 1000
+ 1200
+ 1400
+ 1600
+ 1800
+ 2000
+Time
+RS-Infer
+Strawman
+SQLite Latency (ms)
+ 200
+ 400
+ 600
+ 800
+ 1000
+ 1200
+ 1400
+ 1600
+ 1800
+ 2000
+Time
+RS-Infer
+Strawman
+SQLite Latency (ms)
+Figure 11: Performance overhead to the SQLite.
+cores.
+As shown in Figure 11, compared to the baseline (no back-
+ground inference), the latency increases by up to 3.27× with
+Strawman, but only by 1.31× with FlexServe. This result
+demonstrates that the heavy GB-level page migration caused
+by CMA allocation saturates memory bandwidth and triggers
+frequent TLB misses, hurting the application performance.
+FlexServe minimizes the overhead by avoiding unnecessary
+page migrations.
+We quantify the virtualization overhead of FlexServe us-
+ing the SPEC CPU benchmark suite [57], which is averagely
+2.46%. It can be totally eliminated by the On-demand Protec-
+tion mechanism of FlexServe.
+8
+Security Analysis
+FlexServe considers a strong adversary that fully controls
+the OS kernel and attempts to compromise the privacy and
+integrity of the secure LLM inference system.
+Direct Attacks: A compromised kernel may attempt to
+directly steal or tamper with model weights and the KV cache
+by accessing physical memory. FlexServe secures all code
+and data of the inference framework within either TrustZone’s
+secure memory or Flex-Mem. TrustZone protects the former,
+preventing access by the normal-world kernel. Similarly, Flex-
+Mem is unmapped from the normal-world’s stage-2 page table
+11
+
+
+--- Page 12 ---
+(S2PT), rendering it inaccessible to the normal-world kernel.
+Any attempt by the normal-world kernel to access Flex-Mem
+will trigger a stage-2 page fault.
+DMA Attacks: A compromised kernel might attempt to
+initiate malicious DMA requests to read from or write to Flex-
+Mem. FlexServe prevents this by controlling the SMMU page
+tables. Specifically, all Flex-Mem pages are unmapped from
+device access, with the exception of the Flex-NPU, which
+is explicitly authorized to access Flex-Mem via DMA. An
+attacker might then attempt to exploit the Flex-NPU to copy
+content from Flex-Mem to unprotected memory. FlexServe
+mitigates this by: 1) unmapping the Flex-NPU’s MMIO
+region from the normal-world kernel, preventing the com-
+promised kernel from controlling the Flex-NPU; and 2) re-
+stricting the Flex-NPU’s access solely to Flex-Mem regions,
+thereby preventing the Flex-NPU from writing data to unpro-
+tected memory.
+Bypassing FlexServe Protection: First, an attacker may
+attempt to bypass FlexServe’s memory protection. FlexServe
+leverages S2PT to isolate physical memory and MMIO re-
+gions from the untrusted kernel. Since S2PT configuration is
+restricted to EL2, it remains inaccessible to a compromised
+kernel. Second, an attacker may attempt to bypass DMA
+protection by maliciously configuring the SMMU. To prevent
+this, FlexServe unmaps the SMMU’s MMIO region in the
+S2PT, ensuring all SMMU configuration attempts are inter-
+cepted by the Flex-Monitor. Furthermore, all SMMU page
+table pages are unmapped in the S2PT, preventing modifica-
+tion by the untrusted kernel. Third, FlexServe employs an
+On-demand Protection mechanism to reduce overhead. An
+attacker might try to modify the Flex-Monitor’s code, S2PT,
+or SMMU page tables when protection is disabled. FlexServe
+counters this by utilizing the EL3 component of the Flex-
+Monitor to verify the integrity of the Flex-Monitor’s code and
+data, ensuring any modifications are detected.
+Response Tampering: FlexServe ensures that responses
+are generated based on specific user inputs and model weights.
+It produces a response proof containing the request hash, re-
+sponse hash, and a signature. While a malicious kernel might
+attempt to tamper with the response once it enters the normal
+world, the proof is signed with the FlexServe Framework’s
+private key, which resides solely in the secure world. This
+allows any party to verify the response’s integrity. An attacker
+might also attempt to feed fake input and model weights to
+the Flex-NPU to generate a fake response. FlexServe prevents
+this by restricting the Flex-NPU to access only Flex-Mem
+pages, the content of which cannot be modified by the un-
+trusted kernel.
+Security Limitations: FlexServe shares common secu-
+rity limitations with most TrustZone-based systems. First,
+FlexServe does not prevent physical or side-channel attacks.
+However, existing defenses against such attacks can be used,
+which are orthogonal to our work.
+Second, FlexServe responses must be delivered to the
+client, which may be a normal-world application or a secure-
+world TA. A compromised kernel could still steal or tam-
+per with input/output for a normal-world client. Although
+FlexServe provides a response proof to verify output integrity,
+an untrusted kernel could modify the output after the ver-
+ification, or bypass the application’s verification logic en-
+tirely. It is a common limitation of TrustZone-based systems,
+which cannot protect the normal-world client. Nevertheless,
+FlexServe’s protection remains valuable as it secures the
+model weights, and remote users can still verify the response
+integrity.
+Third, like most TEE systems, FlexServe cannot defend
+against Denial-of-Service (DoS) attacks. In the worst-case, a
+compromised kernel could simply shut down the device. Even
+so, the confidentiality and integrity of the LLM inference
+remain protected.
+9
+Discussion
+9.1
+Comparison with Different Choices
+FlexServe reuses the TrustZone secure world to run the
+FlexServe Framework and leverages the virtualization tech-
+nology to protect the Flex-Mem and Flex-NPU. We compare
+FlexServe with two other design choices: Comparing with
+Only Using the TrustZone: The TrustZone-based design
+needs to allocate a physically contiguous memory region and
+configure it as secure memory for the inference, at runtime.
+First, allocating a large contiguous memory region is slow.
+As shown in the evaluation, even with pipelining optimiza-
+tions and a secure NPU, the CMA allocation becomes the
+bottleneck and hurts the performance. Flex-Mem can be al-
+located with fragmented free pages, which is much faster
+than allocating a contiguous region. Second, the contiguous
+requirement restricts the memory management optimizations.
+Flex-Mem can be extended or reclaimed in page granularity,
+and FlexServe leverages it to implement different memory
+management optimizations.
+Comparing with Using a Protected Virtual Machine
+(VM): The inference can be protected in a protected VM,
+e.g., Android pVM [8]. However, such a design may incur
+additional resource and performance overhead. First, it needs
+to run an OS kernel and software stack in the VM, which
+requires additional memory resources. FlexServe leverages
+the existing software stack in the TrustZone secure world, so
+it does not add additional resource overhead. Second, the
+VM-based design incurs virtualization overhead, even when
+there is no secure inference task. FlexServe leverages the se-
+cure EL3 of TrustZone to implement On-demand Protection,
+mitigating the virtualization overhead.
+12
+
+
+--- Page 13 ---
+9.2
+Possible Optimizations
+Supporting More LLM Models:
+The evaluation uses
+Llama3 and Qwen3 series models. FlexServe is compat-
+ible with other LLM models. The optimizations are also
+applicable to them. For the LLMs with new architectures,
+e.g., the Mixture of Experts (MoE) models, FlexServe is still
+compatible with them. Moreover, new memory management
+optimizations could be designed for these models, e.g., the
+expert-aware memory management.
+Using GPU: Currently, FlexServe only uses CPU and NPU
+to execute the inference task. GPU is also common in mobile
+devices. Existing work has shown that using CPU, GPU
+and NPU together can achieve better performance [15]. The
+design of FlexServe is compatible with the GPU. It is possible
+to construct Flex-GPU and use it to further speed up the secure
+inference.
+Using Faster NPU: FlexServe mainly optimizes the mem-
+ory allocation and loading latencies. However, the NPU and
+its runtime are not fast in our current implementation, causing
+the computation stage to become the bottleneck. If using a
+faster NPU, FlexServe could achieve a higher speedup com-
+pared to the two TrustZone-based strawmen.
+10
+Related Work
+Protecting Model Inference From Untrusted OS: Many
+existing works [21,25,30,33,36,38,47,51,55,56,59,65,70]
+try to protect the model inference from untrusted OS with
+Trusted Execution Environment (TEE), e.g., ARM Trust-
+Zone [7] and Intel SGX [17]. Privado [25] protect DNN
+inference within SGX enclaves. Oblivious ML [51] also runs
+DNN inference in SGX enclaves and leverages obfuscation
+to prevent side-channel attacks. However, the SGX-based so-
+lutions cannot work on mobile devices. Confidential DL [30]
+protects the deep learning inference within TrustZone. Smart-
+Zone [33] can also run LLM inference in TrustZone’s secure
+world. It supports the multi-threading parallel. And the above
+TrustZone-based solutions does not solve the inflexibility
+problem of the TrustZone’s secure memory, and have the
+limitation introduced in Section 2.2.
+TZ-LLM [62] is a concurrent work with FlexServe, which
+also tries to protect the LLM inference with TrustZone. It
+leverages the pipeline method to hide the CMA allocation
+latency. Different from it, FlexServe introduces a totally dif-
+ferent approach, which provides page-granular secure mem-
+ory isolation and removes the contignuous requirement of
+the secure memory. Based on that, FlexServe further consid-
+ers a real-world multi-model scenarios in the mobile devices
+and introduces a series of memory management optimiza-
+tions based on the page-granular Flex-Mem. TZ-LLM only
+considers the single model scenario.
+Many works try to partition the inference task and run
+parts of the task outside the TEE, to achieve higher perfor-
+mance [21,38,47,55,56,59,65]. TransLinkGuard [38] runs
+the locked model outside the TEE and only protects an au-
+thorization model in the TEE. Darknetz [47] also runs only
+part of the DNN layers in the TrustZone’s secure world to
+achieve the strong security and high performance. Soter [56]
+runs parts of DNN operations in the SGX enclave, and runs
+part of layers on the GPU for the high performance. However,
+these works cannot fully leverage the accelerator to speed
+up the inference, and does not solve the memory challenge
+(Section 2.3).
+Enabling Accelerator in TEE: Existing works also try
+to enable accelerators, e.g., GPU and NPU, in the TEE [19,
+22,29,31,32,46,52,61,63,77]. Graviton [61] modifies the
+GPU chip to support GPU TEE. It reserves a protected range
+of memory inside the GPU memory and introduces some
+special commands for security-critical operations. Strong-
+Box [19] targets the ARM platform and integrated GPU with-
+out hardware modification. HETEE [77] uses special boxes
+with sensors to protect the accelerator from malicious phys-
+ical touch. It also introduces FPGA controllers to manage
+the servers’ access to the secure accelerators. SAGE [31]
+can ensure a verification function is securely installed on the
+GPU, but the compromised OS can still arbitrarily access
+the GPU. XpuTEE [22] is a high-performance and practi-
+cal heterogeneous trusted execution environment for high-
+performanceGPUs. FlexServe provides a Flex-NPU abstrac-
+tion which allows the NPU to be efficiently switched be-
+tween normal and secure. Different from the above works,
+FlexServe focuses on the inflexible secure resource of Trust-
+Zone, and provides a fast and secure LLM inference system.
+Isolated Execution Environment on ARM: Researchers
+have constructed different isolated execution environment
+on ARM platform, to isolate sensitive tasks from untrusted
+OS [12,14,16,28,58,64]. OSP [16], TrustICE [58] and Sanc-
+tuary [14] leverage virtualization and TrustZone to construct
+non-privileged isolated execution environment. vTZ [28] con-
+structs multiple virtual secure worlds by levearging the single
+TrustZone’s secure world. Colony [64] and SKEE [12] con-
+struct isolated execution environment in the privileged mode.
+Different from these works, FlexServe targets on protecting
+the LLM inference tasks.
+11
+Conclusion
+This paper introduces FlexServe, a fast and secure device-side
+LLM inference system that defends against an untrusted OS
+kernel. FlexServe addresses the inflexible resource isolation
+problem of existing TrustZone-based solutions, which signifi-
+cantly degrades inference performance. FlexServe leverages
+virtualization technology to construct Flex-Mem and Flex-
+NPU, which can be efficiently switched between unprotected
+and protected modes. An On-demand Protection mechanism
+is employed to minimize virtualization overhead. Further-
+more, a pipelined FlexServe Framework performs secure
+13
+
+
+--- Page 14 ---
+inference based on Flex-Mem and Flex-NPU. LLM-Aware
+Memory Management and a Multi-Model Scheduler are in-
+troduced to accelerate secure inference. We implemented a
+prototype of FlexServe and compared it with two TrustZone-
+based strawman designs. The results show that FlexServe
+achieves an average 10.05× speedup in TTFT compared to
+the strawman, and an average 2.44× TTFT speedup com-
+pared to an optimized strawman with pipeline and secure
+NPU enabled.
+References
+[1] Apple
+intelligence.
+https://www.apple.com/
+apple-intelligence/, Sep, 2025.
+[2] Galaxy
+ai.
+https://www.samsung.com/us/
+galaxy-ai/, Sep, 2025.
+[3] Linux
+cves.
+https://www.cvedetails.com/
+version-list/33/47/1/Linux-Linux-Kernel.
+html, Sep, 2025.
+[4] The linux kernel surpasses 40 million lines of
+code:
+A historic nilestone in open-source soft-
+ware.
+https://www.stackscale.com/blog/
+linux-kernel-surpasses-40-million-lines-code/,
+Sep, 2025.
+[5] Marah Abdin, Jyoti Aneja, Harkirat Behl, Sébastien
+Bubeck, Ronen Eldan, Suriya Gunasekar, Michael Har-
+rison, Russell J Hewett, Mojan Javaheripi, Piero Kauff-
+mann, et al. Phi-4 technical report. arXiv preprint
+arXiv:2412.08905, 2024.
+[6] Aboorva
+Devarajan
+Abdul
+Haleem
+and
+so
+on.
+stress-ng.
+https://github.com/ColinIanKing/
+stress-ng, 2020.
+[7] Tiago Alves and Don Felton. Trustzone: Integrated hard-
+ware and software security. ARM white paper, 3(4):18–
+24, 2004.
+[8] Android.
+Android
+virtualiza-
+tion
+framework
+(avf)
+overview.
+https://source.android.com/docs/core/virtualization,
+2026.
+[9] Android.
+Memory allocation among processes.
+https://developer.android.com/topic/
+performance/memory-management, 2026.
+[10] Android.
+Overview
+of
+memory
+management.
+https://developer.android.com/topic/
+performance/memory-overview, 2026.
+[11] AutoGPT. What is the autogpt platform? https://
+agpt.co/docs/platform, 2026.
+[12] Ahmed M Azab, Kirk Swidowski, Jia Ma Bhutkar,
+Wenbo Shen, Ruowen Wang, and Peng Ning. Skee: A
+lightweight secure kernel-level execution environment
+for arm. In Network & Distributed System Security
+Symposium (NDSS), 2016.
+[13] Jinze Bai, Shuai Bai, Yunfei Chu, Zeyu Cui, Kai Dang,
+Xiaodong Deng, Yang Fan, Wenbin Ge, Yu Han, Fei
+Huang, et al. Qwen technical report. arXiv preprint
+arXiv:2309.16609, 2023.
+[14] Ferdinand Brasser, David Gens, Patrick Jauernig,
+Ahmad-Reza Sadeghi, and Emmanuel Stapf. Sanctuary:
+Arming trustzone with user-space enclaves. 2019.
+[15] Le Chen, Dahu Feng, Erhu Feng, Yingrui Wang, Rong
+Zhao, Yubin Xia, Pinjie Xu, and Haibo Chen. Char-
+acterizing mobile soc for accelerating heterogeneous
+llm inference. In Proceedings of the ACM SIGOPS 31st
+Symposium on Operating Systems Principles, pages 359–
+374, 2025.
+[16] Yeongpil Cho,
+Junbum Shin,
+Donghyun Kwon,
+MyungJoo Ham, Yuna Kim, and Yunheung Paek.
+Hardware-assisted on-demand hypervisor activation for
+efficient security critical code execution on mobile de-
+vices. In 2016 USENIX Annual Technical Conference
+(USENIX ATC 16), pages 565–578. USENIX Associa-
+tion, 2016.
+[17] Victor Costan and Srinivas Devadas. Intel sgx explained.
+Cryptology ePrint Archive, 2016.
+[18] Ben Cottier, Robi Rahman, Loredana Fattorini, Nestor
+Maslej, Tamay Besiroglu, and David Owen. The ris-
+ing costs of training frontier ai models. arXiv preprint
+arXiv:2405.21015, 2024.
+[19] Yunjie Deng, Chenxu Wang, Shunchang Yu, Shiqing
+Liu, Zhenyu Ning, Kevin Leach, Jin Li, Shoumeng Yan,
+Zhengyu He, Jiannong Cao, et al. Strongbox: A gpu
+tee on arm endpoints. In Proceedings of the 2022 ACM
+SIGSAC Conference on Computer and Communications
+Security, pages 769–783, 2022.
+[20] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey,
+Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman,
+Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan,
+et al. The llama 3 herd of models. arXiv e-prints, pages
+arXiv–2407, 2024.
+[21] Tarek Elgamal and Klara Nahrstedt. Serdab: An iot
+framework for partitioning neural networks computa-
+tion across multiple enclaves. In 2020 20th IEEE/ACM
+International Symposium on Cluster, Cloud and Internet
+Computing (CCGRID), pages 519–528. IEEE, 2020.
+14
+
+
+--- Page 15 ---
+[22] Shulin Fan, Zhichao Hua, Yubin Xia, and Haibo Chen.
+Xputee: a high-performance and practical heteroge-
+neous trusted execution environment for gpus. ACM
+Transactions on Computer Systems, 43(1-2):1–27, 2025.
+[23] AI4Finance
+Foundation.
+Fingpt.
+https://
+huggingface.co/FinGPT, 2026.
+[24] Google. On-device small language models with multi-
+modality, rag, and function calling, 2026.
+[25] Karan Grover, Shruti Tople, Shweta Shinde, Ranjita
+Bhagwan, and Ramachandran Ramjee. Privado: Prac-
+tical and secure dnn inference with enclaves. arXiv
+preprint arXiv:1810.00602, 2018.
+[26] Le Guan, Peng Liu, Xinyu Xing, Xinyang Ge, Shengzhi
+Zhang, Meng Yu, and Trent Jaeger. Trustshadow: Se-
+cure execution of unmodified applications with arm
+trustzone. In Proceedings of the 15th Annual Inter-
+national Conference on Mobile Systems, Applications,
+and Services, pages 488–501, 2017.
+[27] D. Richard Hipp. Sqlite. https://www.sqlite.org/.
+Version 3.x, accessed 2024-05-10.
+[28] Zhichao Hua, Jinyu Gu, Yubin Xia, Haibo Chen,
+Binyu Zang, and Haibing Guan. {vTZ}: virtualizing
+{ARM}{TrustZone}. In 26th USENIX Security Sympo-
+sium (USENIX Security 17), pages 541–556, 2017.
+[29] Tyler Hunt, Zhipeng Jia, Vance Miller, Ariel Szekely,
+Yige Hu, Christopher J. Rossbach, and Emmett Witchel.
+Telekine: Secure computing with cloud GPUs. In 17th
+USENIX Symposium on Networked Systems Design and
+Implementation (NSDI 20), pages 817–833, Santa Clara,
+CA, 2020. USENIX Association.
+[30] Md Shihabul Islam, Mahmoud Zamani, Chung Hwan
+Kim, Latifur Khan, and Kevin W Hamlen. Confidential
+execution of deep learning inference at the untrusted
+edge with arm trustzone. In Proceedings of the Thir-
+teenth ACM Conference on Data and Application Secu-
+rity and Privacy, pages 153–164, 2023.
+[31] Andrei Ivanov, Benjamin Rothenberger, Arnaud De-
+thise, Marco Canini, Torsten Hoefler, and Adrian Per-
+rig. SAGE: Software-based attestation for GPU execu-
+tion. In 2023 USENIX Annual Technical Conference
+(USENIX ATC 23), pages 485–499, Boston, MA, July
+2023. USENIX Association.
+[32] Insu Jang, Adrian Tang, Taehoon Kim, Simha Sethu-
+madhavan, and Jaehyuk Huh. Heterogeneous isolated
+execution for commodity gpus. In Proceedings of the
+Twenty-Fourth International Conference on Architec-
+tural Support for Programming Languages and Operat-
+ing Systems, pages 455–468, 2019.
+[33] Zhaolong Jian, Xu Liu, Qiankun Dong, Longkai Cheng,
+Xueshuo Xie, and Tao Li. Smartzone: Runtime sup-
+port for secure and efficient on-device inference on arm
+trustzone. IEEE Transactions on Computers, 2025.
+[34] Nikhil Kandpal and Colin Raffel. Position: The most
+expensive part of an llm should be its training data.
+arXiv preprint arXiv:2504.12427, 2025.
+[35] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonza-
+lez, Hao Zhang, and Ion Stoica. Efficient memory man-
+agement for large language model serving with pagedat-
+tention, 2023.
+[36] Taegyeong Lee, Zhiqi Lin, Saumay Pushp, Caihua
+Li, Yunxin Liu, Youngki Lee, Fengyuan Xu, Chenren
+Xu, Lintao Zhang, and Junehwa Song. Occlumency:
+Privacy-preserving remote deep-learning inference us-
+ing sgx. In The 25th Annual International Conference on
+Mobile Computing and Networking, pages 1–17, 2019.
+[37] Ethan Li, Anders Boesen Lindbo Larsen, Chen Zhang,
+Xiyou Zhou, Jun Qin, Dian Ang Yap, Narendran Ragha-
+van, Xuankai Chang, Margit Bowler, Eray Yildiz, et al.
+Apple intelligence foundation language models: Tech
+report 2025. arXiv preprint arXiv:2507.13575, 2025.
+[38] Qinfeng Li, Zhiqiang Shen, Zhenghan Qin, Yangfan
+Xie, Xuhong Zhang, Tianyu Du, Sheng Cheng, Xun
+Wang, and Jianwei Yin. Translinkguard: safeguard-
+ing transformer models against model stealing in edge
+deployment. In Proceedings of the 32nd ACM Inter-
+national Conference on Multimedia, pages 3479–3488,
+2024.
+[39] Wenhao Li, Haibo Li, Haibo Chen, and Yubin Xia. Adat-
+tester: Secure online mobile advertisement attestation
+using trustzone. In Proceedings of the 13th annual in-
+ternational conference on mobile systems, applications,
+and services, pages 75–88, 2015.
+[40] Wenhao Li, Mingyang Ma, Jinchen Han, Yubin Xia,
+Binyu Zang, Cheng-Kang Chu, and Tieyan Li. Build-
+ing trusted path on untrusted device drivers for mobile
+devices. In Proceedings of 5th Asia-Pacific Workshop
+on Systems, pages 1–7, 2014.
+[41] Xiang Li, Zhenyan Lu, Dongqi Cai, Xiao Ma, and Meng-
+wei Xu. Large language models on mobile devices:
+Measurements, analysis, and insights. In Proceedings of
+the Workshop on Edge and Mobile Foundation Models,
+pages 1–6, 2024.
+[42] Zeyang Li, Chuxiong Hu, Shengbo Eben Li, Jia Cheng,
+and Yunan Wang. Robust safe reinforcement learning
+under adversarial disturbances. In 2023 62nd IEEE
+15
+
+
+--- Page 16 ---
+Conference on Decision and Control (CDC), pages 334–
+341. IEEE, 2023.
+[43] Zhangheng Li, Keen You, Haotian Zhang, Di Feng,
+Harsh Agrawal, Xiujun Li, Mohana Prasad Sathya Moor-
+thy, Jeff Nichols, Yinfei Yang, and Zhe Gan. Ferret-ui 2:
+Mastering universal user interface understanding across
+platforms. arXiv preprint arXiv:2410.18967, 2024.
+[44] Linaro and Contributors.
+OP-TEE: Open Portable
+Trusted Execution Environment. GitHub repository,
+2025.
+[45] Shiyu Luo, Zhichao Hua, and Yubin Xia. Tz-kms: A
+secure key management service for joint cloud com-
+puting with arm trustzone. In 2018 IEEE Symposium
+on Service-Oriented System Engineering (SOSE), pages
+180–185. IEEE, 2018.
+[46] Haohui Mai, Jiacheng Zhao, Hongren Zheng, Yiyang
+Zhao, Zibin Liu, Mingyu Gao, Cong Wang, Huimin Cui,
+Xiaobing Feng, and Christos Kozyrakis. Honeycomb:
+Secure and efficient {GPU} executions via static valida-
+tion. In 17th USENIX Symposium on Operating Systems
+Design and Implementation (OSDI 23), pages 155–172,
+2023.
+[47] Fan Mo, Ali Shahin Shamsabadi, Kleomenis Katevas,
+Soteris Demetriou, Ilias Leontiadis, Andrea Cavallaro,
+and Hamed Haddadi. Darknetz: towards model privacy
+at the edge using trusted execution environments. In
+Proceedings of the 18th International Conference on
+Mobile Systems, Applications, and Services, pages 161–
+174, 2020.
+[48] mtx512. rknn-llm. https://github.com/mtx512/
+rk3588-npu, 2023.
+[49] neomancr.
+Basics on android ram management,
+what is(n’t) bloat?
+https://www.reddit.com/r/
+GalaxyS8/comments/6agads/basics_on_android_
+ram_management_what_isnt_bloat/, 2026.
+[50] Notion. The ai workspace that works for you. https:
+//www.notion.com/product/ai, 2026.
+[51] Olga Ohrimenko, Felix Schuster, Cédric Fournet,
+Aastha Mehta, Sebastian Nowozin, Kapil Vaswani, and
+Manuel Costa. Oblivious {Multi-Party} machine learn-
+ing on trusted processors. In 25th USENIX Security Sym-
+posium (USENIX Security 16), pages 619–636, 2016.
+[52] Heejin Park and Felix Xiaozhu Lin. Safe and practical
+gpu computation in trustzone. In Proceedings of the
+Eighteenth European Conference on Computer Systems,
+pages 505–520, 2023.
+[53] Replika. The ai companion who cares always here to
+listen and talk. https://replika.ai/, 2026.
+[54] Nuno Santos, Himanshu Raj, Stefan Saroiu, and Alec
+Wolman. Using arm trustzone to build a trusted lan-
+guage runtime for mobile applications. In Proceedings
+of the 19th international conference on Architectural
+support for programming languages and operating sys-
+tems, pages 67–80, 2014.
+[55] Alexander Schlögl and Rainer Böhme. ennclave: Offline
+inference with model confidentiality. In Proceedings of
+the 13th ACM Workshop on Artificial Intelligence and
+Security, pages 93–104, 2020.
+[56] Tianxiang Shen, Ji Qi, Jianyu Jiang, Xian Wang,
+Siyuan Wen, Xusheng Chen, Shixiong Zhao, Sen Wang,
+Li Chen, Xiapu Luo, et al. {SOTER}: Guarding black-
+box inference for general neural networks at the edge. In
+2022 USENIX Annual Technical Conference (USENIX
+ATC 22), pages 723–738, 2022.
+[57] Standard Performance Evaluation Corporation (SPEC),
+Gainesville, VA, USA. SPEC CPU® 2017 Benchmark
+Suite, 2017. https://www.spec.org/cpu2017/.
+[58] He Sun, Kun Sun, Yuewu Wang, Jiwu Jing, and Haining
+Wang. Trustice: Hardware-assisted isolated comput-
+ing environments on mobile devices. In Dependable
+Systems and Networks (DSN), 2015 45th Annual IEEE/I-
+FIP International Conference on, pages 367–378. IEEE,
+2015.
+[59] Zhichuang Sun, Ruimin Sun, Changming Liu, Am-
+rita Roy Chowdhury, Long Lu, and Somesh Jha. Shad-
+ownet: A secure and efficient on-device model inference
+system for convolutional neural networks. In 2023 IEEE
+Symposium on Security and Privacy (SP), pages 1596–
+1612. IEEE, 2023.
+[60] Gemma Team, Aishwarya Kamath, Johan Ferret, Shreya
+Pathak, Nino Vieillard, Ramona Merhej, Sarah Perrin,
+Tatiana Matejovicova, Alexandre Ramé, Morgane Riv-
+ière, et al. Gemma 3 technical report. arXiv preprint
+arXiv:2503.19786, 2025.
+[61] Stavros Volos, Kapil Vaswani, and Rodrigo Bruno.
+Graviton: Trusted execution environments on gpus. In
+OSDI, pages 681–696, 2018.
+[62] Xunjie Wang, Jiacheng Shi, Zihan Zhao, Yang Yu,
+Zhichao Hua, and Jinyu Gu. Tz-llm: Protecting on-
+device large language models with arm trustzone. arXiv
+preprint arXiv:2511.13717, 2025.
+[63] Xiaolong Wu, Dave Jing Tian, and Chung Hwan Kim.
+Building gpu tees using cpu secure enclaves with gevi-
+sor. In Proceedings of the 2023 ACM Symposium on
+Cloud Computing, pages 249–264, 2023.
+16
+
+
+--- Page 17 ---
+[64] Yubin Xia, Zhichao Hua, Yang Yu, Jinyu Gu, Haibo
+Chen, Binyu Zang, and Haibing Guan. Colony: A privi-
+leged trusted execution environment with extensibility.
+IEEE Transactions on Computers, 71(2):479–492, 2021.
+[65] Yecheng Xiang, Yidi Wang, Hyunjong Choi, Mohsen
+Karimi, and Hyoseung Kim. Aegisdnn: Dependable and
+timely execution of dnn tasks with sgx. In 2021 IEEE
+Real-Time Systems Symposium (RTSS), pages 68–81.
+IEEE, 2021.
+[66] Chaojun Xiao, Xueyu Hu, Zhiyuan Liu, Cunchao Tu,
+and Maosong Sun. Lawformer: A pre-trained language
+model for chinese legal long documents. AI Open, 2:79–
+84, 2021.
+[67] Qianqian Xie, Weiguang Han, Xiao Zhang, Yanzhao
+Lai, Min Peng, Alejandro Lopez-Lira, and Jimin Huang.
+Pixiu: A large language model, instruction data and
+evaluation benchmark for finance.
+arXiv preprint
+arXiv:2306.05443, 2023.
+[68] Jiajun Xu, Zhiyuan Li, Wei Chen, Qun Wang, Xin
+Gao, Qi Cai, and Ziyuan Ling. On-device language
+models: A comprehensive review.
+arXiv preprint
+arXiv:2409.00088, 2024.
+[69] Hao Yang, Weijie Qiu, Ru Zhang, Zhou Fang, Ruichao
+Mao, Xiaoyu Lin, Maji Huang, Zhaosong Huang, Teng
+Guo, Shuoyang Liu, et al.
+Ui-ug: A unified mllm
+for ui understanding and generation. arXiv preprint
+arXiv:2509.24361, 2025.
+[70] Mengda Yang, Wenzhe Yi, Juan Wang, Hongxin Hu,
+Xiaoyang Xu, and Ziang Li.
+Penetralium: Privacy-
+preserving and memory-efficient neural network infer-
+ence at the edge. Future Generation Computer Systems,
+156:30–41, 2024.
+[71] yhcvb. rknn-llm. https://github.com/airockchip/
+rknn-llm, 2025.
+[72] yhcvb.
+rknpu-driver.
+https://github.com/
+airockchip/rknn-llm/tree/main/rknpu-driver,
+2025.
+[73] Yohei. Babyagi. https://babyagi.org/, 2026.
+[74] Keen You, Haotian Zhang, Eldon Schoop, Floris Weers,
+Amanda Swearngin, Jeffrey Nichols, Yinfei Yang, and
+Zhe Gan. Ferret-ui: Grounded mobile ui understand-
+ing with multimodal llms. In European Conference on
+Computer Vision, pages 240–255. Springer, 2024.
+[75] Cheng Zhang, Erhu Feng, Xi Zhao, Yisheng Zhao,
+Wangbo Gong, Jiahui Sun, Dong Du, Zhichao Hua,
+Yubin Xia, and Haibo Chen. Mobiagent: A system-
+atic framework for customizable mobile agents. arXiv
+preprint arXiv:2509.00531, 2025.
+[76] Zhuosheng Zhang and Aston Zhang. You only look at
+screens: Multimodal chain-of-action agents. In Findings
+of the Association for Computational Linguistics: ACL
+2024, pages 3132–3149, 2024.
+[77] Jianping Zhu, Rui Hou, XiaoFeng Wang, Wenhao Wang,
+Jiangfeng Cao, Boyan Zhao, Zhongpu Wang, Yuhui
+Zhang, Jiameng Ying, Lixin Zhang, et al. Enabling
+rack-scale confidential computing using heterogeneous
+trusted execution environment. In 2020 IEEE Sympo-
+sium on Security and Privacy (SP), pages 1450–1465.
+IEEE, 2020.
+17

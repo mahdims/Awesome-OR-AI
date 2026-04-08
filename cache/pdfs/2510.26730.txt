@@ -1,0 +1,1516 @@
+--- Page 1 ---
+EXPERTFLOW: ADAPTIVE EXPERT SCHEDULING AND MEMORY
+COORDINATION FOR EFFICIENT MOE INFERENCE
+Zixu Shen
+† 1 Kexin Chu
+† 1 Yifan Zhang 1 Dawei Xiang 1 Runxin Wu 1 Wei Zhang
+∗1
+ABSTRACT
+The expansion of large language models is increasingly limited by the constrained memory capacity of modern
+GPUs. To mitigate this, Mixture-of-Experts (MoE) architectures activate only a small portion of parameters during
+inference, significantly lowering both memory demand and computational overhead. However, conventional MoE
+inference approaches, which select active experts independently at each layer, often introduce considerable latency
+because of frequent parameter transfers between host and GPU memory. In addition, current cross-layer prediction
+strategies, which are typically based on fixed steps, lack adaptability across different hardware platforms and
+workloads, thereby reducing their robustness and effectiveness.
+To address these challenges, we present ExpertFlow, a runtime system for MoE inference that combines adaptive
+expert prefetching and cache-aware routing. ExpertFlow continuously adjusts its prediction horizon for expert
+activation by leveraging runtime statistics such as transfer bandwidth, parameter dimensionality, and model
+feedback signals. Furthermore, it incorporates a hybrid cross-layer prediction scheme that fuses pregating
+information with intermediate computational states to anticipate future expert needs. By adaptively refining
+prefetching decisions and aligning them with actual usage behavior, ExpertFlow effectively decreases cache
+misses and removes latency caused by expert swap-ins. Our evaluation demonstrates that ExpertFlow reduces
+model stall time to less than 0.1% of the baseline, highlighting its capability to optimize MoE inference under
+stringent memory constraints.
+1
+INTRODUCTION
+The growing complexity of large language models has
+placed increasing emphasis on architectural designs that
+offer both scalability and efficiency. Among these, Mixture-
+of-Experts (MoE) has become a dominant architecture for
+scaling large language models, owing to its sparse activation
+strategy (Shazeer et al., 2017). By activating only a small
+subset of expert subnetworks for each input, MoE models
+can scale to billions of parameters without incurring a pro-
+portional computational cost. This principle has enabled
+breakthroughs in various high-profile systems, including
+Switch Transformer (Fedus et al., 2022), GShard (Lepikhin
+et al., 2020), GPT-3 (Brown et al., 2020), and GPT-4.
+As deployment of MoE models continues to expand, the
+need for responsive and resource-aware expert routing mech-
+anisms has become increasingly urgent. To this end, ex-
+isting models commonly adopt one of three strategies, as
+illustrated in Fig. 1(a)–(c). In some systems, the expert
+assignment is performed statically, each layer is bound to a
+fixed set of experts prior to execution, and that assignment
+†Equal contribution
+1School of Computing, University
+of Connecticut, CT, USA. Correspondence to:
+Wei Zhang
+<wei.13.zhang@uconn.edu>.
+does not change at runtime. Others adopt a reactive ap-
+proach, where expert selection for a given layer depends on
+the activations from the preceding layer. A third option em-
+ploys periodic scheduling: the current layer predicts expert
+configurations for a fixed number of layers ahead, reducing
+routing frequency at the cost of flexibility.
+Although each of these strategies brings computational ben-
+efits, they also suffer from fundamental limitations. Static
+expert assignment leads to linear growth in memory and
+compute overhead as model depth increases (Shazeer et al.,
+2017; Cao et al., 2025). Per-layer reactive prediction ne-
+glects global coordination, often resulting in noisy or incon-
+sistent expert usage. Meanwhile, fixed-interval forecasting
+improves efficiency by amortizing routing cost, but is in-
+herently inflexible and ill-suited for handling diverse input
+dynamics.
+To address these issues, we propose ExpertFlow, a runtime
+system for MoE inference that combines adaptive expert
+prefetching and cache-aware routing. As shown in Fig. 1(d),
+it adaptively determines how far in advance expert predic-
+tions should be made within the model. Our approach in-
+troduces a token-aware scheduling policy, which effectively
+fuses fine-grained input features, such as token-level statis-
+arXiv:2510.26730v1  [cs.DC]  30 Oct 2025
+
+
+--- Page 2 ---
+ExpertFlow: Adaptive Expert Scheduling and Memory Coordination for Efficient MoE Inference
+input
+tokens
+i
+i+S
+i+1+S
+input
+tokens
+i+1
+Iteration-wise Prefetch
+input
+tokens
+i
+i+S
+i+1+S
+input
+tokens
+i+1
+Layer-wise Prefetch
+input
+tokens
+i
+i+S
+i+1+S
+input
+tokens
+i+1
+Stride Prefetch
+input
+tokens
+i
+i+S1
+i+1+S2
+input
+tokens
+i+1
+Dynamic-stride Prefetch
+Predict
+Prefetch
+Transformer Layer
+Embedding/LM Head
+Dynamic Step
+(a)
+(b)
+(c)
+(d)
+Figure 1. Candidate prefetch manners
+tics, with internal routing scores to guide the appropriate
+depth of expert forecasting. Unlike prior work that relies
+on a fixed lookahead window applied uniformly across all
+inputs, our system instead adjusts the routing interval dy-
+namically on a per-input basis, thereby enabling both greater
+accuracy and improved system-wide efficiency.
+Our contributions are threefold:
+• Adaptive Cross-layer Prefetch: We propose an algo-
+rithm that adaptively selects the depth at which expert
+predictions are performed, achieving a trade-off between
+inference cost and model fidelity. This design aligns
+with the broader trend of adaptive computation (Graves,
+2016; Wang et al., 2018).
+• Token-Routing Integration: We design a mechanism
+that merges conventional MoE routing signals with
+token-level metadata, enhancing both the precision and
+reliability of expert activation.
+• Hierarchical Expert Coordination: Drawing inspi-
+ration from hierarchical mixtures of experts (Jordan &
+Jacobs, 1993), we introduce a multi-level expert schedul-
+ing framework that governs expert reuse and cooperation
+across various depths of the model.
+Together, these contributions deliver a more intelligent and
+flexible expert routing solution for MoE models. Our frame-
+work not only improves routing quality and consistency but
+also significantly reduces computational overhead, facilitat-
+ing scalable deployment of MoE-based inference in diverse
+and resource-constrained environments.
+2
+BACKGROUND AND MOTIVATION
+2.1
+MoE Models
+MoE architectures scale large language models by activat-
+ing only a small subset of experts for each input (Shazeer
+et al., 2017; Fedus et al., 2021; Yang et al., 2024b). This
+sparse execution achieves high parameter capacity without
+proportional computational cost (Zhou et al., 2022). Yet,
+most MoE systems rely on a fixed expert prediction interval
+(known as step size S), which determines how many tokens
+are processed before rerouting. While easy to implement,
+this static interval overlooks both hardware and workload
+variability.
+A constant S cannot accommodate changes in GPU band-
+width, memory pressure, or token-level routing divergence.
+Step sizes tuned for one platform often yield suboptimal
+utilization on another, and static tuning fails when batch
+statistics fluctuate across inputs. Moreover, S embodies
+an inherent latency–accuracy tension: small values incur
+frequent expert switches and overhead, whereas large values
+degrade routing precision and inflate memory usage. Con-
+sequently, existing MoE designs remain inefficient under
+dynamic runtime conditions, motivating adaptive step-size
+mechanisms that adjust routing granularity based on real-
+time workload and platform feedback.
+2
+4
+6
+8
+10
+12
+14
+numSteps
+0
+2
+4
+Latency(/s)
+DeepSeek waiting
+DeepSeek cache_mis
+Qwen1.5 waiting
+Qwen1.5 cache_mis
+Qwen2 waiting
+Qwen2 cache_mis
+Figure 2. Latency Comparison Across the Step Size (S)
+2.2
+Motivation
+Dynamic step-size scheduling fundamentally shapes the
+balance between computation and communication in MoE
+inference. As shown in Fig. 2, both large and small step
+values degrade throughput for distinct reasons. Larger steps
+widen the prediction horizon for prefetching, lowering pre-
+diction accuracy and increasing cache misses that waste
+GPU cycles. Smaller steps, in contrast, lead to synchro-
+nization stalls as computation frequently waits for expert
+loading, especially in deep MoE stacks where latency ac-
+cumulates layer-by-layer. The following analysis identifies
+the primary factors that influence step-size selection.
+Hardware Bandwidth Sensitivity:
+As shown in Fig. 2,
+on A6000 GPUs, setting numSteps=2 effectively removes
+most of the waiting latency. This behavior is governed by
+
+
+--- Page 3 ---
+ExpertFlow: Adaptive Expert Scheduling and Memory Coordination for Efficient MoE Inference
+hardware bandwidth. During inference, MoE computation
+depends on expert parameters that must be loaded before
+execution begins. The total step size can be estimated based
+on model size, available bandwidth, and per-layer computa-
+tion time. Generally, GPUs with higher PCIe bandwidth can
+overlap multiple layers of computation with expert trans-
+fers, while slower interconnects, such as those on RTX 4090
+require larger numSteps to achieve comparable overlap
+( Table 1).
+Observation I: The optimal step size depends on hard-
+ware characteristics. Different GPU bandwidths necessi-
+tate distinct scheduling strategies to balance computation
+and communication overlap.
+Table 1. GPU and Transfer Bandwidths
+GPU
+Bandwidth (GB/s)
+NVIDIA H20
+128
+ASCEND 910B
+128
+NVIDIA A100
+64
+NVIDIA A6000
+64
+NVIDIA RTX 4090
+32
+Intel Arc B580
+16
+AMD Radeon RX 6500 XT
+8
+Workload Scale and Contention:
+Even under fixed hard-
+ware, workload parameters significantly affect latency. As
+shown in Fig. 3, increasing batch size initially improves
+throughput by amortizing expert-loading overhead. Past a
+certain point, however, larger batches intensify contention
+for shared GPU memory and I/O bandwidth. This raises
+token-level diversity and enlarges the total candidate expert
+set Ntotal, which in turn stresses the swap-in path. When
+preloaded experts align with available bandwidth, cache
+misses fall and latency drops. When they do not align, re-
+dundant expert loading amplifies end-to-end delay. This
+results in a non-monotonic trend: after batch size enters
+a saturation region, average waiting latency increases by
+up to 2.5×, even though cache-miss latency decreases by
+12–40%, following
+Lcache ∝Rmiss = 1 −Nselected
+Ntotal
+,
+where Nselected and Ntotal denote correctly predicted and total
+experts. These results indicate that a single static step size
+cannot capture the interaction between workload scale, GPU
+memory pressure, and cache behavior.
+Observation II: Workload scale influences latency
+through both resource contention and expert diversity.
+Intra-Batch Diversity:
+Batch size alone does not fully
+explain expert activation behavior. Tokens within the same
+request may trigger very different experts depending on
+0
+200
+400
+600
+800
+1000
+1200
+1400
+Batch Size
+0.5
+1.0
+Latency(/s)
+DeepSeek waiting
+DeepSeek cache_miss
+Qwen1.5 waiting
+Qwen1.5 cache_miss
+Qwen2 waiting
+Qwen2 cache_miss
+Figure 3. Latency comparison across batch sizes.
+0
+100
+200
+300
+400
+500
+Batch Size
+0.5K
+1.0K
+1.5K
+Activated Experts
+0.0K
+20.0K
+40.0K
+60.0K
+80.0K
+100.0K 120.0K 140.0K
+Euclidean Distances
+DeepSeek
+Qwen1.5
+Qwen2
+Figure 4. Variation of activated experts with batch size and Eu-
+clidean distance
+their semantics. To quantify this diversity, we define the
+cumulative Euclidean distance among token embeddings as:
+Dist(t) =
+X
+1≤i<j≤k
+∥vti −vtj∥2,
+where vti is the embedding of token ti. This metric mea-
+sures how widely the token representations are spread in
+embedding space, and it correlates more strongly with ex-
+pert demand than batch size alone. Empirically, requests
+with the same batch size can vary in end-to-end latency by
+up to 300% solely due to differences in semantic diversity.
+As shown in Fig. 4, Dist(t) grows smoothly with work-
+load complexity and provides a stable signal for anticipating
+expert reuse, swap pressure, and cache residency.
+Observation III: Semantic diversity within a batch is a
+reliable predictor of expert demand. Cumulative embed-
+ding distance offers a stable runtime signal for adaptive
+step-size selection and cache-aware scheduling.
+Collectively, these observations motivate a dynamic,
+bandwidth- and input-aware scheduling mechanism that
+jointly considers hardware bandwidth, workload scale, and
+token diversity. Such adaptive scheduling minimizes cache
+misses and synchronization stalls, achieving stable and effi-
+cient MoE inference across diverse hardware and workload
+configurations.
+
+
+--- Page 4 ---
+ExpertFlow: Adaptive Expert Scheduling and Memory Coordination for Efficient MoE Inference
+2.3
+Challenges in Implementing the Method
+Implementing dynamic step size control in MoE architec-
+tures presents several non-trivial challenges that must be
+addressed to ensure both execution efficiency and system
+reliability.
+2.3.1
+Dynamic Step Size Selection.
+At the start of each iteration, the cumulative Euclidean
+distances among tokens in the current batch are computed
+to estimate expected expert activations per layer. Deriving
+a suitable step size S involves multiple interacting factors,
+including expert module size, device bandwidth, and per-
+layer latency. For example, the expert loading cost can be
+approximated as:
+swap in latency = predicted num experts × SIZE
+bandwidth
+,
+which reflects the overhead from expert swaps. The step
+size should balance this latency against layer compute time
+to ensure timely prefetching. This becomes more complex
+under varying workload patterns and hardware conditions,
+requiring a method that remains robust across different run-
+time scenarios.
+2.3.2
+Expert Prediction Reliability.
+After determining S, the next challenge is ensuring accu-
+rate expert preselection to maximize cache efficiency. Stan-
+dard pre-gating—passing the hidden state directly to the
+next-layer router—often lacks predictive reliability. A more
+robust mechanism is needed, ideally incorporating richer
+context across layers and potentially leveraging learned mod-
+els to better capture expert selection patterns. Improving
+prediction fidelity is critical for reducing cache misses and
+aligning preselected experts with actual usage.
+2.3.3
+Real-time Step Size Adjustment.
+Even with a well-chosen initial S, runtime conditions may
+necessitate adjustments. If expert wait times accumulate
+due to underestimation, the system should be able to expand
+S on the fly. This requires a feedback loop that monitors
+indicators like cache miss rate and wait time, and adjusts S
+responsively. The control logic must be stable and respon-
+sive, avoiding oscillations or overcompensation that could
+disrupt inference performance.
+3
+SYSTEM DESIGN
+3.1
+Overview
+The key insight of ExpertFlow is to dynamically determine
+a hardware-aware adaptive step size S for cross-layer expert
+activation in Mixture-of-Experts (MoE) models. Instead
+of statically activating experts layer-by-layer, ExpertFlow
+ExpertFlow
+Preprocess
+layer 1
+···
+layer i
+···
+layer i+S
+REQUESTS
+Dynamic Step
+Waiting/Overprefetch
+Initial S
+Pregate
+Predictor
+S
+Prefetcher
+Memory
+CPU
+Cache
+Experts
+GPU
+Figure 5. The System Architecture of ExpertFlow
+predicts the required experts several layers in advance and
+continuously updates S based on runtime conditions. This
+adaptive process prevents the cumulative latency that typi-
+cally arises from sequential expert swapping, aligning expert
+activation with GPU memory availability and interconnect
+bandwidth.
+As shown in Fig. 5, to achieve accurate and efficient pre-
+diction, ExpertFlow combines a pre-gate strategy with a
+predictive mechanism that utilizes both token identifiers and
+recent expert activation states derived from hidden represen-
+tations. This dual-source design improves the accuracy of
+expert prefetching, minimizes cache misses, and sustains
+high GPU utilization. The initial value of S is determined
+by expert size, transfer bandwidth, and token dependency
+distance, and is later refined through real-time monitoring of
+waiting latency. By integrating pre-gate outputs with token
+semantics and activation history, ExpertFlow ensures con-
+sistent accuracy under dynamic workloads. Together, these
+techniques enable ExpertFlow to deliver high-throughput
+MoE inference with reduced computational and communi-
+cation overhead.
+3.2
+Adaptive Expert Pre-gating
+3.2.1
+Dynamic Expert Activation.
+ExpertFlow improves the efficiency of MoE models by dy-
+namically determining the number of layers to skip (S)
+based on communication cost, expert characteristics, and
+device capabilities. The mechanism is illustrated in Fig. 6.
+The process begins by estimating the number of experts
+likely to be activated per layer. This is derived from pre-
+gate outputs, which provide a probability distribution over
+experts. Experts are selected in descending order until their
+cumulative probability surpasses a predefined threshold,
+yielding an expected activation count. Combined with ex-
+pert size and device communication bandwidth, this informs
+the calculation of S, the number of layers to skip.
+
+
+--- Page 5 ---
+ExpertFlow: Adaptive Expert Scheduling and Memory Coordination for Efficient MoE Inference
+The step size is formally computed as:
+S = Ne · Es
+Cs · Tl
+,
+where Ne is the number of experts to activate, Es is expert
+size, Cs is communication bandwidth, and Tl is per-layer
+compute time.
+This formulation adapts S to reflect the trade-off between
+communication overhead and computation. During infer-
+ence, ExpertFlow updates S in real time using feedback
+from prediction accuracy. When predictions degrade, S in-
+creases to reduce reliance on uncertain forecasts; when pre-
+dictions remain stable, S is lowered to maximize prefetching
+efficiency.
+3.2.2
+Cross-Layer Prediction and Delta Adjustment.
+Cross-layer prediction is a core component of ExpertFlow,
+enabling adaptive expert activation based on historical pat-
+terns and real-time feedback. A pre-trained model, built
+from past pre-gate outputs and actual expert activations,
+learns to estimate their deviation(∆), which is added to the
+pre-gate result to refine predictions for future layers.
+This model relies on three inputs: (1). pre-gate output of
+the current layer, as a baseline estimate; (2). token IDs of
+the current batch, capturing input-specific semantics; (3).
+expert activation history from previous layers, reflecting
+inter-layer dependencies. By integrating these signals, the
+model corrects naive pre-gate predictions, enhancing expert
+selection accuracy and reducing unnecessary activations.
+To maintain runtime efficiency, ExpertFlow first checks for
+cached predictions. If a cached prediction for that (token
+sequence, layer index, and step size) exists, ExpertFlow
+reuses it. Otherwise, the system falls back to direct top-k
+selection from the router logits. This dual-mode design
+ensures efficient yet reliable routing.
+ExpertFlow also employs a lightweight feedback loop to
+adapt step size S. During execution, if a predicted expert is
+unavailable (causing wait latency), a stall counter increases.
+When it exceeds a threshold, the counter resets and S is
+incremented by 1. Conversely, if experts are already loaded
+when needed, an overfetch counter increases. Once this
+reaches its threshold, it resets and decrements S by 1. This
+loop allows S to self-adjust based on prediction effective-
+ness and expert readiness, balancing latency and accuracy.
+3.2.3
+File Collection and Data Parsing.
+We first collect the activation metadata of the current MoE
+model, which includes the token ID list, corresponding
+layer indices, the list of predicted experts, the list of actually
+activated experts during execution, and the adaptive step
+size S. After validation and parsing, each line is converted
+into a structured sample:
+Samplei =
+
+
+
+
+
+
+
+
+
+
+
+token ids : ti,
+layer idx : li,
+predicted experts : pi,
+actual experts : ai,
+S : si
+
+
+
+
+
+
+
+
+
+
+
+,
+and the dataset is denoted by D = {Samplei}n
+i=1.
+This structure provides a clean representation of expert acti-
+vation behavior at each layer and step configuration, which
+serves as the foundation for downstream grouping and learn-
+ing.
+3.2.4
+Request Grouping and Feature Construction.
+Samples are grouped by the tuple (t, S), i.e., token ID se-
+quences and step size, under the assumption that each group
+represents a unique input request under a specific step con-
+figuration:
+G = {(t, S) 7→{Samplej | token ids = t, S = sj}}.
+For each group, we construct training examples by iterating
+over layers in ascending order. Token sequences are first
+embedded via a fixed random embedding table E ∈RV ×d,
+and aggregated by mean pooling:
+e = 1
+k
+k
+X
+i=1
+Eti,
+where V is the vocabulary size and d is the embedding
+dimension.
+Each training feature vector is constructed as:
+x = [e, S, l, prev act],
+where l is the current layer index, and prev act ∈{0, 1}L·M
+is a binary vector encoding the activation status of experts in
+all previous layers, assuming L total layers and M experts
+per layer.
+The corresponding label is a one-hot vector indicating the
+actual experts used in the current layer:
+y ∈{0, 1}M.
+By constructing one training example per layer per request,
+we capture temporal activation dependencies across layers
+and steps.
+3.2.5
+Training and Evaluation.
+The final dataset consists of feature-label pairs:
+X ∈RN×F ,
+Y ∈RN×M,
+
+
+--- Page 6 ---
+ExpertFlow: Adaptive Expert Scheduling and Memory Coordination for Efficient MoE Inference
+layer i
+layer i+S
+experts
+S
+request
+S adjustment
+S
+Prefetch
+Predict
+pregate
+···
+Figure 6. Mechanism for Determining Dynamic Step Size (S).
+where N is the number of samples, F = d + 2 + L · M is
+the feature dimensionality, and M is the number of experts
+per layer.
+We use the RandomForestRegressor model from the
+scikit-learn library (Pedregosa et al., 2011). We se-
+lected it because it runs on CPU, introduces negligible GPU
+interference, and can be evaluated asynchronously with re-
+spect to GPU kernels. We also found that shallow MLP
+predictors offered comparable accuracy but consumed GPU
+compute during inference, which directly contends with
+model execution.
+The model is trained to minimize Mean Squared Error:
+MSE = 1
+N
+N
+X
+i=1
+∥yi −ˆyi∥2,
+where yi is the true expert activation vector and ˆyi is the
+model’s prediction.
+To evaluate prediction quality, we compute the accuracy as
+the proportion of correctly predicted expert bits, averaged
+across all samples. Additionally, to capture how perfor-
+mance varies under different execution configurations, we
+report per-step-size accuracy for each value of S.
+This end-to-end pipeline, from parsing expert activation logs
+to learning with a random forest model, enables the system
+to anticipate expert usage patterns based on token semantics,
+prior activations, and layer context. The resulting predictor
+supports accurate expert prefetch planning, reducing cache
+misses and latency during MoE inference.
+3.3
+Expert Memory Management
+Effective memory management is critical for sustaining high
+throughput during MoE inference, particularly when GPU
+memory is limited. ExpertFlow introduces an advanced
+two-tiered caching architecture, complemented by dynamic
+reassignment and coordinated integration with the prefetch
+module, to optimize expert residency and minimize costly
+reloads.
+3.3.1
+Two-Level LRU Cache
+Rather than relying on a single eviction queue, ExpertFlow
+maintains two distinct LRU structures:
+• LRU high: Stores experts with demonstrated high
+reuse potential. These typically include experts accessed
+within the last layers or those predicted for imminent
+activation by the expert prediction module.
+• LRU low: Contains experts that have not been recently
+accessed or are less likely to be reused in the near future.
+Evictions are performed preferentially from LRU low,
+which offloads completed or low-priority experts to DRAM
+and preserves high-reuse experts in GPU memory. In con-
+trast to prior single-level LRU strategies, this two-tiered
+approach preserves frequently accessed experts in GPU
+memory while prioritizing less critical ones for eviction.
+This design reduces memory pressure, allowing the sys-
+tem to scale effectively to larger expert pools and operate
+efficiently under constrained GPU memory conditions.
+A key motivation for this design stems from the sequen-
+tial nature of layer-wise MoE inference. Under standard
+eviction policies, experts from the initial S layers—though
+often reused later during decoding—are prematurely evicted,
+resulting in frequent cache misses and increased latency.
+As the step size S dynamically evolves throughout execu-
+tion, expert-to-tier assignments are continuously updated.
+This ensures that the caching policy remains aligned with the
+current inference path and maintains near-optimal memory
+utilization over time.
+3.3.2
+Prefetch and Cache Coordination
+Memory management and dynamic activation operate in
+tandem: (1). Prior to computing the skip distance S, Expert-
+Flow queries current cache occupancy to estimate effective
+bandwidth and anticipated eviction cost. (2). Post-prefetch,
+observed transfer times update the bandwidth estimate Cs,
+informing subsequent skip-distance calculations. (3). Feed-
+back counters for prefetch adaptation incorporate cache
+hit/miss statistics, ensuring that memory decisions reinforce
+activation strategies rather than conflict with them. This
+feedback-driven coordination aligns expert loading with
+cache availability, preventing redundant load/evict cycles
+and reducing overall data movement.
+3.4
+Cache-aware Routing
+Cache misses disrupt MoE execution by introducing asyn-
+chronous stalls that delay computation. Unlike fixed-point
+waiting latency, cache misses occur unpredictably, but this
+very asynchrony creates an opportunity for latency hiding
+through task overlap.
+To exploit this, ExpertFlow overlaps cache miss handling
+with ongoing computation. When a miss triggers an expert
+swap-in, the transfer proceeds in parallel with active infer-
+ence tasks. A cache-aware routing policy gives scheduling
+
+
+--- Page 7 ---
+ExpertFlow: Adaptive Expert Scheduling and Memory Coordination for Efficient MoE Inference
+priority to tokens whose required experts are already res-
+ident in memory, while deferring those that would cause
+additional I/O.
+In contrast, conventional MoE systems perform swap-in
+sequentially and often block due to contention with swap-
+out operations. ExpertFlow addresses this by assigning
+cache miss resolution the highest priority in the memory
+queue, ensuring timely fault handling and improving overall
+throughput by reducing exposed latency.
+4
+EVALUATION
+In this section, we perform an extensive evaluation of Ex-
+pertFlow and demonstrate its performance improvement in
+terms of reduced waiting latency and improved MoE ex-
+pert prediction accuracy. We also test the impact of request
+length, and different MoE vectors on the performance of Ex-
+pertFlow. In our evaluation, we aim to answer the following
+questions:
+1. Compared with the baseline, what effects does Expert-
+Flow exert on waiting latency and cache miss latency?
+(§ 4.2)
+2. Compared with the baseline, how does ExpertFlow af-
+fect expert activation prediction accuracy? (§ 4.3)
+3. Compared with the baseline, is the proposed swap-out
+policy effective? (§ 4.4)
+4. Is the cache-aware routing used in ExpertFlow effective?
+(§ 4.5)
+4.1
+Experiment Setup
+Testbeds. All experiments were conducted independently
+on three GPU platforms: NVIDIA A6000 (NVIDIA Corpo-
+ration, 2024) (64 GB/s bandwidth), H20 (128 GB/s), and
+Ascend 910B (128 GB/s). ExpertFlow was implemented in
+Python and CUDA using the Transformers framework (Wolf
+et al., 2020). GPU HBM and DRAM were managed in
+blocks to improve utilization and reduce fragmentation,
+with dynamic allocation based on inference demands. Data
+transfer between GPU and DRAM was handled by a dedi-
+cated CUDA stream, and a separate thread tracked transfer
+progress and memory block status. Continuous batching
+was enabled to improve throughput.
+Workloads and Models. The experiment workload was
+derived from the ShareGPT dataset (Anonymous). Due to
+uneven request length distribution, we selected up to 50
+samples per length group (±5% fluctuation). Experiments
+used the DeepSeek-V2-Lite (AI; Bi et al., 2024; DeepSeek-
+AI et al., 2024), Qwen1.5 (Qwen, a; Team, 2024), and
+Qwen2.0 (Qwen, b; Team et al., 2024) models, applying
+4-bit quantization to Qwen2.0.
+To simulate resource-constrained settings, GPU memory
+was capped at 20GB across all platforms. The Ascend 910B
+lacks INT4 quantization support, preventing Qwen2.0 execu-
+tion under these limits. Although runtime data for Qwen2.0
+on 910B were unavailable, consistent performance trends
+from DeepSeek and Qwen1.5 confirm that ExpertFlow ef-
+fectively reduces waiting latency across devices. Once quan-
+tization is supported on 910B, the remaining experiments
+will be completed.
+Baseline.
+We compared ExpertFlow with a baseline ap-
+proach (Baseline) implemented using the Transformers,
+ProMoE (Song et al., 2024) and pre-gate jobs from yan-
+dex (Eliseev & Mazur, 2023). We compare the results of
+our work with ProMoe and transformers with respect to the
+reduction in waiting latency as well as cache miss situation
+for cross-layer prediction, and the accuracy of the activated
+experts required for cross-layer prediction. For pre-gate as-
+pects, such as the accuracy of pre-gate, we mainly compare
+our results with Yandex’s work.
+4.2
+Overall Latency Declines
+In this section, we introduce the performance improvements
+brought by ExpertFlow. The primary objective of Expert-
+Flow is to dynamically predict the activation of experts with
+variable step sizes, enabling the prefetching of required
+experts and efficient management of GPU memory. This
+approach collaboratively reduces both waiting latency and
+cache miss latency. Our experiments first focus on evalu-
+ating the accuracy of expert predictions. Subsequently, as
+demonstrated in Fig. 7, our system effectively reduces the
+latency encountered during the operation of MoE models.
+We constructed a test dataset with prompt lengths from 8 to
+1024 to evaluate three MoE models: DeepSeek, Qwen1.5,
+and Qwen2. As shown in the figure, relative to baseline, all
+models achieved a major reduction in combined waiting and
+cache-miss latency, averaging 98.5%. Qwen1.5 showed the
+greatest gain, reducing latency by over 99.9%.
+This latency reduction highlights the effectiveness of our
+approach in addressing two key MoE inference bottlenecks:
+waiting and cache-miss latency. Waiting occurs when com-
+putation stalls for expert data, while cache misses arise when
+requested parameters are absent from GPU memory. Both
+degrade performance by causing stalls and memory-access
+overhead. Through dynamic prediction and memory-aware
+scheduling, our method proactively mitigates these effects,
+improving execution continuity, inference stability, and over-
+all efficiency.
+In cross-device evaluation, we observed an unexpected re-
+sult: although ExpertFlow reduced end-to-end latency on
+both H20 and A6000 platforms, total latency on the H20
+was still higher, despite its superior specifications—greater
+
+
+--- Page 8 ---
+ExpertFlow: Adaptive Expert Scheduling and Memory Coordination for Efficient MoE Inference
+DeepSeek
+Qwen1.5
+Qwen2.0
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+2.00
+Latency(/s)
+1.38
+1.05
+1.77
+0.038
+0.0068
+0.0172
+MoE
+FlexMoE
+(a) Nvidia A6000
+DeepSeek
+Qwen1.5
+Qwen2.0
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Latency(/s)
+0.46
+0.3944
+1.1554
+0.0012
+0.0019
+0.0385
+MoE
+FlexMoE
+(b) Nvidia H20
+DeepSeek
+Qwen1.5
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+Latency(/s)
+0.6063
+0.5222
+0.0008
+0.0004
+MoE
+FlexMoE
+(c) Ascend 910B
+Figure 7. Overall Waiting Latency
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+17.5
+20.0
+numSteps
+40
+50
+60
+70
+80
+90
+Accuracy(/%)
+DeepSeek Pregate Acc
+DeepSeek Model Acc
+Qwen1.5 Pregate Acc
+Qwen1.5 Model Acc
+Qwen2 Pregate Acc
+Qwen2 Model Acc
+Figure 8. Accuracy of pre-gate and Predictor
+compute, memory, and bandwidth—as shown in Fig. 7 (a)
+and (b). The H20 provides roughly 240 TFLOPS FP16
+performance versus 38.7 TFLOPS on the A6000.
+We hypothesize that this occurs because H20’s memory
+bandwidth does not scale proportionally with its compute
+power. During early inference, when step size S is small,
+H20 finishes layer computation quickly but then idles while
+fetching expert parameters, increasing waiting latency. In
+contrast, A6000’s slower computation naturally overlaps
+with expert loading, reducing idle time and yielding lower
+observed latency under the same scheduling policy.
+4.3
+Pre-Gate-Based Predictor
+In § 4.2, we present a comparative analysis showcasing the
+latency reductions obtained by integrating ExpertFlow into
+multiple MoE models relative to a standard baseline. Within
+the expert preloading phase of MoE inference, the precision
+of expert selection has a direct impact on runtime perfor-
+mance. Higher prediction fidelity leads to fewer delays and
+cache-related inefficiencies, ultimately contributing to re-
+duced overall latency. This section focuses on evaluating
+the effectiveness of our predictor by analyzing its accuracy
+across different inference scenarios.
+Since the prediction model operates solely on token-level
+features and expert activation logs, its accuracy is indepen-
+dent of the underlying GPU device. Therefore, all reported
+results in this section are based on evaluations conducted on
+the A6000 platform.
+As shown in Fig. 8, we evaluated 410 requests of varying
+lengths to measure prediction accuracy when skipping layers
+in DeepSeek, Qwen1.5, and Qwen2.0. The trained model
+notably improved accuracy by an average of 21.79% (up
+to 30.36%) compared to the pre-gate method. Compared
+with proactive prediction (Song et al., 2024), our approach
+achieved higher accuracy at the same step size and exhibited
+a smoother decay trend.
+Table 2. Predictor and pre-gate Accuracy Comparison
+Group
+cp
+cg
+∆∞= cp −cg
+DeepSeek
+63.44
+26.43
+37.01
+Qwen1.5
+65.31
+33.29
+32.02
+Qwen2
+60.45
+29.61
+30.84
+To model the accuracy change, both Predictor and pre-gate
+were fit to an exponential decay function:
+f(t) = ae−bt + c,
+where t is the step number, and a, b, c denote initial devia-
+tion, decay rate, and asymptotic accuracy. Their fitted forms
+are:
+P(t) = ape−bpt + cp,
+G(t) = age−bgt + cg,
+yielding the accuracy gap:
+∆(t) = P(t) −G(t) = (ap −ag)e−bpt + (cp −cg),
+with the limit ∆∞= cp −cg. Fitted parameters cp and cg
+for each group are summarized below.
+Based on the results, the following observations can be
+made:
+• For all mpdel groups, the difference ∆∞> 0, indicating
+that Predictor Accuracy is consistently higher than pre-
+gate Accuracy.
+• The values confirm that Predictor Accuracy has a signif-
+icant and stable advantage over pre-gate Accuracy, with
+differences of 37.01%, 32.0% and 30.84%, respectively.
+Additionally, we monitored the cache miss latency in the
+MoE model after implementing the new prediction model.
+
+
+--- Page 9 ---
+ExpertFlow: Adaptive Expert Scheduling and Memory Coordination for Efficient MoE Inference
+1
+2
+3
+4
+5
+6
+7
+8
+numSteps
+0
+1
+2
+3
+Latency(/s)
+DeepSeek Latency
+DeepSeek Latency with model
+1
+2
+3
+4
+5
+6
+7
+8
+numSteps
+1
+2
+3
+Latency(/s)
+Qwen1.5 Latency
+Qwen1.5 Latency with model
+1
+2
+3
+4
+5
+6
+7
+8
+numSteps
+1
+2
+3
+4
+Latency(/s)
+Qwen2 Latency
+Qwen2 Latency with model
+Figure 9. Latency of different models with our pre-gate-based predictor
+Table 3. Latency of baseline on devices
+Group
+A6000
+H20
+Ascend 910B
+DeepSeek
+1.38
+0.46
+0.6063
+Qwen1.5
+1.05
+0.39
+0.5222
+Qwen2
+1.77
+1.16
+-
+Table 4. Latency of models with Predictor
+Group
+A6000
+H20
+Ascend 910B
+DeepSeek
+0.0441
+0.0012
+0.0624
+Qwen1.5
+0.0384
+0.0379
+0.0686
+Qwen2
+0.1252
+1.0176
+-
+As shown in Fig. 9, cache miss latency consistently de-
+creased, further demonstrating that the high accuracy of
+our model effectively reduces caching and communication
+overhead in MoE.
+Since the observed trends were consistent across different
+hardware platforms, we omit full visualizations for each de-
+vice to conserve space. Instead, we present results obtained
+on the A6000 as a representative case. For completeness,
+Table 4 summarizes the overall end-to-end latency achieved
+under our dynamic step size mechanism across all evaluated
+devices. Compared to the baseline results in Table 3, it
+is evident that all MoE models exhibit significant latency
+reductions across all devices.
+4.4
+Memory Management Policy
+We implemented a memory management policy based on
+the Least Recently Used (LRU) strategy to provide fine-
+grained control over expert swap operations. As shown
+in Fig. 10, the MoE model with this policy consistently
+achieves lower latency during cross-layer prediction than
+the baseline without memory management.
+A key observation is the sudden latency “jump” around a
+S = 4, mainly caused by limited GPU memory. Smaller
+step sizes increase expert predictions, triggering frequent
+swap-in. As the model progresses, many new experts are
+loaded, eventually exceeding memory capacity. When this
+occurs, previously swapped-in experts are evicted to free
+space; if later required, they must be reloaded, causing sharp
+latency spikes. This behavior consistently appears near step
+size 4 on our test systems, though the exact threshold varies
+Table 5. Latency of models with Cache-aware Routing
+Group
+A6000
+H20
+Ascend 910B
+DeepSeek
+0.0328
+0.0029
+0.0020
+Qwen1.5
+0.0216
+0.0022
+0.0018
+Qwen2
+0.1034
+0.0978
+-
+with GPU memory size.
+As with the § 4.3 evaluation, we report results based solely
+on the A6000 platform, since all tested devices exhibit con-
+sistent trends. In Table 5, we further evaluate the effective-
+ness of our cache-aware routing mechanism across multiple
+hardware platforms. Compared to the baseline, models
+incorporating this mechanism show a clear reduction in
+end-to-end latency, demonstrating its capability to allevi-
+ate expert loading bottlenecks and reduce communication
+overhead in large-scale MoE inference.
+4.5
+Cache-aware Routing
+As shown in Fig. 11, we compared end-to-end la-
+tency in three MoE models—DeepSeek, Qwen1.5, and
+Qwen2.0—with and without the proposed cache-aware rout-
+ing mechanism. Across all models, integrating cache-aware
+routing significantly reduced latency by mitigating delays
+from expert loading and cache misses. This improvement
+is essential for fast inference and efficient expert schedul-
+ing, preventing memory access overhead from becoming a
+bottleneck.
+Quantitatively, cache-aware routing reduced latency by over
+96.65% in DeepSeek and Qwen1.5, which initially lacked
+cache miss mitigation and were vulnerable to latency spikes
+from expert swapping. Qwen2.0, designed with shared
+experts to ease cache inefficiencies (Yang et al., 2024a),
+achieved a smaller yet substantial 55.58% improvement.
+Even so, integrating cache-aware routing further boosted
+Qwen2.0’s performance, confirming that the mechanism
+complements existing cache optimization strategies.
+5
+RELATED WORK
+5.1
+Scalable Sparse Activation and Inference
+Optimization
+Sparse activation allows MoE models to reduce computation
+by activating only a subset of experts per input (Riquelme
+
+
+--- Page 10 ---
+ExpertFlow: Adaptive Expert Scheduling and Memory Coordination for Efficient MoE Inference
+1
+2
+3
+4
+5
+6
+7
+8
+numSteps
+1
+2
+3
+Latency(/s)
+DeepSeek Latency
+DeepSeek Latency with Policy
+1
+2
+3
+4
+5
+6
+7
+8
+numSteps
+0
+1
+2
+3
+Latency(/s)
+Qwen1.5 Latency
+Qwen1.5 Latency with Policy
+1
+2
+3
+4
+5
+6
+7
+8
+numSteps
+0
+1
+2
+3
+4
+Latency(/s)
+Qwen2 Latency
+Qwen2 Latency with Policy
+Figure 10. Latency of different models with New Memory Management
+DeepSeek
+Qwen1.5
+Qwen2.0
+0.0
+0.5
+1.0
+1.5
+Latency(/s)
+1.38
+1.05
+1.77
+0.0462
+0.0352
+0.653
+MoE Routing
+Cache-aware Routing
+(a) Nvidia A6000
+DeepSeek
+Qwen1.5
+Qwen2.0
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+Latency(/s)
+0.46
+0.3944
+1.1554
+0.0046
+0.0195
+0.0433
+MoE Routing
+Cache-aware Routing
+(b) Nvidia H20
+DeepSeek
+Qwen1.5
+0.0
+0.2
+0.4
+0.6
+Latency(/s)
+0.6063
+0.5222
+0.0009
+0.0197
+MoE Routing
+Cache-aware Routing
+(c) Ascend 910B
+Figure 11. Comparison of latency with or without cache-aware routing across different models
+et al., 2021; Li et al., 2025; Zhu et al., 2025). The Switch
+Transformer exemplifies this by routing each token to a
+single expert, greatly simplifying both training and infer-
+ence (Fedus et al., 2021). Building on this principle, ExFlow
+exploits inter-layer expert affinity to colocate frequently
+co-activated experts and reduce cross-GPU communica-
+tion (Yao et al., 2024), while TA-MoE incorporates net-
+work topology into its dispatch strategy for communication-
+aware scheduling, achieving up to 4.77× acceleration (Chen
+et al., 2022). These topology- and scheduling-aware de-
+signs effectively lower communication overhead but still
+face challenges under strict memory constraints. Expert-
+Flow addresses these limits through predictive caching
+and token-aware scheduling, cutting GPU memory usage
+by 93.72% and boosting throughput by 9.99× (He et al.,
+2024).
+Similarly, MoE-Lightning employs hierarchical
+memory management for dynamic load balancing, achiev-
+ing 10.3× speedup (Cao et al., 2024). MoE-ERAS im-
+proves efficiency by prioritizing experts already resident in
+fast memory (Bambhaniya et al., 2024), AdaMOE adapts
+expert activation per token via null experts (Zeng et al.,
+2024), and HOBBIT leverages mixed-precision offloading
+with quantized (e.g., Int4) experts, layer-wise prefetching,
+and multi-level caching (Tang et al., 2024). Collectively,
+these frameworks enhance MoE inference through memory-
+aware scheduling, adaptive routing, and expert approxima-
+tion. ExpertFlow focuses on adaptive cross-layer prefetch-
+ing through a dynamic step-size predictor guided by token
+ID, pre-gate outputs, and expert history, minimizing cache
+misses and waiting latency without loss of precision.
+5.2
+Routing, Load Balancing, & Application
+Adaptability
+Effective routing is critical to MoE performance (Huang
+et al., 2025; Zhou et al., 2025). Expert Choice enables load
+balancing by allowing experts to self-select tokens without
+auxiliary loss (Zhou et al., 2022). AdaMOE adjusts active
+expert counts based on token complexity (Zeng et al., 2024),
+while ExFlow reduces communication by maintaining con-
+sistent token-to-expert mappings across layers (He et al.,
+2024). MoDSE improves compute efficiency by assigning
+smaller experts to simple tokens and larger ones to complex
+tokens (Sun et al., 2024). Together, these approaches explore
+dynamic expert allocation based on token characteristics to
+balance load and maximize parallelism. By adapting routing
+to token-level diversity, they reduce bottlenecks and improve
+throughput. Such mechanisms also help MoE systems adapt
+to varying workloads, enhancing inference efficiency under
+dynamic input distributions. Combined with memory-aware
+execution, these optimizations form the basis for adaptive
+and efficient MoE pipelines.
+Beyond general-purpose language modeling, MoE architec-
+tures extend to specialized domains. TIMEMOE uses sparse
+activation for multitask time-series forecasting, improving
+accuracy across benchmarks (Shi et al., 2024a). In speech
+deepfake detection, dynamic gating enhances generaliza-
+tion to multilingual and unseen data (Negroni et al., 2024).
+KAMoE applies Kolmogorov-Arnold-based gating for in-
+terpretable, efficient expert selection (Inzirillo & Genet,
+2024), while MOE-NP advances graph learning by assign-
+ing experts based on local and global node patterns (Shi
+et al., 2024b). These domain-specific adaptations show how
+routing and gating can be customized for task-dependent
+data, expanding MoE’s versatility in real-world applications.
+Overall, they emphasize the need for routing frameworks
+that are both computationally efficient and adaptable to di-
+verse learning scenarios.
+6
+CONCLUSION
+The proposed system, ExpertFlow, is a dynamic prefetch-
+ing framework for adaptive cross-layer prediction in MoE
+models, integrating flexible memory management and cache-
+aware routing to reduce expert loading and waiting latency.
+
+
+--- Page 11 ---
+ExpertFlow: Adaptive Expert Scheduling and Memory Coordination for Efficient MoE Inference
+It combines a dynamic layer-adjustment algorithm, expert-
+priority-based memory management, and real-time routing
+under a first-come, first-served protocol. Experiments show
+that ExpertFlow improves expert prediction accuracy by
+over 30% and eliminates up to 99.9% of waiting latency
+while maintaining stable performance across different hard-
+ware and workloads, demonstrating strong scalability for
+real-world MoE inference.
+REFERENCES
+AI,
+D.
+Deepseek-coder-v2-lite-base.
+https:
+//huggingface.co/deepseek-ai/
+DeepSeek-Coder-V2-Lite-Base.
+Anonymous.
+Sharegpt
+vicuna
+unfiltered.
+https://huggingface.co/datasets/
+anon8231489123/ShareGPT_Vicuna_
+unfiltered.
+Bambhaniya, A. R., Kumar, S. C., and Krishna, T. Moe-eras:
+Expert residency aware selection. In Machine Learning
+for Computer Architecture and Systems 2024, 2024.
+Bi, X., Chen, D., Chen, G., Chen, S., Dai, D., Deng, C.,
+Ding, H., Dong, K., Du, Q., Fu, Z., et al. Deepseek llm:
+Scaling open-source language models with longtermism.
+arXiv preprint arXiv:2401.02954, 2024.
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D.,
+Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G.,
+Askell, A., et al. Language models are few-shot learners.
+Advances in neural information processing systems, 33:
+1877–1901, 2020.
+Cao, S., Liu, S., Griggs, T., Schafhalter, P., Liu, X., Sheng,
+Y., Gonzalez, J. E., Zaharia, M., and Stoica, I. Moe-
+lightning: High-throughput moe inference on memory-
+constrained gpus. In Proceedings of the 30th ACM In-
+ternational Conference on Architectural Support for Pro-
+gramming Languages and Operating Systems, Volume 1,
+pp. 715–730, 2025.
+Cao, S. et al. Moe-lightning: High-throughput moe in-
+ference on memory-constrained gpus. arXiv preprint
+arXiv:2411.11217, 2024.
+Chen, C., Li, M., Wu, Z., Yu, D., and Yang, C. Ta-moe:
+Topology-aware large scale mixture-of-expert training.
+Advances in Neural Information Processing Systems, 35:
+22173–22186, 2022.
+DeepSeek-AI et al. Deepseek-v2: A strong, economical,
+and efficient mixture-of-experts language model, 2024.
+URL https://arxiv.org/abs/2405.04434.
+Eliseev, A. and Mazur, D. Fast inference of mixture-of-
+experts language models with offloading. arXiv preprint
+arXiv:2312.17238, 2023.
+Fedus, W., Zoph, B., and Shazeer, N. Switch transform-
+ers: Scaling to trillion parameter models with simple and
+efficient sparsity, 2021.
+Fedus, W., Zoph, B., and Shazeer, N. Switch transformers:
+Scaling to trillion parameter models with simple and ef-
+ficient sparsity. Journal of Machine Learning Research,
+23(120):1–39, 2022.
+Graves, A. Adaptive computation time for recurrent neural
+networks. arXiv preprint arXiv:1603.08983, 2016.
+He, X., Zhang, S., Wang, Y., Yin, H., Zeng, Z., Shi, S.,
+Tang, Z., Chu, X., Tsang, I., and Soon, O. Y. Expert-
+flow: Optimized expert activation and token allocation
+for efficient mixture-of-experts inference. arXiv preprint
+arXiv:2410.17954, 2024.
+Huang, H., Lu, S., Shan, Y., Qu, H., Zhang, F., Guan, W.,
+Hong, Q., and Li, L. Dynamic language group-based
+moe: Enhancing code-switching speech recognition with
+hierarchical routing. In ICASSP 2025-2025 IEEE Inter-
+national Conference on Acoustics, Speech and Signal
+Processing (ICASSP), pp. 1–5. IEEE, 2025.
+Inzirillo, H. and Genet, R. A gated residual kolmogorov-
+arnold networks for mixtures of experts. arXiv preprint
+arXiv:2409.15161, 2024.
+Jordan, M. and Jacobs, R. Hierarchical mixtures of ex-
+perts and the em algorithm.
+In Proceedings of 1993
+International Conference on Neural Networks (IJCNN-
+93-Nagoya, Japan), volume 2, pp. 1339–1344 vol.2, 1993.
+doi: 10.1109/IJCNN.1993.716791.
+Lepikhin, D., Lee, Y., Xu, Y., Chen, M., Vinyals, O., Huang,
+Y., and Zoph, B. Gshard: Scaling giant models with
+conditional computation and automatic sharding, 2020.
+Li, Y., Jiang, S., Hu, B., Wang, L., Zhong, W., Luo, W., Ma,
+L., and Zhang, M. Uni-moe: Scaling unified multimodal
+llms with mixture of experts.
+IEEE Transactions on
+Pattern Analysis and Machine Intelligence, 2025.
+Negroni, V., Salvi, D., Mezza, A. I., Bestagini, P., and
+Tubaro, S.
+Leveraging mixture of experts for im-
+proved speech deepfake detection.
+arXiv preprint
+arXiv:2409.16077, 2024.
+NVIDIA
+Corporation.
+NVIDIA
+RTX
+A6000
+Datasheet.
+https://resources.nvidia.
+com/en-us-briefcase-for-datasheets/
+proviz-print-nvidia-1?ncid=no-ncid,
+2024. Accessed: 2025-06-14.
+
+
+--- Page 12 ---
+ExpertFlow: Adaptive Expert Scheduling and Memory Coordination for Efficient MoE Inference
+Pedregosa, F., Varoquaux, G., Gramfort, A., Michel, V.,
+Thirion, B., Grisel, O., Blondel, M., Prettenhofer, P.,
+Weiss, R., Dubourg, V., Vanderplas, J., Passos, A., Cour-
+napeau, D., Brucher, M., Perrot, M., and Duchesnay, E.
+Scikit-learn: Machine learning in Python. Journal of
+Machine Learning Research, 12:2825–2830, 2011.
+Qwen. Qwen1.5-moe-a2.7b. https://huggingface.
+co/Qwen/Qwen1.5-MoE-A2.7B, a.
+Qwen.
+Qwen2-57b-a14b-instruct-gptq-int4.
+https://huggingface.co/Qwen/
+Qwen2-57B-A14B-Instruct-GPTQ-Int4,
+b.
+Riquelme, C. et al. Scaling vision with sparse mixture
+of experts. Advances in Neural Information Processing
+Systems, 34:8583–8595, 2021.
+Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le,
+Q. V., Hinton, G., and Dean, J. Outrageously large neural
+networks: The sparsely-gated mixture-of-experts layer,
+2017.
+Shi, X., Wang, S., Nie, Y., Li, D., Ye, Z., Wen, Q., and
+Jin, M.
+Time-moe: Billion-scale time series founda-
+tion models with mixture of experts.
+arXiv preprint
+arXiv:2409.16040, 2024a.
+Shi, Y., Wang, Y., Lang, W., Zhang, J., Dong, P., and Li, A.
+Mixture of experts for node classification. arXiv preprint
+arXiv:2412.00418, 2024b.
+Song, X., Zhong, Z., and Chen, R. Promoe: Fast moe-
+based llm serving using proactive caching. arXiv preprint
+arXiv:2410.22134, 2024.
+Sun, M., Liu, W., Luan, J., Gao, P., and Wang, B. Mixture
+of diverse size experts. arXiv preprint arXiv:2409.12210,
+2024.
+Tang, P., Liu, J., Hou, X., Pu, Y., Wang, J., Heng, P.-A.,
+Li, C., and Guo, M. Hobbit: A mixed precision expert
+offloading system for fast moe inference. arXiv preprint
+arXiv:2411.01433, 2024.
+Team, Q.
+Qwen1.5-moe:
+Matching 7b model per-
+formance with 1/3 activated parameters”, February
+2024. URL https://qwenlm.github.io/blog/
+qwen-moe/.
+Team, Q. et al. Qwen2 technical report. arXiv preprint
+arXiv:2407.10671, 2(3), 2024.
+Wang, X., Yu, F., Dou, Z.-Y., Darrell, T., and Gonzalez,
+J. E. Skipnet: Learning dynamic routing in convolutional
+networks. In Proceedings of the European conference on
+computer vision (ECCV), pp. 409–424, 2018.
+Wolf, T., Debut, L., Sanh, V., Chaumond, J., Delangue, C.,
+Moi, A., Cistac, P., Rault, T., Louf, R., Funtowicz, M.,
+et al. Transformers: State-of-the-art natural language
+processing. In Proceedings of the 2020 conference on em-
+pirical methods in natural language processing: system
+demonstrations, pp. 38–45, 2020.
+Yang, A., Yang, B., Zhang, B., Hui, B., Zheng, B., Yu, B., Li,
+C., Liu, D., Huang, F., Wei, H., et al. Qwen2. 5 technical
+report. arXiv preprint arXiv:2412.15115, 2024a.
+Yang, Y., Qi, S., Gu, W., Wang, C., Gao, C., and Xu, Z.
+Xmoe: Sparse models with fine-grained and adaptive ex-
+pert selection. In Findings of the Association for Compu-
+tational Linguistics ACL 2024, pp. 11664–11674, 2024b.
+Yao, J., Anthony, Q., Shafi, A., Subramoni, H., and Panda,
+D. K. D. Exploiting inter-layer expert affinity for ac-
+celerating mixture-of-experts model inference. In 2024
+IEEE International Parallel and Distributed Processing
+Symposium (IPDPS), pp. 915–925. IEEE, 2024.
+Zeng, Z., Miao, Y., Gao, H., Zhang, H., and Deng, Z.
+Adamoe: Token-adaptive routing with null experts for
+mixture-of-experts language models.
+arXiv preprint
+arXiv:2406.13233, 2024.
+Zhou, H., Wang, Z., Huang, S., Huang, X., Han, X., Feng,
+J., Deng, C., Luo, W., and Chen, J. Moe-lpr: Multilingual
+extension of large language models through mixture-of-
+experts with language priors routing. In Proceedings
+of the AAAI Conference on Artificial Intelligence, vol-
+ume 39, pp. 26092–26100, 2025.
+Zhou, Y., Lei, T., Liu, H., Du, N., Huang, Y., Zhao, V.,
+Dai, A. M., Le, Q. V., Laudon, J., et al. Mixture-of-
+experts with expert choice routing. Advances in Neural
+Information Processing Systems, 35:7103–7114, 2022.
+Zhu, J., Yang, C., Zheng, K., Xu, Y., Shi, Z., Zhang, Y.,
+Chen, Q., and Shen, Y. Exploring sparse moe in gans for
+text-conditioned image synthesis. In Proceedings of the
+Computer Vision and Pattern Recognition Conference, pp.
+18411–18423, 2025.
