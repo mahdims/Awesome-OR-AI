@@ -52,6 +52,8 @@ def _parse_analysis_fields(analysis: dict) -> tuple:
     tags     = _j(analysis.get('tags'), {})
     methods  = set(tags.get('methods', []))
     problems = set(tags.get('problems', []))
+    application      = set(tags.get('application', []))       # new: real-world sector
+    problem_properties = set(tags.get('problem_properties', []))  # new: cross-cutting characteristics
 
     # Fine-grained open-ended fields (added by improved methods.txt)
     framework_lineage = tags.get('framework_lineage') or ''
@@ -74,7 +76,8 @@ def _parse_analysis_fields(analysis: dict) -> tuple:
     ancestors = lineage.get('direct_ancestors', [])  # list of {paper, relationship}
 
     return (methods, problems, class_, llm_role, search_type, benchmarks, props,
-            ancestors, framework_lineage, specific_domain, llm_coupling)
+            ancestors, framework_lineage, specific_domain, llm_coupling,
+            application, problem_properties)
 
 
 def build_semantic_edges(corpus_ids: set, db, semantic_weight: float,
@@ -135,8 +138,8 @@ def build_semantic_edges(corpus_ids: set, db, semantic_weight: float,
     coupling_df = Counter() # document frequency per llm_coupling value
 
     for pid, (methods, problems, cls, role, stype, benchmarks, _props,
-              _anc, fw_lineage, sp_domain, llm_cpl) in analyses.items():
-        for t in methods | problems:
+              _anc, fw_lineage, sp_domain, llm_cpl, app, pp) in analyses.items():
+        for t in methods | problems | app | pp:
             tag_df[t] += 1
         for b in benchmarks:
             bench_df[b] += 1
@@ -213,13 +216,13 @@ def build_semantic_edges(corpus_ids: set, db, semantic_weight: float,
 
     for i in range(len(ids)):
         pid_a = ids[i]
-        m_a, p_a, cls_a, role_a, stype_a, bench_a, _p, _anc_a, lin_a, dom_a, cpl_a = analyses[pid_a]
-        tags_a = m_a | p_a
+        m_a, p_a, cls_a, role_a, stype_a, bench_a, _p, _anc_a, lin_a, dom_a, cpl_a, app_a, pp_a = analyses[pid_a]
+        tags_a = m_a | p_a | app_a | pp_a
 
         for j in range(i + 1, len(ids)):
             pid_b = ids[j]
-            m_b, p_b, cls_b, role_b, stype_b, bench_b, _p, _anc_b, lin_b, dom_b, cpl_b = analyses[pid_b]
-            tags_b = m_b | p_b
+            m_b, p_b, cls_b, role_b, stype_b, bench_b, _p, _anc_b, lin_b, dom_b, cpl_b, app_b, pp_b = analyses[pid_b]
+            tags_b = m_b | p_b | app_b | pp_b
 
             # --- All signals normalized to [0, 1] ---
 
@@ -236,19 +239,22 @@ def build_semantic_edges(corpus_ids: set, db, semantic_weight: float,
                     return 0.0
                 return idf(df_map[val_a]) / log_N
 
-            s_cat = (0.25 * _nc(cls_a,   cls_b,   class_df)    # problem class
-                   + 0.20 * _nc(role_a,  role_b,  role_df)     # LLM role
-                   + 0.15 * _nc(stype_a, stype_b, stype_df)    # search type
-                   + 0.20 * _nc(lin_a,   lin_b,   lineage_df)  # framework lineage
+            # s_cat weights: framework_lineage and llm_coupling raised after improved
+            # tag taxonomy (more discriminating values); reader-derived cls/role/stype lowered.
+            s_cat = (0.20 * _nc(cls_a,   cls_b,   class_df)    # problem class     (was 0.25)
+                   + 0.15 * _nc(role_a,  role_b,  role_df)     # LLM role          (was 0.20)
+                   + 0.10 * _nc(stype_a, stype_b, stype_df)    # search type       (was 0.15)
+                   + 0.30 * _nc(lin_a,   lin_b,   lineage_df)  # framework lineage (was 0.20)
                    + 0.15 * _nc(dom_a,   dom_b,   domain_df)   # specific domain
-                   + 0.05 * _nc(cpl_a,   cpl_b,   coupling_df) # LLM coupling
+                   + 0.10 * _nc(cpl_a,   cpl_b,   coupling_df) # LLM coupling      (was 0.05)
                    )  # s_cat ∈ [0, 1] since weights sum to 1.0
 
-            # Tag score: weighted combination of three tag sub-signals  [0, 1]
+            # Tag score: s_tags raised to 0.60 (now includes application + problem_properties
+            # in addition to methods + problems); s_bench reduced since tags compensate.
             tag_score = min(1.0,
-                0.50 * s_tags    # methods/problems: most informative
-              + 0.30 * s_cat     # categorical structure: refinement
-              + 0.20 * s_bench   # benchmark overlap: specific but sparse
+                0.60 * s_tags    # methods/problems/application/properties (was 0.50)
+              + 0.30 * s_cat     # categorical structure
+              + 0.10 * s_bench   # benchmark overlap: reduced (was 0.20)
             )
 
             # Embedding score: normalized cosine  [0, 1]
@@ -297,7 +303,7 @@ def build_semantic_edges(corpus_ids: set, db, semantic_weight: float,
     # Lineage edges (only exact arxiv_id matches in corpus)
     # ancestors is index 7 in the 11-field tuple
     for pid_a, (_m, _p, _cls, _role, _stype, _bench, _props,
-                ancestors, _lin, _dom, _cpl) in analyses.items():
+                ancestors, _lin, _dom, _cpl, _app, _pp) in analyses.items():
         for entry in ancestors:
             anc = entry.get('paper', '')
             if anc not in corpus_ids:
