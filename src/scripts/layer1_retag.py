@@ -77,16 +77,20 @@ def build_reader_context_from_db(analysis: dict) -> str:
 
 def _format_tags(tags: dict) -> str:
     """Format tags dict for display."""
-    methods   = tags.get('methods', [])
-    problems  = tags.get('problems', [])
-    contrib   = tags.get('contribution_type', [])
-    lineage   = tags.get('framework_lineage')
-    domain    = tags.get('specific_domain')
-    coupling  = tags.get('llm_coupling')
+    methods     = tags.get('methods', [])
+    problems    = tags.get('problems', [])
+    contrib     = tags.get('contribution_type', [])
+    application = tags.get('application', [])
+    properties  = tags.get('problem_properties', [])
+    lineage     = tags.get('framework_lineage')
+    domain      = tags.get('specific_domain')
+    coupling    = tags.get('llm_coupling')
     lines = [
-        f"  methods:          {', '.join(methods) or '(none)'}",
-        f"  problems:         {', '.join(problems) or '(none)'}",
-        f"  contribution:     {', '.join(contrib) or '(none)'}",
+        f"  methods:           {', '.join(methods) or '(none)'}",
+        f"  problems:          {', '.join(problems) or '(none)'}",
+        f"  contribution:      {', '.join(contrib) or '(none)'}",
+        f"  application:       {', '.join(application) or '(none)'}",
+        f"  problem_properties:{', '.join(properties) or '(none)'}",
         f"  framework_lineage: {lineage or '(null)'}",
         f"  specific_domain:   {domain or '(null)'}",
         f"  llm_coupling:      {coupling or '(null)'}",

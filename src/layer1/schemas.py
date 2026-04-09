@@ -67,9 +67,11 @@ class Lineage(BaseModel):
     novelty_type: str  # "incremental" | "combinatorial_novelty" | "paradigm_shift"
 
 class Tags(BaseModel):
-    methods: List[str]
-    problems: List[str]
-    contribution_type: List[str]  # ["new_method", "new_benchmark", "sota_result"]
+    methods: List[str] = Field(default_factory=list, max_length=4)           # Max 4: core technical methods only
+    problems: List[str] = Field(default_factory=list, max_length=3)          # Max 3: specific problem classes
+    contribution_type: List[str] = Field(default_factory=list, max_length=2) # Max 2: dominant contribution types
+    application: List[str] = Field(default_factory=list, max_length=2)       # Max 2: real-world sector (logistics, energy, ai_infrastructure, ...)
+    problem_properties: List[str] = Field(default_factory=list, max_length=3) # Max 3: cross-cutting characteristics (stochastic, multi_objective, large_scale, ...)
     # Fine-grained open-ended differentiators — LLM fills these freely (None = not applicable)
     framework_lineage: Optional[str] = None  # e.g. "alphaevolve", "funsearch", "eoh", "llamea"
     specific_domain: Optional[str] = None    # e.g. "combinatorial_routing", "matrix_multiplication"

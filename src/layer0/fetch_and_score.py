@@ -104,6 +104,7 @@ MIN_YEAR = _CONSTANTS['min_year']
 RELEVANCE_THRESHOLD = _CONSTANTS['relevance_threshold']
 SCORE_CACHE_PATH = _CONSTANTS['score_cache_path']
 ARXIV_API_URL = _CONSTANTS['arxiv_api_url']
+ARXIV_LOOKBACK_DAYS = _CONSTANTS.get('arxiv', {}).get('lookback_days', 60)
 ARXIV_NS = {
     "atom": "http://www.w3.org/2005/Atom",
     "arxiv": "http://arxiv.org/schemas/atom",
@@ -228,12 +229,16 @@ def _arxiv_api_call(params, timeout=30, max_retries=5):
 # Max OR clauses per arxiv API call before splitting
 ARXIV_MAX_QUERY_CLAUSES = 8
 
-def arxiv_search(query=None, id_list=None, max_results=10, sort_by="submittedDate", timeout=30):
+def arxiv_search(query=None, id_list=None, max_results=10, sort_by="submittedDate", timeout=30, date_filter=None):
     """
     Search arxiv via the API using requests with a hard timeout.
     Automatically splits long OR queries into smaller chunks to avoid
     URL length issues and arxiv API errors.
     Returns a list of dicts with paper metadata (deduplicated by ID).
+
+    date_filter: YYYYMMDD string (e.g. "20260201"). If set, restricts results to
+                 papers submitted on or after this date, preventing old papers from
+                 consuming max_results slots.
     """
     if id_list:
         params = {
@@ -245,6 +250,11 @@ def arxiv_search(query=None, id_list=None, max_results=10, sort_by="submittedDat
     if not query:
         return []
 
+    def _apply_date_filter(q):
+        if date_filter:
+            return f"({q}) AND submittedDate:[{date_filter}* TO *]"
+        return q
+
     # Split long OR queries into chunks
     # Detect OR-separated clauses (handles both parenthesized and plain terms)
     clauses = [c.strip() for c in re.split(r'\s+OR\s+', query)]
@@ -253,7 +263,7 @@ def arxiv_search(query=None, id_list=None, max_results=10, sort_by="submittedDat
         # Short enough to send as one request
         params = {
             "max_results": max_results,
-            "search_query": query,
+            "search_query": _apply_date_filter(query),
             "sortBy": sort_by,
             "sortOrder": "descending",
         }
@@ -265,7 +275,7 @@ def arxiv_search(query=None, id_list=None, max_results=10, sort_by="submittedDat
     all_results = []
     for i in range(0, len(clauses), ARXIV_MAX_QUERY_CLAUSES):
         chunk = clauses[i:i + ARXIV_MAX_QUERY_CLAUSES]
-        chunk_query = " OR ".join(chunk)
+        chunk_query = _apply_date_filter(" OR ".join(chunk))
         print(f"    [arxiv] Chunk {i // ARXIV_MAX_QUERY_CLAUSES + 1}/{(len(clauses) + ARXIV_MAX_QUERY_CLAUSES - 1) // ARXIV_MAX_QUERY_CLAUSES}:", flush=True)
         params = {
             "max_results": max_results,
@@ -800,7 +810,7 @@ def extract_venue(journal_ref=None, comment=None):
                 return match.group(1).strip() if match.lastindex else match.group(0).strip()
     return ""
 
-def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, category_description="", score_cache=None, existing_ids=None):
+def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, category_description="", score_cache=None, existing_ids=None, lookback_days=None):
     """
     @param topic: str
     @param query: str
@@ -809,6 +819,7 @@ def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, catego
     @param category_description: str for LLM relevance scoring
     @param score_cache: dict - persistent cache of relevance scores
     @param existing_ids: set of paper IDs already in database (skip these)
+    @param lookback_days: int - if set, only fetch papers submitted in the last N days
     @return paper_with_code: dict
     """
     content = dict()
@@ -816,7 +827,12 @@ def get_daily_papers(topic, query="slam", max_results=2, llm_client=None, catego
     if existing_ids is None:
         existing_ids = set()
 
-    results = arxiv_search(query=query, max_results=max_results)
+    date_filter = None
+    if lookback_days is not None:
+        since = datetime.date.today() - datetime.timedelta(days=lookback_days)
+        date_filter = since.strftime("%Y%m%d")
+
+    results = arxiv_search(query=query, max_results=max_results, date_filter=date_filter)
 
     skipped_existing = 0
     for idx, result in enumerate(results, 1):
@@ -1531,7 +1547,8 @@ def demo(**config):
                                                 llm_client=llm_client,
                                                 category_description=category_descriptions.get(topic, topic),
                                                 score_cache=score_cache,
-                                                existing_ids=existing_ids)
+                                                existing_ids=existing_ids,
+                                                lookback_days=ARXIV_LOOKBACK_DAYS)
                 count = len(data.get(topic, {}))
                 total_found += count
                 elapsed = time.time() - t0

@@ -389,8 +389,10 @@ def export_category_tables(db: Database, papers: list, front_map: dict) -> dict:
             "front_id": p.get("front_id"),
             "front_name": None,   # filled in second pass after export_fronts()
             "front_status": p.get("front_status"),
-            "methods": (tags.get("methods") or [])[:5],
-            "problems": (tags.get("problems") or [])[:5],
+            "methods": (tags.get("methods") or [])[:4],
+            "problems": (tags.get("problems") or [])[:3],
+            "application": (tags.get("application") or [])[:2],
+            "problem_properties": (tags.get("problem_properties") or [])[:3],
             "code_url": code_url,
             "brief": p.get("brief", ""),
             "affiliations": p.get("affiliations", ""),
