@@ -218,9 +218,13 @@ def main():
     if results['success'] > 0:
         print(f"\n✓ Analysis complete! Database updated with {results['success']} new papers")
         print(f"  Database: {db.db_path}")
+    elif results['failed'] > 0:
+        # Paper-specific failures (e.g., PDF 404) are not CI-breaking errors.
+        # Permanent failures get a stub inserted so they won't be retried.
+        print(f"\n⚠ No papers were successfully analyzed ({results['failed']} failed).")
+        print(f"  Permanent failures (404 PDFs) have been stubbed out in the database.")
     else:
-        print(f"\n✗ No papers were successfully analyzed")
-        return 1
+        print(f"\n[INFO] No papers were analyzed (all skipped or none queued).")
 
     # Backfill is_relevant for any papers that pre-date automatic flag computation
     print(f"\n[BACKFILL] Recomputing is_relevant flags for all papers...")

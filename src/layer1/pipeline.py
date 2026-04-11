@@ -166,6 +166,43 @@ class PaperAnalysisPipeline:
             print(f"Error: {str(e)}")
             import traceback
             traceback.print_exc()
+
+            # Permanent failures (e.g., PDF deleted from ArXiv) — insert a stub
+            # so the paper is not retried on every subsequent CI run.
+            error_str = str(e)
+            is_permanent = (
+                "404" in error_str and "Not Found" in error_str
+            )
+            if is_permanent:
+                print(f"  [STUB] Inserting permanent-failure stub to skip on future runs.")
+                try:
+                    stub = {
+                        'arxiv_id': arxiv_id,
+                        'category': category,
+                        'title': title,
+                        'authors': authors or [],
+                        'abstract': '',
+                        'published_date': published_date or '1970-01-01',
+                        'problem': {'short': 'PDF unavailable', 'formal_name': '', 'class_': '', 'properties': [], 'scale': ''},
+                        'methodology': {'core_method': '', 'llm_role': '', 'llm_model_used': '', 'search_type': '', 'novelty_claim': '', 'components': [], 'training_required': False},
+                        'experiments': {'benchmarks': [], 'baselines': [], 'hardware': '', 'instance_sizes': []},
+                        'results': {'vs_baselines': '', 'scalability': '', 'statistical_rigor': '', 'limitations_acknowledged': ''},
+                        'artifacts': {'code_url': '', 'models_released': False, 'new_benchmark': False},
+                        'lineage': {'direct_ancestors': [], 'closest_prior_work': '', 'novelty_type': ''},
+                        'tags': {'methods': [], 'problems': [], 'contribution_type': []},
+                        'extensions': {'next_steps': [], 'transferable_to': [], 'open_weaknesses': []},
+                        'relevance': {'methodological': 0, 'problem': 0, 'inspirational': 0},
+                        'significance': {'must_read': False, 'changes_thinking': False, 'team_discussion': False, 'reasoning': ''},
+                        'brief': f'PDF fetch permanently failed (404 Not Found). Paper removed from ArXiv.',
+                        'analysis_model': 'failed/pdf-404',
+                        'is_relevant': 0,
+                    }
+                    with self.db as db:
+                        db.insert_analysis(stub)
+                    print(f"  [STUB] Stub inserted — paper will be skipped in future runs.")
+                except Exception as stub_err:
+                    print(f"  [STUB] Failed to insert stub: {stub_err}")
+
             return None
 
     def _run_agent(self, agent_name: str, client, prompt: str, context: str, output_schema):
