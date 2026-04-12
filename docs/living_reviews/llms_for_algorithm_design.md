@@ -1,10 +1,21 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-04-07
+**Last Updated:** 2026-04-12
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-12 (1 papers)
+
+### [RoboPhD: Evolving Diverse Complex Agents Under Tight Evaluation Budgets](https://arxiv.org/abs/2604.04347)
+
+**2026-04-06** | Independent Researchers | M=8 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Elo tournament selection for evolutionary optimization with comparative error reports and Deep Focus refinement | *LLM role:* evolutionary_search
+
+> RoboPhD optimizes LLM agent evolution under tight evaluation budgets by replacing traditional validation sets with an Elo-based tournament on training data and allowing agents to evolve their own diagnostic instrumentation. The results are backed by solid empirical comparisons, outperforming GEPA and Autoresearch on 3 out of 4 benchmarks (ARC-AGI, Text2SQL, DocFinQA) under a strict 1,500 evaluation budget. The single most useful takeaway we can steal is 'self-instrumenting agents'—seeding the initial agent with print() statements and letting the evolutionary process grow its own logging to provide richer Actionable Side Information (ASI) to the LLM optimizer. This paper matters immensely for AlgoEvo; we should immediately test dropping our validation splits in favor of Elo tracking and implement self-instrumenting diagnostics to improve our evolutionary signal without increasing API costs.
+
 
 #### 2026-04-02 (3 papers)
 

@@ -1,10 +1,21 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-04-07
+**Last Updated:** 2026-04-12
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-12 (1 papers)
+
+### [GENSERVE: Efficient Co-Serving of Heterogeneous Diffusion Model Workloads](https://arxiv.org/abs/2604.04335)
+
+**2026-04-06** | University of Washington, NVIDIA, Rice University, University of Waterloo, Cisco Research, Independent Researcher | M=6 P=7 I=6 *discuss*
+
+*Method:* SLO-aware dynamic programming scheduler with intelligent video preemption, elastic sequence parallelism, and dynamic batching | *LLM role:* none
+
+> GENSERVE optimizes the co-serving of text-to-image and text-to-video diffusion models on shared GPUs using a dynamic programming scheduler that jointly manages step-level preemption, dynamic batching, and elastic sequence parallelism. The results are empirically backed, demonstrating up to a 44% improvement in SLO attainment over baselines like SRTF on an 8-GPU cluster. The most useful takeaway is their two-stage DP formulation: they first generate a small set of anchored candidate actions (hold, resume, scale SP) per request, then run a knapsack DP to maximize global SLOs in under 2ms. While this targets diffusion models rather than LLMs, the OR formulation for elastic sequence parallelism and batching under strict latency SLOs is directly applicable to our GPUSched project.
+
 
 #### 2026-04-02 (2 papers)
 
