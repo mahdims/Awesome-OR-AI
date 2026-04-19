@@ -1,10 +1,21 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-04-14
+**Last Updated:** 2026-04-19
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-19 (1 papers)
+
+### [Modeling Copilots for Text-to-Model Translation](https://arxiv.org/abs/2604.12955)
+
+**2026-04-14** | Brown University, Fidelity Investments | M=4 P=8 I=7 *discuss*
+
+*Method:* LLM-based prompting strategies for MiniZinc model generation | *LLM role:* code_writer
+
+> This paper introduces Text2Zinc, a solver-agnostic benchmark of 1,775 natural language combinatorial problems, and evaluates various LLM copilot strategies (CoT, knowledge graphs, grammar validation) for generating formal MiniZinc models. The results are backed by extensive empirical evaluation, demonstrating that even advanced models like GPT-4o struggle, achieving only ~40-50% solution accuracy despite much higher execution (compilation) accuracy. The key insight is that decoupling syntax enforcement from generation via post-hoc grammar validation significantly improves execution accuracy without requiring constrained decoding, though capturing the underlying optimization logic remains a major bottleneck. This work is highly relevant for our OR benchmarking and evaluation efforts, as the dataset schema and the clear demonstration of the execution-solution accuracy gap provide a strong foundation for evaluating LLM reasoning in symbolic OR modeling.
+
 
 #### 2026-04-02 (1 papers)
 
