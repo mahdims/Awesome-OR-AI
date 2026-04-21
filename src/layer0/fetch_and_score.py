@@ -227,7 +227,7 @@ def _arxiv_api_call(params, timeout=30, max_retries=5):
     return []
 
 # Max OR clauses per arxiv API call before splitting
-ARXIV_MAX_QUERY_CLAUSES = 8
+ARXIV_MAX_QUERY_CLAUSES = 5
 
 def arxiv_search(query=None, id_list=None, max_results=10, sort_by="submittedDate", timeout=30, date_filter=None):
     """
@@ -251,8 +251,10 @@ def arxiv_search(query=None, id_list=None, max_results=10, sort_by="submittedDat
         return []
 
     def _apply_date_filter(q):
+        # arxiv's parser rejects wildcard dates (`YYYYMMDD* TO *`) with HTTP 500.
+        # Use the documented 12-digit YYYYMMDDHHMM format with a far-future upper bound.
         if date_filter:
-            return f"({q}) AND submittedDate:[{date_filter}* TO *]"
+            return f"({q}) AND submittedDate:[{date_filter}0000 TO 999912312359]"
         return q
 
     # Split long OR queries into chunks
