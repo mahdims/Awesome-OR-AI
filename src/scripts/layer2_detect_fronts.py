@@ -343,6 +343,9 @@ def main():
 
     # S2 API key from env if not provided
     s2_api_key = args.s2_api_key or os.getenv("S2_API_KEY")
+    if not s2_api_key:
+        print("[WARNING] S2_API_KEY not set - Semantic Scholar calls will use the public quota (may 429 on long runs; citation/venue data may be missing).")
+        print("          Pass --s2_api_key or export S2_API_KEY=your_key_here")
 
     print(f"{'='*70}")
     print(f"LAYER 2: BIBLIOMETRIC ANALYSIS & FRONT DETECTION")

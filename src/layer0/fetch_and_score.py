@@ -749,12 +749,14 @@ def get_relevance_score(paper_id, title, abstract, category, category_descriptio
             return db_cached
 
     if client is None:
-        return 10
+        # No LLM available — mark -1 so a future run with an API key retries.
+        # Title+abstract still get persisted below for that retry.
+        score = -1
+    else:
+        desc = category_description if category_description else category
+        researcher_context = _PROFILE_SECTIONS.get(category, "")
 
-    desc = category_description if category_description else category
-    researcher_context = _PROFILE_SECTIONS.get(category, "")
-
-    user_prompt = f"""Rate how relevant this paper is to the research category "{category}" on a scale of 0 to 10.
+        user_prompt = f"""Rate how relevant this paper is to the research category "{category}" on a scale of 0 to 10.
 
 Category description: {desc}
 
@@ -770,23 +772,22 @@ Scoring guide:
 Title: {title}
 Abstract: {abstract}"""
 
-    try:
-        # Use unified client's generate_json method for structured output
-        result = client.generate_json(
-            system_prompt="You are an expert research paper evaluator.",
-            user_prompt=user_prompt,
-            output_schema=RelevanceScore
-        )
+        try:
+            result = client.generate_json(
+                system_prompt="You are an expert research paper evaluator.",
+                user_prompt=user_prompt,
+                output_schema=RelevanceScore
+            )
 
-        if result is None or not hasattr(result, 'score'):
-            logging.warning(f"Empty/invalid LLM response for '{title}', marking for retry (score=-1)")
-            score = -1  # Mark as failed, will retry next run
-        else:
-            score = min(max(result.score, 0), 10)
-    except Exception as e:
-        logging.warning(f"Relevance scoring failed for '{title}': {e}")
-        logging.warning(f"Marking paper for retry on next run (score=-1)")
-        score = -1  # Mark as failed, will retry next run
+            if result is None or not hasattr(result, 'score'):
+                logging.warning(f"Empty/invalid LLM response for '{title}', marking for retry (score=-1)")
+                score = -1
+            else:
+                score = min(max(result.score, 0), 10)
+        except Exception as e:
+            logging.warning(f"Relevance scoring failed for '{title}': {e}")
+            logging.warning(f"Marking paper for retry on next run (score=-1)")
+            score = -1
 
     # Store in JSON cache
     if score_cache is not None:
@@ -1445,6 +1446,67 @@ def _load_existing_ids(json_path):
         pass
     return ids
 
+def _warn_if_auxiliary_keys_missing():
+    """Emit one-time startup warnings for non-LLM API keys that silently degrade when absent."""
+    if not os.environ.get("GITHUB_TOKEN"):
+        print("       [WARNING] GITHUB_TOKEN not set - GitHub code-link lookups will be unauthenticated (60 req/hr limit, may 403 during the run)", flush=True)
+    if not os.environ.get("S2_API_KEY"):
+        print("       [WARNING] S2_API_KEY not set - Semantic Scholar calls will use the public quota (may 429 on long runs; venue/affiliation data may be missing)", flush=True)
+
+def rescore_stale_entries(llm_client, score_cache, config):
+    """Rescore every paper in rescore_cache with score=-1 using the current LLM client.
+
+    A -1 entry means a previous run couldn't score the paper (no API key, API error,
+    malformed response, etc.). Title+abstract are already stored in the DB, so no
+    arxiv refetch is needed. Papers that now pass the threshold are picked up
+    automatically by the normal arxiv re-fetch downstream via the score_cache hit.
+
+    Returns the number of entries actually rescored.
+    """
+    if llm_client is None or _SCORE_DB is None:
+        return 0
+    try:
+        rows = _SCORE_DB.fetchall(
+            "SELECT arxiv_id, category, title, abstract FROM rescore_cache WHERE score = -1"
+        )
+    except Exception as e:
+        logging.warning(f"Failed to load stale -1 entries: {e}")
+        return 0
+    if not rows:
+        return 0
+
+    print(f"[rescore] Retrying {len(rows)} previously-unscored papers ...", flush=True)
+    categories_dict = config.get('categories', config.get('keywords', {}))
+
+    rescored = 0
+    newly_passing = 0
+    for row in rows:
+        paper_id = row["arxiv_id"]
+        category = row["category"]
+        title = row["title"]
+        abstract = row["abstract"]
+        if not title or not abstract:
+            continue
+
+        # Force retry path: delete the -1 from JSON cache so get_relevance_score
+        # re-attempts scoring instead of returning the cached -1.
+        cache_key = f"{paper_id}::{category}"
+        if score_cache is not None and score_cache.get(cache_key) == -1:
+            del score_cache[cache_key]
+
+        cat_cfg = categories_dict.get(category, {})
+        category_description = cat_cfg.get('description', category)
+        score = get_relevance_score(
+            paper_id, title, abstract, category,
+            category_description, llm_client, score_cache
+        )
+        rescored += 1
+        if score >= RELEVANCE_THRESHOLD:
+            newly_passing += 1
+
+    print(f"[rescore] Rescored {rescored} papers, {newly_passing} now pass threshold", flush=True)
+    return rescored
+
 def demo(**config):
     start_time = time.time()
     data_collector = []
@@ -1480,15 +1542,21 @@ def demo(**config):
                 print(f"[1/6] LLM client initialized ({RELEVANCE_SCORER_CONFIG['provider']}/{RELEVANCE_SCORER_CONFIG['model_name']}) - filtering ON", flush=True)
             else:
                 provider_upper = RELEVANCE_SCORER_CONFIG['provider'].upper()
-                print(f"[1/6] No {provider_upper}_API_KEY set - LLM filtering OFF (all papers pass through)", flush=True)
+                print(f"[1/6] [WARNING] {provider_upper}_API_KEY not set - fetched papers will be marked score=-1 and retried on the next run with a valid key", flush=True)
         except Exception as e:
-            print(f"[1/6] Failed to initialize LLM client: {e} - LLM filtering OFF", flush=True)
+            print(f"[1/6] [WARNING] Failed to initialize LLM client: {e} - fetched papers will be marked score=-1 and retried next run", flush=True)
     else:
-        print("[1/6] LLM client library not available - LLM filtering OFF (all papers pass through)", flush=True)
+        print("[1/6] [WARNING] LLM client library not available - fetched papers will be marked score=-1 and retried next run", flush=True)
+
+    _warn_if_auxiliary_keys_missing()
 
     # Load persistent relevance score cache
     score_cache = load_score_cache()
     print(f"[2/6] Loaded score cache: {len(score_cache)} previously scored papers", flush=True)
+
+    # Retry any papers that previously failed to score (score=-1 in DB).
+    # Must run before arxiv re-fetch so the updated scores are visible via cache hits.
+    rescore_stale_entries(llm_client, score_cache, config)
 
     # Build category descriptions lookup
     category_descriptions = {}
@@ -1724,11 +1792,13 @@ def redo_category(category_name, **config):
                 print(f"[2/5] LLM client initialized ({RELEVANCE_SCORER_CONFIG['provider']}/{RELEVANCE_SCORER_CONFIG['model_name']}) - filtering ON", flush=True)
             else:
                 provider_upper = RELEVANCE_SCORER_CONFIG['provider'].upper()
-                print(f"[2/5] No {provider_upper}_API_KEY set - LLM filtering OFF", flush=True)
+                print(f"[2/5] [WARNING] {provider_upper}_API_KEY not set - fetched papers will be marked score=-1 and retried on the next run with a valid key", flush=True)
         except Exception as e:
-            print(f"[2/5] Failed to initialize LLM client: {e} - LLM filtering OFF", flush=True)
+            print(f"[2/5] [WARNING] Failed to initialize LLM client: {e} - fetched papers will be marked score=-1 and retried next run", flush=True)
     else:
-        print("[2/5] LLM client library not available - LLM filtering OFF", flush=True)
+        print("[2/5] [WARNING] LLM client library not available - fetched papers will be marked score=-1 and retried next run", flush=True)
+
+    _warn_if_auxiliary_keys_missing()
 
     score_cache = load_score_cache()
 
