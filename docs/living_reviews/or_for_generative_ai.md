@@ -1,10 +1,29 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-04-21
+**Last Updated:** 2026-04-23
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-23 (2 papers)
+
+### [Hive: A Multi-Agent Infrastructure for Algorithm- and Task-Level Scaling](https://arxiv.org/abs/2604.17353)
+
+**2026-04-19** | Peking University | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Hive multi-agent inference infrastructure with Logits Cache and Agent-Aware Scheduling | *LLM role:* inference_engine_optimization
+
+> Hive is an LLM inference infrastructure that optimizes multi-agent and test-time scaling workloads by introducing Logits Cache for redundant sampling paths and Agent-Aware Scheduling for KV cache eviction. The results are backed by solid empirical evidence, demonstrating a 1.11x-1.76x speedup for re-sampling and a 33%-51% reduction in KV cache miss rates on Qwen3-8B. The key insight is that caching intermediate logits (not just KV states) allows the engine to skip expensive forward passes during stochastic resampling of shared prefixes, while evicting KV cache based on an agent's structural contribution outperforms standard LRU. This is highly relevant for scaling LLM evolutionary search and multi-agent optimization, as it provides concrete systems-level techniques to drastically reduce the inference costs associated with branching generation and complex agent coordination.
+
+### [Scepsy: Serving Agentic Workflows Using Aggregate LLM Pipelines](https://arxiv.org/abs/2604.15186)
+
+**2026-04-16** | Imperial College London, Independent Researcher | M=7 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Aggregate LLM Pipeline for performance prediction combined with a hierarchical heuristic search for joint throughput/latency optimization of GPU allocations and topology-aware fractional placement | *LLM role:* none
+
+> Scepsy is a serving system that schedules multi-LLM agentic workflows onto GPU clusters by profiling relative LLM execution times to create an Aggregate LLM Pipeline and using a hierarchical heuristic for fractional GPU allocation. The results are strongly backed by empirical numbers on a 16-GPU cluster, showing up to 2.4x higher throughput and 27x lower latency compared to baselines like Kubernetes HPA and Ayo. The key insight is that instead of modeling the highly variable end-to-end latency of dynamic agentic workflows, systems can achieve stable steady-state performance predictions by modeling the aggregate fractional demand each LLM places on the system. This is highly relevant for our research in LLM serving scheduling and GPU resource allocation, providing a strong heuristic baseline and modeling abstraction that our formal OR formulations must benchmark against.
+
 
 #### 2026-04-12 (1 papers)
 

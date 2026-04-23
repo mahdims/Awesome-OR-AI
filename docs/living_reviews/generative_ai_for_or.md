@@ -1,10 +1,37 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-04-21
+**Last Updated:** 2026-04-23
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-23 (3 papers)
+
+### [AutoOR: Scalably Post-training LLMs to Autoformalize Operations Research Problems](https://arxiv.org/abs/2604.16804)
+
+**2026-04-18** | X, University of Oxford | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Reinforcement learning (GRPO) with scalable synthetic data generation and LoRA adapters | *LLM role:* code_writer
+
+> AutoOR trains an 8B LLM to autoformalize linear, mixed-integer, and non-linear optimization problems using a scalable backtranslation data generation pipeline and GRPO with solver-execution rewards. The results are strongly backed by empirical evidence, showing the 8B model outperforming Gemini 2.5 Pro and matching Gemini 3 Pro across 9 benchmarks, including a leap from near 0% to 48.98% on a hard non-linear pump network task. The key insight is the backtranslation pipeline: by instantiating standard OR forms to guarantee ground-truth code and then generating natural language descriptions, the authors bypass the hard problem of verifying code generated from ambiguous text. Furthermore, their curriculum RL strategy—temporarily providing solver syntax as privileged information—successfully breaks the cold-start barrier in hard non-linear domains. This is a must-read for work in OR benchmarking and LLM reasoning evaluation, as the data generation and solver-in-the-loop RL techniques directly address the scalability and verification bottlenecks in symbolic OR modeling.
+
+### [Co-evolving Agent Architectures and Interpretable Reasoning for Automated Optimization](https://arxiv.org/abs/2604.17708)
+
+**2026-04-20** | Harbin Institute of Technology, Nanjing University of Information Science and Technology | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Co-evolutionary framework using Activity-on-Edge (AOE) networks for agent architecture and reasoning trajectory evolution | *LLM role:* problem_interpreter, heuristic_generator, code_writer, decomposition_guide, evolutionary_search_operator, evaluator
+
+> Huang et al. propose EvoOR-Agent, a co-evolutionary framework that represents LLM agent workflows as Activity-on-Edge (AOE) networks to simultaneously evolve the agent's architectural topology and its reasoning trajectories for operations research tasks. The results are backed by strong empirical evidence, showing up to 17% improvement over fixed-pipeline OR agents and 15% over general evolutionary agents on complex benchmarks like IndustryOR and BWOR. The key insight is that abstracting agent workflows into an explicit, evolvable AOE graph allows for path-conditioned recombination and structural pruning, enabling the evolutionary search to optimize the problem-solving process (e.g., formulation decomposition, solver routing, debugging loops) rather than just the prompt text or final code. This is highly relevant for our work in LLM evolutionary search and multi-agent optimization, as the AOE graph representation provides a concrete, implementable mechanism for dynamically adapting and evolving agent pipelines.
+
+### [PARM: Pipeline-Adapted Reward Model](https://arxiv.org/abs/2604.18327)
+
+**2026-04-20** | The Chinese University of Hong Kong, Hong Kong University of Science and Technology, City University of Hong Kong, Peking University, Tsinghua University, University of California, Los Angeles, Shanghai Jiao Tong University | M=8 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Pipeline-Adapted Reward Model (PARM) training with Direct Preference Optimization (DPO) for stage-wise candidate selection | *LLM role:* generator, evaluator
+
+> Fan et al. introduce a Pipeline-Adapted Reward Model (PARM) that trains stage-specific reward models for LLM optimization pipelines using Direct Preference Optimization on automatically collected execution feedback. The results are backed by strong empirical numbers, demonstrating that a 7B model pipeline can outperform GPT-4o on operations research benchmarks like NL4Opt (0.52 vs 0.15 solving accuracy). The key insight is that intermediate pipeline stages, such as problem formulation, can be effectively scored by training a reward model via DPO where preference pairs are automatically labeled based on whether any downstream execution succeeds. This is highly relevant for our work in multi-agent optimization and LLM evolutionary search, as it provides a concrete, scalable method to train process reward models without human annotation.
+
 
 #### 2026-04-19 (1 papers)
 
