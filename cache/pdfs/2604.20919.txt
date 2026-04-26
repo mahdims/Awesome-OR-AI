@@ -1,0 +1,934 @@
+--- Page 1 ---
+DiP-SD: Distributed Pipelined Speculative Decoding
+for Efficient LLM Inference at the Edge
+Yaodan Xu, Sheng Zhou, Zhisheng Niu
+Department of Electronic Engineering, Tsinghua University, Beijing 100084, P.R. China
+xyd21@mails.tsinghua.edu.cn, {sheng.zhou, niuzhs}@tsinghua.edu.cn
+Abstract—Speculative decoding has emerged as a promising
+technique for large language model (LLM) inference by acceler-
+ating autoregressive decoding via draft-then-verify. This paper
+studies a new edge scenario with multi-user inference, where
+draft tokens are generated locally on devices and subsequently
+offloaded to a centralized edge server for batch verification.
+The key challenge is to sustain high throughput under coupled
+decisions of (i) batching and pipeline scheduling and (ii) per-
+user draft token length. We propose DiP-SD, which exploits two
+complementary parallelism dimensions: device-level distributed
+drafting and phase-level draft–verify pipelining. We formulate
+a throughput-maximization objective, defined as the expected
+number of accepted tokens per unit time, and jointly optimize the
+number of batches, user-to-batch assignment, and integer draft
+lengths. To solve the resulting fractional mixed-integer program,
+DiP-SD scans the batch number and iteratively alternates be-
+tween an association subproblem and a draft-length subproblem.
+Numerical results under a Qwen3-1.7B/Qwen3-32B device–edge
+deployment show that DiP-SD achieves up to 17.89× throughput
+over autoregressive decoding (AD) and 1.93× over AD with greedy
+batching.
+I. INTRODUCTION
+Large language models (LLMs) are now widely used in
+interactive applications such as assistants, search, coding copi-
+lots, and customer support. These services repeatedly invoke
+LLM inference to generate responses, making throughput and
+latency first-order system concerns. However, modern LLMs
+are parameter-heavy and resource-intensive, creating a funda-
+mental tension between high inference cost and low-latency
+requirements for interactive use.
+LLM inference is usually decomposed into a prefill stage
+and an autoregressive decode stage. While prefill can be amor-
+tized by caching and batching, decode remains latency-critical
+because tokens must be generated sequentially, making total
+latency proportional to output length. This token dependency
+makes decode the main throughput bottleneck for interactive
+services. Speculative decoding (SD) addresses this bottleneck
+by using a draft-then-verify scheme: a fast draft model proposes
+multiple draft tokens, and a stronger target model verifies them
+in parallel. Foundational SD work has shown that carefully
+designed accept/reject-and-resample procedures can preserve
+the target distribution while generating multiple tokens per
+target model call [1]–[3].
+Recent SD research improves acceleration from several
+directions. One line improves draft-target alignment and ac-
+ceptance through distillation or online adaptation [4], [5].
+Another line redesigns the draft and verification structure, e.g.,
+Fig. 1. Edge deployment of distributed pipelined speculative decoding: user-
+side devices run the draft model, and the edge server runs the target model for
+verification.
+feature-space drafting, dynamic draft trees, or multi-head or
+self-speculative variants [6]–[9]. As SD moves to distributed
+deployment, communication and synchronization become dom-
+inant concerns, including adaptive window control, selective
+feedback, and bandwidth-aware sparsification [10]–[13].
+Deploying inference at the edge can further improve respon-
+siveness by placing models closer to users and reducing end-to-
+end delay. SD has also been explored in edge-oriented systems
+with heterogeneous devices and networks [14]–[18], but a
+key caveat is that SD does not automatically scale to multi-
+user, high-concurrency workloads: throughput can degrade
+when verification becomes a shared bottleneck [15], [19]. This
+makes batching unavoidable, where batching means grouping
+multiple inputs to the same model to be processed together
+so that compute and overhead can be amortized to increase
+throughput; however, existing edge SD systems typically adopt
+simple batching policies, e.g., static batching in SLED [14] or
+heuristic batch-size decisions in SPIN [15]. Beyond batching,
+pipeline parallelism has been studied to reduce bubbles and
+improve utilization: the authors of [20] pipeline draft and
+target phases via micro-batches within each draft–verify round,
+while FlowSpec [17] and PEARL [21] pipeline draft and target
+execution within a single request.
+In this paper, we focus on a distributed edge setting where
+draft generation runs on multiple user-side devices locally
+and verification runs on an edge server, as shown in Fig. 1.
+This setting is increasingly practical because small LLMs have
+been deployed on end devices (e.g., tablets and smartphones),
+enabling local drafting with server-side verification. It creates
+two coupled parallelism dimensions: device-level distributed
+draft parallelism and phase-level draft–target pipeline paral-
+arXiv:2604.20919v1  [cs.IT]  22 Apr 2026
+
+
+--- Page 2 ---
+lelism. Unlike [20], which pipelines micro-batches within each
+draft–verify round, we pipeline across multiple batches over
+successive rounds, combining distributed drafting with batch-
+level verification pipelining.
+DiP-SD is the first SD scheme to exploit batch-level pipeline
+parallelism between distributed drafting and centralized verifi-
+cation, with co-optimized speculation length and batching. The
+key control variables are the user-to-batch assignment, per-user
+speculative length, and the number of batches, which are tightly
+coupled by latency, memory, and communication constraints.
+Although DiP-SD is motivated by edge inference, it also applies
+to other SD deployments with distributed drafting and shared
+verification.
+To address this coupled optimization problem, we propose
+a joint optimization framework. For each candidate number of
+batches, we iteratively alternate between a batch association
+subproblem and a draft-length subproblem, and select the
+best solution over scanned batch counts. Extensive numerical
+experiments show that the proposed scheme exhibits superior
+performance across all test points.
+II. SYSTEM MODEL AND PROBLEM FORMULATION
+A. Edge Deployment Scenario
+We consider an edge inference system serving M user
+requests, indexed by M = {1, . . . , M}. The system adopts a
+distributed speculative decoding framework: lightweight draft
+models are deployed on distributed edge devices, while a large-
+scale target model (the verifier) resides on a centralized edge
+server. As illustrated in Fig. 1, the draft and verification phases
+are decoupled across heterogeneous compute resources. This
+architecture naturally enables device-level parallelism during
+drafting and phase-level pipelining between the devices and
+the server. Specifically, in each speculation round, each device
+sequentially generates a sequence of draft tokens, which are
+subsequently transmitted to the edge server for concurrent
+batch verification. The target model processes these tokens in a
+single forward pass, and employs techniques such as rejection
+sampling to determine their validity.
+The iterative speculation process for each request follows a
+four-stage cycle:
+1) Local Drafting: Each edge device independently em-
+ploys its lightweight draft model to generate a sequence
+of tokens in a serial manner. These draft tokens are
+subsequently offloaded to the edge server.
+2) Batch Verification: The edge server validates the re-
+ceived draft tokens through the target model in a single
+forward pass. It identifies the first mismatched token
+for each request, discards all subsequent incorrect pre-
+dictions, and simultaneously produces one bonus token
+following the last accepted position, ensuring at least one
+token is generated per round. In our system, multiple
+requests are grouped into batches and verified together
+to amortize the overhead of target model inference.
+3) Synchronization: The server transmits the verified to-
+kens and the bonus token back to the respective device,
+Fig. 2. Example of batching and pipelined verification. Requests are assigned
+into N batches; each batch is verified at the edge server in sequence while
+drafting proceeds in parallel at devices.
+ensuring both sides are synchronized with the latest
+generation state.
+4) State Update: The device updates its local KV cache
+and resumes the next drafting round, starting from the
+newly received bonus token.
+For the optimization, we introduce a batch count N with
+index set N = {1, . . . , N}, where N ∈{2, . . . , M}. We use
+“batch” to denote a set of requests verified together at the
+edge server. Verification proceeds in N pipeline stages, where
+stage n verifies batch n (thus n also indicates the verification
+order/slot). Fig. 2 illustrates one example.
+Request m has prefix length im, communication overhead
+τ c
+m, and acceptance parameter αm. Here τ c
+m is the per-round
+communication latency between the device and the edge server.
+The communication link can be wireless or wired, and the SD
+payload only contains drafted tokens and (when needed by the
+verification protocol) a small amount of probability information
+(e.g., draft token log-probabilities and sparse target logits),
+so the transmitted volume is small and we consider τ c
+m as a
+constant. The prefix length im counts both the original input
+prompt and the previously accepted tokens (i.e., the current
+context length at the beginning of the optimization window).
+We focus on optimizing the speculative decoding (decode)
+process and omit prefill latency, since prefill is executed once
+per request and can be treated as an additive constant. Since
+each request spans hundreds of tokens and thus many SD
+rounds, the set of active requests and system parameters are
+approximately stationary within each optimization horizon.
+Although the prefix length im grows by the number of accepted
+tokens each round, this increment is small relative to the full
+generation length, so we treat im as a constant.
+B. Speculative Decoding Utility Model
+Each user m selects integer draft length lm ∈N+. The
+token acceptance rate αm ∈(0, 1) characterizes the statistical
+alignment between the draft and target models. Given that this
+rate inherently fluctuates across different tasks, we model the
+acceptance rate as a user-specific parameter to account for such
+heterogeneity. The expected number of accepted tokens of one
+
+
+--- Page 3 ---
+TABLE I
+MAIN NOTATION IN THE SYSTEM MODEL.
+Symbol
+Meaning
+M, M
+user number and user index set
+N, N
+batch number and batch index set
+im
+prefix length of user m
+lm
+draft length of user m
+αm
+expected token acceptance rate of user m
+xmn
+assignment variable from user m to batch n
+bn
+batch size (number of users in batch n)
+Ln, In
+max draft length and max prefix length in batch n
+td
+n, tv
+n
+draft completion time and verification latency
+Tn
+stage duration
+cm, βm, cv, βv
+linear latency coefficients
+JΞ, hΞ
+1 , hΞ
+2
+decoder blocks / hidden dims for model Ξ ∈{d, v}
+speculative round for user m is
+um(lm) = 1 −αlm+1
+m
+1 −αm
+,
+(1)
+where each draft token is accepted independently with prob-
+ability αm (geometric acceptance model [1]), and one bonus
+token is always generated regardless of acceptance outcomes.
+The total expected accepted tokens across all users is
+U(l) =
+M
+X
+m=1
+um(lm).
+(2)
+C. Transformer-Cost Primitives
+Let Ξ ∈{d, v} denote draft and verification (target) models.
+Model Ξ has JΞ decoder blocks, hidden dimension hΞ
+1 , and
+hidden dimension hΞ
+2 in feed-forward network (FFN).
+Following standard decoder-only cost scaling, we define
+F d(i) = 4Jdhd
+1
+ 2hd
+1 + i + 1 + hd
+2
+
+,
+(3)
+F v(L, I) = 4Jvhv
+1L(2hv
+1 + I + L + hv
+2) .
+(4)
+Intuitively, F d(·) and F v(·, ·) capture the compute intensity of
+draft and verification for one round, growing with the context
+length i and the batch-wise maximum draft length and prefix
+length (L, I). Following [20], we model the per-step drafting
+and verification latency as affine functions of the product bF:
+Gm(b, F) = cmbF + βm,
+(5)
+Gv(b, F) = cvbF + βv.
+(6)
+The functions Gm(·, ·) and Gv(·, ·) characterize the latency
+for drafting and verification, respectively. Parameters (c, β) are
+obtained from profiling and capture per-compute scaling and
+fixed overhead, and b is the batch size. This affine dependence
+on batch size is consistent with empirical observations reported
+in [22], [23].
+D. Assignment and Batch-Aggregation Constraints
+Binary assignment and one-batch-per-user constraints are
+xmn ∈{0, 1},
+∀m, n,
+(7)
+N
+X
+n=1
+xmn = 1,
+∀m.
+(8)
+Here xmn indicates whether user m is associated with batch
+n (and thus verified in stage n). Draft lengths are positive
+integers:
+lm ∈N+,
+∀m.
+(9)
+Batch size is
+bn =
+M
+X
+m=1
+xmn,
+bn ≥1,
+∀n.
+(10)
+The condition bn ≥1 enforces valid fixed-N batching, i.e.,
+each declared batch is active.
+Batch-level max variables are represented by epigraph in-
+equalities:
+Ln ≥lmxmn,
+∀m, n,
+(11)
+In ≥imxmn,
+∀m, n.
+(12)
+Thus, (Ln, In) act as batch-wise maxima of speculative length
+and prefix length.
+E. Latency-Coupling Constraints
+The per-user drafting latency is defined as:
+τ d
+m = lmGm
+ 1, F d(im)
+
+,
+∀m.
+(13)
+This formulation reflects that the drafting phase is executed
+locally on each device without batching. Specifically, as the
+drafting process is inherently serial, the total latency is calcu-
+lated as the product of the draft length lm and the per-token
+drafting time.
+Batch draft time uses max-epigraph constraints:
+td
+n ≥xmn
+ τ d
+m + τ c
+m
+
+,
+∀m, n.
+(14)
+so td
+n captures when all requests in batch n have completed
+drafting and communication.
+Batch verification latency is
+tv
+n = Gv(bn, F v(Ln, In)) ,
+∀n.
+(15)
+which depends on the batch size bn and the batch-wise maxima
+(Ln, In) due to padding. Stage duration must cover verification:
+Tn ≥tv
+n,
+∀n.
+(16)
+Here Tn is the stage duration in the pipeline schedule: it can
+exceed tv
+n to satisfy global precedence constraints and account
+for pipeline bubbles.
+The total pipeline span S is the steady-state cycle time over
+which one complete SD round (all N batches) is processed:
+S =
+N
+X
+n=1
+Tn.
+(17)
+Pipeline precedence requires the pipeline span to cover both
+the draft completion time and the verification latency of batch
+n:
+S ≥td
+n + tv
+n,
+∀n.
+(18)
+
+
+--- Page 4 ---
+F. Memory Constraints at Edge Side
+Since batching is not employed on the user side, we assume
+that the memory footprint of the draft model remains well
+within the device’s limits. Consequently, our analysis focuses
+on the memory constraints at the edge server, which performs
+batch processing for the target model inference. With FP16
+precision, the model parameters occupy a memory footprint of
+approximately:
+Γv
+p = Jv
+ 8(hv
+1)2 + 4hv
+1hv
+2
+
+.
+(19)
+KV-cache component for batch n is:
+Γv
+kv,n = 4Jvhv
+1bnIn,
+∀n.
+(20)
+The memory feasibility constraint is then:
+Γv
+p + Γv
+kv,n ≤Γv
+max,
+∀n.
+(21)
+G. Overall Joint Optimization Objective
+We define the throughput R as the expected number of
+accepted tokens per unit time:
+R ≜U(l)
+S ,
+(22)
+where U(l) is defined in (2) and S is the total pipeline span in
+(17). This formulation is valid under the stationary workload
+assumption: since the pipeline schedule repeats across succes-
+sive SD rounds within each optimization period, it suffices to
+evaluate throughput over a single representative round.
+The final design jointly optimizes assignment x, speculative
+lengths l, batch count N, and other auxiliary variables:
+P :
+max
+x,l,N,aux R
+(23)
+s.t. (7)–(21),
+N ∈{2, . . . , M}.
+(24)
+III. PROPOSED JOINT SOLVER
+A. Joint Solver Overview
+The joint design problem is challenging because it involves
+(i) integer decisions (user association and draft length) and (ii)
+a throughput objective that is fractional in the total latency. We
+solve it with a two-level joint solver. At the outer level, we
+scan the number of batches N ∈{2, . . . , M}. For each fixed
+N, we solve
+P(N) :
+max
+x,l,aux R(N)
+(25)
+s.t. (7)–(21).
+where R(N) is the throughput defined in (22) under fixed N.
+To handle the coupling between user-to-batch association and
+integer draft lengths, we apply alternating optimization:
+x(r+1) ←arg min S(N, l(r)),
+(26)
+l(r+1) ←arg max R(N, x(r+1)).
+(27)
+The outer loop stops when l is unchanged and the throughput
+change is below tolerance. Finally, we select the best solu-
+tion over the scanned batch counts. The overall workflow is
+summarized in Algorithm 1. Each subproblem reduces to a
+mixed-integer linear program (MILP) that we solve using SCIP
+through its Python interface PySCIPOpt [24], [25].
+In implementation, we additionally impose practical variable
+bounds to tighten the MILPs and improve numerical stability.
+In particular, we use the bound parameters (Lub, Iub, Tub, Sub)
+as upper bounds for draft lengths, prefix lengths, and auxiliary
+timing variables.
+B. x-Subproblem
+Given fixed l, we solve
+X(N, l) :
+min
+x,T,aux S
+(28)
+s.t. (7)–(8), (10)–(12),
+(14)–(21).
+This step decides batching assignment and batch-wise timing
+variables under full feasibility constraints.
+C. l-Subproblem: Binary Reformulation + Dinkelbach
+Given fixed x, we solve
+L(N, x) :
+max
+l
+U(l)
+S(l | x)
+(29)
+s.t. (9), (11), (13)–(21).
+We constrain the draft length to lm ∈{1, . . . , Lub}, where
+Lub denotes the upper bound. This constraint is justified
+by the diminishing returns of the utility function um(lm)
+as lm increases. Furthermore, empirical evidence from prior
+speculative decoding studies [1], [2] suggests that the optimal
+draft length typically falls within the range of 5–15. To handle
+integer draft lengths efficiently, we use binary selectors:
+ymk ∈{0, 1},
+Lub
+X
+k=1
+ymk = 1,
+lm =
+Lub
+X
+k=1
+k ymk,
+(30)
+znk ∈{0, 1},
+Lub
+X
+k=0
+znk = 1,
+Ln =
+Lub
+X
+k=0
+k znk.
+(31)
+For users in batch n, max-consistency is enforced by
+Ln ≥lm,
+∀m ∈Bn(x), ∀n,
+(32)
+where Bn(x) denotes the user set of the n-th batch.
+Define lookup utility
+umk = 1 −αk+1
+m
+1 −αm
+,
+U(y) =
+M
+X
+m=1
+Lub
+X
+k=1
+umkymk.
+(33)
+We handle the fractional objective via the classic Dinkelbach
+method [26]. At Dinkelbach iteration t, solve inner mixed-
+integer problem:
+max
+y,z,aux U(y) −q(t)S(y, z)
+(34)
+s.t. (13)–(21), (30)–(32).
+
+
+--- Page 5 ---
+Algorithm 1: DiP-SD: Joint Optimization Solver
+Require: M, parameter set, Lub, tolerances, solver
+limits
+Ensure : N ⋆, x⋆, l⋆, R⋆
+1 for N ←2 to M do
+2
+Initialize l(0) and r ←0;
+3
+repeat
+4
+Solve x-subproblem with fixed l(r) to get
+x(r+1);
+5
+Solve l-subproblem using (34)–(36) to get
+l(r+1);
+6
+r ←r + 1;
+7
+until convergence;
+8
+Compute converged throughput R⋆(N);
+9 Select N ⋆= arg maxN∈{2,...,M} R⋆(N);
+10 return (N ⋆, x⋆, l⋆, R⋆);
+Then update
+q(t+1) =
+U(y(t))
+S(y(t), z(t)).
+(35)
+Stop when
+U(y(t)) −q(t)S(y(t), z(t))
+ ≤ϵ,
+(36)
+or an equivalent throughput-change threshold is met. Each
+inner problem is a MILP. We solve these MILPs using
+SCIP/PySCIPOpt [24], [25].
+D. Batch-Count Selection and Final Deployment Decision
+For each fixed N, let the converged throughput be R⋆(N).
+Then we select
+N ⋆= arg
+max
+N∈{2,...,M} R⋆(N).
+(37)
+E. Complexity Discussion
+As shown in Algorithm 1, DiP-SD scans the batch count
+and alternates MILP-based x and l updates for each fixed N
+to maximize throughput. Let Iout be the number of alternating
+iterations and Idin be Dinkelbach iterations. Per fixed N,
+complexity is approximately
+O
+ Iout
+ Cx(M, N) + IdinCl(M, N, Lub)
+
+,
+where Cx and Cl denote solver-dependent inner complexities.
+The outer batch-count scan multiplies this by the number of
+tested batch counts.
+IV. NUMERICAL RESULTS
+A. System Setup
+We evaluate DiP-SD using the Qwen3 model series [27].
+Specifically, Qwen3-1.7B serves as the draft model on an
+NVIDIA GeForce RTX 3090, and Qwen3-32B serves as the
+target model on an NVIDIA A100-80GB edge server. Their
+TABLE II
+DEFAULT SYSTEM PARAMETERS.
+Parameter
+Value
+User number M
+6
+Scan range of N
+2 to M
+Acceptance rate αm
+0.78
+Prefix length im
+512
+Communication latency τ c
+m
+3.0
+User-side latency parameters (cm, βm)
+(4.0305 × 10−11, 33.8151)
+Initial draft length lm
+7
+Draft model (Jd, hd
+1, hd
+2)
+(28, 2048, 6144)
+Verify model (Jv, hv
+1, hv
+2)
+(64, 5120, 25600)
+Verify timing (cv, βv)
+(1.2077 × 10−11, 95.1074)
+Memory cap Γv
+max
+8.0 × 1010
+Bounds (Lub, Iub, Tub, Sub)
+(20, 1024, 106, 3 × 106)
+transformer dimensions, (Jd, hd
+1, hd
+2) and (Jv, hv
+1, hv
+2) respec-
+tively, along with all other default parameters, are listed in
+Table II. Latency parameters are obtained by profiling each
+model on its respective hardware and fitting the measurements
+to the affine latency model in (5)–(6). The default acceptance
+rate is estimated from inference statistics over 100 sampled
+prompts. All remaining experiments are conducted via nu-
+merical simulation under the default parameters in Table II.
+All latency parameters are in milliseconds (ms) and memory
+parameters are in bytes (B).
+We compare five methods:
+• DiP-SD (proposed): joint solver that scans batch counts
+and alternates x/l updates.
+• AD: edge-only large model autoregressive decoding with-
+out speculative drafting. No batching scheme is applied.
+• AD w/ greedy batching: AD with greedy memory-
+feasible batching: sort users by im in descending order,
+then pack them into batches sequentially until the memory
+bound would be violated.
+• DiP-SD w/o batching: enforce N = M and one user per
+batch; optimize only l.
+• DiP-SD w/ fixed lm = 7: fix lm and optimize only x.
+The primary metric is throughput, which is expected ac-
+cepted tokens per unit time in our context. Since S is in ms,
+R = U(l)/S has unit token/ms, and we report throughput with
+1000 × R token/s.
+B. Results
+1) Homogeneous Setting: We first consider a homogeneous-
+user setting, where all users share the same per-user parameters
+at each test point. We conduct two groups of experiments:
+1) throughput versus user number M (number of concur-
+rent users), with M
+∈{2, 4, . . . , 14}; and 2) throughput
+versus token acceptance rate αm, with M
+= 6, αm
+∈
+{0.70, 0.75, 0.80, 0.85, 0.90, 0.95}. Other parameters are set as
+the default values in Table II.
+Fig. 3(a) shows that the proposed DiP-SD consistently
+achieves the highest throughput among all methods. The basic
+AD scheme, lacking batching, has throughput independent of
+user count. DiP-SD without batching exhibits throughput that
+
+
+--- Page 6 ---
+2
+4
+6
+8
+10
+12
+14
+User Number M
+50
+100
+150
+System Throughput [token/s]
+DiP-SD
+DiP-SD w/ fixed lm = 7
+DiP-SD w/o batching
+AD w/ greedy batching
+AD
+(a) Throughput vs. user number M
+0.70
+0.75
+0.80
+0.85
+0.90
+0.95
+Acceptance Rate ®m
+20
+40
+60
+80
+100
+120
+System Throughput [token/s]
+DiP-SD
+DiP-SD w/ fixed lm = 7
+DiP-SD w/o batching
+AD w/ greedy batching
+AD
+(b) Throughput vs. acceptance rate αm (M = 6)
+Fig. 3. Homogeneous-setting throughput comparison (token/s).
+first increases with M and then plateaus. In contrast, batching-
+enabled methods — DiP-SD, DiP-SD with fixed lm = 7,
+and AD with greedy batching — all exhibit approximately
+linear throughput growth with increasing M. This is because
+the throughput numerator scales proportionally with M, while
+newly added users are absorbed into existing batches with
+negligible increase in total pipeline span S. The performance
+gap between DiP-SD and AD with greedy batching widens
+as M increases; at peak, DiP-SD achieves 1.38× over AD
+with greedy batching and 17.89× over AD. Meanwhile, DiP-
+SD with fixed lm = 7 underperforms DiP-SD, highlighting
+the importance of draft length selection. Furthermore, DiP-SD
+without batching is substantially outperformed by the three
+batching-enabled methods when M ≥6, demonstrating the
+critical role of batching in supporting concurrent multi-user
+inference.
+As illustrated in Fig. 3(b), the throughput of all SD-based
+benchmarks exhibits a monotonic increase with the acceptance
+rate αm. This is because a higher αm allows more drafted
+tokens accepted per round. In contrast, the throughput of AD
+baselines remains constant, as they do not leverage speculative
+execution. The proposed DiP-SD scheme maintains the highest
+throughput at all testpoints. Quantitatively, as αm increases
+from 0.70 to 0.95 (with M = 6), the throughput of DiP-
+SD grows from 74.13 to 117.56 token/s, representing a 1.59×
+improvement. At its peak, the proposed DiP-SD achieves a
+substantial speedup of 11.25× over the vanilla AD and 1.93×
+Heterogeneous im
+Heterogeneous αm Heterogeneous (cm, βm)
+0
+20
+40
+60
+80
+100
+System Throughput [token/s]
+DiP-SD
+DiP-SD w/ fixed lm = 7
+DiP-SD w/o batching
+AD w/ greedy batching
+AD
+Fig. 4. Heterogeneous-setting throughput comparison over three single-factor
+cases (token/s).
+over the AD baseline with greedy batching, demonstrating
+the superiority of our method in high-acceptance regimes.
+However, for model pairs with a large size gap, the acceptance
+rate is usually moderate. In our setting, the default αm is 0.78,
+at which DiP-SD achieves around 1.38× throughput over AD
+with greedy batching. It is also noted that DiP-SD with fixed
+lm = 7 and DiP-SD without batching do not always outperform
+AD with greedy batching: their performance crossover points
+occur near αm = 0.75 and αm = 0.85, respectively, below
+which the overhead of failed drafting offsets the gains of
+speculation. This further confirms that adaptive draft length
+and batching each make an essential contribution to throughput
+improvement.
+2) Heterogeneous
+Setting:
+We
+next
+evaluate
+three
+single-factor heterogeneous cases with fixted user number
+M
+=
+6. Case 1 heterogenizes prefix length im with
+values
+{200, 320, 440, 560, 680, 800},
+while
+Case
+2
+considers non-uniform acceptance rates αm ranging from
+{0.80, 0.82, 0.84, 0.86, 0.88, 0.90}. In Case 3, we heterogenize
+the draft-side latency coefficients (cm, βm) by applying the
+scale set {0.2, 0.5, 1.0, 3.0, 5.0, 7.0} to the default values.
+Fig. 4 shows that DiP-SD remains the best-performing
+method across all three heterogeneous cases, achieving up
+to 8.09× throughput over AD and 1.39× over AD with
+greedy batching. The proposed throughput ranges from 78.49
+to 84.53 token/s across the three scenarios, with the αm-
+heterogeneous case yielding the largest advantage. This gain
+is primarily attributed to the inclusion of several users whose
+acceptance rates exceed the default value, which directly raises
+the expected number of accepted tokens per verification round.
+From an architectural perspective, variations in αm fundamen-
+tally affect the utility of speculation, whereas heterogeneity
+in prefix length or latency coefficients primarily impacts the
+latency components of the system. It is also worth noting that
+DiP-SD-based methods suffer a pronounced throughput degra-
+dation under heterogeneous (cm, βm): the imbalance across
+user-side latencies disrupts the pipeline, enlarging the total span
+and reducing pipeline efficiency.
+
+
+--- Page 7 ---
+V. CONCLUSION
+This paper presented DiP-SD, a joint optimization frame-
+work for distributed pipelined speculative decoding. We max-
+imize throughput, defined as the expected number of accepted
+tokens per unit time, under latency, memory, and commu-
+nication constraints. DiP-SD jointly optimizes user-to-batch
+association and integer draft lengths via an outer scan over
+the batch count and an alternating update between the two
+subproblems. Numerical results show that DiP-SD consistently
+achieves the highest throughput across all evaluated scenarios,
+with substantial gains over baselines.
+DiP-SD targets edge-first deployments, where multiple de-
+vices host lightweight drafting and a nearby edge server per-
+forms shared verification. This makes the framework suitable
+for edge assistants, vehicle–road–edge collaborative inference,
+and other low-latency interactive LLM applications. Beyond
+edge serving, the framework also applies to general multi-
+accelerator deployments with distributed drafting and shared
+verification, covering both single-node and multi-node GPU
+configurations. Future work includes real-world deployment
+and online adaptation to nonstationary workloads.
+VI. ACKNOWLEDGEMENT
+This work is supported in part by the State Key Laboratory of
+Internet of Things for Smart City (University of Macau) Open
+Research Project under Grant SKL-IoTSC(UM)/ORP04/2026,
+and in part by the Project of Tsinghua University-Toyota Joint
+Research Center for AI Technology of Automated Vehicle
+under Grant TTAD-2024-08-2.
+REFERENCES
+[1] Y. Leviathan, M. Kalman, and Y. Matias, “Fast inference from transform-
+ers via speculative decoding,” in Proceedings of the 40th International
+Conference on Machine Learning (ICML), 2023.
+[2] C. Chen, S. Borgeaud, G. Irving, J.-B. Lespiau, L. Sifre, and J. Jumper,
+“Accelerating large language model decoding with speculative sampling,”
+arXiv preprint arXiv:2302.01318, 2023.
+[3] H. Xia, T. Ge, P. Wang, S.-Q. Chen, F. Wei, and Z. Sui, “Speculative
+decoding: Exploiting speculative execution for accelerating seq2seq gen-
+eration,” in Findings of the Association for Computational Linguistics:
+EMNLP 2023, 2023.
+[4] Y. Zhou, K. Lyu, A. S. Rawat, A. K. Menon, A. Rostamizadeh, S. Kumar,
+J.-F. Kagy, and R. Agarwal, “Distillspec: Improving speculative decoding
+via knowledge distillation,” in International Conference on Learning
+Representations (ICLR), 2024.
+[5] X. Liu, L. Hu, P. Bailis, A. Cheung, Z. Deng, I. Stoica, and H. Zhang,
+“Online speculative decoding,” in Proceedings of the 41st International
+Conference on Machine Learning (ICML), 2024.
+[6] Y. Li, F. Wei, C. Zhang, and H. Zhang, “EAGLE: Speculative sampling
+requires rethinking feature uncertainty,” in Proceedings of the 41st
+International Conference on Machine Learning (ICML), 2024.
+[7] Y. Li, F. Wei, C. Zhang, and H. Zhang, “EAGLE-2: Faster inference
+of language models with dynamic draft trees,” in Proceedings of the
+2024 Conference on Empirical Methods in Natural Language Processing
+(EMNLP), 2024.
+[8] T. Cai, Y. Li, Z. Geng, H. Peng, J. D. Lee, D. Chen, and T. Dao, “Medusa:
+Simple LLM inference acceleration framework with multiple decoding
+heads,” in Proceedings of the 41st International Conference on Machine
+Learning (ICML), 2024.
+[9] J. Zhang, J. Wang, H. Li, L. Shou, K. Chen, G. Chen, and S. Mehrotra,
+“Draft & verify: Lossless large language model acceleration via self-
+speculative decoding,” in Proceedings of the 62nd Annual Meeting of the
+Association for Computational Linguistics (ACL), 2024.
+[10] F. Yu, L. Li, B. McDanel, and S. Q. Zhang, “Dsd: A distributed
+speculative decoding solution for edge-cloud agile large model serving,”
+arXiv preprint arXiv:2511.21669, 2025.
+[11] J. Ning, C. Zheng, and T. Yang, “DSSD: Efficient edge-device de-
+ployment and collaborative inference via distributed split speculative
+decoding,” in ICML 2025 Workshop on Machine Learning for Wireless
+Communication and Networks, 2025.
+[12] C.
+Zheng
+and
+T.
+Yang,
+“Communication-efficient
+collaborative
+llm inference via distributed speculative decoding,” arXiv preprint
+arXiv:2509.04576, 2025.
+[13] P. Bhattacharjee, F. Tian, M. Zhong, G. Zhang, O. Simeone, and
+R. Tandon, “Conformal sparsification for bandwidth-efficient edge-cloud
+speculative decoding,” arXiv preprint arXiv:2510.09942, 2025.
+[14] X. Li, D. Spatharakis, S. Ghafouri, J. Fan, H. Vandierendonck, D. John,
+B. Ji, and D. S. Nikolopoulos, “Sled: A speculative llm decoding frame-
+work for efficient edge serving,” in Proceedings of the Tenth ACM/IEEE
+Symposium on Edge Computing (SEC), 2025.
+[15] F. Chen, P. Li, T. H. Luan, Z. Su, and J. Deng, “Spin: Accelerating
+large language model inference with heterogeneous speculative models,”
+in Proceedings of the 44th IEEE International Conference on Computer
+Communications (INFOCOM), 2025.
+[16] Y. Venkatesha, S. Kundu, and P. Panda, “Fast and cost-effective
+speculative edge-cloud decoding with early exits,” arXiv preprint
+arXiv:2505.21594, 2025.
+[17] X. Liu, L. Luo, M. Tang, C. Huang, and X. Chen, “Flowspec: Continuous
+pipelined speculative decoding for efficient distributed llm inference,”
+arXiv preprint arXiv:2507.02620, 2026.
+[18] Y. Li, R. Kong, Z. Lyu, Q. Li, X. Chen, H. Cai, L. Yan, S. Wang, J. Zhao,
+G. Zhu, L. Kong, G. Chen, H. Xiong, and D. Yin, “Flexspec: Frozen
+drafts meet evolving targets in edge-cloud collaborative llm speculative
+decoding,” arXiv preprint arXiv:2601.00644, 2026.
+[19] X. Liu, C. Daniel, L. Hu, W. Kwon, Z. Li, X. Mo, A. Cheung, Z. Deng,
+I. Stoica, and H. Zhang, “Optimizing speculative decoding for serving
+large language models using goodput,” arXiv preprint arXiv:2406.14066,
+2024.
+[20] B. Zhu, Z. Chen, L. Zhao, H. Shin, and A. Nallanathan, “Efficient llm
+inference over heterogeneous edge networks with speculative decoding,”
+arXiv preprint arXiv:2510.11331, 2025.
+[21] T. Liu, Y. Li, Q. Lv, K. Liu, J. Zhu, W. Hu, and X. Sun, “Pearl:
+Parallel speculative decoding with adaptive draft length,” in International
+Conference on Learning Representations (ICLR), 2025.
+[22] Y. Xu, S. Zhou, and Z. Niu, “Smdp-based dynamic batching for im-
+proving responsiveness and energy efficiency of batch services,” IEEE
+Transactions on Parallel and Distributed Systems, pp. 1–16, 2025.
+[23] Y. Xu, J. Sun, S. Zhou, and Z. Niu, “Smdp-based dynamic batching for
+efficient inference on gpu-based platforms,” in Proceedings of the IEEE
+International Conference on Communications (ICC), 2023.
+[24] T. Achterberg, “SCIP: Solving constraint integer programs,” Mathemati-
+cal Programming Computation, vol. 1, no. 1, pp. 1–41, 2009.
+[25] S. Maher, M. Miltenberger, J. P. Pedroso, D. Rehfeldt, R. Schwarz, and
+F. Serrano, “Pyscipopt: Mathematical programming in Python with the
+SCIP optimization suite,” in Mathematical Software – ICMS 2016, 2016.
+[26] W. Dinkelbach, “On nonlinear fractional programming,” Management
+Science, vol. 13, no. 7, pp. 492–498, 1967.
+[27] A. Yang, A. Li, B. Yang, et al., “Qwen3 technical report,” arXiv preprint
+arXiv:2505.09388, 2025.
