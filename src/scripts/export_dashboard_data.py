@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Export dashboard data from SQLite to docs/dashboard_data.json.
+Export dashboard data from Postgres to docs/dashboard_data.json.
 
-Reads research_intelligence.db and produces a single JSON file consumed
-by docs/ui/dashboard.html. Run after Layer 1/2/3 pipeline steps.
+Reads paper_analyses + research_fronts + bridge_papers and produces a single
+JSON file consumed by docs/ui/dashboard.html. Run after Layer 1/2/3 pipeline
+steps. Connection string comes from DATABASE_URL (.env).
 
 Usage:
     python src/scripts/export_dashboard_data.py
     python src/scripts/export_dashboard_data.py --output docs/dashboard_data.json
-    python src/scripts/export_dashboard_data.py --db src/db/research_intelligence.db
 """
 
 import argparse
@@ -25,7 +25,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # === Imports from existing modules (read-only, no modification) ===
 from db.database import Database
-from config import DB_PATH, PROJECT_ROOT
+from config import PROJECT_ROOT
 from layer3.data_collector import (
     _enrich_paper, _enrich_front, _enrich_bridge, _json, _max_relevance,
 )
@@ -117,7 +117,7 @@ def build_paper_maps(db: Database) -> tuple:
         if not snapshot_date:
             continue
         bridge_rows = db.fetchall(
-            "SELECT paper_id, bridge_score FROM bridge_papers WHERE category = ? AND snapshot_date = ?",
+            "SELECT paper_id, bridge_score FROM bridge_papers WHERE category = %s AND snapshot_date = %s",
             (category, snapshot_date),
         )
         for b in bridge_rows:
@@ -131,7 +131,7 @@ def build_paper_maps(db: Database) -> tuple:
 def export_papers(db: Database, front_map: dict, front_status_map: dict, bridge_map: dict) -> list:
     """Export all relevant paper analyses, enriched with priority/front/bridge info."""
     rows = db.fetchall(
-        "SELECT * FROM paper_analyses WHERE is_relevant = 1 ORDER BY published_date DESC"
+        "SELECT * FROM paper_analyses WHERE is_relevant = TRUE ORDER BY published_date DESC"
     )
     papers = []
     for row in rows:
@@ -160,7 +160,8 @@ def export_papers(db: Database, front_map: dict, front_status_map: dict, bridge_
         # (_enrich_paper omits these; we add them from the raw row)
         p["experiments"] = _json(row.get("experiments"), {})
         p["results"] = _json(row.get("results"), {})
-        p["analysis_date"] = (row.get("analysis_date") or "")[:10]
+        ad = row.get("analysis_date")
+        p["analysis_date"] = ad.date().isoformat() if ad is not None else ""
 
         papers.append(p)
 
@@ -244,7 +245,7 @@ def export_bridges(db: Database, papers_by_id: dict) -> list:
             front_methods[front["front_id"]] = methods
 
         bridge_rows = db.fetchall(
-            "SELECT * FROM bridge_papers WHERE category = ? AND snapshot_date = ? ORDER BY bridge_score DESC",
+            "SELECT * FROM bridge_papers WHERE category = %s AND snapshot_date = %s ORDER BY bridge_score DESC",
             (category, snapshot_date),
         )
 
@@ -422,10 +423,11 @@ def build_snapshot(db: Database, papers: list, fronts: list, bridges: list) -> d
     last_update = {}
     for cat in CATEGORIES:
         row = db.fetchone(
-            "SELECT MAX(analysis_date) as last_date FROM paper_analyses WHERE category = ? AND is_relevant = 1",
+            "SELECT MAX(analysis_date) as last_date FROM paper_analyses WHERE category = %s AND is_relevant = TRUE",
             (cat,),
         )
-        last_update[cat] = (row["last_date"] or "")[:10] if row else ""
+        ld = row["last_date"] if row else None
+        last_update[cat] = ld.date().isoformat() if ld is not None else ""
 
     return {
         "total_papers": len(papers),
@@ -443,15 +445,13 @@ def build_snapshot(db: Database, papers: list, fronts: list, bridges: list) -> d
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Export dashboard_data.json from SQLite DB")
+    parser = argparse.ArgumentParser(description="Export dashboard_data.json from Postgres")
     parser.add_argument("--output", default=str(OUTPUT_PATH), help="Output JSON path")
-    parser.add_argument("--db", default=str(DB_PATH), help="SQLite DB path")
     args = parser.parse_args()
 
-    print(f"[export] DB:     {args.db}")
     print(f"[export] Output: {args.output}")
 
-    with Database(Path(args.db)) as db:
+    with Database() as db:
         print("[export] Building paper/front/bridge lookup maps...")
         front_map, front_status_map, bridge_map = build_paper_maps(db)
 

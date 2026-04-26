@@ -18,15 +18,12 @@ from db.database import Database
 
 
 def _parse_json_field(value):
-    """Parse JSON string or return as-is."""
+    """JSONB columns round-trip as dict; pass through, fall back to {}."""
     if value is None:
         return {}
     if isinstance(value, dict):
         return value
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        return {}
+    return {}
 
 
 def _parse_date(date_str: str) -> datetime:
@@ -55,13 +52,14 @@ def extract_framework_lineages(db: Database,
         papers = db.get_papers_by_category(category)
     else:
         papers = [dict(r) for r in db.fetchall(
-            "SELECT * FROM paper_analyses WHERE is_relevant = 1 ORDER BY published_date DESC"
+            "SELECT * FROM paper_analyses WHERE is_relevant = TRUE ORDER BY published_date DESC"
         )]
 
     lineages = defaultdict(list)
 
     for paper in papers:
-        pub_date = paper.get('published_date', '')
+        pub_date_raw = paper.get('published_date')
+        pub_date = pub_date_raw.isoformat() if hasattr(pub_date_raw, 'isoformat') else (pub_date_raw or '')
         if min_date and pub_date < min_date:
             continue
 

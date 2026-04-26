@@ -5,7 +5,6 @@ Gathers data from Layer 1 (paper analyses) and Layer 2 (fronts, bridges)
 for use in email reports and living review updates.
 """
 
-import json
 from collections import Counter
 from datetime import date, timedelta
 from typing import Dict, List, Optional
@@ -18,15 +17,21 @@ from db.database import Database
 
 
 def _json(value, default=None):
-    """Parse a JSON string stored in the DB, or return default."""
+    """JSONB columns round-trip as dict/list; pass them through, fall back to default."""
     if value is None:
         return default
     if isinstance(value, (list, dict)):
         return value
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        return default
+    return default
+
+
+def _isoformat(value) -> str:
+    """Render PG date/datetime columns as YYYY-MM-DD strings (downstream code compares as strings)."""
+    if value is None or value == '':
+        return ''
+    if hasattr(value, 'isoformat'):
+        return value.isoformat()[:10]
+    return str(value)[:10]
 
 
 def _max_relevance(paper: dict) -> int:
@@ -48,7 +53,7 @@ def _enrich_paper(paper: dict) -> dict:
         'title': paper.get('title', ''),
         'authors': _json(paper.get('authors'), []),
         'abstract': paper.get('abstract', ''),
-        'published_date': paper.get('published_date', ''),
+        'published_date': _isoformat(paper.get('published_date')),
         'affiliations': paper.get('affiliations') or '',
         'category': paper.get('category', ''),
         'relevance': _json(paper.get('relevance'), {}),
@@ -68,7 +73,7 @@ def _enrich_front(front: dict) -> dict:
     return {
         'front_id': front['front_id'],
         'category': front['category'],
-        'snapshot_date': front.get('snapshot_date', ''),
+        'snapshot_date': _isoformat(front.get('snapshot_date')),
         'core_papers': _json(front.get('core_papers'), []),
         'size': front.get('size', 0),
         'internal_density': front.get('internal_density', 0),
@@ -88,7 +93,7 @@ def _enrich_bridge(bridge: dict) -> dict:
     return {
         'paper_id': bridge['paper_id'],
         'category': bridge['category'],
-        'snapshot_date': bridge.get('snapshot_date', ''),
+        'snapshot_date': _isoformat(bridge.get('snapshot_date')),
         'home_front_id': bridge.get('home_front_id', ''),
         'connected_fronts': _json(bridge.get('connected_fronts'), []),
         'bridge_score': bridge.get('bridge_score', 0),
@@ -116,7 +121,7 @@ def collect_daily_data(category: str, db: Database,
 
     rows = db.fetchall(
         """SELECT * FROM paper_analyses
-           WHERE category = ? AND published_date >= ? AND is_relevant = 1
+           WHERE category = %s AND published_date >= %s AND is_relevant = TRUE
            ORDER BY published_date DESC""",
         (category, cutoff)
     )
@@ -124,7 +129,7 @@ def collect_daily_data(category: str, db: Database,
     papers.sort(key=_max_relevance, reverse=True)
 
     total_row = db.fetchone(
-        "SELECT COUNT(*) as cnt FROM paper_analyses WHERE category = ? AND is_relevant = 1",
+        "SELECT COUNT(*) as cnt FROM paper_analyses WHERE category = %s AND is_relevant = TRUE",
         (category,)
     )
 
@@ -158,7 +163,7 @@ def collect_weekly_data(category: str, db: Database,
     cutoff = (date.today() - timedelta(days=days)).isoformat()
     rows = db.fetchall(
         """SELECT * FROM paper_analyses
-           WHERE category = ? AND published_date >= ? AND is_relevant = 1
+           WHERE category = %s AND published_date >= %s AND is_relevant = TRUE
            ORDER BY published_date DESC""",
         (category, cutoff)
     )
@@ -189,7 +194,7 @@ def collect_weekly_data(category: str, db: Database,
     if snapshot_date:
         bridge_rows = db.fetchall(
             """SELECT * FROM bridge_papers
-               WHERE category = ? AND snapshot_date = ?
+               WHERE category = %s AND snapshot_date = %s
                ORDER BY bridge_score DESC
                LIMIT 5""",
             (category, snapshot_date)
@@ -240,7 +245,7 @@ def collect_weekly_data(category: str, db: Database,
 
     # --- Stats ---
     total_row = db.fetchone(
-        "SELECT COUNT(*) as cnt FROM paper_analyses WHERE category = ? AND is_relevant = 1",
+        "SELECT COUNT(*) as cnt FROM paper_analyses WHERE category = %s AND is_relevant = TRUE",
         (category,)
     )
     must_read = sum(1 for p in papers if p['significance'].get('must_read'))
@@ -274,7 +279,7 @@ def collect_monthly_data(category: str, db: Database,
     # Also include ALL relevant papers for the full review
     all_rows = db.fetchall(
         """SELECT * FROM paper_analyses
-           WHERE category = ? AND is_relevant = 1
+           WHERE category = %s AND is_relevant = TRUE
            ORDER BY published_date DESC""",
         (category,)
     )

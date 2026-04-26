@@ -218,7 +218,6 @@ def override_model(agent_name: str, model_config: ModelConfig):
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
-DB_PATH = PROJECT_ROOT / "src" / "db" / "research_intelligence.db"
 PDF_CACHE_DIR = PROJECT_ROOT / "cache" / "pdfs"
 LIVING_REVIEWS_DIR = PROJECT_ROOT / "docs" / "living_reviews"
 GRAPHS_DIR = LIVING_REVIEWS_DIR / "graphs"
@@ -247,7 +246,7 @@ def print_config():
     print(f"  Email Generator:  {AGENT_MODELS.email_generator.provider} / {AGENT_MODELS.email_generator.model_name}")
 
     print("\nPaths:")
-    print(f"  Database:         {DB_PATH}")
+    print(f"  Database:         (DATABASE_URL via .env)")
     print(f"  PDF Cache:        {PDF_CACHE_DIR}")
     print(f"  Living Reviews:   {LIVING_REVIEWS_DIR}")
     print("="*70)

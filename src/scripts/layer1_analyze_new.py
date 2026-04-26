@@ -217,7 +217,7 @@ def main():
 
     if results['success'] > 0:
         print(f"\n✓ Analysis complete! Database updated with {results['success']} new papers")
-        print(f"  Database: {db.db_path}")
+        print(f"  Database: {db.dsn}")
     elif results['failed'] > 0:
         # Paper-specific failures (e.g., PDF 404) are not CI-breaking errors.
         # Permanent failures get a stub inserted so they won't be retried.

@@ -252,7 +252,7 @@ class CitationGraphBuilder:
         """Load previously built citation graph from database."""
         with self.db as db:
             rows = db.fetchall(
-                "SELECT source_paper_id, target_paper_id FROM citations WHERE category = ?",
+                "SELECT source_paper_id, target_paper_id FROM citations WHERE category = %s",
                 (category,)
             )
             papers = db.get_papers_by_category(category)

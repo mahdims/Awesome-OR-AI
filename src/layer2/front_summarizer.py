@@ -10,13 +10,13 @@ Uses all available Layer 1 fields per paper for richer context, including
 experiments, results, lineage, extensions, and significance.
 """
 
-import json
 from typing import Dict, List, Optional
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel
 from db.database import Database
 from llm_client import create_agent_client
@@ -57,15 +57,12 @@ Return ONLY the JSON object, no preamble."""
 
 
 def _parse(value, default=None):
-    """Safely parse a JSON string or return as-is."""
+    """JSONB columns round-trip as dict/list; pass them through, fall back to default."""
     if value is None:
         return default
     if isinstance(value, (list, dict)):
         return value
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        return default
+    return default
 
 
 def _join(lst: list, limit: int = 5, sep: str = ", ") -> str:
@@ -389,12 +386,12 @@ def summarize_all_fronts(fronts: List[Dict],
                 with db:
                     db.execute(
                         """UPDATE research_fronts
-                           SET name = ?, summary = ?, future_directions = ?
-                           WHERE front_id = ? AND snapshot_date = ?""",
+                           SET name = %s, summary = %s, future_directions = %s
+                           WHERE front_id = %s AND snapshot_date = %s""",
                         (
                             enrichment['name'],
                             enrichment['summary'],
-                            json.dumps(enrichment['future_directions']),
+                            Jsonb(enrichment['future_directions']),
                             fid,
                             front['snapshot_date'],
                         )
@@ -413,12 +410,12 @@ def summarize_all_fronts(fronts: List[Dict],
                     with db:
                         db.execute(
                             """UPDATE research_fronts
-                               SET name = ?, summary = ?, future_directions = ?
-                               WHERE front_id = ? AND snapshot_date = ?""",
+                               SET name = %s, summary = %s, future_directions = %s
+                               WHERE front_id = %s AND snapshot_date = %s""",
                             (
                                 front['name'],
                                 front['summary'],
-                                json.dumps(front['future_directions']),
+                                Jsonb(front['future_directions']),
                                 fid,
                                 front['snapshot_date'],
                             )

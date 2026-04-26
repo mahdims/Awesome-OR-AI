@@ -263,6 +263,12 @@ def main() -> None:
             dry_run=args.dry_run,
         )
 
+        report["rescore_cache"] = copy_table(
+            sconn, pconn, "rescore_cache",
+            conflict_cols=["arxiv_id", "category"],
+            dry_run=args.dry_run,
+        )
+
     sconn.close()
 
     action = "would copy" if args.dry_run else "copied"

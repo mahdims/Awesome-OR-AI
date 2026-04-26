@@ -51,7 +51,7 @@ class PaperAnalysisPipeline:
         print(f"  Reader:      {AGENT_MODELS.reader.provider} / {AGENT_MODELS.reader.model_name}")
         print(f"  Methods:     {AGENT_MODELS.methods_extractor.provider} / {AGENT_MODELS.methods_extractor.model_name}")
         print(f"  Positioning: {AGENT_MODELS.positioning.provider} / {AGENT_MODELS.positioning.model_name}")
-        print(f"  Database:    {self.db.db_path}")
+        print(f"  Database:    {self.db.dsn}")
 
     def analyze_paper(self, arxiv_id: str, category: str,
                       title: str, authors: list, abstract: str,
@@ -195,7 +195,7 @@ class PaperAnalysisPipeline:
                         'significance': {'must_read': False, 'changes_thinking': False, 'team_discussion': False, 'reasoning': ''},
                         'brief': f'PDF fetch permanently failed (404 Not Found). Paper removed from ArXiv.',
                         'analysis_model': 'failed/pdf-404',
-                        'is_relevant': 0,
+                        'is_relevant': False,
                     }
                     with self.db as db:
                         db.insert_analysis(stub)

@@ -45,7 +45,7 @@ def _get_cocitation_graph(db: Database, category: str,
     rows = db.fetchall(
         """SELECT paper1_id, paper2_id, strength
            FROM cocitation_edges
-           WHERE category = ? AND snapshot_date = ?""",
+           WHERE category = %s AND snapshot_date = %s""",
         (category, snapshot_date)
     )
     G = nx.Graph()

@@ -604,28 +604,12 @@ class RelevanceScore(BaseModel):
 # === Database-backed score + abstract storage ===
 
 def _init_score_db():
-    """Initialize DB connection and ensure rescore_cache table exists."""
+    """Open a Database connection. Schema is owned by Alembic (rescore_cache lives in 0002)."""
     if _Database is None:
         return None
     try:
         db = _Database()
         db.connect()
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS rescore_cache (
-                arxiv_id        TEXT NOT NULL,
-                category        TEXT NOT NULL,
-                title           TEXT,
-                abstract        TEXT,
-                score           INTEGER,
-                score_date      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (arxiv_id, category)
-            )
-        """)
-        db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_rescore_category
-            ON rescore_cache(category)
-        """)
-        db.commit()
         return db
     except Exception as e:
         logging.warning(f"Failed to init score DB: {e}")
@@ -639,9 +623,14 @@ def _store_score_to_db(paper_id, category, title, abstract, score):
         return
     try:
         _SCORE_DB.execute(
-            """INSERT OR REPLACE INTO rescore_cache
+            """INSERT INTO rescore_cache
                (arxiv_id, category, title, abstract, score, score_date)
-               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+               VALUES (%s, %s, %s, %s, %s, now())
+               ON CONFLICT (arxiv_id, category) DO UPDATE SET
+                 title = EXCLUDED.title,
+                 abstract = EXCLUDED.abstract,
+                 score = EXCLUDED.score,
+                 score_date = EXCLUDED.score_date""",
             (paper_id, category, title, abstract, score)
         )
         _SCORE_DB.commit()
@@ -655,7 +644,7 @@ def _load_score_from_db(paper_id, category):
         return None
     try:
         row = _SCORE_DB.fetchone(
-            "SELECT score FROM rescore_cache WHERE arxiv_id = ? AND category = ?",
+            "SELECT score FROM rescore_cache WHERE arxiv_id = %s AND category = %s",
             (paper_id, category)
         )
         if row is None:
@@ -1729,7 +1718,7 @@ def clear_category_from_cache(category, cache_path=SCORE_CACHE_PATH):
     if _SCORE_DB is not None:
         try:
             cur = _SCORE_DB.execute(
-                "DELETE FROM rescore_cache WHERE category = ?",
+                "DELETE FROM rescore_cache WHERE category = %s",
                 (category,)
             )
             _SCORE_DB.commit()

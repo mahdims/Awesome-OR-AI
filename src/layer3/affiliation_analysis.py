@@ -17,15 +17,12 @@ from db.database import Database
 
 
 def _parse_json_field(value):
-    """Parse JSON string or return as-is."""
+    """JSONB columns round-trip as list; pass through, fall back to []."""
     if value is None:
         return []
     if isinstance(value, list):
         return value
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        return []
+    return []
 
 
 def _parse_affiliations(aff_str: str) -> List[str]:
@@ -162,7 +159,7 @@ def get_top_affiliations_overall(db: Database,
         papers = db.get_papers_by_category(category)
     else:
         papers = [dict(r) for r in db.fetchall(
-            "SELECT affiliations FROM paper_analyses WHERE is_relevant = 1"
+            "SELECT affiliations FROM paper_analyses WHERE is_relevant = TRUE"
         )]
 
     aff_counter = Counter()

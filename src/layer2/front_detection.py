@@ -650,9 +650,12 @@ def store_cocitation_edges(cocitation_graph: nx.Graph, category: str,
         # Enforce ordering (paper1_id < paper2_id)
         p1, p2 = (u, v) if u < v else (v, u)
         db.execute(
-            """INSERT OR REPLACE INTO cocitation_edges
+            """INSERT INTO cocitation_edges
                (paper1_id, paper2_id, category, cocitation_count, strength, snapshot_date)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT (paper1_id, paper2_id, category, snapshot_date) DO UPDATE SET
+                 cocitation_count = EXCLUDED.cocitation_count,
+                 strength = EXCLUDED.strength""",
             (p1, p2, category, d.get('weight', 1),
              d.get('strength', 0.0), snapshot_date)
         )

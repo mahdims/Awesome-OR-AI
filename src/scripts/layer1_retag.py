@@ -24,6 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from psycopg.types.json import Jsonb
 from db.database import Database
 from layer1.schemas import MethodsOutput
 from llm_client import create_agent_client
@@ -36,15 +37,8 @@ PROMPTS_DIR = Path(__file__).parent.parent / "layer1" / "prompts"
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _parse_json_field(value):
-    """Parse a JSON string from the DB or return as-is if already a dict/list."""
-    if value is None:
-        return None
-    if isinstance(value, (dict, list)):
-        return value
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        return value
+    """JSONB columns round-trip as dict/list; pass them through."""
+    return value
 
 
 def build_reader_context_from_db(analysis: dict) -> str:
@@ -123,13 +117,13 @@ def _update_methods_in_db(db: Database, arxiv_id: str,
 
     db.execute(
         """UPDATE paper_analyses
-           SET tags = ?, lineage = ?, extensions = ?, methods_confidence = ?
-           WHERE arxiv_id = ?""",
+           SET tags = %s, lineage = %s, extensions = %s, methods_confidence = %s
+           WHERE arxiv_id = %s""",
         (
-            json.dumps(tags_dict),
-            json.dumps(lineage_dict),
-            json.dumps(extensions_dict),
-            json.dumps(conf_dict) if conf_dict else None,
+            Jsonb(tags_dict),
+            Jsonb(lineage_dict),
+            Jsonb(extensions_dict),
+            Jsonb(conf_dict) if conf_dict else None,
             arxiv_id,
         )
     )

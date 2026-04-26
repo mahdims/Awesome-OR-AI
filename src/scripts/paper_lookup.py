@@ -42,15 +42,12 @@ SECTIONS = [
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _json(value, default=None):
-    """Parse a JSON string stored in the DB, or return default."""
+    """JSONB columns round-trip as dict/list; pass them through, fall back to default."""
     if value is None:
         return default
     if isinstance(value, (list, dict)):
         return value
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        return default
+    return default
 
 
 def _wrap(text, width=WRAP_WIDTH, indent=INDENT):
@@ -116,7 +113,8 @@ def print_metadata(p: dict, row: dict):
     print(_field("Affiliations", row.get("affiliations") or "(none)"))
     print(_field("ArXiv URL",    f"https://arxiv.org/abs/{row['arxiv_id']}"))
     model = row.get("analysis_model") or "?"
-    date  = (row.get("analysis_date") or "?")[:10]
+    ad = row.get("analysis_date")
+    date = ad.date().isoformat() if ad is not None else "?"
     print(_field("Analyzed",     f"{date}  (model: {model})"))
     print(_field("is_relevant",  rel_label))
 

@@ -39,21 +39,18 @@ from layer2.front_summarizer import summarize_all_fronts
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _json(value, default=None):
-    """Parse a JSON string stored in the DB, or return default."""
+    """JSONB columns round-trip as dict/list; pass them through, fall back to default."""
     if value is None:
         return default
     if isinstance(value, (list, dict)):
         return value
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        return default
+    return default
 
 
 def _get_latest_snapshot(db: Database, category: str) -> Optional[str]:
     """Return the most recent snapshot_date for a category."""
     row = db.fetchone(
-        "SELECT MAX(snapshot_date) AS snap FROM research_fronts WHERE category = ?",
+        "SELECT MAX(snapshot_date) AS snap FROM research_fronts WHERE category = %s",
         (category,)
     )
     return row["snap"] if row else None
@@ -62,7 +59,7 @@ def _get_latest_snapshot(db: Database, category: str) -> Optional[str]:
 def _get_fronts(db: Database, category: str, snapshot_date: str) -> list[dict]:
     rows = db.fetchall(
         """SELECT * FROM research_fronts
-           WHERE category = ? AND snapshot_date = ?
+           WHERE category = %s AND snapshot_date = %s
            ORDER BY size DESC""",
         (category, snapshot_date)
     )
@@ -80,9 +77,9 @@ def _get_bridge_papers(db: Database, category: str, snapshot_date: str,
                         top_n: int) -> list[dict]:
     rows = db.fetchall(
         """SELECT * FROM bridge_papers
-           WHERE category = ? AND snapshot_date = ?
+           WHERE category = %s AND snapshot_date = %s
            ORDER BY bridge_score DESC
-           LIMIT ?""",
+           LIMIT %s""",
         (category, snapshot_date, top_n)
     )
     bridges = []

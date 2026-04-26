@@ -95,14 +95,14 @@ def _get_abstract_from_db(db, paper_id: str) -> str:
     if db is None:
         return ""
     row = db.fetchone(
-        "SELECT abstract FROM paper_analyses WHERE arxiv_id = ?", (paper_id,)
+        "SELECT abstract FROM paper_analyses WHERE arxiv_id = %s", (paper_id,)
     )
     if row and row["abstract"]:
         return row["abstract"]
     # Fallback: rescore_cache (populated by rescore_and_filter.py)
     try:
         row = db.fetchone(
-            "SELECT abstract FROM rescore_cache WHERE arxiv_id = ? AND abstract != ''",
+            "SELECT abstract FROM rescore_cache WHERE arxiv_id = %s AND abstract != ''",
             (paper_id,),
         )
         return (row["abstract"] or "") if row else ""
@@ -150,49 +150,45 @@ def _move_paper_in_json(data: dict, paper_id: str, entry: str,
 
 
 def _move_paper_in_db(db, paper_id: str, from_cat: str, to_cat: str) -> None:
-    """Move paper in SQLite: copy row to new category, delete old row."""
+    """Re-tag a paper's category in both `papers` and `paper_analyses`.
+
+    `papers` PK is (arxiv_id, category) so the row must be DELETE+INSERTed.
+    `paper_analyses` PK is just (arxiv_id) so a single UPDATE suffices.
+    """
     if db is None:
         return
 
     # Move in `papers` table
     row = db.fetchone(
-        "SELECT * FROM papers WHERE arxiv_id = ? AND category = ?",
+        "SELECT * FROM papers WHERE arxiv_id = %s AND category = %s",
         (paper_id, from_cat),
     )
     if row:
         db.execute(
-            """INSERT OR REPLACE INTO papers
+            """INSERT INTO papers
                (arxiv_id, category, title, authors, date, affiliation, venue, code_url, fetched_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (arxiv_id, category) DO UPDATE SET
+                 title = EXCLUDED.title,
+                 authors = EXCLUDED.authors,
+                 date = EXCLUDED.date,
+                 affiliation = EXCLUDED.affiliation,
+                 venue = EXCLUDED.venue,
+                 code_url = EXCLUDED.code_url,
+                 fetched_at = EXCLUDED.fetched_at""",
             (paper_id, to_cat, row["title"], row["authors"], row["date"],
              row["affiliation"], row["venue"], row["code_url"], row["fetched_at"]),
         )
         db.execute(
-            "DELETE FROM papers WHERE arxiv_id = ? AND category = ?",
+            "DELETE FROM papers WHERE arxiv_id = %s AND category = %s",
             (paper_id, from_cat),
         )
 
-    # Move in `paper_analyses` table if present
-    row_a = db.fetchone(
-        "SELECT * FROM paper_analyses WHERE arxiv_id = ? AND category = ?",
-        (paper_id, from_cat),
+    # `paper_analyses.arxiv_id` is the full PK — just retag.
+    db.execute(
+        "UPDATE paper_analyses SET category = %s WHERE arxiv_id = %s AND category = %s",
+        (to_cat, paper_id, from_cat),
     )
-    if row_a:
-        # Build column list dynamically
-        cols = list(row_a.keys())
-        vals = [row_a[c] for c in cols]
-        cat_idx = cols.index("category")
-        vals[cat_idx] = to_cat
-        placeholders = ", ".join("?" * len(cols))
-        col_names = ", ".join(cols)
-        db.execute(
-            f"INSERT OR REPLACE INTO paper_analyses ({col_names}) VALUES ({placeholders})",
-            tuple(vals),
-        )
-        db.execute(
-            "DELETE FROM paper_analyses WHERE arxiv_id = ? AND category = ?",
-            (paper_id, from_cat),
-        )
 
     db.commit()
 
@@ -214,7 +210,7 @@ def recategorize(config, dry_run: bool = False) -> None:
     if Database is not None:
         db = Database()
         db.connect()
-        print(f"Database: {db.db_path}", flush=True)
+        print(f"Database: {db.dsn}", flush=True)
 
     # Collect JSON paths
     json_paths = []

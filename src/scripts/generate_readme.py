@@ -2,7 +2,7 @@
 """
 Generate enriched README.md and docs/index.md from:
   - docs/or-llm-daily.json  (paper list, pipe-delimited strings)
-  - src/db/research_intelligence.db  (L1 scores/briefs/affiliations, L2 fronts)
+  - Postgres (L1 scores/briefs/affiliations, L2 fronts) via DATABASE_URL
 
 This is the ONLY script that writes README.md and docs/index.md.
 Call it from all three workflows after their respective final analysis step.
@@ -193,12 +193,12 @@ def _is_visible(info: dict) -> bool:
     """True if a paper should appear in the README.
 
     - Not yet L1-analyzed (info is empty/None): show it, we don't know yet.
-    - L1-analyzed and is_relevant=1: show it.
-    - L1-analyzed and is_relevant=0: hide it (failed second-stage filter).
+    - L1-analyzed and is_relevant=True: show it.
+    - L1-analyzed and is_relevant=False: hide it (failed second-stage filter).
     """
     if not info:
         return True
-    return bool(info.get("is_relevant", 1))
+    return bool(info.get("is_relevant", True))
 
 
 def _title_cell_html(title: str, brief: str) -> str:
@@ -225,14 +225,8 @@ def _load_l1(db: Database, category: str = "") -> dict:
     result = {}
     for row in rows:
         aid = _clean_id(row["arxiv_id"])
-        try:
-            rel = json.loads(row["relevance"] or "{}")
-        except Exception:
-            rel = {}
-        try:
-            artifacts = json.loads(row["artifacts"] or "{}")
-        except Exception:
-            artifacts = {}
+        rel = row["relevance"] or {}
+        artifacts = row["artifacts"] or {}
         score = (rel.get("methodological", 0)
                  + rel.get("problem", 0)
                  + rel.get("inspirational", 0))
@@ -242,7 +236,7 @@ def _load_l1(db: Database, category: str = "") -> dict:
             "affiliations": (row["affiliations"] or "").strip(),
             "venue":        (row["venue"] or "").strip(),
             "code_url":     (artifacts.get("code_url") or "").strip(),
-            "is_relevant":  row["is_relevant"],  # 1 = pass, 0 = filtered out
+            "is_relevant":  row["is_relevant"],  # bool: True = pass, False = filtered out
         }
     return result
 
@@ -250,7 +244,7 @@ def _load_l1(db: Database, category: str = "") -> dict:
 def _load_fronts(db: Database, category: str) -> list:
     """Return front dicts for the latest L2 snapshot of this category."""
     row = db.fetchone(
-        "SELECT MAX(snapshot_date) as d FROM research_fronts WHERE category = ?",
+        "SELECT MAX(snapshot_date) as d FROM research_fronts WHERE category = %s",
         (category,)
     )
     if not row or not row["d"]:
@@ -259,24 +253,15 @@ def _load_fronts(db: Database, category: str) -> list:
     rows = db.fetchall(
         """SELECT name, status, size, dominant_methods, dominant_problems, core_papers, summary
            FROM research_fronts
-           WHERE category = ? AND snapshot_date = ?
+           WHERE category = %s AND snapshot_date = %s
            ORDER BY size DESC""",
         (category, snapshot)
     )
     fronts = []
     for r in rows:
-        try:
-            methods = json.loads(r["dominant_methods"] or "[]")[:3]
-        except Exception:
-            methods = []
-        try:
-            problems = json.loads(r["dominant_problems"] or "[]")[:2]
-        except Exception:
-            problems = []
-        try:
-            core_papers = json.loads(r["core_papers"] or "[]")
-        except Exception:
-            core_papers = []
+        methods = (r["dominant_methods"] or [])[:3]
+        problems = (r["dominant_problems"] or [])[:2]
+        core_papers = r["core_papers"] or []
         fronts.append({
             "name":        r["name"] or "Unnamed front",
             "status":      r["status"] or "stable",
@@ -416,7 +401,7 @@ def _render_category(category: str, papers: dict, l1: dict, fronts: list) -> str
     # ── Full list (collapsible HTML table) ────────────────────────────────────
     # Column widths: title is 1.8× the base unit.
     # Base ≈ 9 → title ≈ 16.  Total = 6+8+16+12+14+9+13 = 78 → normalised below.
-    # Count visible papers (exclude is_relevant=0 analyzed papers).
+    # Count visible papers (exclude is_relevant=False analyzed papers).
     visible_total = sum(
         1 for _, c in sorted_papers
         if _is_visible(l1.get(_parse(c)[5], {}))

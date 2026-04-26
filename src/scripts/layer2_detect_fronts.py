@@ -151,7 +151,7 @@ def run_layer2_pipeline(category: str,
             rows = db.fetchall(
                 """SELECT front_id, core_papers, name, summary, future_directions
                    FROM research_fronts
-                   WHERE category = ? AND snapshot_date = ?""",
+                   WHERE category = %s AND snapshot_date = %s""",
                 (category, snapshot_date)
             )
 
