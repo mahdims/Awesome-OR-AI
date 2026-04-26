@@ -1,10 +1,21 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-04-23
+**Last Updated:** 2026-04-26
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-26 (1 papers)
+
+### [Learning to Evolve: A Self-Improving Framework for Multi-Agent Systems via Textual Parameter Graph Optimization](https://arxiv.org/abs/2604.20714)
+
+**2026-04-22** | Future Living Lab of Alibaba | M=8 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Textual Parameter Graph Optimization (TPGO) with Group Relative Agent Optimization (GRAO) meta-learning | *LLM role:* decomposition_guide, diagnostic_feedback_generator, optimization_proposal_generator, meta_learner
+
+> He et al. introduce Textual Parameter Graph Optimization (TPGO), a framework that optimizes multi-agent systems by representing their configurations as modular graphs and evolving them using textual gradients. The results are backed by solid empirical evidence, demonstrating a 7-10% absolute success rate improvement on complex benchmarks like MCP-Universe and GAIA over strong baselines (ReAct, MiroFlow). The key insight is the Group Relative Agent Optimization (GRAO) mechanism, which maintains an 'Optimization Experience Memory' of past successful and failed graph edits, clustering and retrieving them to teach the LLM optimizer how to generate better updates over time. This is highly relevant for our work in LLM evolutionary search; adopting the graph-based representation and historical experience retrieval could significantly improve the sample efficiency and stability of our evolutionary algorithms.
+
 
 #### 2026-04-23 (1 papers)
 

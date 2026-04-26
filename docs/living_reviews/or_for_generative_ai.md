@@ -1,10 +1,29 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-04-23
+**Last Updated:** 2026-04-26
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-26 (2 papers)
+
+### [Hive: A Multi-Agent Infrastructure for Algorithm- and Task-Level Scaling](https://arxiv.org/abs/2604.17353)
+
+**2026-04-19** | Peking University | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Hive multi-agent inference infrastructure with Logits Cache and Agent-Aware Scheduling | *LLM role:* inference_engine_optimization
+
+> Hive is an LLM inference infrastructure that optimizes multi-agent and test-time scaling workloads by introducing Logits Cache for redundant sampling paths and Agent-Aware Scheduling for KV cache eviction. The results are backed by solid empirical evidence, demonstrating a 1.11x-1.76x speedup for re-sampling and a 33%-51% reduction in KV cache miss rates on Qwen3-8B. The key insight is that caching intermediate logits (not just KV states) allows the engine to skip expensive forward passes during stochastic resampling of shared prefixes, while evicting KV cache based on an agent's structural contribution outperforms standard LRU. This is highly relevant for scaling LLM evolutionary search and multi-agent optimization, as it provides concrete systems-level techniques to drastically reduce the inference costs associated with branching generation and complex agent coordination.
+
+### [DiP-SD: Distributed Pipelined Speculative Decoding for Efficient LLM Inference at the Edge](https://arxiv.org/abs/2604.20919)
+
+**2026-04-22** | Tsinghua University | M=6 P=7 I=7 *discuss*
+
+*Method:* Joint optimization of batching, user-to-batch assignment, and integer draft lengths formulated as a fractional mixed-integer program, solved by scanning batch counts and iteratively alternating between MILP-based subproblems using Dinkelbach's method. | *LLM role:* none
+
+> This paper formulates the scheduling of distributed speculative decoding (local drafting, centralized verification) as a fractional mixed-integer program to maximize multi-user token throughput. The authors demonstrate up to 1.93x throughput improvements over greedy batching in simulated edge deployments using Qwen3 models. The key insight is that the complex fractional objective of throughput (expected accepted tokens per unit time) can be efficiently decoupled and solved using the Dinkelbach method combined with alternating optimization for batch assignment and draft lengths. This is highly relevant for our research in applying operations research to LLM serving scheduling, as the mathematical formulation provides a concrete template for optimizing multi-user inference workloads.
+
 
 #### 2026-04-23 (2 papers)
 

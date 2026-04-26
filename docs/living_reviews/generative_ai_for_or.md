@@ -1,10 +1,45 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-04-23
+**Last Updated:** 2026-04-26
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-26 (4 papers)
+
+### [OptiVerse: A Comprehensive Benchmark towards Optimization Problem Solving](https://arxiv.org/abs/2604.21510)
+
+**2026-04-23** | Xi'an Jiaotong University, Lenovo Research | M=6 P=8 I=7 **MUST-READ** *discuss*
+
+*Method:* Dual-View Auditor Agent (DVA-Agent) with Semantic Triangulation | *LLM role:* adversarial_evaluator
+
+> This paper introduces OptiVerse, a 1,000-problem benchmark spanning six optimization domains (including stochastic and dynamic optimization) to evaluate LLM reasoning, alongside a Dual-View Auditor Agent that detects semantic modeling errors. Extensive evaluation of 22 LLMs shows severe performance degradation on hard problems (under 27% accuracy even for frontier models), while the proposed agent improves accuracy by 1.3-6.3% over baselines like OptiMUS. The key insight is the 'blind code abstraction' technique: forcing the LLM to reverse-engineer mathematical logic solely from its generated code without seeing the original prompt, which effectively mitigates the confirmation bias that plagues standard LLM self-correction. This is highly relevant for our OR benchmarking and evaluation work, as it represents a direct competitor/complement to our datasets. Furthermore, the blind abstraction trick is a highly transferable mechanism that could be adopted to improve the verification and reward modeling steps in our multi-agent optimization and LLM evolutionary search frameworks.
+
+### [Dual-Cluster Memory Agent: Resolving Multi-Paradigm Ambiguity in Optimization Problem Solving](https://arxiv.org/abs/2604.20183)
+
+**2026-04-22** | Xi’an Jiaotong University, Ministry of Education Key Laboratory of Intelligent Networks and Network Security, Shaanxi Province Key Laboratory of Big Data Knowledge Engineering | M=7 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Dual-Cluster Memory Agent (DCM-Agent) with Dual-Cluster Memory Construction and Memory-Augmented Inference | *LLM role:* knowledge_synthesizer_code_generator_verifier
+
+> This paper introduces a training-free Dual-Cluster Memory Agent that resolves multi-paradigm ambiguity in optimization modeling by decoupling abstract mathematical modeling from concrete coding implementation into separate memory clusters linked by a bipartite graph. The results are backed by strong empirical evidence, showing 11-21% average accuracy improvements across 7 OR benchmarks (including OptiBench and NLP4LP) over baselines like OptiMUS and OptiTree, while reducing inference time compared to heavy tree-search methods. The key insight is the structured extraction of 'Pitfalls' from persistent failures and the resulting 'knowledge inheritance'—using a large model to build a high-quality bipartite memory graph allows smaller, cheaper models to achieve SOTA performance during inference. This is highly relevant for our work in symbolic OR modeling and multi-agent memory architectures, as the decoupled memory structure and failure-driven pitfall extraction could directly improve our agentic modeling workflows and LLM reasoning evaluation.
+
+### [Co-evolving Agent Architectures and Interpretable Reasoning for Automated Optimization](https://arxiv.org/abs/2604.17708)
+
+**2026-04-20** | Harbin Institute of Technology, Nanjing University of Information Science and Technology | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Co-evolutionary framework using Activity-on-Edge (AOE) networks for agent architecture and reasoning trajectory evolution | *LLM role:* problem_interpreter, heuristic_generator, code_writer, decomposition_guide, evolutionary_search_operator, evaluator
+
+> Huang et al. propose EvoOR-Agent, a co-evolutionary framework that represents LLM agent workflows as Activity-on-Edge (AOE) networks to simultaneously evolve the agent's architectural topology and its reasoning trajectories for operations research tasks. The results are backed by strong empirical evidence, showing up to 17% improvement over fixed-pipeline OR agents and 15% over general evolutionary agents on complex benchmarks like IndustryOR and BWOR. The key insight is that abstracting agent workflows into an explicit, evolvable AOE graph allows for path-conditioned recombination and structural pruning, enabling the evolutionary search to optimize the problem-solving process (e.g., formulation decomposition, solver routing, debugging loops) rather than just the prompt text or final code. This is highly relevant for our work in LLM evolutionary search and multi-agent optimization, as the AOE graph representation provides a concrete, implementable mechanism for dynamically adapting and evolving agent pipelines.
+
+### [PARM: Pipeline-Adapted Reward Model](https://arxiv.org/abs/2604.18327)
+
+**2026-04-20** | The Chinese University of Hong Kong, Hong Kong University of Science and Technology, City University of Hong Kong, Peking University, Tsinghua University, University of California, Los Angeles, Shanghai Jiao Tong University | M=8 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Pipeline-Adapted Reward Model (PARM) training with Direct Preference Optimization (DPO) for stage-wise candidate selection | *LLM role:* generator, evaluator
+
+> Fan et al. introduce a Pipeline-Adapted Reward Model (PARM) that trains stage-specific reward models for LLM optimization pipelines using Direct Preference Optimization on automatically collected execution feedback. The results are backed by strong empirical numbers, demonstrating that a 7B model pipeline can outperform GPT-4o on operations research benchmarks like NL4Opt (0.52 vs 0.15 solving accuracy). The key insight is that intermediate pipeline stages, such as problem formulation, can be effectively scored by training a reward model via DPO where preference pairs are automatically labeled based on whether any downstream execution succeeds. This is highly relevant for our work in multi-agent optimization and LLM evolutionary search, as it provides a concrete, scalable method to train process reward models without human annotation.
+
 
 #### 2026-04-23 (3 papers)
 
