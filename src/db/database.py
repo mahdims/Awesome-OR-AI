@@ -1,135 +1,195 @@
-import sqlite3
-import json
-from pathlib import Path
-from typing import Optional, List, Dict, Any
+"""Postgres database wrapper.
 
-DB_PATH = Path(__file__).parent / "research_intelligence.db"
+Replaces the prior SQLite wrapper. The public method surface is preserved
+so Layer 1 / Layer 2 / Layer 3 / scripts do not need invasive rewrites,
+with two deliberate behavior changes that callers must adopt:
+
+1.  JSONB round-trips as ``dict`` / ``list`` — not as JSON ``str``.
+    Callers that used ``json.loads(row["artifacts"])`` must drop the
+    ``json.loads`` call. See the SQL dialect sweep (M1a, step 2).
+2.  ``is_relevant`` round-trips as ``bool``, not as ``int`` 0/1.
+    Callers doing ``== 1`` must switch to truthiness checks.
+
+Schema is owned by Alembic migrations in ``src/db/migrations/``. This class
+does NOT create tables; run ``alembic upgrade head`` once against a fresh
+Postgres before using.
+
+Connection string: ``DATABASE_URL`` env var. Expected form
+``postgresql+psycopg://user:pass@host:port/db`` (SQLAlchemy-style). We strip
+the ``+psycopg`` suffix when handing it to psycopg3 directly.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+
+import psycopg
+from pgvector.psycopg import register_vector
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+
+def _get_dsn() -> str:
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL not set. Copy .env.example to .env and fill it in."
+        )
+    # Accept both SQLAlchemy-style (postgresql+psycopg://...) and native
+    # (postgresql://...) URLs; psycopg3 wants the native form.
+    return url.replace("postgresql+psycopg://", "postgresql://", 1)
+
+
+# JSONB columns that the class serializes automatically on insert/update.
+_JSON_FIELDS_ANALYSIS = {
+    "authors", "problem", "methodology", "experiments", "results",
+    "artifacts", "reader_confidence", "lineage", "tags", "extensions",
+    "methods_confidence", "relevance", "significance",
+}
+_JSON_FIELDS_FRONT = {
+    "core_papers", "dominant_methods", "dominant_problems", "future_directions",
+}
+_JSON_FIELDS_BRIDGE = {"connected_fronts"}
+
+
+def _wrap_json(value: Any) -> Any:
+    """Wrap ``value`` for a JSONB column. Accepts dict/list or an already-JSON string."""
+    if isinstance(value, (dict, list)):
+        return Jsonb(value)
+    if isinstance(value, str):
+        # Legacy callers may still pass JSON strings. Parse and re-wrap so the
+        # column receives JSONB rather than a TEXT literal.
+        try:
+            return Jsonb(json.loads(value))
+        except (json.JSONDecodeError, TypeError):
+            return Jsonb(value)
+    return value
+
 
 class Database:
-    """Thin wrapper for SQLite with JSON serialization helpers."""
+    """Thin Postgres wrapper, sync psycopg3.
 
-    def __init__(self, db_path: Path = DB_PATH):
-        self.db_path = db_path
-        self.conn = None
+    Usage::
 
-    def connect(self):
-        self.conn = sqlite3.connect(str(self.db_path))
-        self.conn.row_factory = sqlite3.Row
-        # Auto-initialize schema from schema.sql (all CREATE TABLE IF NOT EXISTS — safe for existing DBs)
-        schema_path = Path(__file__).parent / "schema.sql"
-        if schema_path.exists():
-            self.conn.executescript(schema_path.read_text())
-        # Ensure citation_fetch_log exists (migration for pre-existing databases)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS citation_fetch_log (
-                arxiv_id    TEXT NOT NULL,
-                category    TEXT NOT NULL,
-                fetch_date  DATE NOT NULL DEFAULT (date('now')),
-                fetch_mode  TEXT NOT NULL,
-                refs_count  INTEGER DEFAULT 0,
-                cited_count INTEGER DEFAULT 0,
-                PRIMARY KEY (arxiv_id, category)
-            )
-        """)
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_fetch_log_category "
-            "ON citation_fetch_log(category)"
-        )
-        # Add LLM-enrichment columns to research_fronts if they don't exist yet
-        for col in ("name TEXT", "future_directions TEXT"):
-            try:
-                self.conn.execute(f"ALTER TABLE research_fronts ADD COLUMN {col}")
-            except Exception:
-                pass  # column already exists
-        # Add is_relevant column to paper_analyses if it doesn't exist yet
-        try:
-            self.conn.execute("ALTER TABLE paper_analyses ADD COLUMN is_relevant INTEGER DEFAULT 1")
-        except Exception:
-            pass  # column already exists
-        # Add venue column to paper_analyses if it doesn't exist yet
-        try:
-            self.conn.execute("ALTER TABLE paper_analyses ADD COLUMN venue TEXT")
-        except Exception:
-            pass  # column already exists
-        self.conn.commit()
+        with Database() as db:
+            rows = db.fetchall("SELECT * FROM papers WHERE category = %s", (cat,))
+    """
+
+    def __init__(self, dsn: Optional[str] = None):
+        self.dsn = dsn or _get_dsn()
+        self.conn: Optional[psycopg.Connection] = None
+
+    # --- connection lifecycle ---
+
+    def connect(self) -> "Database":
+        self.conn = psycopg.connect(self.dsn, row_factory=dict_row)
+        # Required for pgvector list<->vector adaptation on embedding column.
+        register_vector(self.conn)
         return self
 
-    def close(self):
-        if self.conn:
+    def close(self) -> None:
+        if self.conn is not None:
             self.conn.close()
+            self.conn = None
 
-    def __enter__(self):
+    def __enter__(self) -> "Database":
         return self.connect()
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.conn:
-            self.conn.commit()
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self.conn is not None:
+            if exc_type is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
         self.close()
 
-    def execute(self, query: str, params: tuple = ()):
-        return self.conn.execute(query, params)
-
-    def fetchone(self, query: str, params: tuple = ()):
-        return self.execute(query, params).fetchone()
-
-    def fetchall(self, query: str, params: tuple = ()):
-        return self.execute(query, params).fetchall()
-
-    def commit(self):
+    def commit(self) -> None:
+        assert self.conn is not None, "connect() first"
         self.conn.commit()
+
+    # --- low-level query helpers (paramstyle: pyformat "%s") ---
+
+    def execute(self, query: str, params: Sequence[Any] = ()) -> psycopg.Cursor:
+        assert self.conn is not None, "connect() first"
+        cur = self.conn.cursor()
+        cur.execute(query, params)
+        return cur
+
+    def fetchone(self, query: str, params: Sequence[Any] = ()) -> Optional[Dict[str, Any]]:
+        cur = self.execute(query, params)
+        try:
+            return cur.fetchone()
+        finally:
+            cur.close()
+
+    def fetchall(self, query: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
+        cur = self.execute(query, params)
+        try:
+            return cur.fetchall()
+        finally:
+            cur.close()
 
     # === Paper Analyses ===
 
     def has_analysis(self, arxiv_id: str) -> bool:
-        """Check if paper already analyzed."""
         row = self.fetchone(
-            "SELECT 1 FROM paper_analyses WHERE arxiv_id = ?",
-            (arxiv_id,)
+            "SELECT 1 FROM paper_analyses WHERE arxiv_id = %s", (arxiv_id,)
         )
         return row is not None
 
-    def get_analysis(self, arxiv_id: str) -> Optional[Dict]:
-        """Retrieve full analysis record."""
-        row = self.fetchone(
-            "SELECT * FROM paper_analyses WHERE arxiv_id = ?",
-            (arxiv_id,)
+    def get_analysis(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
+        return self.fetchone(
+            "SELECT * FROM paper_analyses WHERE arxiv_id = %s", (arxiv_id,)
         )
-        return dict(row) if row else None
 
-    def get_embedding(self, arxiv_id: str) -> Optional[bytes]:
-        """Return raw embedding BLOB, or None if not yet generated."""
+    def get_embedding(self, arxiv_id: str) -> Optional[List[float]]:
+        """Return embedding as a list of floats, or None if not yet generated.
+
+        Behavior change from SQLite: the column is now ``vector(768)`` (pgvector),
+        not ``BLOB``. Callers that previously did ``np.frombuffer(blob)`` should
+        switch to using the list directly (or ``np.asarray(row)``).
+        """
         row = self.fetchone(
-            "SELECT embedding FROM paper_analyses WHERE arxiv_id = ?",
-            (arxiv_id,)
+            "SELECT embedding FROM paper_analyses WHERE arxiv_id = %s", (arxiv_id,)
         )
-        return row['embedding'] if row else None
+        return row["embedding"] if row else None
 
-    def store_embedding(self, arxiv_id: str, blob: bytes) -> None:
-        """Persist serialized float32 embedding into the paper_analyses row."""
+    def store_embedding(self, arxiv_id: str, embedding: Iterable[float]) -> None:
+        """Persist an embedding into the paper_analyses row.
+
+        Accepts any iterable of floats (list, numpy array, etc.). The
+        pgvector pg adapter is registered lazily by the pgvector package;
+        we pass a plain list which the adapter coerces.
+        """
         self.execute(
-            "UPDATE paper_analyses SET embedding = ? WHERE arxiv_id = ?",
-            (blob, arxiv_id)
+            "UPDATE paper_analyses SET embedding = %s WHERE arxiv_id = %s",
+            (list(embedding), arxiv_id),
         )
         self.commit()
 
     def store_abstract(self, arxiv_id: str, abstract: str) -> None:
-        """Backfill abstract into paper_analyses (only if currently NULL/empty)."""
         self.execute(
-            "UPDATE paper_analyses SET abstract = ? WHERE arxiv_id = ? AND (abstract IS NULL OR abstract = '')",
-            (abstract, arxiv_id)
+            "UPDATE paper_analyses SET abstract = %s "
+            "WHERE arxiv_id = %s AND (abstract IS NULL OR abstract = '')",
+            (abstract, arxiv_id),
         )
         self.commit()
 
     @staticmethod
-    def _compute_is_relevant(relevance, significance) -> int:
-        """Return 1 if paper passes the positioning filter, 0 otherwise.
+    def _compute_is_relevant(relevance: Any, significance: Any) -> bool:
+        """Return True if the paper passes the positioning filter.
 
-        Threshold: (max(M,P,I) >= 6  AND  sum(M,P,I) >= 18)  OR  must_read == True.
-
-        The dual condition ensures papers score well in at least one dimension
-        (max >= 6) AND have sufficient overall relevance (sum >= 18), preventing
-        one-dimensional papers (e.g. 10/0/0) from passing. must_read overrides.
-        Accepts either a dict or a JSON string for both arguments.
+        Threshold: ``(max(M,P,I) >= 6  AND  sum(M,P,I) >= 18)  OR  must_read``.
+        Accepts either a dict (new Postgres path) or a JSON string (legacy
+        SQLite callers during the migration window).
         """
         if isinstance(relevance, str):
             try:
@@ -143,338 +203,345 @@ class Database:
                 significance = {}
         rel = relevance or {}
         sig = significance or {}
-        m = rel.get('methodological', 0)
-        p = rel.get('problem', 0)
-        i = rel.get('inspirational', 0)
-        max_score = max(m, p, i)
-        sum_score = m + p + i
-        passes_scores = (max_score >= 6 and sum_score >= 18)
-        return 1 if (passes_scores or sig.get('must_read', False)) else 0
+        m = rel.get("methodological", 0)
+        p = rel.get("problem", 0)
+        i = rel.get("inspirational", 0)
+        passes_scores = max(m, p, i) >= 6 and (m + p + i) >= 18
+        return bool(passes_scores or sig.get("must_read", False))
 
-    def insert_analysis(self, analysis: Dict):
-        """Insert new paper analysis."""
-        # Convert nested dicts to JSON strings
-        json_fields = ['authors', 'problem', 'methodology', 'experiments', 'results',
-                       'artifacts', 'reader_confidence', 'lineage', 'tags', 'extensions',
-                       'methods_confidence', 'relevance', 'significance']
+    def insert_analysis(self, analysis: Dict[str, Any]) -> None:
+        """Upsert a paper analysis row.
 
-        analysis_copy = analysis.copy()
-        for field in json_fields:
-            if field in analysis_copy and isinstance(analysis_copy[field], (dict, list)):
-                analysis_copy[field] = json.dumps(analysis_copy[field])
-
-        # Compute relevance filter flag from Positioning agent outputs
-        analysis_copy['is_relevant'] = self._compute_is_relevant(
-            analysis_copy.get('relevance'),
-            analysis_copy.get('significance'),
+        JSONB columns are auto-wrapped. ``is_relevant`` is computed from
+        ``relevance`` + ``significance`` and overrides any value in ``analysis``.
+        """
+        row = {k: v for k, v in analysis.items()}
+        row["is_relevant"] = self._compute_is_relevant(
+            row.get("relevance"), row.get("significance")
         )
+        for field in list(row.keys()):
+            if field in _JSON_FIELDS_ANALYSIS:
+                row[field] = _wrap_json(row[field])
 
-        columns = ', '.join(analysis_copy.keys())
-        placeholders = ', '.join(['?'] * len(analysis_copy))
-
+        columns = list(row.keys())
+        col_sql = ", ".join(columns)
+        placeholders = ", ".join(["%s"] * len(columns))
+        update_sql = ", ".join(
+            f"{c} = EXCLUDED.{c}" for c in columns if c != "arxiv_id"
+        )
         self.execute(
-            f"INSERT OR REPLACE INTO paper_analyses ({columns}) VALUES ({placeholders})",
-            tuple(analysis_copy.values())
+            f"INSERT INTO paper_analyses ({col_sql}) VALUES ({placeholders}) "
+            f"ON CONFLICT (arxiv_id) DO UPDATE SET {update_sql}",
+            tuple(row.values()),
         )
         self.commit()
 
     def recompute_relevance_flags(self) -> int:
-        """Recompute is_relevant for all existing papers. Returns number updated."""
-        rows = self.fetchall("SELECT arxiv_id, relevance, significance FROM paper_analyses")
+        """Recompute is_relevant for every paper. Returns rows updated."""
+        rows = self.fetchall(
+            "SELECT arxiv_id, relevance, significance FROM paper_analyses"
+        )
         updated = 0
-        for row in rows:
-            flag = self._compute_is_relevant(row['relevance'], row['significance'])
+        for r in rows:
+            flag = self._compute_is_relevant(r["relevance"], r["significance"])
             self.execute(
-                "UPDATE paper_analyses SET is_relevant = ? WHERE arxiv_id = ?",
-                (flag, row['arxiv_id'])
+                "UPDATE paper_analyses SET is_relevant = %s WHERE arxiv_id = %s",
+                (flag, r["arxiv_id"]),
             )
             updated += 1
         self.commit()
         return updated
 
-    def get_papers_by_category(self, category: str,
-                                limit: Optional[int] = None,
-                                relevant_only: bool = True) -> List[Dict]:
-        """Get analyzed papers for a category.
-
-        Args:
-            relevant_only: If True (default), return only papers where
-                is_relevant = 1 (max(M,P,I) >= 6 or must_read).
-                Set False to get all papers regardless of filter.
-        """
-        relevance_clause = " AND is_relevant = 1" if relevant_only else ""
+    def get_papers_by_category(
+        self,
+        category: str,
+        limit: Optional[int] = None,
+        relevant_only: bool = True,
+    ) -> List[Dict[str, Any]]:
+        relevance_clause = " AND is_relevant = TRUE" if relevant_only else ""
         query = (
-            f"SELECT * FROM paper_analyses WHERE category = ?{relevance_clause}"
-            " ORDER BY published_date DESC"
+            f"SELECT * FROM paper_analyses WHERE category = %s{relevance_clause} "
+            "ORDER BY published_date DESC"
         )
+        params: List[Any] = [category]
         if limit:
-            query += f" LIMIT {limit}"
-        return [dict(row) for row in self.fetchall(query, (category,))]
+            query += " LIMIT %s"
+            params.append(limit)
+        return self.fetchall(query, tuple(params))
 
-    def get_unanalyzed_papers(self, category: str,
-                              all_paper_ids: List[str]) -> List[str]:
-        """Find papers in JSON but not yet analyzed."""
+    def get_unanalyzed_papers(
+        self, category: str, all_paper_ids: List[str]
+    ) -> List[str]:
         if not all_paper_ids:
             return []
-
-        placeholders = ','.join(['?'] * len(all_paper_ids))
         analyzed = self.fetchall(
-            f"SELECT arxiv_id FROM paper_analyses WHERE arxiv_id IN ({placeholders})",
-            tuple(all_paper_ids)
+            "SELECT arxiv_id FROM paper_analyses WHERE arxiv_id = ANY(%s)",
+            (list(all_paper_ids),),
         )
-        analyzed_ids = {row['arxiv_id'] for row in analyzed}
+        analyzed_ids = {r["arxiv_id"] for r in analyzed}
         return [pid for pid in all_paper_ids if pid not in analyzed_ids]
 
     # === Citations & Fronts ===
 
-    def insert_citations(self, citations: List[tuple], category: str):
-        """Bulk insert citations for a category."""
-        self.conn.executemany(
-            "INSERT OR IGNORE INTO citations (source_paper_id, target_paper_id, category) VALUES (?, ?, ?)",
-            [(src, tgt, category) for src, tgt in citations]
-        )
+    def insert_citations(self, citations: List[tuple], category: str) -> None:
+        assert self.conn is not None, "connect() first"
+        cur = self.conn.cursor()
+        try:
+            cur.executemany(
+                "INSERT INTO citations (source_paper_id, target_paper_id, category) "
+                "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                [(src, tgt, category) for src, tgt in citations],
+            )
+        finally:
+            cur.close()
         self.commit()
 
-    def clear_citations(self, category: str):
-        """Delete all citation edges for a category.
-
-        Used during force-refresh so stale edges from a previous fetch are
-        fully removed before re-inserting fresh data.
-        """
-        self.execute(
-            "DELETE FROM citations WHERE category = ?",
-            (category,)
-        )
+    def clear_citations(self, category: str) -> None:
+        self.execute("DELETE FROM citations WHERE category = %s", (category,))
         self.commit()
 
-    def get_unfetched_papers(self, paper_ids: List[str], category: str,
-                              fetch_mode: str) -> List[str]:
-        """
-        Return corpus paper IDs that have not yet been fetched from Semantic
-        Scholar for this category/mode combination.
-
-        A paper is considered already fetched if:
-          - It has a row in citation_fetch_log for this category, AND
-          - The logged fetch_mode covers the requested mode
-            (a "both" log satisfies a "references" request; the reverse
-             does not — "references"-only log won't satisfy "both").
-        """
+    def get_unfetched_papers(
+        self, paper_ids: List[str], category: str, fetch_mode: str
+    ) -> List[str]:
         if not paper_ids:
             return []
-
-        # Fetch existing log entries for this category
-        placeholders = ','.join(['?'] * len(paper_ids))
         rows = self.fetchall(
-            f"""SELECT arxiv_id, fetch_mode FROM citation_fetch_log
-                WHERE category = ? AND arxiv_id IN ({placeholders})""",
-            (category, *paper_ids)
+            "SELECT arxiv_id, fetch_mode FROM citation_fetch_log "
+            "WHERE category = %s AND arxiv_id = ANY(%s)",
+            (category, list(paper_ids)),
         )
-        already_fetched = set()
-        for row in rows:
-            logged_mode = row['fetch_mode']
-            # "both" satisfies any mode; "references" only satisfies "references"
-            if logged_mode == 'both' or logged_mode == fetch_mode:
-                already_fetched.add(row['arxiv_id'])
-
+        already_fetched = {
+            r["arxiv_id"]
+            for r in rows
+            if r["fetch_mode"] == "both" or r["fetch_mode"] == fetch_mode
+        }
         return [pid for pid in paper_ids if pid not in already_fetched]
 
-    def log_citation_fetch(self, arxiv_id: str, category: str,
-                            fetch_mode: str, refs_count: int = 0,
-                            cited_count: int = 0):
-        """Record that Semantic Scholar was queried for this corpus paper."""
+    def log_citation_fetch(
+        self,
+        arxiv_id: str,
+        category: str,
+        fetch_mode: str,
+        refs_count: int = 0,
+        cited_count: int = 0,
+    ) -> None:
         self.execute(
-            """INSERT OR REPLACE INTO citation_fetch_log
-               (arxiv_id, category, fetch_date, fetch_mode, refs_count, cited_count)
-               VALUES (?, ?, date('now'), ?, ?, ?)""",
-            (arxiv_id, category, fetch_mode, refs_count, cited_count)
+            "INSERT INTO citation_fetch_log "
+            "(arxiv_id, category, fetch_date, fetch_mode, refs_count, cited_count) "
+            "VALUES (%s, %s, CURRENT_DATE, %s, %s, %s) "
+            "ON CONFLICT (arxiv_id, category) DO UPDATE SET "
+            "fetch_date = EXCLUDED.fetch_date, "
+            "fetch_mode = EXCLUDED.fetch_mode, "
+            "refs_count = EXCLUDED.refs_count, "
+            "cited_count = EXCLUDED.cited_count",
+            (arxiv_id, category, fetch_mode, refs_count, cited_count),
         )
         self.commit()
 
-    def clear_fetch_log(self, category: str):
-        """Remove all log entries for a category (forces full re-fetch next run)."""
+    def clear_fetch_log(self, category: str) -> None:
         self.execute(
-            "DELETE FROM citation_fetch_log WHERE category = ?",
-            (category,)
+            "DELETE FROM citation_fetch_log WHERE category = %s", (category,)
         )
         self.commit()
 
-    def clear_fronts_for_snapshot(self, category: str, snapshot_date: str):
-        """Delete all fronts for a (category, snapshot_date) before re-inserting.
-
-        Called at the start of each detection run so stale fronts from an
-        earlier same-day run don't accumulate alongside the new ones.
-        Also clears cocitation_edges for the same snapshot so removed edges
-        don't persist (INSERT OR REPLACE only upserts, never deletes).
-        """
+    def clear_fronts_for_snapshot(self, category: str, snapshot_date: str) -> None:
         self.execute(
-            "DELETE FROM research_fronts WHERE category = ? AND snapshot_date = ?",
-            (category, snapshot_date)
+            "DELETE FROM research_fronts WHERE category = %s AND snapshot_date = %s",
+            (category, snapshot_date),
         )
         self.execute(
-            "DELETE FROM bridge_papers WHERE category = ? AND snapshot_date = ?",
-            (category, snapshot_date)
+            "DELETE FROM bridge_papers WHERE category = %s AND snapshot_date = %s",
+            (category, snapshot_date),
         )
         self.execute(
-            "DELETE FROM cocitation_edges WHERE category = ? AND snapshot_date = ?",
-            (category, snapshot_date)
+            "DELETE FROM cocitation_edges WHERE category = %s AND snapshot_date = %s",
+            (category, snapshot_date),
         )
         self.commit()
 
-    def get_latest_fronts(self, category: str) -> List[Dict]:
-        """Get most recent front snapshot for a category."""
-        query = """
+    def get_latest_fronts(self, category: str) -> List[Dict[str, Any]]:
+        return self.fetchall(
+            """
             SELECT * FROM research_fronts
-            WHERE category = ? AND snapshot_date = (
-                SELECT MAX(snapshot_date) FROM research_fronts WHERE category = ?
+            WHERE category = %s AND snapshot_date = (
+                SELECT MAX(snapshot_date) FROM research_fronts WHERE category = %s
             )
             ORDER BY size DESC
-        """
-        return [dict(row) for row in self.fetchall(query, (category, category))]
+            """,
+            (category, category),
+        )
 
-    def insert_front(self, front: Dict):
-        """Insert research front."""
-        # Convert JSON fields
-        front_copy = front.copy()
-        for field in ['core_papers', 'dominant_methods', 'dominant_problems', 'future_directions']:
-            if field in front_copy and isinstance(front_copy[field], list):
-                front_copy[field] = json.dumps(front_copy[field])
+    def insert_front(self, front: Dict[str, Any]) -> None:
+        row = {k: v for k, v in front.items()}
+        for field in list(row.keys()):
+            if field in _JSON_FIELDS_FRONT:
+                row[field] = _wrap_json(row[field])
 
-        columns = ', '.join(front_copy.keys())
-        placeholders = ', '.join(['?'] * len(front_copy))
+        columns = list(row.keys())
+        col_sql = ", ".join(columns)
+        placeholders = ", ".join(["%s"] * len(columns))
+        update_sql = ", ".join(
+            f"{c} = EXCLUDED.{c}"
+            for c in columns
+            if c not in ("front_id", "snapshot_date")
+        )
         self.execute(
-            f"INSERT OR REPLACE INTO research_fronts ({columns}) VALUES ({placeholders})",
-            tuple(front_copy.values())
+            f"INSERT INTO research_fronts ({col_sql}) VALUES ({placeholders}) "
+            f"ON CONFLICT (front_id, snapshot_date) DO UPDATE SET {update_sql}",
+            tuple(row.values()),
         )
         self.commit()
 
-    def insert_bridge_papers(self, bridges: List[Dict]):
-        """Bulk insert bridge papers."""
+    def insert_bridge_papers(self, bridges: List[Dict[str, Any]]) -> None:
         for bridge in bridges:
-            # Convert connected_fronts list to JSON
-            bridge_copy = bridge.copy()
-            if isinstance(bridge_copy.get('connected_fronts'), list):
-                bridge_copy['connected_fronts'] = json.dumps(bridge_copy['connected_fronts'])
+            row = {k: v for k, v in bridge.items()}
+            for field in list(row.keys()):
+                if field in _JSON_FIELDS_BRIDGE:
+                    row[field] = _wrap_json(row[field])
 
-            columns = ', '.join(bridge_copy.keys())
-            placeholders = ', '.join(['?'] * len(bridge_copy))
+            columns = list(row.keys())
+            col_sql = ", ".join(columns)
+            placeholders = ", ".join(["%s"] * len(columns))
+            update_sql = ", ".join(
+                f"{c} = EXCLUDED.{c}"
+                for c in columns
+                if c not in ("paper_id", "category", "snapshot_date")
+            )
             self.execute(
-                f"INSERT OR REPLACE INTO bridge_papers ({columns}) VALUES ({placeholders})",
-                tuple(bridge_copy.values())
+                f"INSERT INTO bridge_papers ({col_sql}) VALUES ({placeholders}) "
+                f"ON CONFLICT (paper_id, category, snapshot_date) DO UPDATE SET {update_sql}",
+                tuple(row.values()),
             )
         self.commit()
 
     # === Paper Metadata Enrichment ===
 
-    def update_paper_metadata(self, arxiv_id: str, affiliations: str = None,
-                               code_url: str = None, venue: str = None):
-        """Update paper metadata fields (affiliations, venue, code_url). Only fills empty fields."""
+    def update_paper_metadata(
+        self,
+        arxiv_id: str,
+        affiliations: Optional[str] = None,
+        code_url: Optional[str] = None,
+        venue: Optional[str] = None,
+    ) -> None:
         if affiliations:
             self.execute(
-                "UPDATE paper_analyses SET affiliations = ? WHERE arxiv_id = ? AND (affiliations IS NULL OR affiliations = '')",
-                (affiliations, arxiv_id)
+                "UPDATE paper_analyses SET affiliations = %s "
+                "WHERE arxiv_id = %s AND (affiliations IS NULL OR affiliations = '')",
+                (affiliations, arxiv_id),
             )
         if venue:
             self.execute(
-                "UPDATE paper_analyses SET venue = ? WHERE arxiv_id = ? AND (venue IS NULL OR venue = '')",
-                (venue, arxiv_id)
+                "UPDATE paper_analyses SET venue = %s "
+                "WHERE arxiv_id = %s AND (venue IS NULL OR venue = '')",
+                (venue, arxiv_id),
             )
         if code_url:
-            # Update code_url inside artifacts JSON
             row = self.fetchone(
-                "SELECT artifacts FROM paper_analyses WHERE arxiv_id = ?",
-                (arxiv_id,)
+                "SELECT artifacts FROM paper_analyses WHERE arxiv_id = %s",
+                (arxiv_id,),
             )
-            if row and row['artifacts']:
-                try:
-                    artifacts = json.loads(row['artifacts'])
-                    if not artifacts.get('code_url'):
-                        artifacts['code_url'] = code_url
-                        self.execute(
-                            "UPDATE paper_analyses SET artifacts = ? WHERE arxiv_id = ?",
-                            (json.dumps(artifacts), arxiv_id)
-                        )
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            # artifacts is JSONB; psycopg3 returns a dict directly.
+            if row and row["artifacts"]:
+                artifacts = row["artifacts"]
+                if isinstance(artifacts, str):
+                    try:
+                        artifacts = json.loads(artifacts)
+                    except (json.JSONDecodeError, TypeError):
+                        artifacts = None
+                if isinstance(artifacts, dict) and not artifacts.get("code_url"):
+                    artifacts["code_url"] = code_url
+                    self.execute(
+                        "UPDATE paper_analyses SET artifacts = %s WHERE arxiv_id = %s",
+                        (Jsonb(artifacts), arxiv_id),
+                    )
         self.commit()
 
     # === Fetched Papers (intake table) ===
 
-    def upsert_paper(self, arxiv_id: str, category: str, title: str = "",
-                     authors: str = "", date: str = "", affiliation: str = "",
-                     venue: str = "", code_url: str = ""):
-        """Insert or update a fetched paper in the intake table.
-
-        Only updates non-empty fields; never overwrites with blank values.
-        """
+    def upsert_paper(
+        self,
+        arxiv_id: str,
+        category: str,
+        title: str = "",
+        authors: str = "",
+        date: str = "",
+        affiliation: str = "",
+        venue: str = "",
+        code_url: str = "",
+    ) -> None:
         self.execute(
-            """INSERT INTO papers (arxiv_id, category, title, authors, date, affiliation, venue, code_url)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(arxiv_id, category) DO UPDATE SET
-                   title       = CASE WHEN excluded.title != ''       THEN excluded.title       ELSE title END,
-                   authors     = CASE WHEN excluded.authors != ''     THEN excluded.authors     ELSE authors END,
-                   date        = CASE WHEN excluded.date != ''        THEN excluded.date        ELSE date END,
-                   affiliation = CASE WHEN excluded.affiliation != '' THEN excluded.affiliation ELSE affiliation END,
-                   venue       = CASE WHEN excluded.venue != ''       THEN excluded.venue       ELSE venue END,
-                   code_url    = CASE WHEN excluded.code_url != ''    THEN excluded.code_url    ELSE code_url END""",
-            (arxiv_id, category, title or "", authors or "", date or "",
-             affiliation or "", venue or "", code_url or "")
+            """
+            INSERT INTO papers (arxiv_id, category, title, authors, date,
+                                affiliation, venue, code_url)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (arxiv_id, category) DO UPDATE SET
+                title       = CASE WHEN EXCLUDED.title       <> '' THEN EXCLUDED.title       ELSE papers.title       END,
+                authors     = CASE WHEN EXCLUDED.authors     <> '' THEN EXCLUDED.authors     ELSE papers.authors     END,
+                date        = CASE WHEN EXCLUDED.date        <> '' THEN EXCLUDED.date        ELSE papers.date        END,
+                affiliation = CASE WHEN EXCLUDED.affiliation <> '' THEN EXCLUDED.affiliation ELSE papers.affiliation END,
+                venue       = CASE WHEN EXCLUDED.venue       <> '' THEN EXCLUDED.venue       ELSE papers.venue       END,
+                code_url    = CASE WHEN EXCLUDED.code_url    <> '' THEN EXCLUDED.code_url    ELSE papers.code_url    END
+            """,
+            (
+                arxiv_id,
+                category,
+                title or "",
+                authors or "",
+                date or "",
+                affiliation or "",
+                venue or "",
+                code_url or "",
+            ),
         )
 
-    def get_all_papers(self, category: str = None) -> Dict[str, List[Dict]]:
-        """Return all fetched papers grouped by category.
-
-        Returns: {category_name: [{arxiv_id, title, authors, date, affiliation, venue, code_url}, ...]}
-        """
+    def get_all_papers(self, category: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
         if category:
             rows = self.fetchall(
-                "SELECT * FROM papers WHERE category = ? ORDER BY date DESC",
-                (category,)
+                "SELECT * FROM papers WHERE category = %s ORDER BY date DESC",
+                (category,),
             )
         else:
             rows = self.fetchall(
                 "SELECT * FROM papers ORDER BY category, date DESC"
             )
-        result: Dict[str, List[Dict]] = {}
+        result: Dict[str, List[Dict[str, Any]]] = {}
         for row in rows:
-            d = dict(row)
-            cat = d['category']
-            if cat not in result:
-                result[cat] = []
-            result[cat].append(d)
+            result.setdefault(row["category"], []).append(row)
         return result
 
     def get_unanalyzed_paper_ids(self, category: str) -> List[str]:
-        """Return arxiv_ids of papers in `papers` table not yet in `paper_analyses`."""
         rows = self.fetchall(
-            """SELECT p.arxiv_id FROM papers p
-               WHERE p.category = ?
-               AND NOT EXISTS (
-                   SELECT 1 FROM paper_analyses a WHERE a.arxiv_id = p.arxiv_id
-               )""",
-            (category,)
+            """
+            SELECT p.arxiv_id FROM papers p
+            WHERE p.category = %s
+              AND NOT EXISTS (
+                SELECT 1 FROM paper_analyses a WHERE a.arxiv_id = p.arxiv_id
+              )
+            """,
+            (category,),
         )
-        return [row['arxiv_id'] for row in rows]
+        return [r["arxiv_id"] for r in rows]
 
     def migrate_json_to_papers(self, json_path) -> int:
-        """One-time migration: populate `papers` table from docs/or-llm-daily.json.
+        """One-time backfill: populate `papers` from docs/or-llm-daily.json.
 
         Safe to call repeatedly — uses ON CONFLICT DO UPDATE (upsert).
         Returns number of papers upserted.
         """
-        import json as _json
         import re as _re
+        from pathlib import Path
+
         path = Path(json_path)
         if not path.exists():
             return 0
 
-        with open(path, encoding='utf-8') as f:
-            data = _json.load(f)
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
 
         count = 0
         for cat, papers in data.items():
             for pid, content in papers.items():
-                s = str(content)
-                parts = s.split("|")
+                parts = str(content).split("|")
                 try:
                     if len(parts) >= 9:
                         raw_date, title, authors = parts[1].strip(), parts[2].strip(), parts[3].strip()
@@ -493,33 +560,39 @@ class Database:
                 except IndexError:
                     continue
 
-                # Clean date (strip markdown bold)
-                date_clean = _re.sub(r'\*+', '', raw_date).strip()
-                # Clean title
-                title_clean = _re.sub(r'\*+', '', title).strip()
-                m = _re.match(r'\[([^\]]+)\]', title_clean)
+                date_clean = _re.sub(r"\*+", "", raw_date).strip()
+                title_clean = _re.sub(r"\*+", "", title).strip()
+                m = _re.match(r"\[([^\]]+)\]", title_clean)
                 if m:
                     title_clean = m.group(1)
-                # Extract code URL
-                url_m = _re.search(r'\[link\]\((.+?)\)', raw_code)
+                url_m = _re.search(r"\[link\]\((.+?)\)", raw_code)
                 code_url = url_m.group(1) if url_m else ""
 
-                self.upsert_paper(pid, cat, title_clean, authors, date_clean,
-                                  affiliation, venue, code_url)
+                self.upsert_paper(
+                    pid, cat, title_clean, authors, date_clean,
+                    affiliation, venue, code_url,
+                )
                 count += 1
         self.commit()
         return count
 
     # === Review Updates ===
 
-    def insert_review_update(self, category: str, update_type: str,
-                            papers_added: int = 0, fronts_changed: int = 0,
-                            commit_hash: Optional[str] = None,
-                            summary: Optional[str] = None):
-        """Record a review update event."""
+    def insert_review_update(
+        self,
+        category: str,
+        update_type: str,
+        papers_added: int = 0,
+        fronts_changed: int = 0,
+        commit_hash: Optional[str] = None,
+        summary: Optional[str] = None,
+    ) -> None:
         self.execute(
-            """INSERT INTO review_updates (category, update_type, papers_added, fronts_changed, commit_hash, summary)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (category, update_type, papers_added, fronts_changed, commit_hash, summary)
+            """
+            INSERT INTO review_updates
+                (category, update_type, papers_added, fronts_changed, commit_hash, summary)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (category, update_type, papers_added, fronts_changed, commit_hash, summary),
         )
         self.commit()
