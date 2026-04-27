@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
-from src.api.routers import auth, health, me
+from src.api.routers import auth, health, init, me, papers, stubs, subdomains
 from src.api.settings import get_settings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -37,10 +37,14 @@ def create_app() -> FastAPI:
         https_only=settings.cookie_secure,
     )
 
-    # Routers — health is public; auth handles its own auth; /api/me requires JWT.
+    # Routers — health is public; auth handles its own auth; /api/me + writes require JWT.
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(me.router)
+    app.include_router(subdomains.router)
+    app.include_router(papers.router)
+    app.include_router(init.router)
+    app.include_router(stubs.router)
 
     # Static UI mount — serves src/ui/* at the root path so the React mockup
     # works without a build step. index.html sits at src/ui/index.html.
