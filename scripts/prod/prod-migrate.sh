@@ -52,15 +52,21 @@ set -euo pipefail
 PROD_APP_DIR="$1"
 ALEMBIC_CMD="$2"
 
+# DATABASE_URL is built INSIDE the container so $POSTGRES_USER/_PASSWORD/_DB
+# are expanded by the container's shell after --env-file populates them.
+# Single-quoting bash -c keeps the $-vars literal until then; ALEMBIC_CMD is
+# passed through as its own env var.
 docker run --rm \
   --network researchmate_internal \
   -v "$PROD_APP_DIR":/app -w /app \
   --env-file /opt/researchmate/.env \
-  -e DATABASE_URL='postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}' \
-  python:3.13-slim bash -c "
-    pip install -q alembic 'psycopg[binary]>=3.2' 'pgvector>=0.3' 'python-dotenv>=1.0' &&
+  -e ALEMBIC_CMD="$ALEMBIC_CMD" \
+  python:3.13-slim bash -c '
+    set -e
+    pip install -q alembic "psycopg[binary]>=3.2" "pgvector>=0.3" "python-dotenv>=1.0"
+    export DATABASE_URL="postgresql+psycopg://$POSTGRES_USER:$POSTGRES_PASSWORD@postgres:5432/$POSTGRES_DB"
     alembic $ALEMBIC_CMD
-  "
+  '
 REMOTE
 
 echo "[prod-migrate] Done."
