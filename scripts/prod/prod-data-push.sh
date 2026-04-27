@@ -23,6 +23,10 @@ source "$SCRIPT_DIR/_common.sh"
 
 : "${LOCAL_DATABASE_URL:?[prod-data-push] LOCAL_DATABASE_URL not set in .env.prod}"
 
+# psql/pg_dump don't understand the SQLAlchemy "+psycopg" suffix the rest of
+# the codebase uses; strip it for the libpq tools.
+LOCAL_PG_URL="${LOCAL_DATABASE_URL/postgresql+psycopg:\/\//postgresql://}"
+
 DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN=1
@@ -37,7 +41,7 @@ command -v pg_dump >/dev/null || {
 
 # 2. Compare row counts so we don't clobber prod with a smaller local DB.
 echo "[prod-data-push] Checking row counts..."
-LOCAL_COUNT=$(psql "$LOCAL_DATABASE_URL" -tAc 'SELECT count(*) FROM paper_analyses')
+LOCAL_COUNT=$(psql "$LOCAL_PG_URL" -tAc 'SELECT count(*) FROM paper_analyses')
 PROD_COUNT=$(prod_ssh "docker exec researchmate_postgres psql -U researchmate -d researchmate -tAc 'SELECT count(*) FROM paper_analyses'")
 echo "[prod-data-push]   local paper_analyses: $LOCAL_COUNT"
 echo "[prod-data-push]   prod  paper_analyses: $PROD_COUNT"
@@ -52,7 +56,7 @@ fi
 DUMP_FILE="/tmp/researchmate-$(date -u +%Y%m%dT%H%M%SZ).dump"
 cat <<EOF
 [prod-data-push] Plan:
-  pg_dump  $LOCAL_DATABASE_URL  -F c -f $DUMP_FILE
+  pg_dump  $LOCAL_PG_URL  -F c -f $DUMP_FILE
   scp      $DUMP_FILE  $PROD_HOST:$DUMP_FILE
   ssh      $PROD_HOST  '
     docker compose -f /opt/researchmate/docker-compose.yml stop web
@@ -78,7 +82,7 @@ fi
 
 # 5. Dump + ship.
 echo "[prod-data-push] Dumping local..."
-pg_dump "$LOCAL_DATABASE_URL" -F c -f "$DUMP_FILE"
+pg_dump "$LOCAL_PG_URL" -F c -f "$DUMP_FILE"
 DUMP_SIZE=$(du -h "$DUMP_FILE" | cut -f1)
 echo "[prod-data-push] Dump size: $DUMP_SIZE"
 
