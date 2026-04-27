@@ -23,10 +23,13 @@ if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN=1
 fi
 
-ALEMBIC_CMD="upgrade head"
+# Pass a single-token mode through SSH (it joins multi-arg cmds with spaces,
+# so a literal "upgrade head" would be split into two positional args on the box).
+MODE="upgrade-head"
 if [[ $DRY_RUN -eq 1 ]]; then
-  ALEMBIC_CMD="current"
+  MODE="current"
 fi
+ALEMBIC_CMD="$MODE"  # for the user-facing log line below
 
 # Verify the repo exists on the box before launching the migrator container,
 # so we get a clean error instead of a Python ImportError.
@@ -47,25 +50,30 @@ fi
 
 echo "[prod-migrate] Running 'alembic $ALEMBIC_CMD' on $PROD_HOST..."
 
-prod_ssh bash -s -- "$PROD_APP_DIR" "$ALEMBIC_CMD" <<'REMOTE'
+prod_ssh bash -s -- "$PROD_APP_DIR" "$MODE" <<'REMOTE'
 set -euo pipefail
 PROD_APP_DIR="$1"
-ALEMBIC_CMD="$2"
+MODE="$2"
+
+case "$MODE" in
+  current)      ALEMBIC_ARGS="current" ;;
+  upgrade-head) ALEMBIC_ARGS="upgrade head" ;;
+  *) echo "[prod-migrate] Unknown MODE: $MODE" >&2; exit 1 ;;
+esac
 
 # DATABASE_URL is built INSIDE the container so $POSTGRES_USER/_PASSWORD/_DB
 # are expanded by the container's shell after --env-file populates them.
-# Single-quoting bash -c keeps the $-vars literal until then; ALEMBIC_CMD is
-# passed through as its own env var.
+# Single-quoting bash -c keeps the $-vars literal until then.
 docker run --rm \
   --network researchmate_internal \
   -v "$PROD_APP_DIR":/app -w /app \
   --env-file /opt/researchmate/.env \
-  -e ALEMBIC_CMD="$ALEMBIC_CMD" \
+  -e ALEMBIC_ARGS="$ALEMBIC_ARGS" \
   python:3.13-slim bash -c '
     set -e
     pip install -q alembic "psycopg[binary]>=3.2" "pgvector>=0.3" "python-dotenv>=1.0"
     export DATABASE_URL="postgresql+psycopg://$POSTGRES_USER:$POSTGRES_PASSWORD@postgres:5432/$POSTGRES_DB"
-    alembic $ALEMBIC_CMD
+    alembic $ALEMBIC_ARGS
   '
 REMOTE
 
