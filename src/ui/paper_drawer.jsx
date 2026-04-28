@@ -2,7 +2,17 @@
 
 const PaperDrawer = ({ paper, onClose }) => {
   if (!paper) return <div className="drawer-scrim"/>;
-  const [state, setState] = React.useState('unread');
+  // Initial status: whatever's already in the user's queue, otherwise 'unread'.
+  const initialStatus = (window.QUEUE || []).find(q => q.paper_id === paper.id)?.status || 'unread';
+  const [state, _setState] = React.useState(initialStatus);
+  const setState = (next) => {
+    _setState(next);
+    if (window.api && window.ME) {
+      window.api.setPaperState(paper.id, next, null).catch(err => {
+        console.error('failed to persist paper state', err);
+      });
+    }
+  };
 
   return (
     <>

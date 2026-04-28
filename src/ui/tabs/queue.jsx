@@ -78,8 +78,12 @@ const MyQueue = ({ onOpenPaper }) => {
       <div className="section">
         <SectionHeader title="Followed subdomains" hint="Get audio & digest for these."/>
         <div style={{display:'grid', gridTemplateColumns:'repeat(3, 1fr)', gap: 16}}>
-          {['evo_llm_search', 'nl_to_opt', 'llm_serving_opt'].map(id => {
+          {((window.FOLLOWS && window.FOLLOWS.length)
+              ? window.FOLLOWS
+              : Object.keys(window.SUBDOMAINS || {}).slice(0, 3)
+           ).map(id => {
             const s = window.SUBDOMAINS[id];
+            if (!s) return null;
             return (
               <div key={id} className="q-card">
                 <div className="between" style={{marginBottom: 10}}>

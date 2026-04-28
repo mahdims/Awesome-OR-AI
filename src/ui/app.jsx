@@ -5,7 +5,7 @@ const App = () => {
     try { return JSON.parse(localStorage.getItem('ri_nav') || 'null'); } catch { return null; }
   })();
   const [tab, setTab] = React.useState(saved?.tab || 'today');
-  const [sdId, setSdId] = React.useState(saved?.sdId || 'evo_llm_search');
+  const [sdId, setSdId] = React.useState(saved?.sdId || window.DEFAULT_SDID || null);
   const [paper, setPaper] = React.useState(null);
 
   React.useEffect(() => {
@@ -37,7 +37,7 @@ const App = () => {
             </div>
             <span><span className="pulse"/>Updated <b>2d ago</b></span>
             <span><b>{total}</b> papers · <b>{mr}</b> must-read · <b>{gapTotal}</b> gaps</span>
-            <span className="mono" style={{fontSize:11}}>mahdi@ku.edu.tr</span>
+            <span className="mono" style={{fontSize:11}}>{window.ME?.email || 'guest'}</span>
           </div>
         </div>
         <nav className="nav">
@@ -77,4 +77,11 @@ const App = () => {
   );
 };
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+// Wait for /api/init before mounting so the App component's first render
+// already has window.PAPERS / SUBDOMAINS / ME populated.
+const _mount = () => ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+if (window.__ri_init_promise && typeof window.__ri_init_promise.then === 'function') {
+  window.__ri_init_promise.then(_mount);
+} else {
+  _mount();
+}

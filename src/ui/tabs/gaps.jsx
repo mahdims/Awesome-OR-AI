@@ -6,8 +6,9 @@ const GapExplorer = ({ onOpenPaper, onNav }) => {
   const [expanded, setExpanded] = React.useState(null);
   const [hoverCell, setHoverCell] = React.useState(null);
 
-  // Build a benchmark × method coverage matrix for the evo_llm_search subdomain
-  const sd = 'evo_llm_search';
+  // Build a benchmark × method coverage matrix for the operator's first
+  // pinned/followed subdomain (or the first available one for guests).
+  const sd = window.DEFAULT_SDID || Object.keys(window.SUBDOMAINS || {})[0] || '';
   const papers = window.papersIn(sd);
   const topBench = window.benchmarksFor(sd).slice(0, 10).map(b => b.name);
   const methodCounts = {};
@@ -17,7 +18,9 @@ const GapExplorer = ({ onOpenPaper, onNav }) => {
   const cellCount = (bench, meth) =>
     papers.filter(p => (p.benchmarks||[]).includes(bench) && (p.methods||[]).includes(meth)).length;
 
-  const allGaps = Object.entries(window.GAPS).flatMap(([sdId, gs]) => gs.map(g => ({...g, sdId, sdName: window.SUBDOMAINS[sdId].name})));
+  const allGaps = Object.entries(window.GAPS || {}).flatMap(([sdId, gs]) =>
+    (gs || []).map(g => ({...g, sdId, sdName: window.SUBDOMAINS[sdId]?.name || sdId}))
+  );
   const filtered = allGaps.filter(g => (sdFilter==='all' || g.sdId===sdFilter) && (kindFilter==='all' || g.kind===kindFilter));
 
   return (

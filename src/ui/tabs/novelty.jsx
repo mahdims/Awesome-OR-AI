@@ -2,7 +2,7 @@
 
 const NoveltyCheck = ({ onOpenPaper }) => {
   const [idea, setIdea] = React.useState("Combine Elo-tournament selection with self-instrumenting agents to train a code-evolving LLM on IndustryOR, using solver execution as the sole reward signal.");
-  const [sd, setSd] = React.useState('evo_llm_search');
+  const [sd, setSd] = React.useState(window.DEFAULT_SDID || Object.keys(window.SUBDOMAINS || {})[0] || '');
   const [result, setResult] = React.useState(null);
   const [running, setRunning] = React.useState(false);
 

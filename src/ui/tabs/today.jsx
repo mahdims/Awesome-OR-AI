@@ -3,10 +3,12 @@
 const Today = ({ onNav, onOpenPaper }) => {
   const [newMenuOpen, setNewMenuOpen] = React.useState(false);
   const [profileOpen, setProfileOpen] = React.useState(false);
-  const userName = "Aigerim";
+  const userName = (window.ME?.name || window.ME?.email || 'there').split('@')[0];
 
-  // Pinned topics (subdomains) for this user — would be persisted
-  const pinnedIds = ['evo_llm_search', 'nl_to_opt', 'llm_serving_opt', 'rl_for_opt_modeling'];
+  // Pinned topics (subdomains) for this user — server-driven, persisted via /api/me/pins.
+  // Falls back to first 4 available subdomains for guests / new users.
+  const allSdIds = Object.keys(window.SUBDOMAINS || {});
+  const pinnedIds = (window.PINS && window.PINS.length) ? window.PINS : allSdIds.slice(0, 4);
   // last visit = 2 days ago
   const since = new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
 
@@ -108,7 +110,7 @@ const Today = ({ onNav, onOpenPaper }) => {
       title: 'New audio: LLM Evo Search weekly roundup',
       body: '12 min · 7 papers · generated 4h ago',
       action: 'Play',
-      action_nav: () => onNav('subdomain', 'evo_llm_search'),
+      action_nav: () => onNav('subdomain', pinnedIds[0] || allSdIds[0]),
     },
     {
       kind: 'novelty', icon: 'spark',
