@@ -34,17 +34,58 @@ source "$SCRIPT_DIR/_common.sh"
 # the codebase uses; strip it for the libpq tools.
 LOCAL_PG_URL="${LOCAL_DATABASE_URL/postgresql+psycopg:\/\//postgresql://}"
 
-# Pin to pg16 client tools by default (matches prod). Override with PG_DUMP_BIN /
-# PSQL_BIN env vars if your setup differs.
-PG_DUMP_BIN="${PG_DUMP_BIN:-/opt/homebrew/opt/postgresql@16/bin/pg_dump}"
-PSQL_BIN="${PSQL_BIN:-/opt/homebrew/opt/postgresql@16/bin/psql}"
+# Find pg_dump / psql.
+#
+#   1. Honor explicit PG_DUMP_BIN / PSQL_BIN if set (escape hatch — used as-is).
+#   2. Otherwise prefer macOS Homebrew's postgresql@16 keg (matches prod's pg16
+#      and keeps libpq 18.x — installed for psql/pg_dump-via-PATH-elsewhere —
+#      from writing dump headers prod can't read).
+#   3. Otherwise fall back to whatever's on $PATH (Linux package managers
+#      typically ship a major-matched client, and any compatible build works).
+#
+# We sanity-check the major version of the chosen pg_dump and warn if it's not
+# pg16; the user can still proceed (override or accept the warning).
 
-if [[ ! -x "$PG_DUMP_BIN" ]]; then
-  echo "[prod-data-push] pg_dump not found at $PG_DUMP_BIN" >&2
-  echo "[prod-data-push] Install:  brew install postgresql@16" >&2
-  echo "[prod-data-push] Or set:   export PG_DUMP_BIN=/path/to/pg_dump" >&2
+_HOMEBREW_PG16_BIN="/opt/homebrew/opt/postgresql@16/bin"
+
+_resolve_bin() {
+  local name="$1" override="$2"
+  if [[ -n "$override" ]]; then
+    if [[ ! -x "$override" ]]; then
+      echo "[prod-data-push] override path not executable: $override" >&2
+      return 1
+    fi
+    echo "$override"
+    return 0
+  fi
+  if [[ -x "$_HOMEBREW_PG16_BIN/$name" ]]; then
+    echo "$_HOMEBREW_PG16_BIN/$name"
+    return 0
+  fi
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
+    return 0
+  fi
+  return 1
+}
+
+PG_DUMP_BIN="$(_resolve_bin pg_dump "${PG_DUMP_BIN:-}")" || {
+  echo "[prod-data-push] pg_dump not found." >&2
+  echo "[prod-data-push] Install pg_dump (macOS: brew install postgresql@16; debian: apt install postgresql-client-16) or set PG_DUMP_BIN." >&2
   exit 1
+}
+PSQL_BIN="$(_resolve_bin psql "${PSQL_BIN:-}")" || {
+  echo "[prod-data-push] psql not found." >&2
+  exit 1
+}
+
+# Major-version sanity check — pg16 server can't read pg18-format dumps.
+_PG_DUMP_MAJOR=$("$PG_DUMP_BIN" --version 2>/dev/null | grep -oE '[0-9]+' | head -1)
+if [[ "$_PG_DUMP_MAJOR" != "16" ]]; then
+  echo "[prod-data-push] WARN: pg_dump is major version ${_PG_DUMP_MAJOR:-unknown}; prod runs pg16." >&2
+  echo "[prod-data-push] WARN: dump may be unreadable by prod. Continuing — set PG_DUMP_BIN to override." >&2
 fi
+echo "[prod-data-push] using pg_dump=$PG_DUMP_BIN (major=$_PG_DUMP_MAJOR), psql=$PSQL_BIN"
 
 DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then

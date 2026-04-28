@@ -39,6 +39,14 @@ def health_deep(
         session.execute(text("SELECT 1"))
         db_ok = True
     except Exception as exc:  # noqa: BLE001
+        # Roll back the failed transaction so the get_session() teardown's
+        # session.commit() is a no-op. Without this, /health/deep crashes
+        # with InFailedSqlTransaction (500) precisely when the DB is down —
+        # the opposite of what a health endpoint should do.
+        try:
+            session.rollback()
+        except Exception:
+            pass
         log.warning("db ping failed: %s", exc)
 
     try:

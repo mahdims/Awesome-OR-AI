@@ -10,8 +10,15 @@ from __future__ import annotations
 
 from typing import List
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# Sentinel from earlier dev defaults — refusing to start with this prevents
+# any deploy that forgets to set JWT_SECRET from accepting attacker-forged
+# cookies signed with a known string.
+_JWT_SECRET_PLACEHOLDER = "dev-only-do-not-use-in-prod"
+_JWT_SECRET_MIN_LEN = 32
 
 try:
     from dotenv import load_dotenv
@@ -32,8 +39,28 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://127.0.0.1:6379/0", validation_alias="REDIS_URL")
 
     # --- Auth ---
-    jwt_secret: str = Field(default="dev-only-do-not-use-in-prod", validation_alias="JWT_SECRET")
+    # Required. Must be set to a non-placeholder, sufficiently-long value or
+    # startup fails (a known fallback would let attackers forge session cookies).
+    jwt_secret: str = Field(validation_alias="JWT_SECRET")
     jwt_algorithm: str = "HS256"
+
+    @field_validator("jwt_secret")
+    @classmethod
+    def _jwt_secret_must_be_real(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError(
+                "JWT_SECRET is required. Generate one with: openssl rand -hex 64"
+            )
+        if v.strip() == _JWT_SECRET_PLACEHOLDER:
+            raise ValueError(
+                f"JWT_SECRET is set to the dev placeholder; refusing to start. "
+                f"Generate a real secret: openssl rand -hex 64"
+            )
+        if len(v) < _JWT_SECRET_MIN_LEN:
+            raise ValueError(
+                f"JWT_SECRET is shorter than {_JWT_SECRET_MIN_LEN} chars; refusing to start."
+            )
+        return v
     jwt_expire_days: int = 30
     cookie_name: str = "ri_session"
     cookie_secure: bool = Field(default=True, validation_alias="COOKIE_SECURE")
