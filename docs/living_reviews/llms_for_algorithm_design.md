@@ -1,10 +1,37 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-04-28
+**Last Updated:** 2026-04-30
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-30 (3 papers)
+
+### [A2DEPT: Large Language Model-Driven Automated Algorithm Design via Evolutionary Program Trees](https://arxiv.org/abs/2604.24043)
+
+**2026-04-27** | National University of Defense Technology, University of Electronic Science and Technology of China, Academy of Military Medical Sciences | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Tree-structured evolutionary search with hybrid selection, hierarchical operators, and a program-maintenance loop for feedback-driven repair | *LLM role:* system-level algorithm architect
+
+> A2DEPT advances LLM-driven algorithm design by evolving complete, open-ended solver programs via a tree-structured search with hierarchical operators and an automated dependency repair loop. The results are rigorously backed by empirical data, showing a 9.8% reduction in the mean normalized optimality gap relative to state-of-the-art baselines (FunSearch, EoH, ReEvo) across standard combinatorial optimization benchmarks like CVRP and FJSP. The key insight is the decoupling of mutations into hierarchical operators (macro-mutation for workflow restructuring vs. micro-tuning for local refinement) paired with a closed-loop dependency repair mechanism, which allows the LLM to safely rewrite system-level logic without permanently breaking executability. This is highly relevant for LLM evolutionary search research, as it provides a concrete, implementable mechanism to escape the performance ceiling of fixed algorithmic templates and synthesize entirely novel solver architectures.
+
+### [SeaEvo: Advancing Algorithm Discovery with Strategy Space Evolution](https://arxiv.org/abs/2604.24372)
+
+**2026-04-27** | The University of Hong Kong, City University of Hong Kong, JIUTIAN Research, China Mobile | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* LLM-driven evolutionary search augmented with a modular strategy-space layer (SEAEVO) comprising Strategy Articulation, Stratified Experience Retrieval, and Strategic Landscape Navigation | *LLM role:* mutation_operator, decomposition_guide, research_agent
+
+> SeaEvo augments LLM-driven evolutionary search by maintaining a persistent, population-level memory of natural-language strategy descriptions, clustering them to ensure diverse parent selection and tracking strategy saturation. Backed by strong empirical results, it achieves up to a 66% improvement on systems optimization tasks (like GPU model placement) over state-of-the-art backbones like ShinkaEvolve, while reducing cumulative API costs. The key insight is the Stratified Experience Retrieval (SER) module, which clusters candidate strategies using text embeddings and selects parents based on behavioral complementarity rather than just fitness, preventing premature convergence on syntactic variants of the same flawed idea. This is a must-read for our work in LLM evolutionary search, as it provides a concrete, implementable architecture for persistent memory and sample efficiency, directly tested on the exact LLM serving and scheduling problems we target.
+
+### [GR-Evolve: Design-Adaptive Global Routing via LLM-Driven Algorithm Evolution](https://arxiv.org/abs/2604.22234)
+
+**2026-04-24** | Arizona State University | M=8 P=3 I=8 **MUST-READ** *discuss*
+
+*Method:* LLM-driven code evolution framework for global routing algorithms | *LLM role:* evolutionary_search, code_writer
+
+> GR-Evolve applies an LLM-driven evolutionary search framework to automatically specialize C++ global routing algorithms for specific chip designs. The results are empirically strong, demonstrating up to an 8.72% reduction in post-detailed-routing wirelength over established baselines like FastRoute and CUGR. The key insight is the use of 'warm-start evolution'—evolving heuristics on smaller, cheaper-to-evaluate instances and transferring the modified codebase as the initialization for larger instances—combined with a stateless, Git-backed persistent memory to avoid context degradation. This is highly relevant to our work in LLM evolutionary search; the warm-start curriculum and stateless memory architecture are concrete techniques we should adopt to improve sample efficiency when evolving heuristics for large-scale optimization problems.
+
 
 #### 2026-04-26 (1 papers)
 

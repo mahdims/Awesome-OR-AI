@@ -1,10 +1,21 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-04-28
+**Last Updated:** 2026-04-30
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-30 (1 papers)
+
+### [CacheFlow: Efficient LLM Serving with 3D-Parallel KV Cache Restoration](https://arxiv.org/abs/2604.25080)
+
+**2026-04-28** | University of Illinois Urbana-Champaign, National University of Singapore | M=7 P=8 I=7 *discuss*
+
+*Method:* 3D-parallel KV cache restoration framework with batch-aware two-pointer scheduler | *LLM role:* none
+
+> CacheFlow optimizes KV cache restoration in long-context LLM serving by formulating it as a 3D-parallel scheduling problem (token, layer, GPU) that overlaps recomputation and I/O transfer. The results are backed by strong empirical numbers, showing a 10%-62% reduction in Time-To-First-Token (TTFT) compared to state-of-the-art frameworks like vLLM and SGLang across diverse hardware and bandwidth conditions. The key insight is that the optimal balance between recomputation (which scales quadratically) and I/O loading (which scales linearly but is bandwidth-bound) can be achieved using a batch-aware two-pointer scheduler that prioritizes I/O for requests with the longest remaining lengths to restore. This is highly relevant for our research in LLM serving scheduling; the two-pointer heuristic and harmonic-mean optimality bound offer concrete algorithmic baselines that could be integrated into or compared against our formal OR-based resource allocation models.
+
 
 #### 2026-04-26 (2 papers)
 

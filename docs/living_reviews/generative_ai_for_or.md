@@ -1,10 +1,29 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-04-28
+**Last Updated:** 2026-04-30
 
 ---
 
 ## Recent Papers
+
+#### 2026-04-30 (2 papers)
+
+### [From Soliloquy to Agora: Memory-Enhanced LLM Agents with Decentralized Debate for Optimization Modeling](https://arxiv.org/abs/2604.25847)
+
+**2026-04-28** | Tsinghua University, University of Chicago Booth School of Business, Shanghai Jiao Tong University, The Chinese University of Hong Kong, Shenzhen (CUHK-Shenzhen) | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Modular agentic framework combining decentralized debate with a read-write memory bank | *LLM role:* Formulator, Programmer, and Debugger agents for generating and refining optimization models and solver code
+
+> This paper introduces Agora-Opt, a multi-agent framework for optimization modeling that combines decentralized debate across heterogeneous LLMs with a read-write memory bank. The results are backed by strong empirical evidence, achieving state-of-the-art Pass@1 accuracy (84.6%) across 7 OR benchmarks and outperforming both frontier zero-shot models and fine-tuned OR models. The key insight is that decentralized debate, where consensus is driven by solver-verified endpoints rather than a centralized LLM judge, can synthesize correct formulations even when all initial agent proposals are flawed. Furthermore, storing the trajectories of how these disagreements are resolved in a dedicated 'debate memory' allows the system to continuously improve its collaborative reasoning without parameter updates. This is highly relevant for our research in multi-agent optimization and memory architectures; the decentralized consensus mechanism and debate memory structure offer immediate, actionable upgrades for our multi-agent debate systems.
+
+### [OptiVerse: A Comprehensive Benchmark towards Optimization Problem Solving](https://arxiv.org/abs/2604.21510)
+
+**2026-04-23** | Xi'an Jiaotong University, Lenovo Research | M=6 P=8 I=7 **MUST-READ** *discuss*
+
+*Method:* Dual-View Auditor Agent (DVA-Agent) with Semantic Triangulation | *LLM role:* adversarial_evaluator
+
+> This paper introduces OptiVerse, a 1,000-problem benchmark spanning six optimization domains (including stochastic and dynamic optimization) to evaluate LLM reasoning, alongside a Dual-View Auditor Agent that detects semantic modeling errors. Extensive evaluation of 22 LLMs shows severe performance degradation on hard problems (under 27% accuracy even for frontier models), while the proposed agent improves accuracy by 1.3-6.3% over baselines like OptiMUS. The key insight is the 'blind code abstraction' technique: forcing the LLM to reverse-engineer mathematical logic solely from its generated code without seeing the original prompt, which effectively mitigates the confirmation bias that plagues standard LLM self-correction. This is highly relevant for our OR benchmarking and evaluation work, as it represents a direct competitor/complement to our datasets. Furthermore, the blind abstraction trick is a highly transferable mechanism that could be adopted to improve the verification and reward modeling steps in our multi-agent optimization and LLM evolutionary search frameworks.
+
 
 #### 2026-04-26 (4 papers)
 
