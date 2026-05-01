@@ -94,8 +94,14 @@ async def google_callback(
     return response
 
 
-@router.post("/logout")
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 def logout(settings: Settings = Depends(get_settings)):
-    response = RedirectResponse(url="/", status_code=status.HTTP_302_FOUND)
+    """Clear the session cookie. Client decides what to do next (usually nav to /).
+
+    Returning 204 (rather than a 302 to /) lets the JSON-fetch client in
+    api_client.js handle this without choking on an HTML redirect body.
+    """
+    from fastapi import Response
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
     clear_session_cookie(response, settings)
     return response

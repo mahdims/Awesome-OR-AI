@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from src.api.auth.jwt import current_user
 from src.api.deps import get_session
+from src.api.routers.subdomains import load_subdomains
 from src.api.schemas.user import MeResponse
 
 router = APIRouter(prefix="/api", tags=["me"])
@@ -190,6 +191,12 @@ def update_paper_state(
 # ---- follows + pins ----
 
 
+def _require_subdomain(subdomain_id: str) -> None:
+    known = {sd.id for sd in load_subdomains()}
+    if subdomain_id not in known:
+        raise HTTPException(status_code=400, detail=f"Unknown subdomain: {subdomain_id!r}")
+
+
 class IdList(BaseModel):
     ids: List[str]
 
@@ -212,6 +219,7 @@ def follow(
     user: dict = Depends(current_user),
     session: Session = Depends(get_session),
 ):
+    _require_subdomain(subdomain_id)
     session.execute(
         text(
             "INSERT INTO user_follows (user_id, subdomain_id) VALUES (:uid, :sd) "
@@ -228,6 +236,7 @@ def unfollow(
     user: dict = Depends(current_user),
     session: Session = Depends(get_session),
 ):
+    _require_subdomain(subdomain_id)
     session.execute(
         text("DELETE FROM user_follows WHERE user_id = :uid AND subdomain_id = :sd"),
         {"uid": user["id"], "sd": subdomain_id},
@@ -256,6 +265,7 @@ def pin(
     user: dict = Depends(current_user),
     session: Session = Depends(get_session),
 ):
+    _require_subdomain(subdomain_id)
     next_pos = session.execute(
         text("SELECT COALESCE(MAX(position), 0) + 1 FROM user_pins WHERE user_id = :uid"),
         {"uid": user["id"]},
@@ -276,6 +286,7 @@ def unpin(
     user: dict = Depends(current_user),
     session: Session = Depends(get_session),
 ):
+    _require_subdomain(subdomain_id)
     session.execute(
         text("DELETE FROM user_pins WHERE user_id = :uid AND subdomain_id = :sd"),
         {"uid": user["id"], "sd": subdomain_id},

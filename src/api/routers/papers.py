@@ -98,6 +98,16 @@ def _row_to_detail(row: Dict[str, Any]) -> PaperDetail:
 # --- endpoints -------------------------------------------------------------
 
 
+# Columns _row_to_list_item actually consumes. Avoids `SELECT *` pulling the
+# vector(768) embedding + the heavy methods_confidence / experiments / results
+# / abstract blobs that the list view never serializes — meaningful overhead
+# on /api/init's 200-row default.
+_LIST_COLUMNS = (
+    "arxiv_id, title, authors, affiliations, category, published_date, "
+    "relevance, significance, tags, problem, lineage, artifacts, brief"
+)
+
+
 def query_papers(
     session: Session,
     q: Optional[str] = None,
@@ -123,7 +133,7 @@ def query_papers(
 
     sql = text(
         f"""
-        SELECT *
+        SELECT {_LIST_COLUMNS}
         FROM paper_analyses
         WHERE {' AND '.join(where)}
         ORDER BY published_date DESC NULLS LAST, arxiv_id

@@ -53,21 +53,31 @@ cd /opt/researchmate
 docker compose build api
 docker compose up -d --no-deps api
 
-# Wait for the api container to come up + report healthy
+# Wait for the api container to come up + report fully healthy.
+# /health/deep returns 200 even when degraded (db:false), so curl -fs alone
+# would let a half-broken deploy through — we have to inspect the body.
+healthy=0
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 2
   body=\$(curl -fsS http://127.0.0.1:8080/health/deep 2>/dev/null || true)
   echo "  [\$i/10] /health/deep: \$body"
   if [[ "\$body" == *'"db":true'* && "\$body" == *'"redis":true'* ]]; then
+    healthy=1
     break
   fi
 done
-
-# Public-facing health check via Caddy
-curl -fs https://app.researchmate.app/health/deep || {
-  echo "[remote] FAIL: public /health/deep not responding."
+if [[ \$healthy -ne 1 ]]; then
+  echo "[remote] FAIL: api never reported db+redis healthy after 20s. Rolling back not automatic — investigate." >&2
   exit 1
-}
+fi
+
+# Public-facing health check via Caddy. Same body check applies.
+public_body=\$(curl -fsS https://app.researchmate.app/health/deep 2>/dev/null || true)
+echo "  public /health/deep: \$public_body"
+if [[ "\$public_body" != *'"db":true'* || "\$public_body" != *'"redis":true'* ]]; then
+  echo "[remote] FAIL: public /health/deep not fully healthy." >&2
+  exit 1
+fi
 EOS
 )
 
