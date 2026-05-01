@@ -38,8 +38,10 @@ if [[ $DRY_RUN -eq 1 ]]; then
 [prod-deploy-app] --dry-run: would run on $PROD_HOST:
   cd $PROD_APP_DIR && git pull
   docker compose -f /opt/researchmate/docker-compose.yml build api
+  docker compose -f /opt/researchmate/docker-compose.yml run --rm api alembic upgrade head
   docker compose -f /opt/researchmate/docker-compose.yml up -d --no-deps api
-  curl -fs https://app.researchmate.app/health/deep
+  docker exec researchmate_api curl -fsS http://localhost/health/deep  (x10, body check)
+  curl -fs https://app.researchmate.app/health/deep  (public Caddy check)
 EOF
   exit 0
 fi
@@ -51,6 +53,7 @@ cd $PROD_APP_DIR && git pull --ff-only
 
 cd /opt/researchmate
 docker compose build api
+docker compose run --rm api alembic upgrade head
 docker compose up -d --no-deps api
 
 # Wait for the api container to come up + report fully healthy.
@@ -59,7 +62,7 @@ docker compose up -d --no-deps api
 healthy=0
 for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 2
-  body=\$(curl -fsS http://127.0.0.1:8080/health/deep 2>/dev/null || true)
+  body=\$(docker exec researchmate_api curl -fsS http://localhost/health/deep 2>/dev/null || true)
   echo "  [\$i/10] /health/deep: \$body"
   if [[ "\$body" == *'"db":true'* && "\$body" == *'"redis":true'* ]]; then
     healthy=1
