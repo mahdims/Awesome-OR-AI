@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Apply pending Alembic migrations to prod Postgres.
 #
+# NOTE: prod-deploy-app.sh ALSO runs `alembic upgrade head` as part of every
+# deploy. So this script is mostly useful for inspection (--dry-run / current)
+# and one-off migration work between deploys. Running it before
+# prod-deploy-app.sh is a no-op the second time around.
+#
 # Runs alembic in an ephemeral python:3.13-slim container attached to the
 # prod Docker network. No host-side Python install needed, no port exposure.
 #
-# Prerequisite: repo cloned at $PROD_APP_DIR on the box (M1b onward).
-# Until that exists this script exits with a clear message — for M1a today
-# the only migration (0001_initial_schema) is already on prod via pg_restore.
+# Prerequisite: repo cloned at $PROD_APP_DIR on the box.
 #
 # Usage:
 #   bash scripts/prod/prod-migrate.sh             # alembic upgrade head
@@ -36,14 +39,11 @@ ALEMBIC_CMD="$MODE"  # for the user-facing log line below
 if ! prod_ssh "test -d $PROD_APP_DIR/src/db/migrations"; then
   cat >&2 <<EOF
 [prod-migrate] $PROD_APP_DIR/src/db/migrations not found on $PROD_HOST.
-[prod-migrate] First-time setup (run once when M1b is ready):
+[prod-migrate] First-time setup:
 [prod-migrate]
 [prod-migrate]   ssh $PROD_HOST '
 [prod-migrate]     git clone https://github.com/mahdims/Awesome-OR-AI.git $PROD_APP_DIR
 [prod-migrate]   '
-[prod-migrate]
-[prod-migrate] For M1a today: the only migration (0001_initial_schema) is
-[prod-migrate] already on prod via the 2026-04-26 pg_restore. Nothing to do.
 EOF
   exit 1
 fi

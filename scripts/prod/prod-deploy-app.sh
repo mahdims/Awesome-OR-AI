@@ -5,9 +5,11 @@
 # has already done the one-time cutover from docs/PROD_M1B_CUTOVER.md:
 #   - /opt/researchmate/docker-compose.yml has an `api` service block
 #   - /opt/researchmate/caddy/Caddyfile points reverse_proxy at api:80
+#   - /opt/researchmate/app is a git checkout of this repo
 #
 # Run alembic migrations BEFORE recreating the service so the schema is at
-# head when the new image starts serving requests.
+# head when the new image starts serving requests. The migration step is
+# idempotent — running this script twice is safe.
 #
 # Usage:
 #   bash scripts/prod/prod-deploy-app.sh             # real deploy
@@ -41,6 +43,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
   docker compose -f /opt/researchmate/docker-compose.yml run --rm api alembic upgrade head
   docker compose -f /opt/researchmate/docker-compose.yml up -d --no-deps api
   docker exec researchmate_api curl -fsS http://localhost/health/deep  (x10, body check)
+  docker compose -f /opt/researchmate/docker-compose.yml exec caddy caddy reload --config /etc/caddy/Caddyfile
   curl -fs https://app.researchmate.app/health/deep  (public Caddy check)
 EOF
   exit 0
@@ -60,25 +63,33 @@ docker compose up -d --no-deps api
 # /health/deep returns 200 even when degraded (db:false), so curl -fs alone
 # would let a half-broken deploy through — we have to inspect the body.
 healthy=0
-for i in 1 2 3 4 5 6 7 8 9 10; do
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
   sleep 2
   body=\$(docker exec researchmate_api curl -fsS http://localhost/health/deep 2>/dev/null || true)
-  echo "  [\$i/10] /health/deep: \$body"
+  echo "  [\$i/15] /health/deep: \$body"
   if [[ "\$body" == *'"db":true'* && "\$body" == *'"redis":true'* ]]; then
     healthy=1
     break
   fi
 done
 if [[ \$healthy -ne 1 ]]; then
-  echo "[remote] FAIL: api never reported db+redis healthy after 20s. Rolling back not automatic — investigate." >&2
+  echo "[remote] FAIL: api never reported db+redis healthy after 30s. Investigate before retrying." >&2
   exit 1
 fi
 
+# Reload Caddy so it picks up the api:80 upstream (Caddyfile was edited
+# during cutover; Caddy hasn't reloaded since the container name changed).
+# Idempotent — safe to run on every deploy.
+echo "[remote] Reloading Caddy..."
+docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
+
 # Public-facing health check via Caddy. Same body check applies.
+# Give Caddy a beat to finish reloading.
+sleep 2
 public_body=\$(curl -fsS https://app.researchmate.app/health/deep 2>/dev/null || true)
 echo "  public /health/deep: \$public_body"
 if [[ "\$public_body" != *'"db":true'* || "\$public_body" != *'"redis":true'* ]]; then
-  echo "[remote] FAIL: public /health/deep not fully healthy." >&2
+  echo "[remote] FAIL: public /health/deep not fully healthy. Caddy reloaded but proxy may be misconfigured." >&2
   exit 1
 fi
 EOS

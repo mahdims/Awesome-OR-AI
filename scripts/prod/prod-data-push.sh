@@ -42,9 +42,6 @@ LOCAL_PG_URL="${LOCAL_DATABASE_URL/postgresql+psycopg:\/\//postgresql://}"
 #      from writing dump headers prod can't read).
 #   3. Otherwise fall back to whatever's on $PATH (Linux package managers
 #      typically ship a major-matched client, and any compatible build works).
-#
-# We sanity-check the major version of the chosen pg_dump and warn if it's not
-# pg16; the user can still proceed (override or accept the warning).
 
 _HOMEBREW_PG16_BIN="/opt/homebrew/opt/postgresql@16/bin"
 
@@ -111,7 +108,7 @@ cat <<EOF
 [prod-data-push] Plan:
   pg_dump  ($PG_DUMP_BIN, format=custom)  $LOCAL_PG_URL  ->  $DUMP_FILE
   scp      $DUMP_FILE  ->  $PROD_HOST:$DUMP_FILE
-  remote: stop web, dropdb+createdb, pg_restore, start web, verify counts
+  remote: stop api, dropdb+createdb, pg_restore, start api, verify counts
   remote: rm $DUMP_FILE   (and locally too on success)
 EOF
 
@@ -144,18 +141,29 @@ set -euo pipefail
 DUMP_FILE='$DUMP_FILE'
 
 cd /opt/researchmate
-docker compose stop web
+
+# Stop the api so it doesn't choke on the DB being recreated underneath it.
+# After M1b cutover the placeholder \`web\` is gone — it's \`api\` now.
+docker compose stop api
 
 docker exec researchmate_postgres dropdb   -U researchmate researchmate --force
 docker exec researchmate_postgres createdb -U researchmate researchmate
 
-# pg_restore reads the dump file from inside the container
-docker exec -i researchmate_postgres pg_restore \\
+# Copy dump file into the container, then pg_restore from it. We do this
+# instead of piping with -i because docker exec -i and SSH stdin can race.
+docker cp "\$DUMP_FILE" researchmate_postgres:/tmp/restore.dump
+docker exec researchmate_postgres pg_restore \\
   -U researchmate -d researchmate --no-owner --role=researchmate \\
-  < "\$DUMP_FILE"
+  /tmp/restore.dump
+docker exec researchmate_postgres rm /tmp/restore.dump
 
 rm "\$DUMP_FILE"
-docker compose start web
+
+# Bring api back up. Migrations: any new schema landed since the dump was
+# taken would be re-applied by the next prod-deploy-app.sh run, but typical
+# usage is that this script is run AFTER deploys, so the schema already
+# matches.
+docker compose start api
 
 # Assert: prod row count >= what it was before
 NEW_COUNT=\$(docker exec researchmate_postgres psql -U researchmate -d researchmate -tAc 'SELECT count(*) FROM paper_analyses')
