@@ -1,10 +1,21 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-04-30
+**Last Updated:** 2026-05-03
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-03 (1 papers)
+
+### [From Soliloquy to Agora: Memory-Enhanced LLM Agents with Decentralized Debate for Optimization Modeling](https://arxiv.org/abs/2604.25847)
+
+**2026-04-28** | Tsinghua University, University of Chicago Booth School of Business, Shanghai Jiao Tong University, The Chinese University of Hong Kong, Shenzhen (CUHK-Shenzhen) | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Modular agentic framework combining decentralized debate with a read-write memory bank | *LLM role:* Formulator, Programmer, and Debugger agents for generating and refining optimization models and solver code
+
+> This paper introduces Agora-Opt, a multi-agent framework for optimization modeling that combines decentralized debate across heterogeneous LLMs with a read-write memory bank. The results are backed by strong empirical evidence, achieving state-of-the-art Pass@1 accuracy (84.6%) across 7 OR benchmarks and outperforming both frontier zero-shot models and fine-tuned OR models. The key insight is that decentralized debate, where consensus is driven by solver-verified endpoints rather than a centralized LLM judge, can synthesize correct formulations even when all initial agent proposals are flawed. Furthermore, storing the trajectories of how these disagreements are resolved in a dedicated 'debate memory' allows the system to continuously improve its collaborative reasoning without parameter updates. This is highly relevant for our research in multi-agent optimization and memory architectures; the decentralized consensus mechanism and debate memory structure offer immediate, actionable upgrades for our multi-agent debate systems.
+
 
 #### 2026-04-30 (2 papers)
 
