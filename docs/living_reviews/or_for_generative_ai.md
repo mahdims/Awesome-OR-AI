@@ -1,10 +1,29 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-05-05
+**Last Updated:** 2026-05-07
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-07 (2 papers)
+
+### [SAGA: Workflow-Atomic Scheduling for AI Agent Inference on GPU Clusters](https://arxiv.org/abs/2605.00528)
+
+**2026-05-01** | The University of Hong Kong, Stellaris AI Limited, Brain Investing Limited | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Distributed workflow-atomic scheduling for AI agent inference on GPU clusters, utilizing Agent Execution Graphs for predictive KV cache management (WA-LRU, Tool-Call-Aware TTL, speculative prefetching), session-affinity batching with work stealing, and Agent Fair Share for task-level fairness. | *LLM role:* none
+
+> SAGA introduces a workflow-atomic scheduler for AI agent inference on GPU clusters that uses Agent Execution Graphs to proactively manage KV cache retention across multi-step reasoning and tool-call boundaries. Backed by strong empirical results on a 64-GPU cluster, it achieves a 1.64x geometric mean speedup in task completion time and 1.22x better memory utilization over state-of-the-art vLLM with automatic prefix caching. The key insight is the Workflow-Aware LRU (WA-LRU) eviction policy, which uses the agent's execution graph to predict future KV cache reuse probabilities, effectively bridging the gap between online cache management and the offline-optimal Bélády policy. This is highly relevant for our research in LLM serving scheduling and multi-agent optimization, as it provides a concrete, mathematically grounded framework to optimize the infrastructure underlying complex, multi-step AI workloads.
+
+### [Position: LLM Serving Needs Mathematical Optimization and Algorithmic Foundations, Not Just Heuristics](https://arxiv.org/abs/2605.01280)
+
+**2026-05-02** | HKUST | M=6 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Mathematical optimization and principled algorithmic design for LLM serving systems | *LLM role:* none
+
+> This position paper argues that LLM inference serving must transition from generic heuristics to rigorous mathematical optimization, synthesizing recent advances in applying operations research to AI infrastructure. Rather than presenting new experiments, it aggregates empirical evidence from recent literature—such as LP-based load balancers for Mixture-of-Experts and online integer programming for data parallelism—to demonstrate that OR methods consistently outperform heuristics. The key insight is the formalization of LLM serving bottlenecks, like dynamically growing KV caches and prefill-decode asymmetry, into specific OR problem classes, alongside a roadmap of open problems including scheduling for agentic workloads. This is highly relevant for our work on OR formulations for LLM serving scheduling, as it provides a comprehensive framework for positioning our research, identifying state-of-the-art baselines, and selecting high-impact future directions.
+
 
 #### 2026-05-03 (1 papers)
 

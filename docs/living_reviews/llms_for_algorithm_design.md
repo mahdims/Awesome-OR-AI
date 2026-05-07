@@ -1,10 +1,29 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-05-05
+**Last Updated:** 2026-05-07
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-07 (2 papers)
+
+### [AlphaInventory: Evolving White-Box Inventory Policies via Large Language Models with Deployment Guarantees](https://arxiv.org/abs/2605.00369)
+
+**2026-05-01** | Tsinghua University, Boston College, Shanghai Jiao Tong University, The Chinese University of Hong Kong, Shenzhen, Shanghai University of Finance and Economics | M=8 P=6 I=8 **MUST-READ** *discuss*
+
+*Method:* LLM-guided evolutionary search with GRPO and confidence-interval-based certification | *LLM role:* evolutionary_search
+
+> AlphaInventory uses an RL-fine-tuned LLM (via GRPO) to iteratively evolve and certify white-box inventory policies for non-stationary environments. Backed by strong empirical results on synthetic and real-world retail data, it outperforms classical and deep learning baselines, discovering novel structural extensions to the Capped Base Stock policy (Tilted-CBS and Tilted-PIC). The key insight is the integration of a confidence-interval-based certification gate during the evolutionary search, which ensures that generated heuristics are statistically safe for future deployment by bridging the gap between historical replay and online performance. This is highly relevant for our work in LLM evolutionary search; the team should consider adopting the statistical certification framework and GRPO-based proposal training for evolving robust heuristics in stochastic routing and scheduling problems.
+
+### [Beyond the Training Distribution: Mapping Generalization Boundaries in Neural Program Synthesis](https://arxiv.org/abs/2604.27551)
+
+**2026-04-30** | Friedrich Schiller University Jena | M=7 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Multimodal transformer architecture for sequence-to-sequence program synthesis | *LLM role:* code_writer
+
+> Voigt et al. evaluate the out-of-distribution generalization limits of transformers in program synthesis by mapping arithmetic programs into continuous syntactic and semantic manifolds. Backed by rigorous evaluation on millions of programs, they demonstrate that while transformers can extrapolate semantically using known syntax, they suffer a massive >30% performance drop when forced to extrapolate to novel syntactic structures. The key insight is that pure autoregressive scaling yields strictly log-linear returns for structural extrapolation, exposing a fundamental bottleneck in LLMs that cannot be overcome by compute alone. This is highly relevant for LLM evolutionary search, as it provides empirical proof that evolutionary algorithms are strictly necessary to navigate beyond the learned data manifold. Furthermore, the community could directly adopt their dual-manifold projection technique to measure and enforce population diversity during evolutionary search.
+
 
 #### 2026-05-03 (3 papers)
 

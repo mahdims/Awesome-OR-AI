@@ -1,10 +1,37 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-05-05
+**Last Updated:** 2026-05-07
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-07 (3 papers)
+
+### [Strategy-Aware Optimization Modeling with Reasoning LLMs](https://arxiv.org/abs/2605.02545)
+
+**2026-05-04** | Beihang University, JIUTIAN Research | M=8 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Supervised Fine-Tuning followed by Segment-Weighted Group Relative Policy Optimization (GRPO) | *LLM role:* reasoning_guide
+
+> SAGE is a framework for automated optimization modeling that explicitly separates high-level modeling strategy from concrete formulation, training an LLM via supervised fine-tuning and Segment-Weighted GRPO with solver feedback. The results are backed by strong empirical evidence, improving average pass@1 from 72.7% to 80.3% over the strongest open-source baseline across eight OR benchmarks, while also producing more compact, solver-efficient constraint systems. The key insight is the use of Segment-Weighted GRPO, which assigns higher optimization weights to early, high-level strategic reasoning tokens than to later surface-level tokens, effectively mitigating the credit assignment problem in long-horizon reasoning. This is highly relevant for our work in symbolic OR modeling and RL-infused LLM search; the segment-weighted RL approach and efficiency-aware composite reward are concrete techniques we should adapt for our process reward models.
+
+### [EngiAgent: Fully Connected Coordination of LLM Agents for Solving Open-ended Engineering Problems with Feasible Solutions](https://arxiv.org/abs/2605.02289)
+
+**2026-05-04** | Nanyang Technological University, The Chinese University of Hong Kong, Shenzhen, The University of Sydney, INSAIT Sofia University “St. Kliment Ohridski”, AIRS | M=7 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Multi-agent system with a fully connected coordinator for iterative problem analysis, modeling, verification, solving, and solution evaluation | *LLM role:* multi-role agent coordination
+
+> EngiAgent is a multi-agent LLM framework that uses a fully connected coordinator to dynamically route debugging feedback across specialized agents (Analyzer, Modeler, Verifier, Solver) to generate feasible Pyomo models for open-ended engineering problems. The results are strongly backed by empirical data on a new 53-problem benchmark, achieving up to 75.4% feasibility with DeepSeek-V3—a massive improvement over fixed-pipeline baselines like DS-Agent. The key insight is that rigid multi-agent pipelines fail on complex OR tasks because errors can stem from semantic extraction, mathematical formulation, or solver execution; dynamically routing specific error traces to the responsible agent significantly improves the rate of physically and mathematically feasible solutions. This is highly relevant for our work in symbolic OR benchmarking and multi-agent optimization, as the benchmark's strict focus on executable feasibility over text-based evaluation aligns perfectly with our evaluation methodology.
+
+### [Relation Reasoning with LLMs in Expensive Optimization](https://arxiv.org/abs/2605.02933)
+
+**2026-04-30** | Shanghai Institute of AI for Education, East China Normal University | M=7 P=6 I=8 **MUST-READ** *discuss*
+
+*Method:* Reinforcement-trained Qwen2.5 LLM with GRPO for relation-based surrogate modeling, using anchor-based iterative context construction and voting-based aggregation | *LLM role:* surrogate_model
+
+> This paper proposes R2SAEA, an evolutionary algorithm that uses a compact LLM (Qwen2.5) fine-tuned via GRPO as a zero-shot, relation-based surrogate model to rank offspring in expensive optimization problems. The results are rigorously backed by numerical experiments on standard continuous benchmarks (LZG, DTLZ), demonstrating that the fine-tuned model outperforms both traditional surrogate models and prompted frontier LLMs (GPT-4o) while running efficiently via quantization. The key insight is to cast surrogate evaluation as an in-context pairwise relation reasoning task, utilizing an anchor-based iterative prompt strategy to reduce $O(N^2)$ comparisons to $O(N)$ before aggregating them via voting. This is highly relevant for LLM evolutionary search; the team can adapt the GRPO relation-training pipeline and anchor-based voting mechanism to improve candidate evaluation and sample efficiency when evolving algorithms or heuristics.
+
 
 #### 2026-05-03 (1 papers)
 
