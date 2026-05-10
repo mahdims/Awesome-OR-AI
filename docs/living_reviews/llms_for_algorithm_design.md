@@ -1,10 +1,29 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-05-07
+**Last Updated:** 2026-05-10
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-10 (2 papers)
+
+### [CoupleEvo: Evolving Heuristics for Coupled Optimization Problems Using Large Language Models](https://arxiv.org/abs/2605.06341)
+
+**2026-05-07** | Karlsruhe Institute of Technology | M=7 P=8 I=7 *discuss*
+
+*Method:* LLM-driven evolutionary search for Large Neighborhood Search (LNS) destroy operators | *LLM role:* heuristic_generator
+
+> CoupleEvo extends LLM-driven heuristic evolution to coupled optimization problems by generating interacting Large Neighborhood Search (LNS) destroy operators using sequential, iterative, or integrated prompting strategies. Results are backed by empirical evaluations on the Inventory Routing Problem and a multi-robot pre-marshalling problem, showing the approach outperforms classical matheuristics but slightly trails highly specialized state-of-the-art solvers. The key insight is that decomposing the evolution of interacting heuristics into sequential or iterative phases yields significantly better and more stable convergence than integrated generation, which overwhelms the LLM's search complexity. This is highly relevant for our research in LLM evolutionary search and vehicle routing, as it provides a concrete architectural blueprint for evolving multi-component ALNS operators.
+
+### [SkillOS: Learning Skill Curation for Self-Evolving Agents](https://arxiv.org/abs/2605.06614)
+
+**2026-05-07** | Google Cloud AI Research, Massachusetts Institute of Technology, University of Illinois Urbana-Champaign | M=8 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Experience-driven Reinforcement Learning with Grouped Reward Policy Optimization (GRPO) for skill curator | *LLM role:* skill_curator_and_agent_executor
+
+> SkillOS trains a dedicated skill curator model using Grouped Reward Policy Optimization (GRPO) to insert, update, and delete reusable skills in a persistent repository for a frozen agent executor. The results are backed by strong empirical evidence, showing up to a 9.8% relative performance improvement and a 6.0% reduction in interaction steps on ALFWorld, WebShop, and math reasoning benchmarks compared to strong memory baselines. The key insight is the training recipe for delayed memory feedback: grouping related tasks sequentially so that skills extracted from early tasks are explicitly rewarded based on their utility in solving later tasks, augmented by intermediate process rewards for skill conciseness and quality. This is highly relevant for LLM evolutionary search and multi-agent optimization, as it provides a scalable, RL-driven mechanism to maintain a persistent, cross-run memory of successful heuristics or strategies without relying on static rules.
+
 
 #### 2026-05-07 (2 papers)
 

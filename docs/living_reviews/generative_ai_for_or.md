@@ -1,10 +1,29 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-05-07
+**Last Updated:** 2026-05-10
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-10 (2 papers)
+
+### [Strategy-Aware Optimization Modeling with Reasoning LLMs](https://arxiv.org/abs/2605.02545)
+
+**2026-05-04** | Beihang University, JIUTIAN Research | M=8 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Supervised Fine-Tuning followed by Segment-Weighted Group Relative Policy Optimization (GRPO) | *LLM role:* reasoning_guide
+
+> SAGE is a framework for automated optimization modeling that explicitly separates high-level modeling strategy from concrete formulation, training an LLM via supervised fine-tuning and Segment-Weighted GRPO with solver feedback. The results are backed by strong empirical evidence, improving average pass@1 from 72.7% to 80.3% over the strongest open-source baseline across eight OR benchmarks, while also producing more compact, solver-efficient constraint systems. The key insight is the use of Segment-Weighted GRPO, which assigns higher optimization weights to early, high-level strategic reasoning tokens than to later surface-level tokens, effectively mitigating the credit assignment problem in long-horizon reasoning. This is highly relevant for our work in symbolic OR modeling and RL-infused LLM search; the segment-weighted RL approach and efficiency-aware composite reward are concrete techniques we should adapt for our process reward models.
+
+### [EngiAgent: Fully Connected Coordination of LLM Agents for Solving Open-ended Engineering Problems with Feasible Solutions](https://arxiv.org/abs/2605.02289)
+
+**2026-05-04** | Nanyang Technological University, The Chinese University of Hong Kong, Shenzhen, The University of Sydney, INSAIT Sofia University “St. Kliment Ohridski”, AIRS | M=7 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Multi-agent system with a fully connected coordinator for iterative problem analysis, modeling, verification, solving, and solution evaluation | *LLM role:* multi-role agent coordination
+
+> EngiAgent is a multi-agent LLM framework that uses a fully connected coordinator to dynamically route debugging feedback across specialized agents (Analyzer, Modeler, Verifier, Solver) to generate feasible Pyomo models for open-ended engineering problems. The results are strongly backed by empirical data on a new 53-problem benchmark, achieving up to 75.4% feasibility with DeepSeek-V3—a massive improvement over fixed-pipeline baselines like DS-Agent. The key insight is that rigid multi-agent pipelines fail on complex OR tasks because errors can stem from semantic extraction, mathematical formulation, or solver execution; dynamically routing specific error traces to the responsible agent significantly improves the rate of physically and mathematically feasible solutions. This is highly relevant for our work in symbolic OR benchmarking and multi-agent optimization, as the benchmark's strict focus on executable feasibility over text-based evaluation aligns perfectly with our evaluation methodology.
+
 
 #### 2026-05-07 (3 papers)
 

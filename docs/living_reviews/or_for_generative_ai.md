@@ -1,10 +1,29 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-05-07
+**Last Updated:** 2026-05-10
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-10 (2 papers)
+
+### [Requests of a Feather Must Flock Together: Batch Size vs. Prefix Homogeneity in LLM Inference](https://arxiv.org/abs/2605.06046)
+
+**2026-05-07** | Indian Institute of Technology Bombay | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Reinforcement Learning-based prefix-aware scheduler with Chunked Hash Tree for fast prefix detection | *LLM role:* none
+
+> Feather introduces a prefix-aware LLM inference scheduler that uses a novel Chunked Hash Tree for fast prefix detection and a reinforcement learning policy to dynamically balance batch size against prefix homogeneity. The results are strongly backed by empirical evidence, demonstrating 2-10x higher end-to-end throughput compared to vLLM and SGLang baselines while reducing CPU scheduling overhead by up to 1000x. The key insight is a paradigm shift for inference batching: maximizing batch size is sub-optimal for prefix-shared workloads, as moderately small, prefix-homogeneous batches achieve higher throughput by maximizing spatial and temporal locality in KV cache accesses. This is highly relevant to our research in LLM serving scheduling, as it fundamentally changes the objective function for batch optimization and provides a highly efficient data structure (Chunked Hash Tree) that we should adapt for our own resource allocation models.
+
+### [Nitsum: Serving Tiered LLM Requests with Adaptive Tensor Parallelism](https://arxiv.org/abs/2605.05467)
+
+**2026-05-06** | University of California, San Diego, GenseeAI Inc. | M=7 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Adaptive Tensor Parallelism (TP) with TP-aware weight reuse and pipelined KV migration for dynamic GPU allocation and SLO-aware request scheduling | *LLM role:* none
+
+> Nitsum dynamically adjusts Tensor Parallelism (TP) levels and prefill/decode GPU allocations at runtime to maximize SLO-compliant goodput for multi-tenant LLM serving. The system achieves up to 5.3x higher goodput than state-of-the-art baselines like Llumnix, backed by rigorous experiments on real-world Azure and Alibaba traces. The key insight is that TP can be treated as a dynamic runtime control surface rather than a static deployment choice, enabled by keeping full weight copies on each GPU and using pipelined KV migration to reduce switching overhead to milliseconds. This is highly relevant for our research in LLM serving scheduling; we should incorporate dynamic TP reconfiguration as a decision variable in our operations research formulations for AI infrastructure.
+
 
 #### 2026-05-07 (2 papers)
 
