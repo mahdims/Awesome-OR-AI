@@ -1,0 +1,1320 @@
+--- Page 1 ---
+HEXISEQ: Accommodating Long Context Training of LLMs
+over Heterogeneous Hardware
+Yan Liang1, Youhe Jiang1, Ran Yan1, Binhang Yuan1, Wei Wang1, Chuan Wu2
+1The Hong Kong University of Science and Technology, 2The University of Hong Kong
+Abstract
+Long-context training of large language models (LLMs) is commonly distributed with Context Paral-
+lelism (CP) and Head Parallelism (HP), but existing training systems largely assume homogeneous
+GPU meshes. This paper extends CP and HP to heterogeneous GPU clusters with mixed GPU models
+and non-uniform network bandwidths, a common setting in production training. We introduce
+HEXISEQ, a system that supports fully asymmetric CP–HP partitioning by assigning sequence shards
+and attention heads according to device compute, memory, and communication capabilities. We
+formalize heterogeneous CP–HP allocation as a constrained optimization problem and develop an
+efficient hierarchical scheduler for finding optimal schedules. We evaluate HEXISEQ against state-of-
+the-art CP and HP baselines on both real and simulated heterogeneous clusters. Across models from
+3B to 70B parameters and context lengths up to one million tokens, HEXISEQ improves throughput by
+1.11× on average and up to 1.19× on mixed H100–A100 testbeds, and by 1.36× on average and up
+to 1.72× in simulations with 32–128 GPUs spanning up to four GPU models. On FLOP-comparable
+pairs against homogeneous clusters, HEXISEQ reaches throughput close to the strongest homogeneous
+baseline, showing that heterogeneous clusters can be used efficiently for long-context LLM training.
+1
+Introduction
+Long-context training has become a foundational workload for large language models (LLMs), enabling
+applications such as long-document analysis, repository-scale code reasoning, and extended multi-turn
+interaction. Frontier models such as GPT-5.5 [45], Claude Opus 4.7 [1], and Gemini 3.1 Pro [12] now
+expose context windows at the million-token scale. Supporting such capabilities requires training systems to
+process extremely long sequences, where attention computation grows quadratically with sequence length and
+activation memory grows rapidly with context size. However, existing long-context parallel training systems
+typically assume homogeneous GPU meshes, with identical devices, uniform sequence shards, uniform head
+placement, and symmetric communication groups. As a result, scaling million-token training often depends on
+provisioning homogeneous clusters of high-calibre GPUs, whose cost and availability limit broader long-context
+LLM development. This paper explores an alternative approach: distributing long-context training across
+heterogeneous GPU clusters, thereby improving resource utilization and expanding access to large-context
+training.
+Heterogeneous clusters are increasingly common in practice. As AI accelerators evolve rapidly, new hardware
+generations are introduced every few years, while older generations often remain in service for much longer.
+For example, NVIDIA has successively introduced A100, H100, B200, and B300 accelerators from 2020 to
+2025 [40–43]. In practice, these newer devices are often deployed alongside earlier accelerators such as V100,
+A800, and L40S in clouds, industrial labs, and academic research clusters. This coexistence creates a widely
+1
+arXiv:2605.07569v1  [cs.DC]  8 May 2026
+
+
+--- Page 2 ---
+available yet heterogeneous hardware pool and highlights an opportunity to use existing mixed-generation
+resources for cost-effective long-context LLM training. As context length grows, the attention workload
+becomes both larger and more divisible, creating more room for heterogeneous CP and HP schedules to utilize
+compute, memory, and communication capacities across mixed accelerator models.
+Realizing this opportunity, however, is challenging from both scheduling and system implementation perspec-
+tives. Long-context training systems typically combine IO-aware attention kernels such as FlashAttention [6, 7]
+with Context Parallelism (CP) and Head Parallelism (HP). CP partitions the sequence dimension and circulates
+key-value (KV) blocks through Ring Attention [34], while HP redistributes attention heads through all-to-all
+(A2A) collectives in the style of Ulysses [17]. Hybrid systems such as USP and LoongTrain [8, 13] compose CP
+and HP into a single training mesh. These systems, however, largely assume homogeneous GPU configurations:
+A2A groups have the same cardinality, GPU ranks within a group hold equal-length sequence shards, and
+attention heads are assigned uniformly across ranks. Such symmetry implicitly assumes that all GPUs perform
+attention computation at the same rate and exchange KV blocks over links with comparable bandwidth. This
+assumption breaks down on heterogeneous clusters, where devices differ in peak FLOPS, HBM (High Band-
+width Memory) capacity, HBM bandwidth, and pairwise communication bandwidth across both intra-node
+and inter-node links.
+Concretely, heterogeneous long-context CP and HP training faces two fundamental challenges:
+C1: Mismatched compute and memory capacities. GPUs from different generations vary in peak FLOPS, HBM
+capacity, and HBM bandwidth. A symmetric CP and HP mesh assigns every rank the same sequence length and
+the same number of attention heads. Consequently, faster devices stall behind slower ones, while memory-rich
+devices cannot absorb the longer sequence shards their HBM capacity would otherwise support. Efficient
+heterogeneous training therefore requires partitioning sequence and head workloads according to each device’s
+compute and memory profile.
+C2: Non-uniform communication bandwidth. Inter-device links differ widely, ranging from high-bandwidth
+NVLink within a node to lower-bandwidth RDMA, InfiniBand, or Ethernet across nodes. Long-context attention
+is highly sensitive to these differences because both A2A redistribution and Ring Attention KV exchange lie on
+the critical path. The slowest link in an A2A group can dominate redistribution latency, and the slowest hop
+on a ring can stall each Ring Attention step. Efficient execution therefore requires aligning A2A groups and KV
+exchange topology with the underlying communication fabric.
+Existing systems fail to address these challenges. CP and HP frameworks such as USP and LoongTrain [8, 13]
+adopt symmetric partitioning strategies that under-utilize heterogeneous hardware. Conversely, heterogeneity-
+aware training systems such as HexiScale [56] and Cephalo [14] support heterogeneous data, pipeline, and
+tensor model parallelism, but leave the CP and HP dimensions, which are central to long-context training,
+largely unaddressed. To bridge this gap, we propose HEXISEQ, a system that exposes heterogeneity directly
+to CP and HP scheduling. Instead of fitting heterogeneous devices into a symmetric mesh, HEXISEQ jointly
+schedules A2A grouping, sequence placement, and head placement according to device compute, memory,
+and communication capabilities.
+Our contributions are summarized as follows.
+Contribution 1. We implement HEXISEQ, a heterogeneous long-context LLM training system that supports
+asymmetric CP and HP execution. HEXISEQ introduces a schedule abstraction with variable A2A groups,
+non-uniform group-level and rank-level sequence shards, and weighted attention-head placement. Its runtime
+materializes heterogeneous process groups, performs ragged A2A redistribution with non-uniform split sizes,
+and decomposes Ring Attention into sub-ring KV exchange tasks while preserving the semantics of existing CP
+and HP attention.
+Contribution 2. We formulate heterogeneous CP and HP scheduling as a constrained optimization problem
+over A2A grouping, sequence placement, and head placement, subject to per-device memory and inter-device
+bandwidth constraints. We develop an analytical performance model for non-attention computation, A2A
+redistribution, Ring Attention compute and communication, and activation memory. We use this model inside
+an efficient hierarchical scheduler that generates topology-aware A2A partitions, plans group-level sequence
+2
+
+
+--- Page 3 ---
+splits, and refines rank-level sequence shards and head counts.
+Contribution 3. We evaluate HEXISEQ on physical heterogeneous testbeds and larger simulated clusters. On
+mixed H100 and A100 testbeds with up to 16 GPUs, covering 3B, 7B, and 13B models and context lengths from
+8K to 256K, HEXISEQ achieves 1.11× throughput on average and up to 1.19× over the strongest of USP, Ulysses,
+and Ring Attention. In simulations with 32 to 128 GPUs spanning up to four accelerator generations, and with
+13B and 70B models at context lengths up to 1024K, HEXISEQ improves throughput by 1.36× on average and
+up to 1.72× over the strongest heterogeneous baseline. Against homogeneous clusters with matched aggregate
+FLOPs, HEXISEQ reaches comparable throughput while running on heterogeneous hardware.
+2
+Related Work
+Long-context attention parallelism. Data parallelism (DP), tensor parallelism (TP), and pipeline parallelism
+(PP) distribute model parameters and layers in LLM training [16, 31, 33, 38, 39, 47, 48], but they do not
+by themselves resolve the memory and communication pressure of a single long sequence. Context-parallel
+systems partition the sequence dimension and circulate KV blocks through Ring Attention [32, 34], while
+head-parallel systems such as Ulysses use A2A collectives to redistribute attention heads [17]. Hybrid
+designs, including USP and LoongTrain, combine both axes to scale to longer contexts [8, 13]. A second
+line of work improves routing, overlap, and memory scheduling for the same attention-parallel patterns [2–
+5, 27, 28, 35, 36, 50, 59, 62, 63]. These systems largely assume that all ranks within the attention mesh
+are symmetric and exchangeable. HEXISEQ preserves their attention semantics, but removes this uniformity
+assumption by allowing sequence shards, head counts, and A2A groups to match heterogeneous hardware.
+Heterogeneous distributed training. A growing line of systems balances training across devices with different
+compute or memory capacities. HexiScale [56] adapts data, pipeline, and tensor model parallel placement
+to mixed GPUs; Poplar [61] pursues similar adaptation; and broader systems extend heterogeneity-aware
+scheduling to multi-region and geo-distributed settings [14, 29, 44, 49, 51, 53]. These works show that
+asymmetric scheduling is essential when hardware differs, but they schedule at the granularity of samples,
+layers, tensor shards, or pipeline stages, and none of them parameterise the context- or head-parallel
+dimensions. As a consequence, in the long-context regime that this paper targets, a heterogeneous DP/PP/TP
+plan cannot avoid out-of-memory failures on the smaller-HBM partition without falling back to a CP layer.
+HEXISEQ targets this attention-internal structure rather than full-sample, layer, or pipeline-stage placement,
+making it complementary to the systems above.
+Variable-length and imbalance-aware training. A complementary line of work addresses workload imbalance
+caused by non-uniform sequence lengths in the training data [10, 11, 18, 30, 55]. These methods rebalance
+data-level work by changing how examples, tokens, or variable-length sequences are packed and distributed
+across ranks. HEXISEQ instead addresses hardware-level imbalance for a fixed long-context training workload:
+the question is not how to batch uneven examples, but how to partition one long sequence and its attention
+heads across devices with different compute, memory, and communication capabilities.
+3
+System Design and Implementation
+This section presents HEXISEQ’s system design and implementation. We first use a representative heterogeneous
+cluster to compare several parallelization strategies and identify why symmetric CP and HP meshes are
+inefficient on such hardware (§3.1). We then describe the asymmetric parallel support that HEXISEQ introduces
+to remove these limitations (§3.2).
+3.1
+Case Study: Parallelism over Heterogeneity
+Consider training a 7B LLM with long-context inputs on a heterogeneous 8-GPU cluster consisting of one
+2-GPU H100 node, one 2-GPU A100 node, and one 4-GPU A800 node. GPUs within each node are connected
+by high-bandwidth NVLink, while GPUs across nodes communicate through lower-bandwidth RDMA. Below,
+we compare three symmetric parallel strategies on this cluster with HEXISEQ’s asymmetric execution.
+3
+
+
+--- Page 4 ---
+t
+Homogeneous Training
+Heterogeneous Training
+H100-80G
+A100-80G
+A800-40G
+Sequence Length
+A2A Group
+Figure 1 Motivating load imbalance in long-context attention on heterogeneous clusters.
+Training with a symmetric CP and HP mesh. Existing CP and HP systems enforce a symmetric layout: each
+A2A group has identical cardinality, each rank holds an equal-sized sequence shard, and attention heads are
+uniformly distributed. Under this constraint, three representative execution plans arise, each incurring a
+distinct communication bottleneck:
+• Plan 1: Ring Attention [34]. The system organizes all ranks into a single 8-rank CP ring that spans
+every node, and attention is computed through sequential KV exchanges along this ring. Since the ring
+traverses inter-node links, the latency of each pipeline stage is dominated by the slowest cross-node hop,
+which leaves the high-bandwidth intra-node links underutilized.
+• Plan 2: Ulysses-style A2A [32]. The system performs a global 8-way A2A communication to redistribute
+attention heads across all ranks. Since every A2A phase entails full cross-node data exchange, overall
+throughput is bounded by inter-node bandwidth. Furthermore, the uniform allocation of heads and
+tokens forces heterogeneous devices (e.g., GPUs of different generations) to operate under identical
+loads, thereby precluding capability-proportional utilization.
+• Plan 3: USP-style with uniform allocation [8]. The system arranges ranks into a regular m×n CP–HP
+mesh (e.g., 4×2 or 2×4), coupling a CP ring with intra-group A2A communication. However, this
+structure exhibits complementary bottlenecks: (i) in the 4×2 layout, each A2A group spans multiple
+nodes, so every redistribution step is constrained by inter-node bandwidth; (ii) in the 2×4 layout, A2A
+communication remains intra-node, but the CP ring crosses node boundaries, causing each attention
+step to stall on the slowest inter-node link.
+Training with HEXISEQ. Unlike the uniform partitioning and symmetric communication structure of Plans 1–3,
+HEXISEQ jointly accounts for network topology and device heterogeneity. Specifically, it schedules the same
+workload as three asymmetric A2A groups aligned with node boundaries as visualized in Figure 1. Within
+and across groups, sequence shards and head counts are weighted by device capability: H100s receive more
+work per device, A100s receive an intermediate load, and A800s receive smaller per-rank shards that fit their
+compute and memory profile.
+This schedule keeps A2A traffic inside high-bandwidth domains and assigns attention workload according to
+device capability, preserving CP and HP semantics while avoiding OOM on smaller-HBM devices and reducing
+stalls on faster devices. Producing such an asymmetric schedule requires both system support for non-uniform
+A2A groups, sequence shards, and head counts (§3.2), and a scheduler that can navigate the larger schedule
+space (§4).
+3.2
+Asymmetric Parallel Support in HEXISEQ
+To train long-context LLMs efficiently on heterogeneous GPU clusters, we implement HEXISEQ with fully
+asymmetric context-parallel and head-parallel execution. The key design is to separate the logical schedule
+from the attention runtime. Concretely, the scheduler emits a schedule T that specifies A2A groups, group-
+level sequence lengths, rank-level sequence shards, and per-rank head counts. The runtime materializes the
+corresponding process groups and communication primitives. The essential changes are as follows.
+4
+
+
+--- Page 5 ---
+Schedule abstraction. The schedule abstraction, formalized in §4.1, relaxes symmetric CP and HP execution
+along three axes: (i) allowing A2A groups to have different cardinalities, keeping bandwidth-heavy redistri-
+bution within high-bandwidth domains when beneficial; (ii) assigning the global sequence length unevenly
+across groups so that faster groups receive longer subsequences and reduce synchronization stalls; and (iii)
+refining intra-group placement by assigning per-rank sequence shards and head counts according to device
+capability while preserving attention semantics.
+Heterogeneous A2A with per-rank split tables. Conventional A2A-based CP implementations use symmetric
+redistribution, where sequence and head partitions are evenly split across ranks. This uniform placement
+under-utilizes faster devices in heterogeneous clusters, as all ranks receive comparable workloads regardless of
+their capabilities. HEXISEQ replaces symmetric redistribution with heterogeneous ragged A2A, which directly
+supports non-uniform sequence–head mappings. Given a schedule, the runtime derives per-rank input and
+output split tables so that stronger devices receive larger shards and weaker devices receive smaller shards
+during A2A communication.
+Sub-ring KV exchange with batched async transfers. A symmetric Ring Attention pipeline assumes each rank
+holds the same head count, so one ring advances all heads in lockstep. Under HEXISEQ’s schedule, ranks may
+hold different and non-contiguous head ranges, so the runtime decomposes KV exchange into sub-ring tasks
+over contiguous head ranges. Batched asynchronous point-to-point transfers launch these tasks together at
+each step and overlap communication with local attention compute; non-contiguous head slices are packed
+into contiguous buffers before transfer.
+Together, these mechanisms make asymmetric CP and HP execution practical on heterogeneous hardware,
+enabling heterogeneity-aware placement without enforcing symmetric layouts. Combined with the hierarchical
+scheduler in §4, these system primitives form the complete HEXISEQ framework, whose efficiency and
+effectiveness on heterogeneous clusters are evaluated in §5.
+4
+Scheduling with Heterogeneity
+This section formalizes heterogeneous CP and HP scheduling as a constrained optimization problem (§4.1), de-
+scribes the analytical performance model that scores candidate schedules (§4.2), and presents the hierarchical
+scheduler that navigates the schedule space (§4.3).
+4.1
+Formalization
+We work over a heterogeneous device set D with profiles {cd, bd, md}d∈D, where cd is compute throughput, bd
+is device memory bandwidth, and md is HBM capacity, of device d. The communication topology is represented
+by a graph G = (D, E), whose edge bandwidth Bi,j approximates effective pairwise communication bandwidth.
+Given a global sequence length Ltot, a schedule T ∈T specifies an A2A partition P = {G1, . . . , GK}, per-group
+sequence lengths Lk with P
+k Lk = Ltot, per-rank pre-A2A sequence shards spre
+d
+that sum to Lk within each
+group, and per-rank head counts nd that collectively cover all Nheads attention heads (Table 1).
+We seek the schedule that minimizes per-iteration latency subject to per-device memory feasibility:
+T ⋆= arg min
+T ∈T Titer(T )
+s.t.
+Mem(d; T ) ≤md, ∀d ∈D,
+(1)
+where Titer(T ) is the iteration latency under T and Mem(d; T ) is the peak HBM occupied on device d. Eq. (1)
+is hard because the schedule space T grows combinatorially with the number of devices, while latency is
+non-separable across topology, sequence placement, and head placement: the bottleneck A2A group, the
+slowest Ring Attention hop, and the most loaded device are coupled through the attention pipeline. HEXISEQ
+addresses this with an analytical performance model (§4.2) and a hierarchical scheduler (§4.3) that exploits
+the problem structure.
+4.2
+Performance Model
+Comparing schedules whose communication topology, sequence placement, and head placement all differ
+requires a fast and uniform cost estimate. HEXISEQ therefore uses an analytical performance model that
+5
+
+
+--- Page 6 ---
+Table 1 Core notation used in scheduler formalization.
+Symbol Description
+Symbol
+Description
+d
+GPU device index
+D
+Set of GPU devices
+G
+Communication topology graph
+E
+Edges in G
+T
+Candidate schedule
+T ⋆
+Optimal schedule
+T
+Schedule space
+P
+Partition into A2A groups
+Gk
+A2A group
+K
+Number of groups / Ring steps
+cd
+Compute throughput
+md
+Memory capacity
+bd
+Memory bandwidth
+Bi,j
+Pairwise communication bandwidth
+Ltot
+Global sequence length
+Lk
+Sequence length assigned to Gk
+spre
+d
+Pre-A2A sequence shard
+nd
+Heads assigned to device d
+Nheads
+Total attention heads
+Mem(d; T )
+Peak HBM usage
+T
+Latency quantity
+M1, M2, Imax Pruning budgets and coord. desc. iteration cap
+predicts iteration latency from device compute throughput, memory bandwidth, memory capacity, and pairwise
+communication bandwidth. The model does not simulate every kernel; it captures the dominant terms that
+determine the critical path of long-context CP and HP training. The schedule variables Lk, spre
+d , and nd jointly
+control non-attention compute, sequence–head redistribution, Ring Attention payloads, and peak activation
+memory.
+Critical-path latency. For each Transformer block, execution decomposes into three components: (i) non-
+attention computation, including projections, MLPs, and normalization; (ii) sequence–head redistribution
+through A2A communication; and (iii) Ring Attention, in which blockwise attention computation overlaps
+with KV exchange. Since A2A groups execute concurrently, their latency is modeled by the slowest group. The
+block latency is estimated as the critical path:
+Tblk(T ) = max
+d∈D Tnonattn(d; T ) + max
+k
+TA2A(Gk; T ) +
+K−1
+X
+t=0
+Tstep(t; T ),
+(2)
+Here, Tnonattn(d; T ), TA2A(Gk; T ), and Tstep(t; T ) denote the non-attention latency, intra-group A2A latency,
+and Ring Attention step latency, respectively. The full iteration latency Titer(T ) is obtained by scaling Tblk(T )
+by the number of layers and microbatches, with forward/backward costs absorbed into the component
+coefficients; detailed equations are deferred to Appendix A.
+Memory feasibility. The same model also serves as a hard feasibility filter: for each device it estimates peak
+activation and attention-buffer memory from spre
+d , Lk for d ∈Gk, and nd, and any schedule that exceeds
+device capacity is rejected. This prevents the scheduler from selecting high-throughput plans that survive only
+by overflowing a memory-limited GPU.
+4.3
+Hierarchical Scheduler
+Overview. The schedule space T is too large for exhaustive search, as it jointly spans group formation,
+sequence allocation, and rank-level sequence–head placement. HEXISEQ therefore uses an efficient three-stage
+hierarchical scheduler (Figure 2) that decomposes this coupled search into finer decisions: it first constructs
+topology-aware A2A groups, then allocates the global sequence length across groups according to their
+aggregate capabilities, and finally refines rank-level sequence and head placement within each group. The
+full pseudocode is given in Appendix B, and we use M1 = 64, M2 = 16, and Imax = 100 throughout the
+experiments.
+Stage I: A2A grouping and abstraction. Stage I enumerates candidate A2A partitions P by greedy agglomeration
+over the topology graph G, merging high-bandwidth edges first and terminating each merge sequence once
+the bandwidth gap between successive merges exceeds a threshold. The scheduler keeps the top-M1 partitions
+ranked by intra-group bandwidth. Each retained group Gk is then summarized as a super-node by its aggregate
+compute P
+d∈Gk cd, aggregate memory bandwidth P
+d∈Gk bd, conservative memory proxy mind∈Gk md, and
+average communication cost on intra-group and inter-group edges. This abstraction gives the next stage a
+compact representation of what each A2A group can compute, store, and communicate. Stage I therefore
+reduces the device-level partition search to at most M1 super-node summaries, each one a topology-aware
+seed that the remaining stages refine instead of re-deriving.
+6
+
+
+--- Page 7 ---
+Topology Graph
+Stage I - Grouping
+Stage III - Refinement
+Stage II - Allocation
+H100-80G
+A100-80G
+A800-40G
+Attention Head
+All-to-All Group
+Sequence Length
+Figure 2 Hierarchical scheduling pipeline.
+Stage II: Global sequence partitioning.
+For each re-
+tained partition, Stage II enumerates candidate splits
+of the global sequence Ltot between groups {Gk}, sub-
+ject to P
+k Lk = Ltot. The seed splits are compute-
+proportional, square-root-compute, and a memory-
+capped variant that clips a group’s Lk whenever it
+would exceed the activation budget admitted by the
+memory proxy of that group; small local perturbations
+around each seed enrich the candidate set. Each can-
+didate is scored by the performance model of §4.2,
+and the top-M2 are forwarded to Stage III. The out-
+put of this stage is therefore a shortlist of group-level
+plans, each pairing one Stage I partition with feasible
+sequence allocation, so Stage III only refines combina-
+tions that already look promising at the coarse granu-
+larity.
+Stage III: Rank-level refinement.
+For each retained
+group-level plan, Stage III initializes the per-rank se-
+quence shards spre
+d
+and head counts nd, subject to
+P
+d∈Gk spre
+d
+= Lk within each group and P
+d∈D nd =
+Nheads globally. Coordinate descent then proposes moves that transfer a small budget of sequence tokens
+or attention heads between a pair of devices in the same or adjacent groups; a move is accepted only if it
+strictly reduces the predicted block latency and the feasibility filter passes for every device. The descent
+terminates at a local optimum or after a bounded number of iterations, handling integer head counts and the
+local bottlenecks hidden by the super-node abstraction. Each refined plan is now a fully instantiated schedule
+whose A2A partition, group-level sequence split, and per-rank sequence and head placement are all decided.
+Putting it together. The hierarchy therefore navigates T in a coarse-to-fine manner: it first forms topology-
+aware groups, then allocates sequence length across groups, and finally refines rank-level sequence and head
+placement. The early stages prune the candidate space, so the more expensive coordinate descent in Stage III is
+applied only to promising plans. Across all expanded plans, HEXISEQ returns the lowest-cost feasible schedule
+as T ⋆.
+5
+Experiments
+We evaluate HEXISEQ from three perspectives. First, we measure end-to-end training throughput on physical
+heterogeneous testbeds (§5.2). Second, we use simulation to study larger clusters beyond the available
+testbeds (§5.3). Third, we compare HEXISEQ on heterogeneous clusters with the strongest baselines on
+homogeneous clusters that have comparable aggregate compute (§5.4). The measured results are shown in
+Figures 3 and 4, and the large-scale simulation results are given in Figure 5.
+5.1
+Experimental Setup
+Models and workloads. We evaluate HEXISEQ on GPT-style decoder-only language models [48]. The physical
+testbed experiments cover 3B, 7B, and 13B parameters with context lengths from 8K to 256K, and the simulation
+experiments cover 13B and 70B parameters with context lengths up to 1024K. All runs use a global batch size
+of 8. Training inputs are tokenized OpenWebText2 documents [9] packed into fixed-length samples through
+Megatron-LM [39, 48].
+Baselines and metric. We compare against three standard CP and HP baselines: USP [8], Ulysses [17], and
+Ring Attention [34]. We report throughput in tokens per second (TPS). Among the baselines, USP composes
+CP and HP into a 2D mesh whose (CP, HP) factorization of the device count is a tunable hyperparameter. We
+therefore enumerate all legal (CP, HP) factorizations for USP and report the best throughput. All speedups
+are computed against the strongest baseline at the same configuration. For each measurement, we discard the
+7
+
+
+--- Page 8 ---
+S1
+S2
+S3
+0.0
+13.8
+27.6
+41.4
+Thpt (k t/s)
+69%↓
+11%↓
+22%↓
+78%↓
+50%↓
+6%↓
+80%↓
+38%↓
+6%↓
+3B, 16K
+S1
+S2
+S3
+0.0
+12.6
+25.2
+37.7
+68%↓
+11%↓
+15%↓
+77%↓
+46%↓
+6%↓
+78%↓
+30%↓
+9%↓
+3B, 32K
+S1
+S2
+S3
+0.0
+6.9
+13.8
+20.7
+69%↓
+29%↓
+7%↓
+74%↓
+68%↓
+2%↓
+77%↓
+24%↓
+12%↓
+7B, 16K
+S1
+S2
+S3
+0.0
+6.9
+13.9
+20.8
+68%↓
+32%↓
+14%↓
+72%↓
+72%↓
+1%↓
+77%↓
+19%↓
+14%↓
+7B, 32K
+Ring Attention
+USP
+Ulysses
+HexiSeq
+Figure 3 End-to-end training throughput of HEXISEQ compared with three baselines on the 3B and 7B models across
+mixed GPU testbeds.
+first 5 warmup iterations to absorb CUDA, allocator, and NCCL initialization, and report the mean throughput
+over the next 10 stable iterations.
+5.2
+End-to-End Testbed Performance
+We use three mixed H100 and A100 testbeds: Setting 1 pairs 4 H100s with 4 A100s, Setting 2 pairs 4 H100s
+with 8 A100s, and Setting 3 pairs 8 H100s with 8 A100s. Each GPU generation occupies its own node, with
+intra-node NVLink at 450 GB/s on H100 and 300 GB/s on A100, and a cross-node RDMA fabric at 25 GB/s.
+Results and discussions. Across all measured configurations, HEXISEQ achieves a 1.11× mean speedup and
+a 1.19× peak speedup over the strongest baseline. Since the candidate set of HEXISEQ always includes the
+three baseline layouts, the improvement comes from selecting asymmetric schedules rather than excluding
+baseline-equivalent plans.
+First, HEXISEQ consistently outperforms the strongest baseline on various model sizes and context lengths. As
+shown in Figure 3, HEXISEQ achieves the highest throughput at both 16K and 32K contexts on the 3B and 7B
+models across all testbed settings. The mean speedup over the strongest baseline rises from 1.08× at 16K to
+1.10× at 32K; on the 7B model in Setting 1 the gain grows from 1.08× at 16K to 1.17× at 32K, and the same
+pattern holds on the 7B model in Setting 3. This trend is consistent with longer attention execution providing
+additional headroom for asymmetric placement.
+S3
+16K
+S3
+32K
+0.0
+4.8
+9.7
+14.5
+Thpt (k t/s)
+75%↓
+20%↓
+10%↓
+76%↓
+20%↓
+11%↓
+13B
+7B, S3
+64K
+3B, S2
+128K
+3B, S3
+256K
+0.0
+7.2
+14.4
+21.7
+74%↓
+13%↓
+25%↓
+59%↓
+14%↓
+5%↓
+62%↓
+15%↓
+33%↓
+Long contexts
+Ring Attention
+USP
+Ulysses
+HexiSeq
+Figure 4 Throughput of HEXISEQ on the 13B model (left) and three long-
+context configurations (right).
+Second, the performance advan-
+tage remains when the model size
+increases.
+Figure 4 reports the
+13B model on Setting 3 with 8
+H100s and 8 A100s.
+HEXISEQ
+reaches 1.11× the strongest base-
+line at 16K and 1.13× at 32K.
+The improvement persists despite
+the higher activation pressure of
+13B, indicating that the asymmet-
+ric schedule continues to extract
+value from the H100 partition
+once memory headroom tightens.
+Finally, HEXISEQ remains effective at the longest contexts that fit on the testbeds. Figure 4 also reports three
+long-context configurations: 7B on Setting 3 at 64K, 3B on Setting 2 at 128K, and 3B on Setting 3 at 256K. The
+speedup over the strongest baseline is 1.15× at 64K, 1.06× at 128K, and 1.18× at 256K, with the strongest
+baseline switching between USP-style and Ulysses-style baselines.
+5.3
+Larger-Scale Simulation Performance
+To probe scales beyond the physical testbeds, we evaluate HEXISEQ in simulation using the same scheduler
+and the cost model. The cost model is calibrated against measured testbed runs: predictions track measured
+8
+
+
+--- Page 9 ---
+64K
+128K
+256K
+0.0
+12.0
+24.1
+36.1
+65%↓
+25%↓
+27%↓
+60%↓
+26%↓
+18%↓
+62%↓
+39%↓
+19%↓
+Sim 1, 13B
+128K
+256K
+512K
+0.0
+15.5
+30.9
+46.4
+84%↓
+50%↓
+42%↓
+81%↓
+50%↓
+35%↓
+80%↓
+53%↓
+30%↓
+Sim 2, 13B
+256K
+512K
+1024K
+0.0
+19.4
+38.7
+58.1
+90%↓
+55%↓
+25%↓
+89%↓
+59%↓
+22%↓
+89%↓
+66%↓
+23%↓
+Sim 3, 13B
+32K
+64K
+128K
+0.0
+3.0
+6.0
+9.0
+67%↓
+25%↓
+25%↓
+57%↓
+21%↓
+23%↓
+51%↓
+22%↓
+17%↓
+Sim 1, 70B
+64K
+128K
+256K
+0.0
+3.1
+6.2
+9.3
+78%↓
+30%↓
+27%↓
+73%↓
+31%↓
+21%↓
+72%↓
+36%↓
+22%↓
+Sim 2, 70B
+128K
+256K
+512K
+0.0
+5.6
+11.2
+16.7
+92%↓
+57%↓
+40%↓
+89%↓
+53%↓
+28%↓
+87%↓
+55%↓
+24%↓
+Sim 3, 70B
+Thpt (k t/s)
+Ring Attention
+USP
+Ulysses
+HexiSeq
+Figure 5 Simulated training throughput of HEXISEQ compared with three baselines on three larger heterogeneous clusters
+with 13B (top row) and 70B (bottom row) models.
+throughput closely and preserve the relative ordering of competing schedules across validation cases (Ap-
+pendix C), so the simulated throughputs reported below are reliable for comparison at scales we cannot run
+physically. Intra-node bandwidth varies by accelerator generation: 450 GB/s NVLink on H100, 300 GB/s on
+A100, 200 GB/s on A800, and 32 GB/s PCIe on L40S. All nodes communicate cross-node over a 200 GB/s
+RDMA fabric. We study three heterogeneous clusters with progressively larger scale and GPU diversity:
+Simulation 1 is a 32-GPU three-generation cluster with 8 H100s, 8 A100s, and 16 A800s, Simulation 2 is a
+64-GPU four-generation cluster with 16 each of H100, A100, A800, and L40S, and Simulation 3 is a 128-GPU
+four-generation cluster with 16 H100s, 16 A100s, 48 A800s, and 48 L40S. For each cluster, we report training
+throughput on 13B and 70B language models. Figure 5 reports the six model-cluster combinations.
+Results and discussions. First, HEXISEQ achieves the highest throughput on every simulated 13B configuration. As
+shown in the top row of Figure 5, the largest gain appears on Simulation 2, where the cluster contains four
+accelerator generations which provide more flexibility for asymmetric placement. HEXISEQ continues to lead
+on Simulation 3, the largest simulated cluster in our study.
+128
+256
+512 1024
+Number of GPUs
+0
+150
+300
+450
+Runtime (s)
+9.0
+30.3
+115.0
+444.0
+Figure 6 Hierarchical scheduler run-
+time.
+Second, the advantage persists on the 70B model despite higher memory
+pressure. The bottom row of Figure 5 shows that HEXISEQ remains
+the strongest method in every panel. Larger models increase memory
+pressure and per-step communication, but the relative gap does not
+narrow with context length in these simulations. This result suggests that
+asymmetric placement remains useful beyond the smaller testbed-scale
+models.
+Finally, the scheduler overhead remains manageable at larger scales.
+Figure 6 reports the runtime of the hierarchical scheduler as the number
+of GPUs increases from 128 to 1024. The scheduler finishes in 9.0 seconds
+on 128 GPUs and 444.0 seconds on 1024 GPUs, remaining under eight minutes at the largest scale. Thus, the
+pruning and hierarchical refinement used by HEXISEQ keep the scheduling overhead manageable compared
+with the training runs it configures.
+5.4
+FLOP-Equivalent Homogeneous Comparison
+The previous results compare HEXISEQ with heterogeneous baselines. We further ask whether a heterogeneous
+cluster can approach the throughput of a homogeneous cluster with similar FLOPs. We study this question in
+simulation using the cost model from Appendix C. Three baselines run on the homogeneous cluster, while
+HEXISEQ runs on the heterogeneous cluster.
+We report two simulated pairs with similar aggregate FLOPs. Simulation 4 pairs 48 H100s and 8 A100s on the
+9
+
+
+--- Page 10 ---
+heterogeneous side with 152 A100s on the homogeneous side, using a 13B model at 256K context. Simulation 5
+pairs 52 H100s, 4 A100s, and 8 A800s on the heterogeneous side with 168 A100s on the homogeneous side,
+using a 13B model at 128K context.
+13B, 256K
+0.0
+26.3
+52.6
+78.8
+Thpt (k t/s)
+Sim 4
+13B, 128K
+0.0
+18.9
+37.8
+56.7
+Sim 5
+Ring Attention
+USP
+Ulysses
+HexiSeq
+Figure 7 FLOP-equivalent comparison of HEXISEQ and three baselines on
+heterogeneous clusters.
+Results and discussions. On both FLOP-
+comparable pairs, the strongest homoge-
+neous baseline is Ulysses. As shown in
+Figure 7, HEXISEQ stays within ∼0.5%
+of Ulysses throughput on average across
+Simulation 4 and Simulation 5. With
+similar aggregate FLOPs, a heteroge-
+neous cluster scheduled by HEXISEQ
+therefore reaches throughput close to
+the strongest homogeneous baseline, in-
+dicating that asymmetric placement ab-
+sorbs most of the heterogeneity penalty under our cost model rather than leaving it as a residual gap.
+6
+Conclusion
+HEXISEQ is a heterogeneous long-context training system that extends context and head parallelism with
+asymmetric placement and cost-model-guided scheduling algorithm. Empirical studies show that, on mixed
+H100 and A100 testbeds, HEXISEQ improves throughput by 1.11× on average and up to 1.19× over the
+strongest heterogeneous baseline. Simulations on 32 to 128 GPUs further show an average gain of 1.36×, and
+FLOP-equivalent comparisons show that HEXISEQ can approach the throughput of the strongest homogeneous
+baseline while running on heterogeneous clusters.
+References
+[1] Anthropic. What’s new in claude opus 4.7, 2026. URL https://platform.claude.com/docs/en/about-claude/
+models/whats-new-claude-4-7.
+[2] William Brandon, Aniruddha Nrusimha, Kevin Qian, Zachary Ankner, Tian Jin, Zhiye Song, and Jonathan Ragan-
+Kelley. Striped attention: Faster ring attention for causal transformers. arXiv preprint arXiv:2311.09431, 2023.
+[3] Qiaoling Chen, Diandian Gu, Guoteng Wang, Xun Chen, YingTong Xiong, Ting Huang, Qinghao Hu, Xin Jin, Yonggang
+Wen, Tianwei Zhang, et al. Internevo: Efficient long-sequence large language model training via hybrid parallelism
+and redundant sharding. arXiv preprint arXiv:2401.09149, 2024.
+[4] Qiaoling Chen, Shenggui Li, Wei Gao, Peng Sun, Yonggang Wen, and Tianwei Zhang. Sppo: Efficient long-sequence
+llm training via adaptive sequence pipeline parallel offloading. arXiv preprint arXiv:2503.10377, 2025.
+[5] Sirui Chen, Jingji Chen, Siqi Zhu, Ziheng Jiang, Yanghua Peng, and Xuehai Qian.
+Mesh-attention: A new
+communication-efficient distributed attention with improved data locality. arXiv preprint arXiv:2512.20968, 2025.
+[6] Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. In 12th International
+Conference on Learning Representations, ICLR 2024, 2024.
+[7] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-efficient exact
+attention with io-awareness. Advances in neural information processing systems, 35:16344–16359, 2022.
+[8] Jiarui Fang and Shangchun Zhao. Usp: A unified sequence parallelism approach for long context generative ai. arXiv
+preprint arXiv:2405.07719, 2024.
+[9] Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason Phang, Horace He,
+Anish Thite, Noa Nabeshima, et al. The pile: An 800gb dataset of diverse text for language modeling. arXiv preprint
+arXiv:2101.00027, 2020.
+[10] Hao Ge, Fangcheng Fu, Haoyang Li, Xuanyu Wang, Sheng Lin, Yujie Wang, Xiaonan Nie, Hailin Zhang, Xupeng Miao,
+and Bin Cui. Enabling parallelism hot switching for efficient training of large language models. In Proceedings of
+the ACM SIGOPS 30th Symposium on Operating Systems Principles, pages 178–194, 2024.
+10
+
+
+--- Page 11 ---
+[11] Hao Ge, Junda Feng, Qi Huang, Fangcheng Fu, Xiaonan Nie, Lei Zuo, Haibin Lin, Bin Cui, and Xin Liu. Bytescale:
+Communication-efficient scaling of llm training with a 2048k context length on 16384 gpus. In Proceedings of the
+ACM SIGCOMM 2025 Conference, pages 963–978, 2025.
+[12] Google Cloud. Gemini 3.1 pro, 2026. URL https://docs.cloud.google.com/vertex-ai/generative-ai/docs/m
+odels/gemini/3-1-pro.
+[13] Diandian Gu, Peng Sun, Qinghao Hu, Ting Huang, Xun Chen, Yingtong Xiong, Guoteng Wang, Qiaoling Chen,
+Shangchun Zhao, Jiarui Fang, et al.
+Loongtrain: Efficient training of long-sequence llms with head-context
+parallelism. arXiv preprint arXiv:2406.18485, 2024.
+[14] Runsheng Benson Guo, Utkarsh Anand, Arthur Chen, and Khuzaima Daudjee. Cephalo: Harnessing heteroge-
+neous gpu clusters for training transformer models. In Proceedings of the 39th ACM International Conference on
+Supercomputing, pages 368–383, 2025.
+[15] Guoliang He, Youhe Jiang, Wencong Xiao, Jiang Kaihua, Shuguang Wang, Jun Wang, Du Zixian, Zhuo Jiang, Xinlei
+Zhang, Binhang Yuan, et al. Efficient pre-training of llms via topology-aware communication alignment on more
+than 9600 gpus. Advances in Neural Information Processing Systems, 38:147100–147126, 2026.
+[16] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan Ngiam,
+Quoc V Le, Yonghui Wu, et al. Gpipe: Efficient training of giant neural networks using pipeline parallelism. Advances
+in neural information processing systems, 32, 2019.
+[17] Sam Ade Jacobs, Masahiro Tanaka, Chengming Zhang, Minjia Zhang, Reza Yazdani Aminadabi, Shuaiwen Leon
+Song, Samyam Rajbhandari, and Yuxiong He. System optimizations for enabling training of extreme long sequence
+transformer models. In Proceedings of the 43rd ACM Symposium on Principles of Distributed Computing, pages
+121–130, 2024.
+[18] Chenyu Jiang, Zhenkun Cai, Ye Tian, Zhen Jia, Yida Wang, and Chuan Wu. Dcp: Addressing input dynamism
+in long-context training via dynamic context parallelism. In Proceedings of the ACM SIGOPS 31st Symposium on
+Operating Systems Principles, pages 221–236, 2025.
+[19] Youhe Jiang, Fangcheng Fu, Xupeng Miao, Xiaonan Nie, and Bin Cui. Osdp: Optimal sharded data parallel for
+distributed deep learning. arXiv preprint arXiv:2209.13258, 2022.
+[20] Youhe Jiang, Ran Yan, Xiaozhe Yao, Yang Zhou, Beidi Chen, and Binhang Yuan. Hexgen: Generative inference of
+large language model over heterogeneous environment. arXiv preprint arXiv:2311.11514, 2023.
+[21] Youhe Jiang, Fangcheng Fu, Xiaozhe Yao, Guoliang He, Xupeng Miao, Ana Klimovic, Bin Cui, Binhang Yuan, and
+Eiko Yoneki. Demystifying cost-efficiency in llm serving over heterogeneous gpus. arXiv preprint arXiv:2502.00722,
+2025.
+[22] Youhe Jiang, Fangcheng Fu, Xiaozhe Yao, Taiyi Wang, Bin Cui, Ana Klimovic, and Eiko Yoneki. Thunderserve:
+High-performance and cost-efficient llm serving in cloud environments. Proceedings of Machine Learning and
+Systems, 7, 2025.
+[23] Youhe Jiang, Fangcheng Fu, Wanru Zhao, Stephan Rabanser, Jintao Zhang, Nicholas D Lane, and Binhang Yuan.
+Cascadia: An efficient cascade serving system for large language models. arXiv preprint arXiv:2506.04203, 2025.
+[24] Youhe Jiang, Ran Yan, and Binhang Yuan. Hexgen-2: Disaggregated generative inference of llms in heterogeneous
+environment. arXiv preprint arXiv:2502.07903, 2025.
+[25] Youhe Jiang, Fangcheng Fu, Taiyi Wang, Guoliang He, and Eiko Yoneki. Oserve: Accelerating llm serving via
+spatial-temporal workload orchestration. arXiv preprint arXiv:2602.12151, 2026.
+[26] Youhe Jiang, Fangcheng Fu, and Eiko Yoneki. Boute: Cost-efficient llm serving with heterogeneous llms and gpus via
+multi-objective bayesian optimization. arXiv preprint arXiv:2602.10729, 2026.
+[27] Vijay Anand Korthikanti, Jared Casper, Sangkug Lym, Lawrence McAfee, Michael Andersch, Mohammad Shoeybi,
+and Bryan Catanzaro. Reducing activation recomputation in large transformer models. Proceedings of Machine
+Learning and Systems, 5:341–353, 2023.
+[28] Dacheng Li, Rulin Shao, Anze Xie, Eric P Xing, Xuezhe Ma, Ion Stoica, Joseph E Gonzalez, and Hao Zhang.
+Distflashattn: Distributed memory-efficient attention for long-context llms training. In First Conference on Language
+Modeling, 2024.
+11
+
+
+--- Page 12 ---
+[29] Haoyang Li, Fangcheng Fu, Hao Ge, Sheng Lin, Xuanyu Wang, Jiawen Niu, Xupeng Miao, and Bin Cui. Hetu v2:
+A general and scalable deep learning system with hierarchical and heterogeneous single program multiple data
+annotations. arXiv preprint arXiv:2504.20490, 2025.
+[30] Haoyang Li, Fangcheng Fu, Sheng Lin, Hao Ge, Xuanyu Wang, Jiawen Niu, Jinbao Xue, Yangyu Tao, Di Wang, Jie
+Jiang, et al. Hydraulis: Balancing large transformer model training via co-designing parallel strategies and data
+assignment. Proceedings of the ACM on Management of Data, 3(6):1–30, 2025.
+[31] Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar, Pieter Noordhuis, Teng Li, Adam Paszke, Jeff Smith, Brian
+Vaughan, Pritam Damania, et al. Pytorch distributed: experiences on accelerating data parallel training. Proceedings
+of the VLDB Endowment, 13(12):3005–3018, 2020.
+[32] Shenggui Li, Fuzhao Xue, Chaitanya Baranwal, Yongbin Li, and Yang You. Sequence parallelism: Long sequence
+training from system perspective. In Proceedings of the 61st Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), pages 2391–2404, 2023.
+[33] Zhuohan Li, Siyuan Zhuang, Shiyuan Guo, Danyang Zhuo, Hao Zhang, Dawn Song, and Ion Stoica. Terapipe:
+Token-level pipeline parallelism for training large-scale language models. In International Conference on Machine
+Learning, pages 6543–6552. PMLR, 2021.
+[34] Hao Liu, Matei Zaharia, and Pieter Abbeel. Ringattention with blockwise transformers for near-infinite context. In
+The Twelfth International Conference on Learning Representations, 2024.
+[35] Ziming Liu, Shaoyu Wang, Shenggan Cheng, Zhongkai Zhao, Kai Wang, Xuanlei Zhao, James Demmel, and Yang You.
+Startrail: Concentric ring sequence parallelism for efficient near-infinite-context transformer model training. In The
+Thirty-ninth Annual Conference on Neural Information Processing Systems, 2025.
+[36] Cheng Luo, Jiawei Zhao, Zhuoming Chen, Beidi Chen, and Anima Anandkumar. Mini-sequence transformers:
+Optimizing intermediate memory for long sequences training. Advances in Neural Information Processing Systems,
+37:97299–97327, 2024.
+[37] Xupeng Miao, Yujie Wang, Youhe Jiang, Chunan Shi, Xiaonan Nie, Hailin Zhang, and Bin Cui. Galvatron: Efficient
+transformer training over multiple gpus using automatic parallelism. arXiv preprint arXiv:2211.13878, 2022.
+[38] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri, Nikhil R Devanur, Gregory R Ganger, Phillip B
+Gibbons, and Matei Zaharia. Pipedream: Generalized pipeline parallelism for dnn training. In Proceedings of the
+27th ACM symposium on operating systems principles, pages 1–15, 2019.
+[39] Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGresley, Mostofa Patwary, Vijay Korthikanti, Dmitri
+Vainbrand, Prethvi Kashinkunti, Julie Bernauer, Bryan Catanzaro, et al. Efficient large-scale language model training
+on gpu clusters using megatron-lm. In Proceedings of the international conference for high performance computing,
+networking, storage and analysis, pages 1–15, 2021.
+[40] Nvidia. Nvidia’s new ampere data center GPU in full production, 2020. URL https://nvidianews.nvidia.com/ne
+ws/nvidias-new-ampere-data-center-gpu-in-full-production.
+[41] Nvidia. Nvidia announces hopper architecture, the next generation of accelerated computing, 2022. URL https:
+//nvidianews.nvidia.com/news/nvidia-announces-hopper-architecture-the-next-generation-of-accel
+erated-computing.
+[42] Nvidia. Nvidia blackwell platform arrives to power a new era of computing, 2024. URL https://nvidianews.nvi
+dia.com/news/nvidia-blackwell-platform-arrives-to-power-a-new-era-of-computing.
+[43] Nvidia. Nvidia blackwell ultra ai factory platform paves way for age of ai reasoning, 2025. URL https://nvidianews
+.nvidia.com/news/nvidia-blackwell-ultra-ai-factory-platform-paves-way-for-age-of-ai-reasoning.
+[44] Yazan Obeidi, Amir Sarfi, Joel Lidin, Paul Janson, and Eugene Belilovsky. Heterogeneous low-bandwidth pre-training
+of llms. arXiv preprint arXiv:2601.02360, 2026.
+[45] OpenAI. Gpt-5.5 model, 2026. URL https://developers.openai.com/api/docs/models/gpt-5.5.
+[46] You Peng, Youhe Jiang, Wenqi Jiang, Chen Wang, and Binhang Yuan. Hexgen-flow: Optimizing llm inference request
+scheduling for agentic text-to-sql. arXiv preprint arXiv:2505.05286, 2025.
+12
+
+
+--- Page 13 ---
+[47] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimizations toward training
+trillion parameter models. In SC20: international conference for high performance computing, networking, storage
+and analysis, pages 1–16. IEEE, 2020.
+[48] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. Megatron-
+lm: Training multi-billion parameter language models using model parallelism. arXiv preprint arXiv:1909.08053,
+2019.
+[49] Foteini Strati, Zhendong Zhang, George Manos, Ixeia Sánchez Périz, Qinghao Hu, Tiancheng Chen, Berk Buzcu,
+Song Han, Pamela Delgado, and Ana Klimovic. Sailor: Automating distributed training over dynamic, heterogeneous,
+and geo-distributed clusters. In Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles,
+pages 204–220, 2025.
+[50] Ao Sun, Weilin Zhao, Xu Han, Cheng Yang, Zhiyuan Liu, Chuan Shi, and Maosong Sun. Burstattention: An efficient
+distributed attention framework for extremely long sequences. arXiv preprint arXiv:2403.09347, 2024.
+[51] Ding Tang, Jiecheng Zhou, Jiakai Hu, Shengwei Li, Huihuang Zheng, Zhilin Pei, Hui Wang, and Xingcheng Zhang.
+H2: Towards efficient large-scale llm training on hyper-heterogeneous cluster over 1,000 chips. arXiv preprint
+arXiv:2505.17548, 2025.
+[52] Chris Tong, Youhe Jiang, Gufeng Chen, Tianyi Zhao, Sibian Lu, Wenjie Qu, Eric Yang, Lynn Ai, and Binhang Yuan.
+Parallax: Efficient llm inference service over decentralized environment. arXiv preprint arXiv:2509.26182, 2025.
+[53] Jinquan Wang, Xiaojian Liao, Xuzhao Liu, Jiashun Suo, Zhisheng Huo, Chenhao Zhang, Xiangrong Xu, Runnan Shen,
+Xilong Xie, and Limin Xiao. Deepcee: Efficient cross-region model distributed training system under heterogeneous
+gpus and networks. arXiv preprint arXiv:2505.15536, 2025.
+[54] Yujie Wang, Youhe Jiang, Xupeng Miao, Fangcheng Fu, Shenhan Zhu, Xiaonan Nie, Yaofeng Tu, and Bin Cui.
+Improving automatic parallel training via balanced memory workload optimization. IEEE Transactions on Knowledge
+and Data Engineering, 36(8):3906–3920, 2024.
+[55] Yujie Wang, Shiju Wang, Shenhan Zhu, Fangcheng Fu, Xinyi Liu, Xuefeng Xiao, Huixia Li, Jiashi Li, Faming Wu, and
+Bin Cui. Flexsp: Accelerating large language model training via flexible sequence parallelism. In Proceedings of the
+30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems,
+Volume 2, pages 421–436, 2025.
+[56] Ran Yan, Youhe Jiang, Xiaonan Nie, Fangcheng Fu, Bin Cui, and Binhang Yuan. Hexiscale: Accommodating large
+language model training over heterogeneous environment. arXiv preprint arXiv:2409.01143, 2024.
+[57] Ran Yan, Youhe Jiang, Zhuoming Chen, Haohui Mai, Beidi Chen, and Binhang Yuan. Fsa: An alternative efficient
+implementation of native sparse attention kernel. arXiv preprint arXiv:2508.18224, 2025.
+[58] Ran Yan, Youhe Jiang, Tianyuan Wu, Jiaxuan Gao, Zhiyu Mei, Wei Fu, Haohui Mai, Wei Wang, Yi Wu, and
+Binhang Yuan. Areal-hex: Accommodating asynchronous rl training over heterogeneous gpus. arXiv preprint
+arXiv:2511.00796, 2025.
+[59] Jinghan Yao, Sam A Jacobs, Masahiro Tanaka, Olatunji Ruwase, Hari Subramoni, and Dhabaleswar Panda. Training
+ultra long context language model with fully pipelined distributed transformer. Proceedings of Machine Learning
+and Systems, 7, 2025.
+[60] Li Zhang, Youhe Jiang, Guoliang He, Xin Chen, Han Lv, Qian Yao, Fangcheng Fu, and Kai Chen. Efficient mixed-
+precision large language model inference with turbomind. arXiv preprint arXiv:2508.15601, 2025.
+[61] WenZheng Zhang, Yang Hu, Jing Shi, and Xiaoying Bai. Poplar: Efficient scaling of distributed dnn training on
+heterogeneous gpu clusters. In Proceedings of the AAAI Conference on Artificial Intelligence, volume 39, pages
+22587–22595, 2025.
+[62] Pinxue Zhao, Hailin Zhang, Fangcheng Fu, Xiaonan Nie, Qibin Liu, Fang Yang, Yuanbo Peng, Dian Jiao, Shuaipeng Li,
+Jinbao Xue, et al. Memo: Fine-grained tensor management for ultra-long context llm training. Proceedings of the
+ACM on Management of Data, 3(1):1–28, 2025.
+[63] Xuanlei Zhao, Shenggan Cheng, Chang Chen, Zangwei Zheng, Ziming Liu, Zheming Yang, and Yang You. Dsp:
+Dynamic sequence parallelism for multi-dimensional transformers. In International Conference on Machine Learning,
+pages 77390–77404. PMLR, 2025.
+13
+
+
+--- Page 14 ---
+A
+Detailed Cost Model Derivation
+This appendix details the memory, computation, and communication terms used by the HEXISEQ performance
+model of §4.2.
+Table 2 Additional notation used in the cost-model derivation. Symbols already defined in Table 1 are reused without
+redefinition.
+Symbol
+Description
+Symbol
+Description
+B
+Batch or microbatch size
+H
+Model hidden dimension
+dh
+Hidden dimension per attention head
+Pdtype
+Bytes per tensor element
+G(d)
+A2A group containing device d
+Gsrc(t)
+Source group at Ring step t
+LG(d)
+Sequence length of d’s group (Lk for d ∈
+Gk)
+γact
+Activation-retention coefficient
+peer(d, t) = u
+Source peer of device d at Ring step t
+Msg(d, t)
+Ring message size at device d and step t
+αi,j
+Startup latency between i and j
+βi,j
+Per-byte communication cost (βi,j = 1/Bi,j)
+Fnonattn, Fattn Non-attention and attention FLOPs
+Fcomp-step
+Per-step attention FLOPs
+Vnonattn
+Non-attention data movement
+Vd→j
+A2A volume from d to j
+Tblk
+Block latency
+Titer
+Iteration latency
+Tnonattn
+Non-attention latency
+TA2A
+A2A redistribution latency
+Tstep
+Ring Attention step latency
+Memact(d; T ) Peak activation memory estimate
+A.1
+Counting Conventions
+Equation (2) omits explicit execution multiplicities; forward, backward, and recomputation effects are
+absorbed into the per-component FLOP and communication-volume formulas. Non-attention modules (QKV
+projections, MLP, normalization) include forward and backward execution; attention computation includes
+forward, backward, and activation recomputation; communication costs include forward and backward
+execution, while recomputation does not incur additional communication.
+A.2
+Memory Cost Model
+To ensure feasibility, the peak memory usage on each device d must not exceed its capacity md. We decompose
+Mem(d; T ) into a schedule-independent residency M static
+d
+that absorbs weights, gradients, and optimizer states
+under the chosen DP/PP/TP outer layout, and a schedule-dependent activation peak Memact(d; T ) that varies
+with spre
+d , LG(d), and nd. The feasibility filter then applies M static
+d
++ Memact(d; T ) ≤md, so schedule scoring
+reduces to estimating Memact(d; T ). We estimate the activation peak by summing the dominant saved tensors
+required for backward and recomputation under our implementation. Each device stores (i) the non-attention
+activation stream before the sequence-to-head redistribution, of shape [B, spre
+d , H], and (ii) the attention KV
+staging buffers used by Ring Attention, of shape [B, LG(d), nd · dh] for both K and V . Therefore,
+Memact(d; T ) ≈B · Pdtype ·
+
+γact · spre
+d
+· H + 2 · LG(d) · (nd · dh)
+
+,
+(3)
+where γact is the number of backbone activation tensors of shape [B, spre
+d , H] that must be retained at peak
+(e.g., residual stream and normalization inputs and outputs) under the chosen checkpointing and fusion
+strategy. In our implementation we set γact = 2.
+A.3
+Computation Cost Model
+We model the cost of a full training iteration, including forward, backward, and recomputation phases.
+Non-attention computation. This component includes QKV and output projections, MLP layers, and normaliza-
+tion. The FLOPs and memory traffic on device d scale with its pre-A2A sequence shard spre
+d . We approximate
+the activation traffic of non-attention modules by counting the read and write volume of their input and output
+activation tensors. Under a standard decoder-only Transformer block with MLP expansion ratio 4, this yields
+14
+
+
+--- Page 15 ---
+an effective coefficient of about 20 per forward pass, or 40 when accounting for both forward and backward
+execution:
+Vnonattn(d) ≈40 · B · spre
+d
+· H · Pdtype.
+(4)
+We approximate the FLOPs of these modules as
+Fnonattn(d) ≈72 · B · spre
+d
+· H2,
+(5)
+which aggregates the dominant dense GEMMs in one Transformer block under the standard MLP expansion
+ratio. We then use a roofline model to estimate latency:
+Tnonattn(d) = max
+Fnonattn(d)
+cd
+, Vnonattn(d)
+bd
+
+.
+(6)
+Attention computation. Device d computes attention for its assigned heads nd over its local query block LG(d)
+against the global context. The total floating-point operations, aggregated across all Ring Attention steps, are
+Fattn(d) ≈16 · B · LG(d) · (nd · dh) · Ltot.
+(7)
+The latency of attention is not modeled as a standalone term; instead, it is decomposed into per-step execution
+within the Ring Attention pipeline, where computation and communication overlap.
+A.4
+Communication Cost Model
+Heterogeneous A2A. The A2A operation redistributes tensors between the sequence and head dimensions. In
+contrast to homogeneous settings, the model tracks the exact point-to-point data volume sent from device d to
+device j under the relaxed partitioning. The volume Vd→j corresponds to the slice of d’s sequence shard spre
+d
+destined for device j’s assigned heads:
+Vd→j = 3 · B · spre
+d
+· (nj · dh) · Pdtype.
+(8)
+The factor 3 accounts for Q, K, and V in the forward redistribution. Each Transformer block invokes the A2A
+primitive four times (two in the forward pass and two in the backward pass); applying the QKV volume to
+all four yields a conservative high-volume estimate, since the reverse redistributions may carry fewer tensors
+depending on the implementation. The latency of group Gk is bottlenecked by the slowest point-to-point link
+in the group:
+TA2A(Gk) = 4 · max
+d∈Gk
+max
+j∈Gk,j̸=d (αd,j + βd,j · Vd→j) .
+(9)
+Heterogeneous Ring Attention. The Ring Attention pipeline executes in K steps (t = 0, . . . , K −1). Let
+u = peer(d, t) denote the source device from which device d receives data at step t. We distinguish between
+the local attention step (where source and destination groups coincide) and the remote communication steps.
+For the local step (typically t = 0), no communication occurs, so Msg(d, 0) = 0. For remote steps (t > 0), the
+message size depends on the sequence length held by the source group Gsrc(t):
+Msg(d, t) = 4 · B · LGsrc(t) · (nd · dh) · Pdtype.
+(10)
+The computation load at step t corresponds to the blockwise attention between the local query block LG(d)
+and the source KV block LGsrc(t):
+Fcomp-step(d, t) ≈16 · B · LG(d) · LGsrc(t) · (nd · dh).
+(11)
+Assuming overlap between communication and computation, the latency of step t is
+Tstep(t) = max
+d∈D
+
+
+
+
+
+
+
+Fcomp-step(d, t)
+cd
+if t = 0 (local),
+max
+Fcomp-step(d, t)
+cd
+, αu,d + βu,d · Msg(d, t)
+
+if t > 0 (remote).
+(12)
+15
+
+
+--- Page 16 ---
+Algorithm 1 Hierarchical scheduler for heterogeneous CP and HP.
+Input: Devices D with profiles {cd, bd, md}d∈D, topology graph G, sequence length Ltot.
+Output: Schedule T ⋆.
+1: PA2A ←PARTITIONTOPOLOGY(G)
+▷Stage I: candidate topologies
+2: S ←ABSTRACTSUPERNODES(PA2A)
+▷Stage I: super-node abstraction
+3: W ←GENERATECANDIDATES(S, Ltot)
+▷Stage II: group sequence planning
+4: T ⋆←∅;
+C⋆←∞
+5: for all w ∈W do
+6:
+T ←INITIALIZEASSIGNMENT(w, S)
+▷Stage III: rank-level refinement
+7:
+C ←COSTMODEL(T )
+8:
+improved ←true;
+i ←0
+9:
+while improved and i < Imax do
+10:
+improved ←false;
+i ←i + 1
+11:
+for all (da, db) ∈CANDIDATEPAIRS(T ) do
+12:
+T ′ ←PROPOSEMOVE(T , da, db)
+13:
+if FEASIBILITYCHECK(T ′) then
+14:
+C′ ←COSTMODEL(T ′)
+15:
+if C′ < C then
+16:
+T ←T ′;
+C ←C′;
+improved ←true
+17:
+break
+18:
+end if
+19:
+end if
+20:
+end for
+21:
+end while
+22:
+if C < C⋆then
+23:
+T ⋆←T ;
+C⋆←C
+24:
+end if
+25: end for
+26: return T ⋆
+B
+Hierarchical Scheduler Algorithm
+Algorithm 1 gives the pseudocode of the hierarchical scheduler described in §4.3. Stage I (lines 1–2) constructs
+candidate A2A partitions by topology-aware graph agglomeration and summarizes each retained group as a
+super-node. Stage II (line 3) generates candidate splits of the global sequence across groups. Stage III (lines 4–
+19) iterates over each retained group-level plan, initializes the rank-level assignment, and improves it with
+bounded-iteration coordinate descent. The candidate generators PARTITIONTOPOLOGY, ABSTRACTSUPERNODES,
+GENERATECANDIDATES, INITIALIZEASSIGNMENT, CANDIDATEPAIRS, and PROPOSEMOVE are described in §4.3;
+COSTMODEL and FEASIBILITYCHECK invoke the analytical performance model of §4.2.
+C
+Cost-Model Validation on the Testbeds
+HEXISEQ’s scheduler ranks candidate schedules using the analytical performance model in §4.2. Therefore, the
+relevant validation criterion is whether the model predicts both absolute throughput within a reasonable range
+and, more importantly, the relative ordering among competing schedules. Table 3 reports the per-method
+prediction gap, defined as (simulated −measured)/measured, on a representative subset of validation cases
+covering all three baselines and the schedules selected by HEXISEQ on the testbeds in §5.1. Most points fall
+within ±10%, and the model’s relative ordering of schedules matches the measured ordering in every case
+shown. Although larger absolute outliers appear in the full evaluation set, they do not change the ranking
+between HEXISEQ and the strongest baseline at the same configuration. This ranking fidelity justifies using the
+same simulator to compare schedules at scales beyond the physical testbeds in §5.3.
+16
+
+
+--- Page 17 ---
+Method
+Model/Setting
+Context
+Measured (kTPS)
+Simulated (kTPS)
+Gap
+USP
+3B, Setting 2
+64K
+16.6
+16.8
++1.6%
+USP
+3B, Setting 3
+64K
+27.4
+29.9
++9.3%
+Ulysses
+3B, Setting 3
+128K
+19.8
+19.0
+−4.1%
+Ulysses
+13B, Setting 3
+16K
+11.4
+11.2
+−1.5%
+Ring
+3B, Setting 2
+32K
+7.3
+7.6
++4.1%
+Ring
+7B, Setting 3
+16K
+4.3
+4.3
++1.5%
+HEXISEQ
+3B, Setting 3
+64K
+30.2
+30.0
+−0.6%
+HEXISEQ
+7B, Setting 3
+64K
+16.5
+15.9
+−3.8%
+Table 3 Cost-model prediction gap on a representative validation subset measured on the mixed H100/A100 testbeds
+of §5.1. Throughputs are reported in 103 tokens/s; the gap is (simulated −measured)/measured. The full validation set
+covers 76 cases; the rows below are illustrative across methods, models, settings, and context lengths.
+D
+Limitations
+HEXISEQ focuses on heterogeneous CP and HP scheduling for long-context attention. Our implementation and
+evaluation cover the attention-parallel part of the training stack, while leaving broader cluster-level placement
+decisions to future work.
+Evaluation scale. Our direct measurements use mixed H100 and A100 testbeds of up to 16 GPUs, covering
+3B, 7B, and 13B models with context lengths from 8K to 256K. To study larger regimes, we use the validated
+performance model from Appendix C to simulate 32 to 128 GPU clusters, 13B and 70B models, and contexts
+up to 1024K. This combination lets us validate HEXISEQ end to end on real heterogeneous hardware and then
+isolate scaling trends beyond the available testbeds. Future large-cluster measurements would further quantify
+deployment-specific effects such as background traffic and NCCL protocol choices.
+Scheduling scope. HEXISEQ optimizes the CP and HP attention schedule while treating data, tensor, and
+pipeline parallelism as surrounding decisions. This design keeps the schedule space tractable and allows
+HEXISEQ to be composed with existing training stacks. A natural extension is to co-schedule these outer
+parallelism dimensions together with sequence and head placement, enabling a single optimizer to reason
+about model shards, microbatches, and attention partitions jointly.
+17
