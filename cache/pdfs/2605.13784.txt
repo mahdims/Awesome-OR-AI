@@ -1,0 +1,1245 @@
+--- Page 1 ---
+Attention Once Is All You Need:
+Efficient Streaming Inference with Stateful
+Transformers
+Victor Norgren
+LayerScale, Inc.
+https://layerscale.ai
+victor@layerscale.ai
+Abstract
+We introduce a computational model for transformer inference centred on stateful
+sessions: a stateful KV cache that lives across persistent sessions, advanced incre-
+mentally by ingesting only new data as it arrives. By decoupling the data plane
+from the query plane, incoming data is processed into the cache asynchronously
+via lock-free pipelines, while queries execute as lightweight consumers of pre-
+computed attention state. The resulting query complexity is O(|q|) in the query
+length, independent of accumulated context size.
+Stateful sessions are the foundational construct on which we build two further
+mechanisms. Flash Queries pre-compute answers to registered questions after
+each data update, pushing latency from the ∼43 ms standard-query path toward
+zero for predictable query patterns by exploiting idle GPU cycles between data
+arrivals, caching results, and pushing them to clients via server-sent events before
+any question is asked. The architecture treats inference as continuously produc-
+tive rather than discretely reactive, and this stance is only possible because the
+underlying context is persistent. A multi-tenant continuous-batching scheduler
+with cell-budget admission, adaptive chunked prefill, prefix-aware grouped prefill,
+and concurrency-capped speculative decoding allows dozens of stateful sessions to
+coexist on a single GPU alongside stateless API traffic, each retaining the O(|q|)
+query-latency profile.
+Unlike subquadratic architectures (Mamba Gu and Dao [2023], RWKV Peng et al.
+[2023], Linear Attention Katharopoulos et al. [2020], RetNet Sun et al. [2023])
+that trade model capacity for inference efficiency, we preserve full quadratic self-
+attention Vaswani et al. [2017]. This matters: transformers consistently outperform
+state-space and linear recurrence models on multi-step reasoning, in-context learn-
+ing, and precise information retrieval. The proposed architecture delivers the
+latency profile of O(1)-style designs without sacrificing the representational power
+that makes transformers dominant on complex reasoning tasks.
+On streaming benchmarks, the reference implementation achieves 2.4×–5.9×
+speedup over conventional inference engines (vLLM, SGLang, TensorRT-LLM,
+llama.cpp) and 22×–92× over cloud APIs (GPT-5.2, Claude Haiku, Claude Opus
+4.5).
+1
+Introduction
+Large language models perform well on financial analysis tasks: trend detection, pattern recognition,
+and quantitative reasoning over market data Lopez-Lira and Tang [2023], Wu et al. [2023]. Deploying
+these models in real-time trading systems is difficult. A trading system continuously receives price
+updates and must answer analytical queries like “What is the current trend?” with minimal latency.
+arXiv:2605.13784v1  [cs.LG]  13 May 2026
+
+
+--- Page 2 ---
+Modern inference frameworks address latency through KV-cache optimization. vLLM, llama.cpp,
+SGLang, and TensorRT-LLM cache intermediate attention values and reuse them for requests sharing
+common prefixes. This works for request-driven workloads: many users sending similar prompts to
+the same model.
+Streaming workloads are different. Data arrives continuously from external sources (market feeds,
+sensors, logs). Queries arrive sporadically, each seeing the latest accumulated data. The “prefix”
+changes with every data update. Request-driven caching provides no benefit: cache hit rate approaches
+zero because each query has a unique prompt.
+Conventional inference processes the entire context for each query, requiring O(n) operations for
+context length n:
+Cstandard = Q · O(n)
+(1)
+As context grows, query latency scales linearly with accumulated data.
+We address streaming workloads directly. Instead of optimizing cache hit rates for request-driven
+traffic, we exploit the asymmetry between data and query arrival rates to move prefill off the critical
+path: data arrival triggers processing, not queries. The context partitions into regions with distinct
+update semantics. Data processing is amortised across the streaming window. Queries consume
+pre-computed state with O(|q|) latency.
+Moving prefill off the critical path has a second consequence that is the focus of the present section:
+GPU utilisation. Sustained accelerator utilisation in large production inference deployments is well
+known to sit substantially below peak, typically in the 10–45% band, with the high end achieved
+by the most mature serving stacks and the low end characteristic of clusters whose software cannot
+keep their accelerators busy. The structural cause is the same in both regimes: under a request-driven
+model, the accelerator has nothing useful to do between requests, so idle cycles are simply wasted
+heat. A stateful, data-driven design converts those cycles into useful work. Data continues to flow
+into the KV cache between user queries, and the Flash Query mechanism introduced in Section 3.9
+spends idle GPU time pre-computing answers to registered questions against the latest cache state.
+The same accelerator therefore does meaningfully more analytical work per unit power than the same
+accelerator serving the same workload through a stateless request loop, with no change to the model
+weights or the kernel implementations.
+2
+Problem Formulation
+Let C = [S; D1; D2; . . . ; Dk] represent a context consisting of a static prefix S and k data segments
+Di. In streaming applications:
+(i) S remains constant across all queries
+(ii) Di are appended incrementally
+(iii) Queries Qj require attention over the full context
+The naïve approach recomputes attention over [S; D1; . . . ; Dk; Qj] for each query Qj. We seek an
+approach where:
+T(Qj) = O(|Qj|) + o(|C|)
+(2)
+That is, query processing time scales with query length, not context length.
+3
+Architecture
+Our system is designed for streaming-first inference, distinct from request-driven serving frameworks.
+The core insight: existing KV-cache systems optimize for the wrong workload. They assume queries
+drive computation, with caching as an optimization for repeated prefixes. Streaming workloads reverse
+the relationship: data drives computation, and queries are sporadic consumers of pre-computed state.
+3.1
+Data-Driven vs Request-Driven Processing
+Request-driven systems (vLLM, SGLang, TensorRT-LLM, llama.cpp, Ollama) follow this pattern:
+2
+
+
+--- Page 3 ---
+1. Query arrives with full prompt
+2. Check cache for prefix match
+3. On miss: process entire prompt; on hit: process suffix only
+4. Return response
+This works well when many requests share static prefixes. It fails for streaming: each query has a
+different “prefix” (the accumulated data), so cache misses dominate.
+We exploit the asymmetry between the two arrival rates and move prefill off the critical path:
+1. Data arrives continuously, independent of queries
+2. Process and store representations immediately on arrival
+3. Query arrives (sporadically)
+4. Compute only the query tokens against pre-computed data state
+5. Return response
+The difference: data processing happens before any query arrives, driven by the data stream itself.
+Queries become lightweight consumers of already-computed state.
+(a) Request-Driven (vLLM, llama.cpp, Ollama)
+time
+Query
+Data
+Prefill
+(full context)
+Decode
+T = O(n) per query
+(b) Data-Driven (Ours)
+time
+Data
+Data
+Data
+KV Cache
+(pre-built)
+Query
+Decode
+Continuous (amortized)
+T = O(1)
+Figure 1: Architectural comparison. (a) Request-driven systems process the full context when a query
+arrives, yielding O(n) latency. (b) Our data-driven approach processes data continuously into the KV
+cache; queries only trigger lightweight decoding, yielding O(1) latency.
+3.2
+On the Architectural Foundations of Constant-Time Query Performance
+In transformer attention, each token computes attention over all preceding tokens. The standard
+attention operation is:
+Attention(Q, K, V ) = softmax
+QK⊤
+√dk
+
+V
+(3)
+where Q ∈Rm×dk are query vectors, K ∈Rn×dk are keys, and V ∈Rn×dv are values. For a
+context of n tokens, computing attention requires O(mn) operations.
+The key insight: when processing a new query of m tokens against a pre-computed context of n
+tokens, we can decompose the computation. Let Kctx, Vctx denote the cached keys and values from
+prior data ingestion. The query attention becomes:
+Attention(Qquery, Kctx, Vctx) = softmax
+QqueryK⊤
+ctx
+√dk
+
+Vctx
+(4)
+3
+
+
+--- Page 4 ---
+Since Kctx and Vctx are pre-computed and stored, query processing requires only O(m · n) operations
+for the attention computation itself. Critically, when m ≪n (short queries against large contexts), and
+with the KV cache eliminating redundant key-value computation, the effective query cost becomes
+O(m).
+Request-driven systems exploit this for prefix reuse. We exploit it for continuous ingestion: data
+tokens are processed on arrival, not on query. When a query arrives, it attends to pre-computed values.
+Query cost scales with query length (∼50 tokens in our benchmarks), not context length (14,800+
+tokens).
+Complexity profile. The O(|q|) bound applies to query latency. Data ingestion and query response
+operate on distinct paths that scale on different time bases: the ingestion path tracks the data arrival
+rate, the query path scales only with query length. For workloads where these two cadences are
+structurally separate (continuous data, sporadic queries), this separation is the load-bearing property
+of the architecture, and the user-visible latency is governed by the query path alone, independent of
+accumulated context size.
+Formal latency model. Let Tprefill(n) denote the time to process n context tokens, Tdecode the time
+per generated token, and m the number of output tokens. Conventional inference latency is:
+Tstandard = Tprefill(nctx) + m · Tdecode
+(5)
+where Tprefill(n) = O(n) grows with context size. Our approach yields:
+Tours = Tprefill(|q|) + m · Tdecode
+(6)
+where |q| is the query length (30–50 tokens in our benchmark queries). Since |q| ≪nctx, query
+latency becomes effectively constant. For fast-answer queries where m = 1 and the token matches
+pre-computed vocabulary:
+Tfast = Tprefill(|q|) + Tsample ≈const
+(7)
+3.3
+Hierarchical Context Partitioning
+We partition the context into three regions with distinct update semantics:
+• Region 0 (Frozen): System prompt, static instructions
+• Region 1 (Sliding): Streaming data buffer with configurable retention
+• Region 2 (Ephemeral): Query and response tokens
+Region 0 is processed once during session initialization. Region 1 supports incremental updates with
+configurable retention policy. Region 2 is cleared between queries, enabling multiple queries over the
+same accumulated context. Figure 2 illustrates this partitioning scheme.
+Hierarchical Context Partitioning
+Region 0
+(Frozen)
+Region 1 (Sliding)
+Region 2
+(Ephemeral)
+System Prompt
+Streaming Data Buffer
+Query + Response
+Processed once
+at init
+Continuous updates
+FIFO eviction
+Cleared between
+queries
+Old data evicted
+New data
+arrives
+Token Position
+0
+n
+Figure 2: Hierarchical context partitioning. Region 0 (frozen) contains static instructions processed
+once. Region 1 (sliding) holds streaming data with FIFO eviction for bounded memory. Region 2
+(ephemeral) contains query/response tokens, cleared between queries.
+4
+
+
+--- Page 5 ---
+3.4
+Persistent Session State
+Conventional inference frameworks treat each request as independent: the connection terminates
+after response generation, and all intermediate state (including the KV cache) is discarded. This
+stateless design simplifies scaling and load balancing, but forces complete recomputation when the
+same context is queried again.
+For streaming workloads, statelessness is fundamentally incompatible with low-latency queries. If
+intermediate representations are discarded between requests, every query must reprocess the entire
+accumulated context: precisely the O(n) cost we seek to eliminate. Persistent session state is
+therefore not an optimization but a requirement for O(1) query latency.
+Each session maintains:
+• Processed intermediate representations for Regions 0–1
+• Position tracking for sequence continuity
+• Buffer metadata for sliding window management
+• Session isolation for concurrent multi-user deployments
+When new data arrives, only the delta is processed and appended to existing state. This enables
+true streaming: data can flow continuously while queries access the latest accumulated context with
+constant latency.
+The trade-off is memory: each active session consumes KV cache storage proportional to its context
+length (see Section 6.3 for memory analysis). We accept this trade-off because streaming workloads
+are inherently session-oriented: a sensor feed or market data stream maintains logical continuity that
+maps naturally to persistent state.
+3.5
+Continuous Background Ingestion
+For true streaming applications, data arrives faster than individual processing requests can complete.
+We implement asynchronous ingestion where:
+1. Data push operations return immediately without blocking
+2. A background processor continuously ingests queued data into the KV cache
+3. Queries execute against the latest processed state
+4. If ingestion cannot keep pace, oldest unprocessed data is automatically discarded
+This architecture separates the data plane (high-throughput ingestion) from the query plane (low-
+latency responses). The producer (data source) is never blocked by processing latency, and queries
+always see a consistent, pre-computed context state.
+The background processor batches incoming data for efficient KV cache updates, amortizing the
+per-item overhead across multiple entries. After each batch, the system pre-computes query response
+scaffolding, enabling sub-100ms responses when queries arrive. The ring buffer is sized to absorb
+typical burst patterns; when sustained arrival rate exceeds ingestion throughput, the oldest unprocessed
+data is discarded rather than blocking the producer.
+WebSocket transport. In addition to HTTP POST ingestion, sessions accept a persistent WebSocket
+connection for bidirectional streaming. Clients push data frames without per-request overhead, and
+the same socket carries outbound Flash Query results and data-version notifications back to the client.
+Algorithm 1 and Algorithm 2 formalize the data ingestion and query processing loops.
+3.6
+Priority-Scheduled GPU Decoding
+The data plane / query plane separation is architectural, but a single GPU still serializes every forward
+pass underneath. Without coordination, a long-running background ingestion batch can block an
+incoming query for hundreds of milliseconds; an overlapping Flash Query evaluation can starve the
+decode needed for an interactive response. A per-request GPU mutex solves correctness but creates
+arbitrary tail latencies.
+5
+
+
+--- Page 6 ---
+Algorithm 1 Data Ingestion (Background Thread)
+Require: Ring buffer B, KV cache K, batch size b
+1: loop
+2:
+batch ←[]
+3:
+while |batch| < b and B.pending() > 0 do
+4:
+batch.append(B.dequeue())
+5:
+end while
+6:
+if |batch| > 0 then
+7:
+tokens ←Tokenize(batch)
+8:
+if K.size() + |tokens| > K.capacity() then
+9:
+K.evict_oldest(|tokens|) {FIFO eviction}
+10:
+end if
+11:
+K.append(Forward(tokens, K)) {Incremental KV update}
+12:
+PrecomputeQueryScaffold(K)
+13:
+end if
+14: end loop
+Algorithm 2 Query Processing
+Require: Query q, KV cache K already populated from prior data ingestion
+1: tokensq ←Tokenize(q)
+2: logits ←Forward(tokensq, K) {O(|q|) not O(|K|)}
+3: token ←Sample(logits)
+4: output ←[token]
+5: while token ̸= EOS do
+6:
+logits ←Forward(token, K)
+7:
+token ←Sample(logits)
+8:
+output.append(token)
+9: end while
+10: return Detokenize(output)
+Data
+Source
+Ring Buffer
+(Lock-free)
+Background
+Processor
+KV Cache
+Non-blocking
+Batch
+Query
+Decode
+Pre-computed state
+Non-blocking
+Backpressure
+O(1)
+Figure 3: Data plane / query plane separation. The data plane handles high-throughput ingestion via
+a lock-free ring buffer. The query plane executes against pre-computed KV cache state, achieving
+O(1) latency.
+6
+
+
+--- Page 7 ---
+We centralize all GPU decode dispatch through a single worker thread fronted by a priority queue.
+Submissions are tagged with one of four priority classes:
+π ∈{FLASH, SESSION, POOL, STREAM}
+(8)
+ordered from highest to lowest. FLASH is used for registered Flash Query evaluation on the
+latency-critical path; SESSION for interactive /generate queries; POOL for stateless request-driven
+completions on the OpenAI and Anthropic endpoints; STREAM for background data ingestion
+batches. Within a priority class, requests are FIFO by submission sequence number. The worker
+thread blocks on a condition variable, wakes when any request arrives, pops the highest-priority
+request, runs the forward pass, waits for GPU completion under the mutex, and signals the caller.
+Callers submit a batch and wait on a per-request condition variable. While they wait, they hold no
+GPU lock, so CPU-bound work elsewhere (sampling, SSE serialization, JSON parsing) proceeds
+in parallel. A Flash Query evaluation can preempt a streaming ingest at the next batch boundary
+rather than after the current decode: the scheduler yields after every decode, not every request. This
+bounds the worst-case wait for a FLASH-priority decode to the duration of a single in-flight batch,
+independent of how many background ingestion jobs are queued behind it.
+3.7
+Multi-Tenant Continuous Batching
+A single stateful session is sufficient to demonstrate the O(|q|) query property, but a production deploy-
+ment must host many concurrent sessions and stateless API traffic on the same GPU. We implement an
+admit-many / run-few continuous-batching scheduler that builds heterogeneous PREFILL+DECODE
+batches per iteration, with four mechanisms that together let stateful sessions of widely different
+context sizes coexist without starvation.
+Cell-budget admission. The scheduler tracks occupancy of the unified KV cache in cells (one cell per
+token per layer) and admits a new prefill only when the projected total (sum of prompt + max_tokens
+across admitted slots) remains below a fixed ceiling Cbudget = 1
+2|pool|. The other half is reserved for
+cached prefixes (Section 3.10) and in-flight session state. When occupancy crosses a high-water mark
+(95%), incoming prefill chunks are deferred at chunk granularity rather than at request granularity,
+providing fine-grained backpressure without rejecting requests.
+Adaptive chunked prefill. For N slots with pending prefill work, each slot is allocated a per-iteration
+chunk of size chunk = clamp(nbatch/N, 128, 1024) tokens. With a single active prefill the chunk
+reaches ∼1024 (large prefill batches, near-peak throughput); with many concurrent prefills the chunk
+shrinks so that decoding slots are not starved within an iteration. This contrasts with static chunk
+sizes (e.g. vLLM’s default 512) and prefill-priority gating (e.g. SGLang) that can stall decode under
+heavy admission.
+Prefix-aware grouped prefill. Slots whose prompts share a byte-identical prefix beyond the radix-
+cache match point, identified by FNV-1a hashing the next K = 8 tokens, are grouped into a single
+leader-follower prefill. The leader processes the chunk; each follower acquires the resulting state via
+a metadata-only sequence-aliasing operation on the unified KV cache. This converts N redundant
+forward passes into one and is particularly effective for shared system prompts and tool schemas
+across tenants.
+Concurrency-capped speculative decoding. The scheduler runs prompt-lookup speculative decod-
+ing (PLD) Saxena [2023] per slot, predicting continuations from the slot’s recent token history and
+verifying them in a batched forward pass. Naive per-slot speculation collapses at high admission,
+because the verification cost scales as the product of the per-slot draft length and the number of
+concurrent decoders, while the acceptance rate falls sharply on unfamiliar content. The scheduler
+therefore caps the per-slot draft length as a joint function of two signals: the number of active
+decoders, and the per-slot historical acceptance rate. Specific thresholds are tuned per accelerator
+class and model size and surface as configuration parameters rather than constants in the architecture.
+The per-slot prediction step is parallelized across worker threads, removing it from the critical path.
+The result preserves the latency win of speculation on high-acceptance workloads (single-agent tool
+loops, repetitive structured output) while avoiding the throughput collapse that uncapped speculation
+produces under load.
+7
+
+
+--- Page 8 ---
+Why this matters for stateful inference. Without these mechanisms, stateful sessions would not
+scale beyond a small handful: a single long-context session would either starve, or be starved by, all
+other tenants. With cell-budget admission and adaptive chunked prefill, dozens of sessions of mixed
+context lengths coexist on one GPU, each retaining the O(|q|) query-latency profile of Section 3.2.
+The full set of mechanisms above is, to our knowledge, distinct from the schedulers shipped in vLLM
+(PagedAttention with static chunk size) and SGLang (RadixAttention with prefill-priority gating); the
+cell-budget admission, prefix-aware grouped prefill, and concurrency-capped PLD are original to this
+work.
+3.8
+On-Device Greedy Sampling
+The remaining per-token cost in a streaming query is the sampling step. Every generated token
+reduces to an argmax over the vocabulary logits, which for a 128 k-token vocabulary is ∼512 KB of
+floats per token. The naive pipeline pulls those logits back to host memory after a GPU synchronise,
+materialises a candidate array on the CPU, and scans for the maximum. That synchronise-plus-scan
+round trip costs 2–4 ms per token on Apple silicon and 0.5–1 ms on server-class NVIDIA and AMD
+GPUs, comparable to the entire target latency budget on short responses.
+We instead run the argmax on the device. A small runtime dispatcher selects a device-specific
+reduction kernel at startup (one path each for the major accelerator families) and routes greedy
+argmax, along with a batched speculative-verification variant, through the native kernel. Builds
+without a supported accelerator fall back to a wide-SIMD CPU reduction. Each device kernel is a
+parallel reduction with a shared-memory tournament that returns a single token id directly, so the
+host never materialises or scans the logits vector. The same kernel surface exposes a batched variant
+for accepting or rejecting a window of speculated tokens in one dispatch.
+In addition, a set of small CPU-side optimizations (pre-tokenised digit and template fragments for
+numerical streaming data, cache-line aligned atomic counters, lock-free single-producer / single-
+consumer ring buffers between the data plane and ingestion thread) collectively reduce per-operation
+overhead from milliseconds to microseconds. These follow well-known patterns from low-latency
+systems engineering and are not novel in themselves; they appear here because the constant-time
+query path is only constant-time end-to-end if every layer along it is.
+3.9
+Flash Queries: Ahead-of-Time Query Evaluation
+The preceding optimizations minimize query latency but cannot eliminate it: every query still requires
+at least one forward pass over the question tokens. We now introduce Flash Queries, a mechanism
+that pushes latency toward zero by pre-computing answers before questions are asked.
+3.9.1
+Motivation: Reclaiming Idle GPU Cycles
+In streaming workloads, data arrives at a natural cadence: market ticks at 1–60 s intervals, sensor
+readings at fixed sample rates, log entries at variable but bounded rates. Between arrivals, the GPU
+sits idle. The aggregate cost of that idleness is substantial: large inference deployments typically
+run at sustained accelerator utilisation in the 10–45% band, and the gap to peak is dominated by
+exactly this between-request idle time. Meanwhile, many analytical queries are predictable: users
+repeatedly ask the same questions (“What is the trend?”, “Is the signal confirmed?”) as data evolves.
+Flash Queries exploit this predictability by spending the otherwise-wasted GPU cycles between data
+arrivals to pre-evaluate registered questions against the current context state. The accelerator is busy
+whenever it is powered on; the user sees the cached answer instantly when they ask.
+This treats inference as continuously productive rather than discretely reactive: between data arrivals
+the accelerator pre-evaluates registered questions against the latest KV state, so the user-visible query
+path collects a cached answer rather than triggering generation. The framing parallels recent work
+on real-time interaction models, where the same shift from turn-based to always-on processing is
+applied to the human-facing channel instead of the data-facing one.
+Critically, this optimization is only possible in a stateful architecture. Stateless inference engines
+discard the KV cache after each request, making it impossible to speculatively evaluate queries
+against a persistent context. The persistent session state described in Section 3.4 is a prerequisite.
+8
+
+
+--- Page 9 ---
+3.9.2
+Formal Definition
+Let F = {f1, f2, . . . , fk} be a set of k registered Flash Queries, where each fi is a tokenized question
+template. Let Kt denote the KV cache state at data version t (incremented after each data ingestion
+batch). For each Flash Query fi, we define the ahead-of-time evaluation operator:
+ˆa(t)
+i
+= Sample(Forward(fi, Kt))
+(9)
+where ˆa(t)
+i
+is the pre-computed answer for query fi at data version t. The Flash Query cache is the
+mapping:
+Ct =
+n
+fi, ˆa(t)
+i , γ(t)
+i
+
+| i = 1, . . . , k
+o
+(10)
+where γ(t)
+i
+= ℓ(1)
+i
+−ℓ(2)
+i
+is the logit gap, the difference between the highest and second-highest logit
+values, serving as a confidence measure. Larger gaps indicate stronger model certainty. The cache is
+invalidated whenever the data version advances: Ct becomes stale when t′ > t.
+When a query q arrives at data version t, the system first checks the Flash Query cache:
+Response(q, t) =
+(
+ˆa(t)
+i
+if ∃fi ∈F : h(q) = h(fi) and ˆa(t)
+i
+is valid
+Forward(q, Kt)
+otherwise
+(11)
+where h(·) is a hash function over the question string. Cache hits bypass all GPU computation
+entirely.
+3.9.3
+In-Place Evaluation with Header Restore
+Flash Query evaluation must not corrupt the primary KV cache state. We achieve this through
+in-place evaluation: temporarily extending the primary sequence at the pre-decoded header position,
+then removing the extension and restoring the original state.
+Let s0 denote the primary sequence containing the accumulated context through the pre-decoded
+response header at position p. For each Flash Query fi, the evaluation procedure is:
+1. Strip: Remove the pre-decoded header tokens from s0 at position p: SeqRemove(s0, p, ∞)
+2. Extend: Decode the question tokens of fi on s0 starting at position p, yielding logits ℓi
+3. Sample: Compute ˆa(t)
+i
+= arg max(ℓi) with confidence γ(t)
+i
+= ℓ(1)
+i
+−ℓ(2)
+i
+(logit gap between
+top two tokens)
+4. Clear: Remove the question tokens: SeqRemove(s0, p, ∞)
+After all Flash Queries are evaluated, the original header is restored by re-decoding the header tokens
+at position p, returning the KV cache to its pre-evaluation state. This re-decode also refreshes the
+ready-position logits for speculative exit.
+This approach avoids the memory overhead of shadow sequence copies by reusing the primary
+sequence. Each evaluation costs only the forward pass over question tokens (proportional to question
+length, not context length), plus a single header re-decode amortized across all queries.
+3.9.4
+Ready-Position Speculative Exit
+The background ingestion loop (Algorithm 1) already computes a forward pass to pre-decode the
+response header after each data batch. This pass produces logits ℓready that represent the model’s
+output distribution before seeing any question, a signal of the model’s “default” assessment of the
+current data state.
+We cache these ready-position logits and use them for speculative early exit at query time. When a
+query arrives, before any tokenization or GPU work, we check:
+9
+
+
+--- Page 10 ---
+∆ready = ℓ(1)
+ready −ℓ(2)
+ready
+(12)
+where ℓ(1)
+ready and ℓ(2)
+ready are the highest and second-highest logit values, respectively. If ∆ready > τ (we
+use τ = 2.0) and the top token belongs to the fast-answer vocabulary V :
+ℓ(1)
+ready ∈V and ∆ready > τ =⇒return Detokenize(arg max(ℓready))
+(13)
+This exits in O(1) time: no forward pass, no tokenisation, just a comparison and table lookup. The
+logit-gap threshold τ controls the confidence-latency trade-off; a higher τ requires stronger model
+confidence for speculative exit, reducing false positives at the cost of fewer cache hits.
+3.9.5
+Cost Model and Amortization
+Let Tf denote the time to evaluate a single Flash Query (dominated by the forward pass over question
+tokens), and Tdata the interval between data arrivals. The total background compute cost per data
+update is:
+Tbackground = Tingest + Theader + k · Tf
+(14)
+where Tingest is the data ingestion time and Theader is the response header pre-decode time. For Flash
+Queries to be “free” (invisible to query latency), we require:
+Tbackground < Tdata
+(15)
+In practice, with Tf ≈30–35ms per Flash Query and Tdata ≥1s for typical streaming workloads, the
+system can sustain:
+kmax =
+Tdata −Tingest −Theader
+Tf
+
+(16)
+For Tdata = 1 s and Tf = 33 ms, this yields kmax ≈25 Flash Queries, far more than typical analytical
+workloads require.
+3.9.6
+Event-Driven Result Delivery
+Flash Query results are delivered to clients via server-sent events (SSE) over a persistent HTTP
+connection. After each evaluation cycle, the system emits structured events:
+Event(fi, t) =
+D
+flash_ready, fi, ˆa(t)
+i , γ(t)
+i , t
+E
+(17)
+This push-based delivery model means clients receive updated answers before they ask, enabling
+reactive UIs, dashboards, and automated decision systems that respond to model assessments in
+real time. The SSE protocol provides automatic reconnection semantics, ordered delivery, and
+compatibility with standard HTTP infrastructure.
+The event stream also emits data_updated events after each ingestion batch, allowing clients to
+track data freshness and correlate Flash Query answers with specific data versions.
+3.9.7
+Latency Taxonomy
+With Flash Queries and ready-position speculative exit, query latency falls into three tiers:
+The effective average latency depends on the hit rate ρ across the three paths:
+¯T = ρflash · Tflash + ρspec · Tspec + (1 −ρflash −ρspec) · Tstandard
+(18)
+10
+
+
+--- Page 11 ---
+Path
+Latency
+Condition
+Flash Query cache hit
+∼2ms
+Question matches registered Flash Query
+Speculative exit
+∼2ms
+Ready-position logit gap > τ
+Standard query
+∼45ms
+Fallback to full query processing
+For workloads where 60–80% of queries match Flash Query templates and 10–20% trigger specu-
+lative exit, the expected average latency drops from the ∼43 ms standard-query path to single-digit
+milliseconds, a further order-of-magnitude improvement over the already-optimized baseline.
+Algorithm 3 formalizes the complete Flash Query evaluation cycle.
+Algorithm 3 Flash Query Evaluation (Background, after data ingestion)
+Require: KV cache K with primary sequence s0, Flash Queries F, data version t, header position p
+1: ℓready ←GetLogits(K, s0) {Cache ready-position logits}
+2: SeqRemove(s0, p, ∞) {Strip pre-decoded header}
+3: for each fi ∈F do
+4:
+ℓi ←Forward(fi.tokens, K, s0, p) {Decode question at position p}
+5:
+ˆa(t)
+i
+←arg max(ℓi)
+6:
+γ(t)
+i
+←ℓ(1)
+i
+−ℓ(2)
+i
+{Logit gap confidence}
+7:
+Ct[fi] ←(ˆa(t)
+i , γ(t)
+i , t)
+8:
+Emit(flash_ready, fi, ˆa(t)
+i , γ(t)
+i , t) {Push via SSE}
+9:
+SeqRemove(s0, p, ∞) {Clear question tokens}
+10: end for
+11: RestoreHeader(K, s0, p) {Re-decode header, refresh ℓready}
+3.10
+Sequence Pool and Radix Prefix Cache
+The preceding sections describe session-based inference, where each session owns a dedicated, long-
+lived sequence within the inference context. For stateless request-driven workloads (e.g. OpenAI-
+compatible or Anthropic-compatible API endpoints), the proposed architecture additionally provides
+a sequence pool backed by a radix prefix cache, delivering sub-millisecond prefix reuse without CPU
+serialization.
+3.10.1
+Sequence Pool
+At startup, the scheduler partitions the unified KV cache into a transient pool (P sequence IDs for
+stateless requests) and a session pool (S sequence IDs reserved for long-lived sessions). Transient
+slots are recycled across requests through a thread-safe free list with condition-variable blocking
+when all slots are in use. Pre-allocation removes per-request context construction from the critical
+path.
+This single-context, multi-sequence design is deliberate. A single forward pass mixes prefill and
+decode tokens from any subset of sequence IDs (the heterogeneous batching of Section 3.7), so prefix
+sharing across requests reduces to metadata-only aliasing within the same KV cache rather than
+cross-context coordination.
+3.10.2
+Radix Prefix Cache
+Shared prefixes are tracked in a radix trie keyed by token sequences. Each node records the donor
+sequence ID whose KV state still holds the matched cells. When a new request arrives with a
+matching prefix, the scheduler restores the prefix into a freshly acquired slot via a metadata-only
+sequence-aliasing operation:
+Trestore = Talias(m) ≪Tserialize(m)
+(19)
+11
+
+
+--- Page 12 ---
+where m is the prefix length in tokens. Aliasing operates on GPU pointer tables and completes
+in constant time independent of m, an asymptotic improvement over the linear-in-m cost of CPU-
+mediated serialization used by some block-paged designs.
+The radix is admission-aware: prefix saves are gated against the cell budget of Section 3.7, and
+eviction follows a leaf-oldest policy that preserves long shared branches (system prompts, tool
+schemas) while shedding stale tails. Saves are incremental: when a new request extends a cached
+branch, only the delta cells are committed.
+3.10.3
+Response and Render Caches
+Beyond prefix caching, the proposed architecture caches the full response text for any prompt that
+has been served before. The sampler is seeded deterministically from an FNV-1a hash of the prompt
+tokens:
+seed(P) = FNV1a(P) mod 232
+(20)
+so that identical prompts produce identical outputs at any temperature. A 1024-entry LRU response
+cache is consulted before the sequence pool is acquired: on hit, the request returns at network-
+roundtrip latency with zero GPU work. Two complementary caches handle the template-render and
+tokenize stages (256 and 64 entries respectively), eliminating redundant Jinja application and BPE
+tokenization, which on long prompts otherwise consume tens of milliseconds.
+4
+Experimental Setup
+4.1
+Benchmark Scenario
+We designed the benchmark to simulate a realistic streaming workload where data arrives continuously
+and queries arrive sporadically after data updates:
+1. Initialize with 100 data samples
+2. For each of 15 iterations: add 55 new samples, then issue a query
+3. Measure query latency (time from query submission to response)
+This scenario specifically tests the streaming use case: data accumulates over time, and users query
+against the latest state. Context grows from 155 to 925 samples (approximately 2,600 to 14,800
+tokens).
+4.2
+Dataset
+We constructed a synthetic OHLCV dataset representing hourly candlestick bars for a single equity.
+Each sample contains open, high, low, close prices and volume (∼16 tokens per sample). The data
+includes realistic market microstructure:
+• Uptrend phases with higher highs and higher lows
+• Correction phases with pullbacks
+• Consolidation phases with sideways movement
+We report OHLCV results because financial streaming is the most latency-sensitive use case in our
+target workloads. The ingestion framework itself is data-type-agnostic: only the record schema and
+tokenisation rule are application-specific; the ring buffer, ingestion loop, Flash Queries, and caching
+infrastructure are shared.
+4.3
+Query Set
+Six query types testing different analytical capabilities:
+• Q1: Trend classification (UP/DOWN)
+12
+
+
+--- Page 13 ---
+• Q2: Pullback detection (YES/NO)
+• Q3: Recent high detection (YES/NO)
+• Q4: Consolidation detection (YES/NO)
+• Q5: Volume pattern detection (YES/NO)
+• Q6: Exact value retrieval (numeric)
+Q6 specifically tests precise information retrieval from mid-context, a known challenge for trans-
+former models Liu et al. [2024].
+4.4
+Baselines
+We compare against eight baselines spanning open-weight and proprietary models:
+• vLLM: High-throughput inference server with PagedAttention Kwon et al. [2023]
+• SGLang: Structured generation framework with RadixAttention Zheng et al. [2024]
+• TensorRT-LLM: NVIDIA’s optimized inference library with FP8 quantization
+• llama.cpp: Lightweight C++ inference engine with prompt caching enabled
+• OpenAI GPT-4o-mini: Cloud API baseline (smaller, faster model)
+• OpenAI GPT-5.2: Cloud API baseline (latest generation model)
+• Claude 3.5 Haiku: Cloud API baseline (Anthropic’s fast model)
+• Claude Opus 4.5: Cloud API baseline (Anthropic’s flagship model)
+For cloud APIs, each query sends the complete accumulated context. While these services offer
+prompt caching for repeated prefixes, they do not maintain persistent conversational sessions across
+requests. All systems use temperature τ = 0 (greedy decoding) for reproducibility.
+4.5
+Hardware Configuration
+All open-weight model experiments (the proposed system, llama.cpp, vLLM, SGLang, and TensorRT-
+LLM) were conducted on a single NVIDIA L40S accelerator (48 GB GDDR6, 864 GB/s memory
+bandwidth) in a single-tenant configuration. All systems use Meta-Llama-3.1-8B-Instruct in BF16
+precision (∼16 GB of model weights). The same model checkpoint, tokeniser, and chat template
+are used across every engine to isolate the contribution of the inference stack from any model-side
+variation.
+Speedup interpretation. The 2.4×–5.9× speedup over conventional inference engines is an algo-
+rithmic improvement, not a hardware-specific one. Processing data at ingest time rather than query
+time reduces query latency complexity from O(n) to O(|q|) regardless of the accelerator. On more
+capable hardware the relative speedup should be preserved or amplified as larger contexts become
+feasible.
+Scaling projections. On a single accelerator, the proposed architecture achieves sub-50 ms median
+query latency (∼43 ms). Multi-accelerator deployments would enable larger concurrent session
+counts and potentially sub-20 ms latency through parallelisation of the data plane.
+4.6
+Metrics
+• Query latency (ms): Time from query submission to response completion
+• Accuracy (%): Correct responses / total queries
+• Latency scaling: How latency changes as context grows
+13
+
+
+--- Page 14 ---
+200
+300
+400
+500
+600
+700
+800
+900
+Samples
+0
+50
+100
+150
+200
+250
+300
+350
+Query Latency (ms)
+Query Latency Comparison
+llama.cpp
+vLLM
+SGLang
+TRT-LLM
+LayerScale
+LayerScale
+SGLang
+vLLM
+TRT-LLM
+llama.cpp
+0
+50
+100
+150
+200
+250
+300
+Average Latency (ms)
+43ms
+53%
+106ms
+2x | 53%
+139ms
+3x | 53%
+229ms
+5x | 53%
+254ms
+6x | 47%
+Average Latency & Accuracy
+200
+300
+400
+500
+600
+700
+800
+900
+Samples
+0
+2000
+4000
+6000
+8000
+10000
+12000
+14000
+16000
+Tokens in Context
+14,950 tokens
+Context Size
+200
+300
+400
+500
+600
+700
+800
+900
+Samples
+0.00
+0.01
+0.02
+0.03
+0.04
+0.05
+0.06
+0.07
+Latency per Token (ms)
+Efficiency: Latency / Token
+llama.cpp
+vLLM
+SGLang
+TRT-LLM
+LayerScale
+Figure 4: Performance comparison across nine systems on streaming OHLCV data (155–925 samples).
+The proposed architecture maintains constant ∼43 ms query latency regardless of context size.
+Conventional inference engines (vLLM, SGLang, TensorRT-LLM, llama.cpp) show ∼106–254 ms
+latency, while cloud APIs range from 926 ms to 3,962 ms.
+Table 1: Performance comparison (streaming benchmark: 155–925 samples, 15 iterations)
+Platform
+Avg Latency (ms)
+Accuracy (%)
+vs LayerScale
+LayerScale
+43.4
+53.3
+baseline
+SGLang
+105.6
+53.3
+2.4× slower
+vLLM
+139.1
+53.3
+3.2× slower
+TensorRT-LLM
+228.8
+53.3
+5.3× slower
+llama.cpp (with caching)
+254.0
+46.7
+5.9× slower
+GPT-5.2
+926
+75
+21× slower
+GPT-4o-mini
+1,124
+55
+26× slower
+Claude Opus 4.5
+2,628
+70
+61× slower
+Claude 3.5 Haiku
+3,962
+65
+92× slower
+14
+
+
+--- Page 15 ---
+5
+Results
+5.1
+Latency Analysis
+The proposed architecture shows constant query latency regardless of context size. Conventional
+inference engines reach 106–254 ms average latency on the same workload; the stateful path holds
+steady at ∼43 ms throughout, a 2.4×–5.9× speedup.
+Why constant latency? Under the access pattern characterised in Section 3, the query path scales
+with |q| rather than with nctx: the dependence on accumulated context is collapsed into a constant-
+time term that does not grow with the streaming horizon. With short user queries (|q| ≈50 in our
+benchmarks) against contexts that span thousands to tens of thousands of tokens, the observed query
+latency is dominated by the small per-query term and is therefore effectively independent of how
+much data has arrived since the session was opened. Single-token classification responses complete
+in tens of milliseconds.
+Inference engine comparison. Despite their optimizations, request-driven inference engines must
+reprocess the full context every query:
+• SGLang reaches 105.6 ms average latency with RadixAttention prefix caching
+• vLLM reaches 139.1 ms average latency with PagedAttention
+• TensorRT-LLM reaches 228.8 ms average latency
+• llama.cpp reaches 254.0 ms average latency with prompt caching enabled
+The advantage on the streaming workload comes from amortising data ingestion across the inter-query
+interval, which all four request-driven systems cannot exploit because they discard intermediate state
+between requests. The gap to the closest competitor (SGLang) is the smallest because RadixAttention
+captures some incremental savings on a partially-shared context; the gap widens for the remaining
+systems.
+Cloud API comparison. Cloud APIs must transmit and process the full context for each request:
+• GPT-5.2 and GPT-4o-mini reach ∼900–1,100 ms average through optimized infrastructure
+• Claude Opus 4.5 shows ∼2,600 ms latency
+• Claude 3.5 Haiku shows ∼4,000 ms latency
+The stateful path outperforms conventional inference engines by 2.4×–5.9× and cloud APIs by
+21×–92×.
+5.2
+Latency Variance Analysis
+Beyond average latency, variance is critical for real-time applications. Table 2 presents standard
+deviation measurements across all systems.
+Table 2: Latency variance analysis (15 iterations)
+Platform
+Avg (ms)
+Std Dev (ms)
+Min (ms)
+Max (ms)
+LayerScale
+43.4
+15.6
+26.8
+83.4
+SGLang
+105.6
+21.3
+72.0
+135.6
+vLLM
+139.1
+37.2
+80.1
+193.6
+TensorRT-LLM
+228.8
+47.5
+159.8
+318.4
+llama.cpp
+254.0
+44.3
+189.9
+334.1
+GPT-5.2
+926
+213
+697
+1,590
+GPT-4o-mini
+1,124
+423
+602
+2,209
+Claude Opus 4.5
+2,628
+261
+2,215
+3,251
+Claude 3.5 Haiku
+3,962
+1,519
+1,550
+6,824
+Key observations:
+15
+
+
+--- Page 16 ---
+• The stateful path exhibits the lowest absolute variance (σ = 15.6 ms)
+• Open-weight inference engines show moderate variance (σ = 21–48 ms)
+• Cloud APIs exhibit high variance, particularly Claude 3.5 Haiku (σ = 1,519 ms) due to
+network latency and shared infrastructure
+For latency-sensitive applications, low variance is as important as low mean latency: the proposed
+architecture provides both.
+5.3
+Accuracy
+All four open-weight engines run the same Meta-Llama-3.1-8B-Instruct checkpoint and reach the
+same 53.3% accuracy on the streaming query set, with the exception of llama.cpp at 46.7%. Cloud
+models (GPT-5.2 75%, Claude Opus 4.5 70%, Claude 3.5 Haiku 65%, GPT-4o-mini 55%) generally
+score higher on the harder reasoning queries, reflecting model scale rather than serving architecture.
+The architectural optimizations described in Section 3 preserve model quality while delivering
+substantially lower latency.
+6
+Discussion
+6.1
+Applicability
+Our approach is applicable when:
+(i) Context has static/dynamic partitioning
+(ii) Data arrives continuously but queries arrive sporadically
+(iii) Data updates are incremental (append or sliding window)
+(iv) Low query latency is required
+Financial streaming is a natural fit. Other applicable domains include log analysis, sensor monitoring,
+IoT data processing, and conversational agents with persistent memory.
+6.2
+Limitations
+The current implementation assumes:
+• Single-sequence contexts (no cross-document attention)
+• Causal attention patterns
+• Sufficient memory to maintain session state
+Multi-document retrieval and bidirectional models require architectural extensions not addressed in
+this work.
+Attention scope. Within the sliding window, we maintain full quadratic attention over all retained
+data. However, when data is evicted from Region 1, attention over that data is lost. The model retains
+only what remains in the active context. For applications requiring awareness of historical patterns
+beyond the retention window, a promising architectural extension is to add a dedicated KV cache
+region for rolling summaries: periodically compressing older data into summary representations
+before eviction, preserving semantic information while bounding memory growth.
+6.3
+Memory Considerations
+We trade memory for computation. Each session maintains intermediate representations proportional
+to context length. The KV cache memory footprint per session is:
+MKV = 2 · L · d · nctx · sizeof(dtype)
+(21)
+where L is the number of layers, d is the hidden dimension, nctx is the context length, and the factor
+of 2 accounts for both keys and values. For Meta-Llama-3.1-8B (L = 32, d = 4096) with 32K
+context and FP16 precision:
+MKV = 2 · 32 · 4096 · 32768 · 2 bytes ≈17 GB per session
+(22)
+16
+
+
+--- Page 17 ---
+For deployments with many concurrent sessions, memory management matters. The maximum
+concurrent sessions is bounded by:
+Nsessions ≤Mavailable −Mmodel
+MKV
+(23)
+We implement session pooling and LRU eviction for production deployments, prioritizing active
+sessions while evicting idle ones to disk or discarding them entirely.
+7
+Related Work
+KV-Cache Serving Frameworks. Production inference systems like vLLM Kwon et al. [2023],
+TensorRT-LLM, SGLang Zheng et al. [2024], llama.cpp, Ollama, and HuggingFace TGI implement
+KV-cache persistence and prefix sharing to amortize computation across requests with common
+prefixes. These systems are request-driven: computation occurs when queries arrive, and caching
+optimizes for repeated identical prefixes across multiple users. We address a different problem:
+data-driven inference where a single session receives continuous data updates and sporadic queries.
+The optimization target shifts from “serve many users with shared static prefixes” to “serve one
+session with continuously evolving context.”
+Prefix Caching. RadixAttention (SGLang) and automatic prefix caching (vLLM) identify and
+reuse common prefixes across requests. These techniques assume prefixes are static and shared. In
+streaming workloads, the “prefix” changes with each data update, invalidating cached state. Our
+region-based architecture treats the dynamic portion as first-class, processing updates incrementally
+rather than invalidating on change. In companion work, we extend prefix caching with response-level
+caching and n-gram speculative generation for multi-agent tool calling workloads, where conversation
+prefixes grow monotonically across turns.
+Disaggregated Prefill. vLLM’s disaggregated prefilling Zhong et al. [2024] separates prompt
+processing (prefill) from token generation (decode) across different instances, transferring KV caches
+via connectors. This improves time-to-first-token by preventing prefill jobs from blocking decode
+operations. However, it remains request-driven: prefill still occurs when queries arrive, and KV cache
+must be transferred between instances for each request. The approach optimizes latency distribution
+but explicitly does not improve throughput. Our approach is fundamentally different: we process
+data into the KV cache before any query arrives, eliminating prefill from the query path entirely.
+There is no KV cache transfer overhead because the cache already resides where queries execute. For
+streaming workloads, this yields both lower latency and higher throughput.
+Prompt Caching. Cloud providers Anthropic [2024] offer prompt caching for repeated identical
+prompts. This fails for streaming: each query has a different prompt (new data appended), so cache
+hit rate approaches zero.
+Sparse Attention. Longformer Beltagy et al. [2020], BigBird Zaheer et al. [2020], and Sparse
+Transformer Child et al. [2019] reduce attention complexity from O(n2) to O(n) by limiting which
+tokens can attend to which: sliding windows, random patterns, or strided access. The drawback:
+sparse patterns sacrifice full global context access. Long-range dependencies may be missed if they
+don’t align with the sparsity pattern, degrading performance on tasks requiring precise information
+retrieval across the full context. We maintain full quadratic attention while achieving constant query
+latency through architectural separation of data and query processing.
+FlashAttention. FlashAttention Dao et al. [2022] and FlashAttention-2 Dao [2023] optimize the
+implementation of attention by exploiting GPU memory hierarchy: tiling attention computation to
+maximize SRAM utilization and minimize HBM transfers. This achieves 2–4× wall-clock speedups
+while computing mathematically identical results. FlashAttention is orthogonal to our contribution: it
+accelerates individual attention operations, while we eliminate repeated attention operations through
+architectural redesign. Our system can use FlashAttention as the underlying attention kernel while
+still benefiting from data-driven processing that avoids redundant computation.
+RAG. Retrieval-augmented generation Lewis et al. [2020] externalizes context to a retrieval system.
+This introduces retrieval latency, recall failures, and loses the benefits of full attention over complete
+data. We keep all data in-context with full attention, avoiding retrieval overhead and ensuring
+complete context access.
+17
+
+
+--- Page 18 ---
+Summarization Chains. Approaches that summarize context to fit within token limits lose informa-
+tion and introduce summarization errors. We maintain full fidelity of the original data without lossy
+compression.
+Recursive Language Models. Recent work on Recursive Language Models (RLMs) Zhang et al.
+[2025] addresses long-context processing by allowing models to programmatically decompose and
+recursively call themselves over context snippets. RLMs can process inputs up to 100× beyond the
+native context window by treating long prompts as an external environment. However, this approach
+has significant latency implications: each recursive call is blocking with no prefix caching, resulting
+in query latencies ranging from “a few seconds to several minutes” depending on decomposition
+strategy Zhang et al. [2025]. The framework explicitly “did not optimize implementation for speed”
+and provides “no strong guarantees about controlling either the total API cost or the total runtime.”
+Our approach differs fundamentally in optimization target. RLMs optimize for context capacity:
+handling arbitrarily long inputs at the cost of unpredictable, high latency. We optimize for query
+latency: achieving constant tens-of-milliseconds responses within the model’s context window. For
+streaming applications requiring real-time responses, the difference is stark: RLMs may take minutes
+per query while the proposed architecture maintains sub-50 ms latency regardless of accumulated
+context. Additionally, RLMs require multiple recursive LLM calls with information potentially lost
+during decomposition, while we preserve full quadratic attention over all retained data in a single
+forward pass. The approaches are complementary: RLMs excel at one-shot processing of very long
+documents; we excel at continuous streaming with sporadic low-latency queries.
+8
+Conclusion
+Request-driven inference frameworks optimize for the wrong workload when applied to streaming
+applications. Prefix caching assumes static, shared prefixes; streaming workloads have dynamic,
+per-session context. Cache hit rates approach zero, and every query pays full O(n) cost.
+We exploit the asymmetry between data and query arrival rates and move prefill off the critical
+path: data arrival triggers processing, not queries. This enables O(|q|) query latency regardless of
+accumulated context size.
+Results on streaming benchmarks:
+• Sub-50 ms query latency: ∼43 ms average as context grows from 2,600 to 14,800 tokens,
+while request-driven inference engines reach 106–254 ms on the same workload
+• 2.4×–5.9× speedup over conventional inference engines (vLLM, SGLang, TensorRT-LLM,
+llama.cpp)
+• 21×–92× speedup over cloud APIs (GPT-4o-mini, GPT-5.2, Claude Haiku, Claude Opus
+4.5)
+• Continuous ingestion: background processing enables true streaming with non-blocking
+data push, and only the new delta is ever processed
+• Full attention over retained context: unlike sparse attention approaches, we maintain
+complete quadratic attention over all data within the retention window
+Flash Queries extend this further: by pre-evaluating registered questions against evolving context state
+during idle GPU cycles, we push latency from ∼43 ms toward ∼2 ms for predictable query patterns.
+Combined with ready-position speculative exit, the system can return cached or high-confidence
+answers with zero GPU work at query time. For workloads where 60–80% of queries are predictable,
+the effective average latency drops to single-digit milliseconds, approaching the theoretical minimum
+of network round-trip time.
+The contribution is architectural: recognising that streaming workloads require data-driven, not
+request-driven, computation models. Existing KV-cache techniques are necessary but not sufficient.
+We provide the session management, region semantics, incremental update mechanisms, and ahead-
+of-time query evaluation that streaming applications require.
+A second consequence, with broader operational impact than per-query latency, is GPU utilisation.
+Large inference deployments typically run at sustained accelerator utilisation in the 10–45% band,
+18
+
+
+--- Page 19 ---
+with the gap to peak dominated by between-request idle time on accelerators that have nothing useful
+to do. The architecture described here turns that idle time into pre-computed Flash Query answers
+against an always-current KV cache, so the same hardware delivers a higher rate of useful analytical
+output per unit time and per unit power, without any change to model weights or kernel implementa-
+tions. For operators of large clusters, this is the rare class of optimization that simultaneously lowers
+latency, raises throughput, and improves accelerator utilisation.
+References
+Lopez-Lira, A. and Tang, Y. Can ChatGPT Forecast Stock Price Movements? Return Predictability
+and Large Language Models. SSRN, 2023.
+Wu, S., Irsoy, O., Lu, S., Daber, V., Dredze, M., Gehrmann, S., Kambadur, P., Rosenberg, D., and
+Mann, G. BloombergGPT: A Large Language Model for Finance. arXiv preprint arXiv:2303.17564,
+2023.
+Liu, N., Lin, K., Hewitt, J., Paranjape, A., Bevilacqua, M., Petroni, F., and Liang, P. Lost in
+the Middle: How Language Models Use Long Contexts. Transactions of the Association for
+Computational Linguistics, 2024.
+Anthropic. Prompt Caching. Documentation, 2024.
+Beltagy, I., Peters, M.E., and Cohan, A. Longformer: The Long-Document Transformer. arXiv
+preprint arXiv:2004.05150, 2020.
+Zaheer, M., Guruganesh, G., Dubey, A., Ainslie, J., Alberti, C., Ontanon, S., Pham, P., Ravula, A.,
+Wang, Q., Yang, L., and Ahmed, A. Big Bird: Transformers for Longer Sequences. NeurIPS,
+2020.
+Child, R., Gray, S., Radford, A., and Sutskever, I. Generating Long Sequences with Sparse Trans-
+formers. arXiv preprint arXiv:1904.10509, 2019.
+Lewis, P., Perez, E., Piktus, A., Petroni, F., Karpukhin, V., Goyal, N., Küttler, H., Lewis, M., Yih,
+W., Rocktäschel, T., Riedel, S., and Kiela, D. Retrieval-Augmented Generation for Knowledge-
+Intensive NLP Tasks. Advances in Neural Information Processing Systems, 33:9459–9474, 2020.
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A.N., Kaiser, Ł., and
+Polosukhin, I. Attention Is All You Need. Advances in Neural Information Processing Systems,
+30, 2017.
+Gu, A. and Dao, T. Mamba: Linear-Time Sequence Modeling with Selective State Spaces. arXiv
+preprint arXiv:2312.00752, 2023.
+Peng, B., Alcaide, E., Anthony, Q., Albalak, A., Arcadinho, S., Cao, H., Cheng, X., Chung, M.,
+Grber, M., et al. RWKV: Reinventing RNNs for the Transformer Era. Findings of EMNLP, 2023.
+Katharopoulos, A., Vyas, A., Pappas, N., and Fleuret, F. Transformers are RNNs: Fast Autoregressive
+Transformers with Linear Attention. International Conference on Machine Learning, 2020.
+Sun, Y., Dong, L., Huang, S., Ma, S., Xia, Y., Xue, J., Wang, J., and Wei, F. Retentive Network: A
+Successor to Transformer for Large Language Models. arXiv preprint arXiv:2307.08621, 2023.
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C.H., Gonzalez, J., Zhang, H., and Stoica,
+I. Efficient Memory Management for Large Language Model Serving with PagedAttention.
+Proceedings of the 29th Symposium on Operating Systems Principles, 2023.
+Zheng, L., Yin, L., Xie, Z., Huang, J., Sun, C., Yu, C.H., Cao, S., Kober, C., Sheng, Y., et al. SGLang:
+Efficient Execution of Structured Language Model Programs. arXiv preprint arXiv:2312.07104,
+2024.
+Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X., and Zhang, H. DistServe: Disaggregating
+Prefill and Decoding for Goodput-optimized Large Language Model Serving. OSDI, 2024.
+19
+
+
+--- Page 20 ---
+Dao, T., Fu, D.Y., Ermon, S., Rudra, A., and Ré, C. FlashAttention: Fast and Memory-Efficient Exact
+Attention with IO-Awareness. Advances in Neural Information Processing Systems, 35, 2022.
+Dao, T. FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning. arXiv
+preprint arXiv:2307.08691, 2023.
+Zhang, A.L., Kraska, T., and Khattab, O.
+Recursive Language Models.
+arXiv preprint
+arXiv:2512.24601, 2025.
+Saxena,
+A.
+Prompt
+Lookup
+Decoding.
+https://github.com/apoorvumang/
+prompt-lookup-decoding, 2023.
+20
