@@ -1,10 +1,125 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-05-12
+**Last Updated:** 2026-05-14
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-14 (14 papers)
+
+### [Harnessing Agentic Evolution](https://arxiv.org/abs/2605.13821)
+
+**2026-05-13** | Tsinghua University, Université de Montréal & Mila, The Hong Kong University of Science and Technology (Guangzhou), Nanyang Technological University, Shanghai Jiao Tong University, Singapore University of Technology and Design, DeepWisdom | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Harnessed meta-editing framework with a two-phase loop (meta-editing phase and evolution segment) | *LLM role:* process_level_editor
+
+> Zhang et al. introduce AEVO, a framework that formulates LLM evolutionary search as an interactive environment where a meta-agent edits the underlying search procedure or agent context rather than directly generating candidate solutions. The results are backed by strong empirical evidence, achieving state-of-the-art performance on Anthropic's Kernel optimization task (1138 cycles) and outperforming baselines like OpenEvolve and HyperAgents across multiple open-ended discovery and reasoning benchmarks. The key insight is separating the candidate generation loop from a meta-editing phase, allowing the system to dynamically revise its own selection rules, feedback summaries, and memory structures when search plateaus. This is a must-read for our work in LLM evolutionary search, as it provides a concrete, actionable architecture for 'evolving the evolver' and maintaining long-horizon search without agent drift.
+
+### [Budget-Efficient Automatic Algorithm Design via Code Graph](https://arxiv.org/abs/2605.10598)
+
+**2026-05-11** | Massachusetts Institute of Technology, University of California, Berkeley | M=8 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Graph-based search for automatic algorithm design using LLM-generated code corrections | *LLM role:* code_writer
+
+> This paper proposes a graph-based search framework for LLM-driven automatic algorithm design where algorithms are represented as paths in a directed acyclic graph (DAG) of code blocks, allowing the LLM to generate composable corrections rather than full rewrites. The approach is backed by strong empirical results on TSP, LRP, and BRP, demonstrating up to 22% smaller optimality gaps than full-algorithm baselines at equal token budgets. The key insight is the use of a Random Forest surrogate model combined with Shapley values to perform correction-level credit assignment, effectively isolating the impact of specific code edits from the overall algorithm fitness. This is highly relevant for LLM evolutionary search; the DAG representation and Shapley-based credit assignment provide a concrete architectural blueprint for drastically improving sample efficiency, search signal quality, and observability in automated heuristic discovery.
+
+### [Teacher-Aware Evolution of Heuristic Programs from Learned Optimization Policies](https://arxiv.org/abs/2605.10634)
+
+**2026-05-11** | Shanghai Jiao Tong University, Shenzhen Technology University, Shanghai Polytechnic University | M=8 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Teacher-aware evolutionary framework for LLM-based heuristic evolution, using sampled on-policy teacher alignment and teacher-guided reflection for program revision | *LLM role:* heuristic_generator, code_writer, decomposition_guide
+
+> This paper introduces a teacher-aware evolutionary framework that uses pre-trained neural optimization policies to provide step-by-step behavioral feedback to guide the LLM-based evolution of symbolic heuristics. The results are backed by strong empirical numbers, showing consistent improvements over standard performance-driven baselines (EoH, ReEvo) on scheduling, routing, and graph optimization benchmarks, while maintaining the fast inference of static code. The key insight is that instead of relying solely on delayed endpoint performance, one can query a black-box neural policy on the specific states visited by a candidate heuristic and use the behavioral discrepancies (top-1 action agreement) to prompt targeted LLM revisions. This is highly relevant for research in LLM evolutionary search, as it provides a concrete, actionable implementation of a process reward model that directly improves search guidance and sample efficiency.
+
+### [RubricEM: Meta-RL with Rubric-guided Policy Decomposition beyond Verifiable Rewards](https://arxiv.org/abs/2605.10899)
+
+**2026-05-11** | Google Cloud AI Research, University of Illinois Urbana-Champaign | M=8 P=6 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Meta-Reinforcement Learning with Rubric-guided Policy Decomposition and Reflection-based Meta-Policy Training (using Stage-Structured GRPO) | *LLM role:* agent_policy, rubric_generator, reflection_generator, judge
+
+> Li et al. introduce RubricEM, an RL framework for long-horizon LLM agents that uses dynamically generated rubrics to structure trajectories, assign stage-wise process rewards via Stage-Structured GRPO, and train a reflection memory bank for cross-episode transfer. The results are rigorously backed by numbers, showing their 8B model outperforming 30B+ open models and approaching proprietary systems on four long-form research benchmarks. The key insight is that rubrics can serve as a shared interface across the entire RL loop, acting simultaneously as structural priors for planning, dynamic process reward models for intermediate credit assignment, and structured memory for experience reuse. This is highly relevant for our work in LLM evolutionary search and multi-agent optimization, as the asynchronous reflection pipeline and stage-structured credit assignment directly address our core challenges in sample efficiency, process reward modeling, and persistent memory across search runs.
+
+### [LEVI: Stronger Search Architectures Can Substitute for Larger LLMs in Evolutionary Search](https://arxiv.org/abs/2605.09764)
+
+**2026-05-10** | Independent Researcher | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* CVT-MAP-Elites with bootstrapped diverse initialization, role-aware LLM routing, and rank-preserving proxy benchmark selection | *LLM role:* heuristic_generator
+
+> LEVI introduces a cost-efficient framework for LLM-guided evolutionary search that replaces expensive frontier-model reliance with a stronger search architecture. The authors demonstrate that by combining a CVT-MAP-Elites archive, role-aware LLM routing (using small models for local edits and large models only for structural paradigm shifts), and rank-preserving proxy benchmarks, they can outperform existing frameworks like ShinkaEvolve and GEPA on systems-research and prompt-optimization tasks at 3.3 to 6.7x lower cost. The results are rigorously backed by empirical cost and performance metrics across 11 benchmarks. The key insight is the decoupling of mutation roles: routing 90% of mutations to cheap, open-weight models for local refinement while reserving frontier models strictly for escaping local optima via 'paradigm shifts.' This is a must-read for our work in LLM evolutionary search, as the role-aware routing and proxy benchmark techniques offer immediate, concrete ways to drastically improve the sample efficiency and scalability of our own optimization pipelines.
+
+### [Evolutionary Ensemble of Agents](https://arxiv.org/abs/2605.09018)
+
+**2026-05-09** | National University of Singapore | M=8 P=7 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Evolutionary Ensemble (EvE) with two co-evolving populations (functional code solvers and agent guidance states) and Elo-based agent scoring | *LLM role:* evolutionary_search
+
+> Yu and Yang introduce Evolutionary Ensemble (EvE), a framework that co-evolves functional code solvers alongside the guidance and skills of the coding agents that produce them. The results are backed by rigorous ablations on a complex positional-encoding design task, demonstrating that continuous agent evolution prevents the phase mismatch and stagnation seen with static or frozen agents. The key insight is the dual-population credit assignment mechanism, which evaluates and evolves agent guidance based strictly on the downstream performance gains of the code they generate in a synchronous race. This is highly relevant for our work in LLM evolutionary search and multi-agent optimization, offering a concrete method to adapt search strategies dynamically as the optimization landscape shifts.
+
+### [FlashEvolve: Accelerating Agent Self-Evolution with Asynchronous Stage Orchestration](https://arxiv.org/abs/2605.08520)
+
+**2026-05-08** | University of California, San Diego, Georgia Institute of Technology | M=8 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Asynchronous stage orchestration with workers and queues, staleness-aware data handling, speculative stage completion, and adaptive workflow control | *LLM role:* artifact generator, reflector, evaluator, patcher
+
+> FlashEvolve accelerates LLM-based agent evolution by replacing synchronized execution stages with asynchronous workers and queues, allowing proposal, rollout, and evaluation to overlap. Backed by strong empirical numbers, it achieves up to 4.9x higher proposal throughput and reaches higher validation scores significantly faster on benchmarks like IFBench and HotpotQA compared to synchronous baselines. The key insight is 'Reflective Async' for handling data staleness: unlike continuous weights in RL, stale language artifacts (prompts or code) are inspectable and can be semantically patched by the LLM to incorporate recent pool updates, preventing wasted compute. This is highly critical for scaling LLM evolutionary search and optimizing LLM serving scheduling, providing a concrete architectural blueprint to drastically reduce the wall-clock time of evolutionary discovery pipelines.
+
+### [CVEvolve: Autonomous Algorithm Discovery for Unstructured Scientific Data Processing](https://arxiv.org/abs/2605.11359)
+
+**2026-05-12** | Argonne National Laboratory | M=8 P=6 I=8 **MUST-READ** *discuss*
+
+*Method:* Autonomous agentic harness combining multi-round generate-tune-evolve search with lineage-aware stochastic candidate sampling and tool use | *LLM role:* evolutionary_search, code_writer, evaluator, decomposition_guide, research_agent
+
+> CVEvolve is an LLM-based evolutionary search framework that autonomously discovers data-processing algorithms using a generate-tune-evolve loop, lineage-aware sampling, and SQL-backed persistent memory. The results are backed by strong empirical evidence, showing significant improvements over baselines, such as reducing X-ray image registration error from 0.98 to 0.12. The key insight is the use of a relational SQL database to manage search history and lineage (avoiding context bloat) combined with a dedicated holdout-test agent to prevent over-optimization on small development sets. This is highly relevant for our work in LLM evolutionary search; the team could directly adopt the SQL memory architecture and holdout-test agent to improve the scalability and generalization of our own automated heuristic design frameworks.
+
+### [TacoMAS: Test-Time Co-Evolution of Topology and Capability in LLM-based Multi-Agent Systems](https://arxiv.org/abs/2605.09539)
+
+**2026-05-10** | Carnegie Mellon University, University of Science and Technology of China, National University of Singapore, Shanghai AI Lab | M=8 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Two-time-scale replicator-mutator process for co-evolving agent capabilities and communication topology in LLM-based multi-agent systems | *LLM role:* evolutionary_search_and_prompt_optimizer
+
+> TacoMAS introduces a test-time co-evolution framework for LLM multi-agent systems that updates agent capabilities rapidly (via memory refinement) and communication topology slowly (via birth-death operations and edge edits). The results are backed by strong empirical evidence, achieving an average 13.3% accuracy improvement over 20 baselines across four diverse benchmarks. The key insight is the separation of evolution into two time scales—fast capability updates to handle immediate subtasks and slow topology updates to preserve coordination stability—which prevents the system from diverging during test-time adaptation. Furthermore, using a meta-judge to assign contribution scores to individual agents effectively acts as a process reward model to guide the replicator dynamics. This is highly relevant for our research in multi-agent optimization and LLM evolutionary search; the fast-slow update schedule and the meta-judge scoring mechanism are concrete techniques we should evaluate for our own multi-agent frameworks.
+
+### [HMACE: Heterogeneous Multi-Agent Collaborative Evolution for Combinatorial Optimization](https://arxiv.org/abs/2605.07214)
+
+**2026-05-08** | Westlake University | M=8 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Heterogeneous Multi-Agent Collaborative Evolution (HMACE) with CVT-MAP-Elites archive and behavior-aware retrieval | *LLM role:* evolutionary_search
+
+> HMACE decomposes LLM-based heuristic generation into a multi-agent workflow (Proposer, Generator, Evaluator, Reflector) to automate heuristic design for combinatorial optimization problems. Backed by strong empirical numbers, it achieves lower optimality gaps on TSP and Online BPP than SOTA baselines like EoH and CORAL, while using significantly fewer tokens (e.g., 0.13M vs 0.24M for TSP). The key insight is the integration of a CVT-MAP-Elites archive as a 'Reflector' memory to enable behavior-aware retrieval of past heuristics, which, combined with a lightweight deterministic pre-filter, drastically improves the sample efficiency of the evolutionary search. This is highly relevant to our work in multi-agent optimization and LLM evolutionary search, offering actionable techniques to reduce API costs and prevent premature convergence in heuristic discovery.
+
+### [CoupleEvo: Evolving Heuristics for Coupled Optimization Problems Using Large Language Models](https://arxiv.org/abs/2605.06341)
+
+**2026-05-07** | Karlsruhe Institute of Technology | M=7 P=8 I=7 *discuss*
+
+*Method:* LLM-driven evolutionary search for Large Neighborhood Search (LNS) destroy operators | *LLM role:* heuristic_generator
+
+> CoupleEvo extends LLM-driven heuristic evolution to coupled optimization problems by generating interacting Large Neighborhood Search (LNS) destroy operators using sequential, iterative, or integrated prompting strategies. Results are backed by empirical evaluations on the Inventory Routing Problem and a multi-robot pre-marshalling problem, showing the approach outperforms classical matheuristics but slightly trails highly specialized state-of-the-art solvers. The key insight is that decomposing the evolution of interacting heuristics into sequential or iterative phases yields significantly better and more stable convergence than integrated generation, which overwhelms the LLM's search complexity. This is highly relevant for our research in LLM evolutionary search and vehicle routing, as it provides a concrete architectural blueprint for evolving multi-component ALNS operators.
+
+### [SkillOS: Learning Skill Curation for Self-Evolving Agents](https://arxiv.org/abs/2605.06614)
+
+**2026-05-07** | Google Cloud AI Research, Massachusetts Institute of Technology, University of Illinois Urbana-Champaign | M=8 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Experience-driven Reinforcement Learning with Grouped Reward Policy Optimization (GRPO) for skill curator | *LLM role:* skill_curator_and_agent_executor
+
+> SkillOS trains a dedicated skill curator model using Grouped Reward Policy Optimization (GRPO) to insert, update, and delete reusable skills in a persistent repository for a frozen agent executor. The results are backed by strong empirical evidence, showing up to a 9.8% relative performance improvement and a 6.0% reduction in interaction steps on ALFWorld, WebShop, and math reasoning benchmarks compared to strong memory baselines. The key insight is the training recipe for delayed memory feedback: grouping related tasks sequentially so that skills extracted from early tasks are explicitly rewarded based on their utility in solving later tasks, augmented by intermediate process rewards for skill conciseness and quality. This is highly relevant for LLM evolutionary search and multi-agent optimization, as it provides a scalable, RL-driven mechanism to maintain a persistent, cross-run memory of successful heuristics or strategies without relying on static rules.
+
+### [Intentmaking and Sensemaking: Human Interaction with AI-Guided Mathematical Discovery](https://arxiv.org/abs/2605.05921)
+
+**2026-05-07** | Google DeepMind | M=6 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* User Interface Design and Qualitative User Study for AI-assisted Scientific Discovery | *LLM role:* experiment_configuration_assistant, critique_agent
+
+> Bäuerle et al. present a qualitative user study and interactive dashboard for AlphaEvolve, formalizing the iterative human-AI workflow into 'intentmaking' (problem definition) and 'sensemaking' (result interpretation). While results are qualitative (based on observations of 11 mathematicians running 2,300+ experiments) rather than algorithmic benchmarks, the operational insights are highly valuable. The key actionable insight is the implementation of a 'critique agent' and a low-cost test stage during experiment setup, which helps users catch underspecified constraints and prevent evolutionary reward hacking before launching expensive, multi-day compute jobs. This is highly relevant for our work in LLM evolutionary search, as adopting these pre-run validation steps can directly improve sample efficiency, reduce wasted compute, and enhance system observability.
+
+### [Graph-Grounded Optimization: Rao-Family Metaheuristics, Classical OR, and SLM-Driven Formulation over Knowledge Graphs](https://arxiv.org/abs/2605.12204)
+
+**2026-05-13** | Samyama.ai | M=5 P=7 I=7 *changes-thinking* *discuss*
+
+*Method:* Graph-grounded optimization paradigm using Cypher queries to source decision variables, constraints, and objectives from property knowledge graphs, solved by a portfolio of Rao-family metaheuristics and OR-tools. | *LLM role:* none
+
+> This paper introduces a graph-grounded optimization paradigm where operations research problem components are sourced directly from property knowledge graphs via Cypher queries, rather than from lossy natural language descriptions. The results are backed by strong empirical numbers across 7 real-world KGs, demonstrating that while classical solvers and metaheuristics succeed, frontier SLMs (including the MILP-tuned OptiMind) fail almost completely at zero-shot formulation. The key insight is the identification of a 'data-binding pathology': LLMs generate syntactically valid optimization code that silently fails or returns trivial solutions because it binds to hallucinated data structures instead of the actual operational database. This is highly relevant for our OR benchmarking and evaluation work, as it proves that evaluating LLMs purely on text-to-math translation ignores the critical, failure-prone step of grounding the formulation in real-world data schemas.
+
 
 #### 2026-05-10 (2 papers)
 

@@ -1,10 +1,53 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-05-12
+**Last Updated:** 2026-05-14
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-14 (5 papers)
+
+### [Attention Once Is All You Need: Efficient Streaming Inference with Stateful Transformers](https://arxiv.org/abs/2605.13784)
+
+**2026-05-13** | LayerScale, Inc. | M=6 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Data-driven stateful transformer inference with decoupled data and query planes | *LLM role:* none
+
+> Norgren introduces a stateful transformer inference architecture that decouples data ingestion from query processing, maintaining a persistent KV cache to achieve constant-time query latency for streaming workloads. The approach is backed by strong empirical results, demonstrating a 2.4x to 5.9x speedup over state-of-the-art engines like vLLM and SGLang on streaming benchmarks while maintaining approximately 43ms latency regardless of context size. The key insight is the use of Flash Queries, which utilize idle GPU cycles between data arrivals to pre-compute answers to registered queries against the evolving context, effectively pushing user-visible latency toward zero. This is highly relevant to our work: it represents a major systems-level advance in LLM serving scheduling that must be accounted for in OR-based inference optimization models, and the persistent stateful session architecture provides a concrete blueprint for implementing continuous, memory-persistent LLM evolutionary search without the massive overhead of re-processing context in every generation.
+
+### [FATE: Future-State-Aware Scheduling for Heterogeneous LLM Workflows](https://arxiv.org/abs/2605.07238)
+
+**2026-05-08** | University of Science and Technology of China | M=8 P=9 I=8 **MUST-READ** *discuss*
+
+*Method:* CP-SAT-backed frontier planner with horizon-aware candidate scoring and state-conditional cost estimation | *LLM role:* none
+
+> FATE introduces a future-state-aware scheduler for heterogeneous LLM workflows (e.g., multi-agent DAGs) that uses a CP-SAT solver to optimize both immediate execution costs and downstream state preservation. The results are backed by solid empirical evidence, showing an 8.9% reduction in normalized makespan and an 8.8% reduction in P95 latency over the strongest baseline on a WfCommons-derived benchmark. The key insight is that LLM workflow scheduling cannot be myopic; it must explicitly model how current placement decisions alter future execution states, specifically regarding model residency, cross-device transfer, and KV-cache/prefix reuse. This is highly relevant to the team's work on OR formulations for LLM serving scheduling, as the rolling-horizon constraint programming formulation and state-conditional cost estimators offer a directly implementable approach for optimizing multi-agent execution on GPU clusters.
+
+### [Requests of a Feather Must Flock Together: Batch Size vs. Prefix Homogeneity in LLM Inference](https://arxiv.org/abs/2605.06046)
+
+**2026-05-07** | Indian Institute of Technology Bombay | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Reinforcement Learning-based prefix-aware scheduler with Chunked Hash Tree for fast prefix detection | *LLM role:* none
+
+> Feather introduces a prefix-aware LLM inference scheduler that uses a novel Chunked Hash Tree for fast prefix detection and a reinforcement learning policy to dynamically balance batch size against prefix homogeneity. The results are strongly backed by empirical evidence, demonstrating 2-10x higher end-to-end throughput compared to vLLM and SGLang baselines while reducing CPU scheduling overhead by up to 1000x. The key insight is a paradigm shift for inference batching: maximizing batch size is sub-optimal for prefix-shared workloads, as moderately small, prefix-homogeneous batches achieve higher throughput by maximizing spatial and temporal locality in KV cache accesses. This is highly relevant to our research in LLM serving scheduling, as it fundamentally changes the objective function for batch optimization and provides a highly efficient data structure (Chunked Hash Tree) that we should adapt for our own resource allocation models.
+
+### [PipeSD: An Efficient Cloud-Edge Collaborative Pipeline Inference Framework with Speculative Decoding](https://arxiv.org/abs/2605.13319)
+
+**2026-05-13** | Zhejiang University, Northeastern University, University of Surrey, Zhongguancun Institute of Artificial Intelligence | M=6 P=7 I=6 *discuss*
+
+*Method:* Token-batch pipeline scheduling via dynamic programming and dual-threshold NAV triggering with Bayesian optimization autotuner | *LLM role:* inference_engine
+
+> PipeSD accelerates cloud-edge collaborative LLM inference by using dynamic programming to optimally batch and pipeline draft tokens, alongside a Bayesian optimization-tuned dual-threshold mechanism for triggering speculative verification. The results are backed by empirical hardware measurements, demonstrating 1.16x–2.16x speedups and up to 25% energy reduction over baselines like EdgeLLM on standard benchmarks. The key insight is formulating the token-batching decision—balancing communication startup overhead against immediate transmission—as a dynamic programming problem to perfectly overlap edge-side autoregressive generation with network transmission. This is highly relevant to our research in OR formulations for LLM serving scheduling, providing a concrete, mathematically grounded approach to minimizing latency in distributed speculative decoding architectures.
+
+### [DisagMoE: Computation-Communication overlapped MoE Training via Disaggregated AF-Pipe Parallelism](https://arxiv.org/abs/2605.11005)
+
+**2026-05-10** | ByteDance Seed, University of Washington, Cornell University | M=5 P=6 I=7 *discuss*
+
+*Method:* Disaggregated component placement with multi-stage AF-Pipe and roofline-model guided adaptive worker allocation | *LLM role:* none
+
+> DisagMoE optimizes large-scale Mixture-of-Experts (MoE) model training by disaggregating attention and feed-forward network (FFN) layers onto separate GPU groups and using a multi-stage pipeline to overlap communication and computation. The results are backed by strong empirical evidence, demonstrating up to 1.81x throughput speedups over Megatron-LM and 1.34x over state-of-the-art overlap methods on a 128-GPU H800 cluster. The key insight is the use of a Compute-Communication roofline model, solved via MILP, to asymmetrically allocate GPU and NIC resources based on the distinct arithmetic intensities of different model components (compute-bound attention vs. communication-bound FFN). While the paper focuses on MoE training rather than evolutionary search, this specific mathematical formulation for hardware resource partitioning is highly relevant to our operations research efforts in GPU scheduling and LLM serving optimization.
+
 
 #### 2026-05-10 (2 papers)
 
