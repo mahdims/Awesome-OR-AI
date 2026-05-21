@@ -1,10 +1,45 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-05-19
+**Last Updated:** 2026-05-21
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-21 (4 papers)
+
+### [optimize_anything: A Universal API for Optimizing any Text Parameter](https://arxiv.org/abs/2605.19633)
+
+**2026-05-19** | UC Berkeley, MIT | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Pareto-based reflective evolutionary search with LLM proposer and diagnostic Side Information (SI) | *LLM role:* evolutionary_search
+
+> Agrawal et al. introduce optimize_anything, a unified LLM-based evolutionary search API that optimizes arbitrary text artifacts (code, prompts, agent architectures) using Pareto-based selection and diagnostic side information. Results are highly rigorous and backed by numbers, including a controlled ablation showing it beats OpenEvolve on circle packing in 3x fewer evaluations, and achieving SOTA on ARC-AGI (89.5%), cloud scheduling, and CUDA kernel generation. The most actionable takeaway is the combination of multi-task search with a shared Pareto frontier, allowing optimization patterns discovered in one task to transfer to related tasks, alongside the formalization of Side Information (SI) as a first-class 'text gradient' to drive targeted mutations rather than blind evolution. This is a landmark paper for LLM evolutionary search; the team should immediately evaluate adopting the multi-task Pareto frontier and structured SI contracts to improve sample efficiency and cross-problem transfer in our own automated algorithm design frameworks.
+
+### [Property-Guided LLM Program Synthesis for Planning](https://arxiv.org/abs/2605.16142)
+
+**2026-05-18** | University of Oxford, Linköping University, Federal University of Rio Grande do Sul | M=8 P=7 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Property-guided LLM program synthesis with counterexample-driven repair loop (CEGIS-style) | *LLM role:* synthesizer
+
+> This paper replaces scalar fitness scores in LLM heuristic synthesis with a counterexample-guided repair loop that checks formal properties and feeds specific failure states back to the LLM. The results are backed by strong empirical evidence on 10 planning domains, showing a 7.4x reduction in LLM generation cost, a 1000x reduction in evaluation compute, and higher task coverage compared to the previous sample-and-select state of the art. The key insight is that using verifiable properties to generate concrete, localized counterexamples (e.g., 'at state X, your heuristic gave value Y, but successors gave Z') is vastly more sample-efficient than end-to-end scalar rewards. This is highly relevant for LLM evolutionary search and automated algorithm design; the community should investigate defining checkable properties for routing or scheduling heuristics to replace or augment standard scalar fitness evaluations, drastically reducing LLM sample complexity.
+
+### [MetaAgent-X : Breaking the Ceiling of Automatic Multi-Agent Systems via End-to-End Reinforcement Learning](https://arxiv.org/abs/2605.14212)
+
+**2026-05-14** | Amazon AGI, UCSD, Oregon State University, Pennsylvania State University, AG2AI, Inc. | M=8 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* End-to-end reinforcement learning with Group Relative Policy Optimization (GRPO), Executor-Designer Hierarchical Rollout, and Stagewise Co-evolution | *LLM role:* LLM acts as a self-designing meta-agent (Designer) and a self-executing agent (Executor)
+
+> MetaAgent-X is an end-to-end reinforcement learning framework that jointly optimizes a meta-agent (Designer) that generates multi-agent workflows and the downstream agents (Executors) that run them. The results are backed by strong empirical evidence, showing up to 21.7% improvement over baselines on math and code benchmarks using Qwen3-8B. The key insight is the Executor-Designer Hierarchical Rollout combined with stagewise co-evolution: by sampling M designs and executing each N times, the system isolates the designer's reward from the executor's reward, while alternating training phases stabilizes the non-stationary RL environment. This is highly relevant to our work in LLM evolutionary search and multi-agent optimization, providing a concrete, implementable architecture for RL-infused meta-agent training and credit assignment.
+
+### [Adapting AlphaEvolve to Optimize Fully Homomorphic Encryption on TPUs](https://arxiv.org/abs/2605.14718)
+
+**2026-05-14** | Google DeepMind, Google, Georgia Institute of Technology | M=8 P=5 I=8 *discuss*
+
+*Method:* AlphaEvolve, an agentic framework combining LLMs with evolutionary search for hardware-aware code optimization | *LLM role:* code_writer
+
+> This paper applies the AlphaEvolve framework to automatically optimize Fully Homomorphic Encryption (FHE) kernels for TPU execution, using LLM-driven code generation guided by hardware-in-the-loop latency feedback and strict correctness checks. The results are real and backed by physical hardware deployments, achieving up to a 2.5x speedup over human-engineered state-of-the-art baselines on TPUv5e chips. The key insight is that optimizing isolated operations often fails to yield end-to-end speedups; instead, co-evolving multiple components and scoring them against complete system execution, while feeding back low-level execution traces (e.g., Xprof) to the LLM, is necessary to discover non-obvious compiler and scheduling optimizations. This is highly relevant for our work in LLM evolutionary search, as the methodology of using execution traces as diagnostic feedback and enforcing end-to-end co-evolution directly informs how we should structure reward signals and evaluation environments for automated algorithm design.
+
 
 #### 2026-05-17 (11 papers)
 

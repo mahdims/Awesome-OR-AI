@@ -1,10 +1,45 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-05-19
+**Last Updated:** 2026-05-21
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-21 (4 papers)
+
+### [PALS: Power-Aware LLM Serving for Mixture-of-Experts Models](https://arxiv.org/abs/2605.21427)
+
+**2026-05-20** | Harvard University, Boston University | M=5 P=8 I=7 *changes-thinking* *discuss*
+
+*Method:* Closed-loop control system with offline power-performance random forest regression models and online PID feedback controller for joint hardware (power caps) and software (batch size) optimization | *LLM role:* none
+
+> PALS introduces a power-aware runtime for LLM serving that jointly optimizes GPU power caps and batch sizes using a closed-loop controller. Backed by hardware measurements on multi-GPU setups, it achieves up to 26.3% energy efficiency improvements and a 4x-7x reduction in QoS violations. The key insight is that for communication-bound MoE models, increasing power beyond a specific threshold degrades efficiency by accelerating communication overheads rather than useful computation. This is highly relevant for our research in LLM serving scheduling; we should incorporate these non-linear power-performance dynamics and MoE communication constraints into our mathematical optimization models for GPU resource allocation.
+
+### [Frontier: Towards Comprehensive and Accurate LLM Inference Simulation](https://arxiv.org/abs/2605.21312)
+
+**2026-05-20** | The Chinese University of Hong Kong, Anuttacon, StepFun | M=7 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Discrete-event simulation with disaggregated abstraction and hardware-aware predictors | *LLM role:* none
+
+> Frontier is a discrete-event simulator for modern LLM inference serving that accurately models disaggregated architectures, complex parallelism, and stateful reasoning workloads. Backed by extensive physical H800 GPU profiling, it reduces end-to-end latency prediction error from over 45% in existing simulators to under 7% by replacing average-case analytical proxies with hardware-aware predictors. The key insight is that coarse analytical models for KV-cache and operator runtimes distort SLA predictions and can reverse optimization conclusions; accurate evaluation requires modeling the closed-loop dynamics of memory state and batch composition. For our research in OR formulations for LLM serving scheduling, this simulator provides a critical, high-fidelity environment to validate batching and resource allocation policies for emerging multi-agent and reasoning workloads without requiring massive physical GPU clusters.
+
+### [PlexRL: Cluster-Level Orchestration of Serviceized LLM Execution for RLVR](https://arxiv.org/abs/2605.20863)
+
+**2026-05-20** | National University of Singapore, Nanyang Technological University, Beihang University, Shanghai Qiji Zhifeng Co., Ltd., Infrawaves, Shanghai Innovation Institute | M=7 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Cluster-level multiplexing of unified LLM services using spatio-temporal scheduling, affinity-aware placement, and centralized state management | *LLM role:* workload_target
+
+> PlexRL is a cluster-level runtime that multiplexes LLM execution across multiple Reinforcement Learning with Verifiable Rewards (RLVR) jobs to reclaim idle GPU capacity caused by long-tailed rollouts and phase alternation. The results are backed by strong empirical numbers on a 2048-GPU cluster, demonstrating up to a 37.58% reduction in GPU-hour costs for 7B to 235B models compared to asynchronous split deployments. The key insight is that decoupling algorithm control from model execution allows the system to treat rollout and training as shared cluster services, enabling spatio-temporal packing that interleaves jobs to hide the massive latency of long-tailed generation and tool-use stalls. This is highly relevant for the team's work on GPU scheduling for AI systems and scaling LLM evolutionary search, as the architectural separation of state management and the specific trace-fitting scheduling heuristics can directly inform how we build resource allocation models for massively parallel LLM generation and evaluation pipelines.
+
+### [TIDE: Efficient and Lossless MoE Diffusion LLM Inference with I/O-aware Expert Offload](https://arxiv.org/abs/2605.20179)
+
+**2026-05-19** | Rice University, University of Central Florida, Mobi.AI | M=7 P=8 I=7 *discuss*
+
+*Method:* Interval-based expert refresh strategy with I/O-aware expert offload, optimized by mathematical programming and greedy search for optimal interval | *LLM role:* none
+
+> TIDE optimizes inference for Mixture-of-Experts diffusion LLMs by formulating the GPU-CPU expert offloading schedule as a mathematical programming problem based on the temporal stability of expert activations. The results are backed by empirical hardware profiling, achieving up to 1.5x throughput improvements on LLaDA2.0 models using a single GPU-CPU setup. The key insight is that the temporal locality of expert routing in diffusion models allows for interval-based expert refreshing, where the optimal interval balancing I/O overhead and CPU compute can be solved analytically via mathematical programming. This is highly relevant to our research in OR formulations for LLM serving scheduling, providing a concrete example of using mathematical optimization to resolve memory and I/O bottlenecks in emerging MoE architectures.
+
 
 #### 2026-05-17 (3 papers)
 
