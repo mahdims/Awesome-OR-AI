@@ -1,10 +1,37 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-05-21
+**Last Updated:** 2026-05-24
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-24 (3 papers)
+
+### [Vector Policy Optimization: Training for Diversity Improves Test-Time Search](https://arxiv.org/abs/2605.22817)
+
+**2026-05-21** | MIT, Sakana AI, Improbable AI Lab, MIT-IBM Computing Research Lab | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Vector Policy Optimization (VPO) combining multi-answer autoregressive generation with stochastic reward scalarization within a GRPO framework | *LLM role:* solution_generator_for_search
+
+> Bahlous-Boldi et al. introduce Vector Policy Optimization (VPO), an RL post-training method that trains LLMs to generate diverse candidate sets by combining multi-answer autoregressive generation with stochastic reward scalarization. The results are rigorously backed by empirical data, demonstrating that VPO continuously scales with test-time compute and successfully solves hard LiveCodeBench problems inside an AlphaEvolve-style evolutionary loop where standard GRPO completely stalls. The key insight is that collapsing vector rewards (such as per-test-case correctness) into a single scalar during RL causes mode collapse; instead, sampling random weightings from a Dirichlet distribution forces the policy to maintain a Pareto-diverse set of strategies. This is a fundamental advance for LLM evolutionary search, as applying VPO to mutator or generator models directly addresses sample efficiency and prevents premature convergence in automated algorithm design.
+
+### [optimize_anything: A Universal API for Optimizing any Text Parameter](https://arxiv.org/abs/2605.19633)
+
+**2026-05-19** | UC Berkeley, MIT | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Pareto-based reflective evolutionary search with LLM proposer and diagnostic Side Information (SI) | *LLM role:* evolutionary_search
+
+> Agrawal et al. introduce optimize_anything, a unified LLM-based evolutionary search API that optimizes arbitrary text artifacts (code, prompts, agent architectures) using Pareto-based selection and diagnostic side information. Results are highly rigorous and backed by numbers, including a controlled ablation showing it beats OpenEvolve on circle packing in 3x fewer evaluations, and achieving SOTA on ARC-AGI (89.5%), cloud scheduling, and CUDA kernel generation. The most actionable takeaway is the combination of multi-task search with a shared Pareto frontier, allowing optimization patterns discovered in one task to transfer to related tasks, alongside the formalization of Side Information (SI) as a first-class 'text gradient' to drive targeted mutations rather than blind evolution. This is a landmark paper for LLM evolutionary search; the team should immediately evaluate adopting the multi-task Pareto frontier and structured SI contracts to improve sample efficiency and cross-problem transfer in our own automated algorithm design frameworks.
+
+### [Property-Guided LLM Program Synthesis for Planning](https://arxiv.org/abs/2605.16142)
+
+**2026-05-18** | University of Oxford, Linköping University, Federal University of Rio Grande do Sul | M=8 P=7 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Property-guided LLM program synthesis with counterexample-driven repair loop (CEGIS-style) | *LLM role:* synthesizer
+
+> This paper replaces scalar fitness scores in LLM heuristic synthesis with a counterexample-guided repair loop that checks formal properties and feeds specific failure states back to the LLM. The results are backed by strong empirical evidence on 10 planning domains, showing a 7.4x reduction in LLM generation cost, a 1000x reduction in evaluation compute, and higher task coverage compared to the previous sample-and-select state of the art. The key insight is that using verifiable properties to generate concrete, localized counterexamples (e.g., 'at state X, your heuristic gave value Y, but successors gave Z') is vastly more sample-efficient than end-to-end scalar rewards. This is highly relevant for LLM evolutionary search and automated algorithm design; the community should investigate defining checkable properties for routing or scheduling heuristics to replace or augment standard scalar fitness evaluations, drastically reducing LLM sample complexity.
+
 
 #### 2026-05-21 (4 papers)
 
