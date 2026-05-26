@@ -1,0 +1,2258 @@
+--- Page 1 ---
+Optimus: Elastic Decoding for Efficient
+Diffusion LLM Serving
+Chiyue Wei∗
+chiyue.wei@duke.edu
+Duke University
+Durham, North Carolina, USA
+Cong Guo∗
+cong.guo@duke.edu
+Duke University
+Durham, North Carolina, USA
+Bowen Duan
+bowen.duan@duke.edu
+Duke University
+Durham, North Carolina, USA
+Junyao Zhang
+junyao.zhang@duke.edu
+Duke University
+Durham, North Carolina, USA
+Haoxuan Shan
+haoxuan.shan@duke.edu
+Duke University
+Durham, North Carolina, USA
+Yifei Wang
+yifei.wang4@duke.edu
+Duke University
+Durham, North Carolina, USA
+Yangjie Zhou
+yj_zhou@nus.edu.sg
+National University of Singapore
+Singapore, Singapore
+Hai “Helen” Li
+hai.li@duke.edu
+Duke University
+Durham, North Carolina, USA
+Danyang Zhuo
+danyang@cs.duke.edu
+Duke University
+Durham, North Carolina, USA
+Yiran Chen
+yiran.chen@duke.edu
+Duke University
+Durham, North Carolina, USA
+Abstract
+Large language model (LLM) serving is fundamentally lim-
+ited by inefficient hardware utilization. Autoregressive (AR)
+decoding underutilizes GPUs due to its strictly sequential ex-
+ecution, while diffusion LLMs (DLLMs) improve throughput
+by decoding multiple tokens per iteration. However, fixed
+block-size diffusion decoding exhibits strong load sensitivity:
+large blocks exploit idle GPU resources under low load, but
+saturate early and incur substantial redundant computation
+under high load. As a result, throughput gains vanish beyond
+saturation, and no single decoding granularity performs well
+across dynamic serving workloads.
+We present Optimus, a serving system that enables elastic
+decoding for diffusion LLMs by dynamically adapting decod-
+ing granularity to runtime load. The key idea is to treat decod-
+ing granularity as a runtime control variable, balancing GPU
+utilization and token efficiency. Optimus combines chunked
+decoding, which enables fine-grained execution without re-
+training, with saturation-aware scheduling, a closed-loop
+mechanism that selects chunk sizes based on runtime con-
+ditions. Together with system-level optimizations and cus-
+tomized attention kernels, Optimus achieves significant per-
+formance improvements while preserving model accuracy.
+Experiments show that Optimus delivers up to 6.1× through-
+put improvement over AR decoding and 4.3× improvement
+∗Both authors contributed equally to this research.
+Corresponding author: Cong Guo <cong.guo@duke.edu>
+over fixed-block diffusion LLM, while maintaining stable per-
+formance across diverse load regimes and improving end-to-
+end serving capacity under latency constraints. The source
+code is available at https://github.com/dubcyfor3/Optimus.
+1
+Introduction
+Large language models (LLMs) [1, 15, 16, 21, 45] have rapidly
+become critical infrastructure for a wide range of appli-
+cations, including conversational [1, 17, 38], code genera-
+tion [9, 14], and data analysis [33]. As LLM-based services
+scale, serving efficiency has emerged as a primary systems
+bottleneck. Despite the massive computational capability of
+modern GPUs, autoregressive (AR) [40, 47] decoding often
+fails to utilize hardware resources effectively.
+In AR decoding, tokens are generated sequentially, one to-
+ken per iteration. When the batch size (bs) is small (e.g., bs =
+1), execution degenerates into a sequence of GEMV (matrix-
+vector multiplication) operations with poor weight reuse,
+making it inherently memory-bound and leaving most GPU
+compute units idle. On an A100 GPU running Qwen-8B [45],
+we observe utilization dropping below 1% under small-batch
+workloads. Continuous batching (CB) [18, 22, 46, 49] has
+been widely adopted to mitigate this inefficiency by dynami-
+cally batching requests to increase the effective GEMM (ma-
+trix multiplication) dimension, improving arithmetic inten-
+sity and boosting throughput without significantly increas-
+ing latency. As a result, CB has become a de facto standard
+in modern LLM serving systems.
+However, CB only exploits inter-request parallelism. When
+system load is low, GPU underutilization persists due to
+1
+arXiv:2605.24832v1  [cs.DC]  24 May 2026
+
+
+--- Page 2 ---
+64x1
+Tokens
+Underload
+AR
+64x8
+Tokens
+Saturation
+BD8
+64x32
+Tokens
+BD32
+GPU Utilization
+GPU 
+Capacity
+512
+Tokens
+Overload
+AR 
+Saturation
+BD8 
+Saturation
+BD32 
+Saturation
+Pareto Frontier
+3.8 tokens/step
+(T/S)
+2.5 T/S
+1.0 T/S
+Figure 1. Load sensitivity of fixed-granularity decoding.
+Throughput under increasing load for autoregressive (AR)
+(Qwen-8B [45]) and block diffusion (BD) (SDAR-8B [11] with
+block sizes 8 and 32) on an A100 80GB GPU.
+the intrinsic token-by-token execution granularity of AR
+decoding, which fundamentally limits the amount of parallel
+work exposed per request. To characterize this behavior,
+we benchmark throughput across a range of batch sizes.
+As shown in Figure 1, AR decoding remains underloaded
+at small batch sizes and only approaches saturation under
+unrealistically high concurrency (e.g., bs = 512).
+Recent advances in diffusion-style large language models
+(DLLMs) [4, 7, 11, 25, 34, 53] increase decoding granularity
+by computing multiple tokens per iteration. By operating
+on blocks of tokens instead of single-token steps, diffusion
+decoding exposes significantly more intra-request parallelism
+and can effectively utilize otherwise idle GPU resources. As
+shown in Figure 1, under low-load conditions, larger block
+sizes achieve substantially higher throughput (3.8 token-
+s/step) than AR decoding (1.0 token/step). By evaluating
+multiple token positions simultaneously, the model can com-
+mit high-confidence tokens earlier, accelerating decoding.
+However, this improvement comes with two key limitations.
+First, diffusion decoding tends to saturate the GPU at rel-
+atively small batch sizes. As shown in Figure 1, a configu-
+ration with block size 32 (BD32) reaches saturation around
+bs = 16. Beyond this point, increasing the load no longer
+improves throughput, as the GPU is already fully utilized.
+Second, diffusion decoding exhibits low token utilization.
+For example, with a block size of 32, the model computes
+32 tokens per step but only commits around 3.8 tokens on
+average. In contrast, AR decoding achieves full utilization,
+where each computed token is committed. This gap indicates
+that a large fraction of computation in diffusion decoding
+is redundant. While redundant computation is acceptable
+under underloaded conditions, it becomes pure overhead
+under GPU saturation. Consequently, large-block diffusion
+decoding loses its advantage and may underperform smaller
+block sizes (e.g., BD8 at bs > 32) or even AR decoding at
+higher load (e.g., bs > 128).
+This behavior reveals a fundamental limitation of fixed
+block-size decoding: a single configuration cannot perform
+well across all load regimes. In dynamic serving environ-
+ments, fixed-granularity decoding inevitably leads to sub-
+optimal performance. To address this limitation, decoding
+granularity must adapt to runtime load. By dynamically ad-
+justing block size, the system can operate near the optimal
+point along the Pareto frontier between GPU utilization and
+token utilization, achieving consistently high performance.
+We present Optimus, a serving system that enables elas-
+tic decoding guided by GPU saturation for diffusion large
+language models. Optimus dynamically adjusts decoding
+granularity at runtime to keep GPU utilization near satura-
+tion while controlling token decoding efficiency.
+The core insight behind Optimus is an algorithm–system
+trade-off. Algorithmically, token utilization varies with de-
+coding granularity (e.g., BD32 commits 3.8 tokens per 32
+computed tokens, while AR approaches 100%). System-wise,
+larger blocks expose greater parallelism and improve GPU
+utilization. By jointly considering these factors, Optimus
+enables dynamic granularity selection that achieves substan-
+tially higher efficiency than fixed configurations. Realizing
+this idea introduces two key challenges:
+(1) Enabling Chunked Granularity. Existing diffusion
+models operate at fixed block sizes (e.g., BD8, BD32), which
+are trained as separate models with different parameters. In
+practice, serving systems cannot switch between multiple
+models at runtime. To address this, Optimus introduces chun-
+ked decoding, a system-level mechanism that decomposes a
+diffusion decoding block into fine-grained execution units
+without retraining multiple models.
+(2) Runtime Elastic Scheduling. Even with flexible gran-
+ularity, selecting the appropriate chunk size at runtime re-
+mains challenging. The system must continuously sense GPU
+utilization and token efficiency under dynamic workloads,
+while minimizing the overhead of switching execution granu-
+larity. To address this, Optimus implements elastic scheduling,
+a closed-loop control mechanism that dynamically selects
+chunk sizes based on runtime conditions, maintaining ex-
+ecution near the GPU saturation point and avoiding both
+underutilization and overload.
+Optimus integrates chunked decoding with a saturation-
+aware scheduling framework, together with system-level
+optimizations and customized attention kernels. This de-
+sign enables efficient execution without sacrificing model
+accuracy. Our evaluation shows that, under the same sys-
+tem configuration, Optimus achieves significant throughput
+gains over both AR and fixed-block diffusion decoding. On
+8B-scale models, Optimus improves throughput by an aver-
+age of 2.1× (up to 6.1×) over AR, and 1.3× (up to 4.3×) over
+BD32. Under realistic serving workloads with a service-level
+objective (SLO) constraint, Optimus further improves end-to-
+end serving capacity by up to 3.5× over AR and up to 2.0×
+over BD32, and 11.8× over SGLang DLLM implementations.
+2
+
+
+--- Page 3 ---
+Prompt
+Response
+Step 0
+Step 1
+(a) Auto-Regressive (AR) LLM 
+Prompt
+Response
+Block 0, Step 0
+Decoded
+Block 0
+(b) Block Diﬀusion (BD) LLM
+Decoding
+Masked
+Step 2
+Step 3
+Block 1
+Block 0, Step 1
+Block 1, Step 0
+Block 1, Step 1
+Weight
+×
+Input
+1
+Low GPU Utilization
+Weight
+Input
+×
+4
+High GPU Utilization
+GEMV
+GEMM
+High (100%) Token Utilization
+Low (50%) Token Utilization
+1 Gen. Token/Step
+2 Gen. Tokens/Step
+Figure 2. Comparison between autoregressive decoding (left) and block diffusion decoding (right). AR generates one token
+per step, while diffusion-style decoding generates multiple tokens per iteration, batch size 1.
+These results demonstrate that Optimus makes diffusion
+LLM serving practical under dynamic workloads and pro-
+vides a system-level foundation that may inform future algo-
+rithm design. This study makes the following contributions:
+• We identify and characterize the load sensitivity problem in
+diffusion LLM serving, and formalize the trade-off between
+token utilization and GPU utilization.
+• We propose chunked decoding, a system-level mechanism
+that enables fine-grained, runtime-adjustable diffusion de-
+coding without retraining.
+• We develop saturation-aware elastic scheduling, a closed-
+loop control framework that dynamically adapts decoding
+granularity to runtime GPU load.
+• Through extensive evaluation, we demonstrate throughput
+improvement and serving capacity improvement over AR
+decoding over fixed-block diffusion decoding.
+2
+Background
+2.1
+LLM and Autoregressive Decoding
+Most LLMs adopt the transformer architecture [40] and gen-
+erate text autoregressively (AR) [1, 15, 45], which predicts
+each token conditioned on the prompt and previously gen-
+erated tokens. As illustrated in Figure 2 (left), the prompt is
+fully available at the start (step 0), whereas response tokens
+are produced strictly one by one. At decoding step 𝑡, the
+model takes the prompt and generated prefix (orange) as
+input and produces a single token 𝑥𝑡(green), which is then
+appended to the prefix for the next step.
+This token-by-token dependency defines AR decoding and
+fundamentally limits its hardware efficiency. As a result, a
+request that generates 𝑇output tokens typically requires 𝑇
+sequential decoding iterations, which makes latency grow
+linearly with output length. For interactive workloads such
+as chat and code completion, where batch size is often small,
+and latency is critical, this sequential execution becomes the
+dominant systems bottleneck [36, 46]
+2.2
+GPU Underutilization and Serving Optimizations
+From a system perspective, AR decoding is notoriously in-
+efficient on modern GPUs. At small batch sizes, each de-
+coding step effectively resembles a set of narrow matrix–
+vector (GEMV) or “skinny” matrix multiplications, rather
+than compute-dense matrix–matrix multiplications (GEMM).
+These kernels exhibit low arithmetic intensity and limited
+weight reuse, making performance memory-bandwidth-bound
+rather than compute-bound [35, 36, 42]. This mismatch ex-
+plains why single-request decoding frequently fails to fully
+utilize GPU compute resources.
+A standard systems-level remedy is continuous batching
+(CB), also known as iteration-level scheduling [22, 46, 49].
+Instead of executing one request at a time, the server dynam-
+ically merges decoding steps from multiple concurrent re-
+quests into a shared batch. Because different requests may be
+at different decoding positions, the scheduler continuously
+admits new sequences and retires finished ones, thereby
+maintaining a larger effective batch over time. This enlarged
+batch turns many decoding kernels from GEMV-like execu-
+tion into larger GEMM-like execution, improving arithmetic
+intensity and increasing hardware occupancy.
+Continuous batching has become a key design principle in
+modern LLM serving engines because it improves through-
+put substantially without incurring the large head-of-line
+blocking typical of static batching [22, 46]. Nevertheless, CB
+exploits only “inter-request” parallelism. Its effectiveness de-
+pends on workload concurrency. Under low-load conditions,
+when there are too few simultaneous requests to form a
+large batch, AR decoding remains fundamentally sequential
+within each request. Consequently, GPU underutilization is
+alleviated but not eliminated: efficiency improves only when
+sufficient request-level concurrency is available.
+2.3
+Diffusion LLM and Block Diffusion
+To fundamentally overcome the sequential bottleneck of AR
+decoding, diffusion-style large language models (DLLMs) [4,
+7, 11, 53] offer a superior alternative. As illustrated on the
+right side of Figure 2, block diffusion decoding abandons
+the token-by-token progression of AR models. Instead, it
+predicts and refines a block of tokens jointly, allowing the
+model to make progress across multiple positions simultane-
+ously [4]. During decoding, tokens whose confidence exceeds
+a threshold are committed in each iteration.
+This blockwise execution represents a paradigm shift in
+generation efficiency. By generating multiple tokens per iter-
+ation, Diffusion LLMs drastically increase “intra-request” par-
+allelism. Each decoding round performs substantially more
+useful work, transforming narrow operations into wider,
+3
+
+
+--- Page 4 ---
+AR 
+Underload
+AR 
+Saturation
+AR 
+Saturation
+BD32 
+Saturation
+3.23x
+6.20x
+3.23x
+6.20x
+2.15x
+TU: 12% 
+TU: 31% 
+ TU:100% 
+Pareto 
+Frontier
+AR 
+Underload
+BD32 
+Overload
+Batch Size = 16
+(a) AR LLM Decoding
+(c) Utilization Trade-oﬀs
+(b) AR & DLLM Decoding
+(AR)
+(BD)
+BD32 
+Saturation
+(d) Saturation-aware Decoding
+2.5 T/S
+1.0 T/S
+3% 
+12% 
+TU: Token 
+Utilization  
+100% 
+3.8 
+tokens/
+step (T/S)
+1.0 T/S
+3.8 tokens/
+step (T/S)
+Figure 3. Motivation for saturation-aware decoding. (a) AR underutilizes the GPU. (b) Diffusion improves utilization but
+suffers under high load. (c) Granularity trades off GPU and token utilization. (d) The optimal point tracks the saturation
+boundary. Experiments use Qwen3-8B (AR) and SDAR-8B (multiple block sizes, from 2 to 32) on an A100 80GB.
+more compute-dense executions that inherently align with
+the throughput-oriented architecture of modern GPUs. Con-
+sequently, Diffusion LLMs maintain high hardware utiliza-
+tion and deliver significantly faster generation speeds even
+at a batch size of 1, effectively bypassing the concurrency
+reliance that limits AR models.
+While diffusion-style decoding offers clear system bene-
+fits, realizing robust end-to-end efficiency requires careful
+management. Block-based decoding introduces a granularity
+tradeoff: larger blocks increase parallelism and peak through-
+put, but reduce runtime flexibility and make execution more
+sensitive to load variations. Fixed-block diffusion approaches
+may excel under specific conditions while degrading in oth-
+ers. This motivates system support for dynamically control-
+ling decoding granularity, which is the focus of this work.
+3
+Motivation
+We begin with autoregressive (AR) decoding to illustrate
+GPU underutilization, and then compare it with diffusion
+decoding (BD32) to show how larger decoding granular-
+ity improves utilization while introducing new limitations.
+These observations reveal a trade-off between GPU utiliza-
+tion and token utilization, motivating a system design that
+dynamically adapts decoding granularity. We conclude by
+outlining the key challenges in realizing such a design.
+3.1
+AR Decoding Fails to Saturate the GPU
+Figure 3(a) shows throughput and latency as the batch size
+increases. Under small batch sizes, AR decoding severely
+underutilizes the GPU: each decoding step exposes only lim-
+ited parallel work, leaving substantial hardware capacity
+idle. In this underloaded regime, increasing the batch size
+improves throughput almost proportionally, while latency
+remains nearly unchanged. This suggests that additional re-
+quests can be absorbed using otherwise idle GPU resources,
+yielding what is effectively a near-free throughput gain. This
+observation is well known in prior LLM serving systems and
+motivates continuous batching, which improves hardware
+efficiency by increasing the effective batch size [22, 46, 49].
+More importantly, because AR decoding has a fixed gran-
+ularity of one token per step, it is intrinsically difficult for
+a single request to expose enough parallel work to saturate
+the GPU. In our example, AR decoding on an A100 does not
+approach saturation until the batch size reaches around 512.
+Such concurrency is rarely sustainable in real-world serving,
+especially under low-load conditions. As a result, even with
+continuous batching, AR decoding often leaves substantial
+GPU resources idle in practice.
+Takeaway. AR decoding rarely saturates the GPU. With
+one-token-per-step granularity, it requires unrealistically
+high concurrency to fully utilize modern accelerators, leav-
+ing substantial capacity idle in practical serving workloads.
+3.2
+DLLM Improves Utilization but Saturates Early
+Figure 3(b) compares AR decoding with block diffusion using
+a block size of 32 (BD32). By performing more computation
+per step, BD32 converts otherwise idle GPU resources into
+useful decoding progress, achieving an average of 3.8 tokens
+per step. As a result, under small batch sizes (e.g., 𝑏𝑠≤16),
+BD32 achieves up to 3.2× higher throughput than AR, while
+maintaining comparable latency. This demonstrates that
+DLLMs can effectively improve throughput with little to
+no additional latency cost in the underloaded regime.
+However, increasing decoding granularity also increases
+the total computation per step. BD32 reaches GPU satura-
+tion at relatively small batch sizes, after which additional
+workload leads to queuing and rapidly increasing latency. In
+this regime, redundant computation dominates execution,
+and throughput no longer improves. In contrast, AR decod-
+ing continues to scale at higher batch sizes and eventually
+outperforms BD32, with up to 6.2× higher throughput.
+Takeaway. Diffusion decoding improves GPU utilization
+under low load but saturates earlier. As a result, its perfor-
+mance advantage is limited to a narrow operating region.
+3.3
+Algorithm-System Trade-off
+The observations above suggest that decoding granularity
+controls the GPU saturation point. By adjusting the block
+size, diffusion decoding trades off GPU utilization against
+token-level efficiency. To formalize this trade-off, we dis-
+tinguish two metrics: GPU utilization (GU), which reflects
+4
+
+
+--- Page 5 ---
+hardware usage, and token utilization (TU), which reflects
+the fraction of useful computation.
+GPU utilization depends on the amount of parallel work
+exposed to the accelerator. We define the effective workload
+(EW) per decoding step as: EW = batch size × block size.
+Increasing either term pushes execution toward the GPU
+saturation point. In practice, for an A100 GPU, saturation is
+reached when EW approaches a hardware-dependent limit
+(e.g., around 512 in our setup). In contrast, TU captures algo-
+rithmic efficiency:
+TU = # committed tokens
+# computed tokens
+AR decoding achieves TU = 100%, while diffusion decoding
+introduces redundant computation as block size increases
+(e.g., BD32 commits only 3.8/32 ≈12% token per step).
+These objectives are inherently in tension: larger block
+sizes improve GPU utilization but reduce TU. As shown in
+Figure 3(c), no single block size maximizes both, and different
+block sizes correspond to different trade-off points.
+Takeaway. Neither AR nor large-block diffusion alone
+achieves optimal efficiency, making dynamic control over
+decoding granularity necessary.
+3.4
+Saturation-Aware Frontier
+The performance of diffusion decoding depends jointly on
+batch size and block size. As shown in Figure 3(d), different
+block sizes achieve optimal performance under different load
+conditions. Under low load, large blocks improve throughput
+by exploiting idle GPU capacity. Under high load, however,
+the GPU approaches saturation, and redundant computa-
+tion from large blocks degrades efficiency. As a result, each
+block size has a distinct operating region, and no single fixed
+granularity performs well across all regimes.
+This behavior gives rise to a saturation-aware frontier:
+the optimal decoding strategy lies near the GPU saturation
+boundary, and the best block size shifts with load. Therefore,
+achieving consistently high performance requires dynami-
+cally adapting decoding granularity to follow this frontier.
+Takeaway. The optimal decoding granularity is not fixed;
+it varies with runtime load. Static block sizes are inherently
+suboptimal in dynamic serving environments.
+3.5
+Challenges
+Realizing saturation-aware decoding requires dynamically
+tracking the saturation frontier at runtime. However, this
+is fundamentally challenging, as it requires both flexible
+decoding granularity and load-aware scheduling, neither of
+which is supported by existing designs.
+(1) Enabling Chunked Decoding. A straightforward ap-
+proach to supporting multiple block sizes is to train separate
+models (e.g., BD2, BD4, BD8, BD16, BD32 of SDAR-8B [11]),
+as illustrated in Figure 3(c)(d) and adopted by existing dif-
+fusion LLM approaches. Each model operates at a fixed de-
+coding granularity with independently trained parameters.
+However, this design is impractical at serving time due to
+prohibitive memory and model-switching overhead.
+Instead, we must enable multiple granularities within a
+single model by decoupling execution granularity from the
+model’s original block size. We adopt a large-block model as
+the base and introduce a finer-grained abstraction, chunks,
+to represent sub-block execution units. This leads to chun-
+ked decoding, which enables flexible control over decoding
+granularity without requiring multiple models.
+However, chunked decoding is non-trivial. Unlike chun-
+ked prefill [2, 50], DLLM decoding involves strict intra-block
+dependencies, including token ordering constraints and KV-
+cache dependencies. Achieving both correctness and effi-
+ciency under such fine-grained execution requires rethinking
+the decoding process. Section 4 presents our solution.
+(2) Scheduling for Elastic Decoding. Even with chun-
+ked decoding, efficiently selecting the optimal chunk size at
+runtime remains challenging, as it depends on system load
+and must adapt dynamically to track the saturation frontier.
+This requires the system to (i) sense GPU utilization in real
+time, (ii) select chunk sizes that balance GPU utilization and
+token utilization, and (iii) transition between granularities
+without introducing instability or overhead. Unlike static
+batching or fixed-block decoding, this forms a closed-loop
+scheduling problem under dynamic and unpredictable work-
+loads. Designing an elastic decoding scheduler that is both
+responsive and stable is essential for achieving consistently
+high performance. Section 5 presents our design.
+4
+Streaming Chunked Decoding
+This section presents chunked decoding, a mechanism that
+enables fine-grained execution within diffusion LLMs while
+preserving correctness. Starting from block-wise decoding,
+we progressively remove intra-block dependencies and in-
+troduce chunk-level control to enable flexible execution.
+4.1
+Original Block Diffusion
+We first describe the execution model of block-wise diffusion
+(BD) decoding, shown in Figure 4(a). Each token within a
+block can be in one of three states, as summarized in Table 1.
+Both masked and decoding tokens are initialized with a fixed
+mask token. During each step, the model predicts token val-
+ues and assigns confidence scores. Tokens whose confidence
+Table 1. Token states in block-wise diffusion decoding.
+Masked
+Decoding
+Decoded
+(yellow)
+(red)
+(blue)
+Input
+mask token
+mask token
+committed token
+Output
+uncommitted
+committed
+committed
+Description
+low confidence
+high confidence
+update KV cache
+5
+
+
+--- Page 6 ---
+ 0
+Step
+ 7
+ 15
+Block size = 16
+ 0
+ 7
+ 15
+2 Tokens/Step
+Token
+Token
+ 0
+ 31
+ 31
+ 0
+ 0
+ 7
+ 15
+ 31
+ 0
+ 22
+(a) Block-wise Diﬀusion Decoding
+(b) Preﬁx Caching 
+(c) Suﬃx Chunking
+Step
+Step
+Token
+Decoded Token
+(Update KV)
+Decoding Token
+Masked Token
+Intra-block Cached Token
+ (No Computation)
+8
+ 0
+ 7
+ 15
+ 31
+ 0
+ 16
+Step
+Token
+ 16
+ 16
+ 16
+ 16
+ 9
+(d) Streaming Chunked Decoding
+2 Tokens/Step
+1.4 Tokens/Step
+1.9 Tokens/Step
+Chunk-wise
+Decoding
+Block-wise
+Decoding
+Chunk 
+Change
+Block-wise
+Decoding
+Step-wise
+Decoding
+Chunk 
+Change
+8
+Decoding
+Mutation
+ 11 12
+ 11 12
+ 27 28
+ 27 28
+ 5 6
+ 1 2
+Block size = 16
+4
+Chunk size
+Chunk 
+size
+4
+8
+4
+4
+8
+8
+8
+8
+4
+4
+4
+8
+8
+8
+4
+4
+4
+4
+4
+4
+Chunk size
+Figure 4. Chunked decoding overview. (a) Block-wise diffusion decoding. (b) Prefix caching removes prefix dependency. (c)
+Suffix chunking enables fine-grained execution. (d) Streaming chunked decoding restores execution order and efficiency.
+exceeds a threshold are committed (Decoding →Decoded),
+while others remain masked.
+Although decoding tokens produce tentative outputs, their
+KV states are computed from masked inputs and are there-
+fore inconsistent with the final committed tokens. Once a
+token is committed, it must be recomputed using the commit-
+ted token to produce correct KV states. As a result, decoded
+tokens correspond to KV states generated from committed to-
+kens, while decoding tokens only provide provisional states.
+Increasing the block size expands the decoding window, al-
+lowing the model to evaluate multiple token positions simul-
+taneously. Within this window, some positions may reach
+the threshold earlier and be committed ahead of others (e.g.,
+tokens 1, 2, 5, and 6 in Figure 4(a)). This is the fundamental
+reason why diffusion decoding improves throughput.
+However, this parallelism introduces complex intra-block
+dependencies and rigid execution boundaries. Our goal is to
+break this rigid execution model by enabling finer-grained
+execution within each block.
+4.2
+Eliminating Prefix Dependency via Caching
+A major source of dependency in block-wise diffusion de-
+coding comes from repeatedly updating the hidden states of
+the decoded token. This creates strong prefix dependencies
+across decoding steps. Prior work [31, 32, 43] has shown that
+most decoded tokens and their KV states quickly stabilize
+after being committed and rarely change in later steps within
+the same block. As a result, recomputing their KV cache is
+largely unnecessary. Based on this, prefix caching reuses the
+KV cache of decoded tokens and skips their recomputation
+in subsequent steps [29, 32]. In Figure 4(b), prefix decoded
+tokens can be excluded from computation.
+However, this reduction in computation does not directly
+translate into performance gains without system support.
+Under low load, reducing computation does not improve
+throughput due to underutilized GPU resources. Under high
+load, irregular decoded token numbers across requests intro-
+duce additional overhead, which can offset the benefits.
+Despite these limitations, prefix caching provides key ab-
+straction: it removes prefix dependencies by decoupling de-
+coded tokens from subsequent computation. Conceptually,
+this extends inter-block caching into the intra-block phase
+and enables excluding prefix tokens from execution.
+4.3
+Reducing Suffix Dependency via Chunking
+While prefix dependency can be eliminated via caching, suf-
+fix tokens introduce another challenge. Fortunately, suffix
+tokens can be reduced without affecting correctness. Prior
+work [10, 20, 24, 41, 43, 44] has shown that suffix tokens in
+diffusion decoding do not carry committed semantic content,
+and their computation can be cached [20, 43, 44], or partially
+skipped [10, 24, 41]. The primary role of suffix tokens is to
+provide a larger decoding window, allowing DLLM to eval-
+uate multiple token positions simultaneously and increase
+the likelihood of “early commitment”. For example, tokens
+such as positions 1, 2, 5, and 6 in Figure 4(a) can be identified
+and committed earlier due to this expanded context.
+Based on this observation, we reduce the effective decod-
+ing window into smaller execution units, which we refer to
+as chunks. As shown in Figure 4(c), chunked decoding parti-
+tions a block into smaller units, enabling flexible scheduling
+and fine-grained control over decoding granularity.
+4.4
+Streaming Chunked Decoding
+Naively executing chunks in isolation can disrupt decoding
+order, increasing the number of decoding steps and degrad-
+ing throughput. This explains why existing approaches do
+not directly adopt fine-grained chunking. To address this, we
+introduce streaming chunked decoding, shown in Figure 4(d).
+The key idea is to dynamically reorganize chunks at each
+step to approximate the original decoding order.
+Our design is based on three components:
+• Fine-grained caching, which enables reuse of the KV
+cache at the chunk level;
+• Dynamic chunk sizing, which supports multiple granu-
+larities and enables seamless switching between them;
+• Step-wise reorganization, which dynamically adjusts
+chunk positions based on current decoded tokens and
+reconstructs chunk inputs at each step.
+These mechanisms provide two key benefits. First, stream-
+ing execution converts otherwise unused prefix capacity into
+useful computation over suffix tokens. By shifting computa-
+tion from prefix regions to undecoded regions, it maximizes
+6
+
+
+--- Page 7 ---
+the efficiency of each chunk. Second, by expanding the effec-
+tive decoding window and dynamically adjusting execution
+order, streaming chunked decoding closely approximates the
+original block-wise decoding schedule. Compared to naive
+chunking (Figure 4(c)), this significantly reduces stalls at
+chunk boundaries and avoids unnecessary increases in de-
+coding steps. For example, in Figure 4(d), the execution order
+of tokens closely matches that of block-wise decoding in Fig-
+ure 4(a), with only minor deviations (e.g., tokens 12 and 28).
+In contrast, naive chunking leads to substantial reordering,
+resulting in more decoding steps and lower efficiency.
+This design departs from conventional diffusion decoding,
+which typically increases block size to expand the suffix re-
+gion and improve the probability of early commitment. In
+contrast, chunked decoding reduces execution granularity
+and trades excessive parallelism for improved system effi-
+ciency. Importantly, combining prefix caching and chunked
+decoding preserves model correctness. While reordering may
+introduce minor variations, our evaluation shows that accu-
+racy remains stable and can even improve in some cases. We
+integrate streaming chunked decoding into existing DLLM
+serving pipelines and implement customized attention ker-
+nels to efficiently support dynamic chunking and KV reuse.
+Overall, chunked decoding integrates two key insights,
+prefix caching and suffix reduction, to enable dynamic sched-
+uling. This not only improves system efficiency but also
+reshapes the execution paradigm of diffusion LLMs, poten-
+tially informing future algorithm design.
+5
+Saturation-aware Elastic Scheduling
+Chunked decoding enables fine-grained control over exe-
+cution granularity, but selecting the optimal chunk size at
+runtime remains challenging. We address this by jointly
+modeling system and algorithm behavior to determine the
+optimal granularity at each step.
+5.1
+System-Algorithm Co-modeling
+As illustrated in Figure 5(a), for system efficiency, we build
+an offline estimator by profiling the target GPU and model
+across combinations of chunk size and batch size. At runtime,
+given the current batch size, we evaluate candidate chunk
+sizes and estimate their latency. As shown in Figure 5(b), for
+algorithm efficiency, we estimate token utilization online for
+each chunk size, predicting the number of committed tokens
+of the current decoding stage.
+Combining these two factors, we select the optimal chunk
+size 𝑐∗at each step by solving:
+𝑐∗= arg max
+𝑐∈C
+𝑁commit(𝑐) × 𝑏
+𝑇latency(𝑐,𝑏) ,
+where C is the set of candidate chunk sizes, 𝑁commit(𝑐) is the
+estimated number of committed tokens for chunk size 𝑐, and
+𝑇latency(𝑐,𝑏) is the estimated latency given chunk size 𝑐and
+Compute-bound
+Transition
+Memory-bound 
+Token 
+Utilization
+# committed 
+tokens
+Figure 5. GPU latency and the committed token modeling.
+the current batch size 𝑏obtained from continuous batching.
+We next describe the modeling of each component in detail.
+5.2
+Modeling System Efficiency
+We model the decoding latency 𝑇latency(𝑐,𝑏) based on the
+dominant GPU workload. In practice, latency is primarily
+determined by the fully connected (FC) layers, whose com-
+putation scales with the total number of tokens processed
+per step, i.e., 𝑏· 𝑐.
+As illustrated in Figure 5(a), the FC workload exhibits
+three regimes as 𝑏𝑐increases: a memory-bound region at
+small 𝑏𝑐, a transition region, and a compute-bound region at
+large 𝑏𝑐. This behavior arises from the changing arithmetic
+intensity of FC layers: at small 𝑏𝑐, computation is limited
+by memory bandwidth, while at larger 𝑏𝑐, GPU compute
+becomes the bottleneck.
+Although decoding attention also contributes to latency,
+it remains memory-bound and is not the dominant factor
+in our setting. We therefore approximate decoding latency
+using a piecewise affine model over 𝑏𝑐:
+𝑇latency ≈𝛽(𝑘)
+1
+𝑏𝑐+ 𝛽(𝑘)
+0
+,
+𝑘∈{1, 2, 3},
+where each regime 𝑘corresponds to memory-bound, transi-
+tion, and compute-bound regions, respectively.
+The coefficients (𝛽(𝑘)
+1
+, 𝛽(𝑘)
+0
+) are obtained via offline pro-
+filing. In the memory-bound regime, the slope is small and
+latency is dominated by fixed overhead, indicating low GPU
+utilization. As 𝑏𝑐increases, the slope grows in the transition
+region, and eventually becomes linear in the compute-bound
+regime, where latency scales proportionally with workload.
+This piecewise model captures the non-ideal transition
+between memory- and compute-bound execution and pro-
+vides a lightweight yet accurate estimator of GPU latency
+for guiding chunk-size selection in Optimus.
+5.3
+Modeling Algorithm Efficiency
+In contrast to GPU latency, token utilization depends on
+model behavior and input data, and is difficult to predict
+offline. We define token utilization (TU) as
+TU = # committed tokens
+chunk size
+.
+7
+
+
+--- Page 8 ---
+R2-4
+R1-4
+R1-1
+R1-6
+R1-2
+R2-1
+R1-3
+R2-2
+R3-1
+R4-1
+R1-4
+R1-6
+R2-3
+R2-5
+R3-2
+R2-6
+R4-2
+R4-2
+R3-2
+R4-8
+R1-4
+R2-3
+R2-4
+R4-3
+R3-3
+R4-4
+R3-4
+R2-5
+R4-5
+R1-5
+R1-6
+R4-6
+R4-7
+R4-8
+R2-6
+R2-6
+R3-4
+R4-4
+2.4 tokens/s
+R4-8
+3/8
+37.5%
+2/5
+40%
+1/1
+1 committed / 1 computed = 100% token utilization
+4/16
+25%
+GPU
+Saturation:
+16 tokens
+16
+tokens
+8
+5
+AR LLM 
+Underload
+BD LLM
+Overload
+Elastic Decoding
+Saturation-aware
+R1: 2s
+R2: 3s
+R3: 2s
+R4: 3s
+Rm-n
+Request m, n tokens completed
+R1: 6s
+R2: 6s
+R3: 4s
+R4: 8s
+4.8 tokens/s
+3.4 tokens/s
+R1: 3s
+R2: 5s
+R3: 4s
+R4: 5s
+Time (s)
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+Time (s)
+0
+1
+2
+3
+4
+5
+Time (s)
+0
+1
+2
+3
+4
+5
+6
+7
+Overload
+Overload
+Overload
+R3-4
+R4-4
+Overload
+Overload
+Overload
+Arrival
+Continuous Batching
+Figure 6. Scheduling comparison under a GPU capacity of 16
+tokens (1 step = 1s under underload). Top: AR underutilizes
+the GPU. Middle: elastic decoding operates near saturation.
+Bottom: BD overloads the GPU. Elastic scheduling balances
+throughput and latency across workloads.
+As illustrated in Figure 5(b), the number of committed
+tokens increases with chunk size but exhibits diminishing
+returns, leading to decreasing token utilization as chunk
+size grows. To estimate TU at runtime, we adopt an on-
+line approach. During early decoding steps, we observe the
+number of committed tokens under the largest chunk size
+(i.e., the standard block size), and construct an empirical
+mapping from chunk size to committed tokens, denoted as
+𝑁commit(𝑐). This estimate is continuously updated as decod-
+ing progresses, enabling the system to adapt to different
+inputs and workload characteristics.
+Although the exact number of committed tokens is highly
+input-dependent and may deviate from our estimate in prac-
+tice, the overall trend remains stable. Combined with our
+accurate system-level latency model, this approximation is
+sufficient to guide scheduling decisions, allowing Optimus
+to achieve strong performance in online serving scenarios.
+5.4
+Saturation-aware Scheduling
+We compare the execution behavior of three decoding strate-
+gies in Figure 6: autoregressive (AR) decoding, block diffu-
+sion (BD), and our elastic decoding.
+AR: Underutilization. AR decoding struggles to reach
+GPU saturation. Under low-load conditions, each step ex-
+poses limited parallelism, leading to low throughput. Mean-
+while, latency grows linearly with the number of decoded
+tokens, as each token must be generated sequentially. As
+shown in the top panel, AR achieves high token utilization
+but fails to efficiently utilize GPU resources.
+BD: Overload. Block diffusion exhibits the opposite be-
+havior. Without adaptive control, BD tends to overload the
+GPU, especially when batching is applied. This leads to two
+key issues. First, batching under overload can increase la-
+tency. For example, the execution of blocks such as R1-6
+and R2-4 becomes overloaded under contention, effectively
+doubling their execution time. As a result, R1 completes later
+than necessary. In contrast, if R1-6 were scheduled without
+batching, it could complete at 2s instead of 3s, while R2-4
+would still complete in 3s. This shows that batching under
+overload can unnecessarily delay earlier requests without
+improving overall completion time. This illustrates that BD
+is inherently sensitive to batching and does not naturally
+align with standard serving schedulers. Second, overload
+reduces overall efficiency. Larger block sizes introduce lower
+token utilization, and under saturation, this redundant com-
+putation becomes pure overhead. As a result, BD may suffer
+from reduced throughput despite higher nominal parallelism.
+These limitations help explain why diffusion-based decoding
+has not been widely adopted in production systems.
+Elastic Decoding: Saturation-aware Scheduling. In
+contrast, elastic decoding dynamically adjusts execution to
+operate near the GPU saturation point. By jointly adapting
+chunk size and batching behavior, it avoids both underuti-
+lization and overload. As shown in the middle panel, elastic
+scheduling maintains high hardware utilization while pre-
+serving efficient execution order. It achieves both lower la-
+tency and higher throughput compared to AR and BD. This is
+enabled by combining chunked decoding with runtime sched-
+uling, allowing the system to balance algorithmic efficiency
+(token utilization) and system efficiency (GPU utilization).
+This analysis highlights that efficient DLLMs serving re-
+quires co-design between algorithm and system. Elastic decod-
+ing provides a practical mechanism to bridge this gap, enabling
+diffusion models to achieve stable and efficient performance
+across varying workloads. This not only improves serving effi-
+ciency but also opens new directions for designing algorithms
+that are better aligned with system constraints.
+6
+Implementation
+System Design and Kernel Support. We implement Opti-
+mus on top of LMDeploy [13], an open-source, production-
+grade LLM serving system with strong support for diffusion
+LLM inference. Building upon LMDeploy’s diffusion decod-
+ing runtime, we extend the scheduling and execution stack
+to support in-block caching and streaming chunked decod-
+ing, which together enable flexible decoding granularity. To
+efficiently support chunked execution, we further implement
+a Triton-based paged-attention kernel. The kernel maps per-
+chunk KV states into the paged KV cache and enables atten-
+tion over variable-length query tokens, allowing seamless
+support for arbitrary chunk sizes rather than being restricted
+to single-token or fixed block-size execution.
+Runtime Profiling and Scheduling. Optimus employs a
+lightweight warmup phase to collect GPU profiling data and
+characterize the decoding behavior of the target diffusion
+8
+
+
+--- Page 9 ---
+Table 2. Datasets characteristics.
+Dataset
+Input tokens
+Output tokens
+BD32 token/step
+mean(std)
+mean(std)
+mean(std)
+SDAR-8B
+LLaDA2.0-16B
+ShareGPT
+213 (508)
+321 (214)
+5.29 (9.44)
+2.51 (4.19)
+LMSYS-Chat
+89 (133)
+183 (163)
+4.81 (8.80)
+2.52 (4.84)
+LongBench
+4015 (2057)
+116 (138)
+6.06 (10.74)
+1.63 (1.90)
+GSM8K
+89 (22)
+175 (67)
+3.20 (5.68)
+2.61 (4.07)
+HumanEval
+172 (65)
+103 (62)
+3.75 (5.96)
+6.01 (8.51)
+MBPP
+155 (77)
+49 (28)
+1.96 (3.33)
+3.34 (4.81)
+IFEval
+58 (24)
+281 (264)
+1.88 (3.90)
+1.28 (1.74)
+model under the incoming workload. Based on these profil-
+ing results, the runtime elastic scheduler dynamically adjusts
+chunking policies to track the optimal operating point under
+changing load. Overall, Optimus comprises approximately
+8K lines of code and supports widely used diffusion LLM
+families, including LLaDA2.0 [7] and SDAR [11].
+7
+Evaluation
+7.1
+Experiment Setup
+Hardware. We run all experiments on NVIDIA A100-SXM4-
+80GB GPUs interconnected via NVLink.
+Models. We evaluate Optimus on two representative diffu-
+sion LLM families, LLaDA 2.0 [7] and SDAR [11], covering
+a range of model sizes. Our main results use SDAR-8B, a
+dense model, and LLaDA2.0-16B, a Mixture-of-Experts (MoE)
+model, both configured with a standard block size of 32. We
+use a confidence threshold of 0.9 for decoding, according
+to common practice [7, 11]. To provide a stronger point of
+comparison, we also include the corresponding autoregres-
+sive base models (AR) from which these diffusion models
+are derived, namely Qwen3-8B [45] for SDAR-8B and Ling
+2.0-16B [39] for LLaDA 2.0-16B. All experiments use FP16
+weights and activations, following standard deployment prac-
+tices. For the main models, we use a single GPU since they
+fit within the memory budget of one device. To evaluate
+scalability, we further experiment with larger models within
+the same families, where we enable tensor parallelism [37]
+to support multi-GPU execution.
+Workloads. Token utilization of diffusion LLMs is workload-
+dependent; we evaluate Optimus on a diverse collection of
+serving traces and benchmark datasets. For serving experi-
+ments, we use ShareGPT [3], which captures realistic con-
+versational workloads; LMSYS-Chat-1M [48], a large-scale
+chat dataset derived from real user interactions; and Long-
+Bench [6], which emphasizes long-context generation and
+understanding. To evaluate model quality and enable direct
+comparison between autoregressive and diffusion decoding,
+we further include GSM8K [12] for mathematical reason-
+ing, HumanEval [9] for code generation, MBPP [5] for basic
+Python programming tasks, and IFEval [52] for instruction-
+following. Table 2 reports the input and output length statis-
+tics and number of decoded tokens per step of these datasets
+on diffusion LLM models. For online serving, we generate
+2
+4
+6
+8
+12
+16
+24
+32
+0
+50
+100
+Accuracy
+GSM8K
+Avg :-0.31
+Worst :-1.14
+BD32
+AR (Ling2.0-16B)
+Optimus (Ours)
+Optimus-OBS (Ours)
+2
+4
+6
+8
+12
+16
+24
+32
+0
+50
+100
+HumanEval
+Avg :+3.81
+Worst :+1.22
+2
+4
+6
+8
+12
+16
+24
+32
+Chunk size
+0
+50
+100
+Accuracy
+MBPP
+Avg :+3.70
+Worst :+0.00
+2
+4
+6
+8
+12
+16
+24
+32
+Chunk size
+0
+50
+100
+IFEval
+Avg :+1.39
+Worst :-0.18
+2
+4
+6
+8
+12
+16
+24
+32
+0
+50
+100
+Accuracy
+GSM8K
+Avg :+1.57
+Worst :+0.60
+BD32
+AR (Qwen3-8B)
+Optimus (Ours)
+Optimus-OBS (Ours)
+2
+4
+6
+8
+12
+16
+24
+32
+0
+50
+100
+HumanEval
+Avg :+2.21
+Worst :+0.00
+2
+4
+6
+8
+12
+16
+24
+32
+Chunk size
+0
+50
+100
+Accuracy
+MBPP
+Avg :+6.03
+Worst :-1.17
+2
+4
+6
+8
+12
+16
+24
+32
+Chunk size
+0
+50
+100
+IFEval
+Avg :+1.06
+Worst :-0.56
+(a) LLaDA2.0-16B Accuracy
+(b) SDAR-8B Accuracy
+Figure 7. Model accuracy on common LLM benchmarks.
+request arrival traces using a Poisson arrival process. We
+set service-level objectives (SLOs) based on application re-
+quirements, following common practice in prior LLM serving
+work [50]. For interactive chat workloads (ShareGPT and
+LMSYS-Chat-1M), we adopt a relatively stringent 50ms time-
+per-output token (TPOT) SLO, as this is generally perceived
+as instantaneous for interactive applications [8]. For long-
+context workloads (LongBench), we relax the SLO to 100ms
+TPOT, as these tasks are less sensitive to fine-grained token
+latency and prioritize throughput over immediacy.
+Baselines. We compare Optimus against two widely used
+serving frameworks with DLLM inference support.
+SGLang1 [49] is a SOTA serving system designed for high-
+throughput LLM inference and is among the most widely
+adopted frameworks with official DLLM support. It extends
+standard LLM serving optimizations to the diffusion set-
+ting, including continuous batching and radix attention, en-
+abling efficient batched execution. However, SGLang per-
+forms scheduling at a coarse granularity: batching decisions
+are made at the block level, and the batch is updated only
+after all requests finish decoding the current block. This de-
+sign limits flexibility under dynamic workloads and can lead
+to suboptimal utilization when requests progress at different
+rates. SGLang adopts a first-come-first-served (FCFS) policy
+and prioritizes prefill over decoding.
+LMDeploy2 [13] is another high-performance serving
+framework for diffusion LLMs. Compared to SGLang, it
+employs a finer-grained scheduling strategy by updating
+1v0.5.9 Mar. 25, 2026 (commit ID 53c1d8e)
+2v0.11.0 Dec. 12, 2025 (commit ID 32f1f0c)
+9
+
+
+--- Page 10 ---
+1
+2
+4
+8
+16
+32
+64
+128 256
+Batch size
+0
+1000
+2000
+3000
+4000
+5000
+Output throughput (tokens/s)
+(a) Scaling Across Chunk Sizes
+Chunk 32 (OBS)
+Chunk 32
+Chunk 24
+Chunk 16
+Chunk 8
+Chunk 4
+Chunk 2
+Pareto frontier
+1
+2
+4
+8
+16
+32
+64
+128 256
+Batch size
+2.15x vs LMDeploy-BD32
+8.50x vs SGLang-BD32
+5.59x vs LMDeploy-AR
+(b) Comparison with Baselines
+Optimus (Ours)
+LMDeploy-AR
+LMDeploy-BD32
+SGLang-BD32
+Figure 8. Throughput scaling with batch size. (a) Different
+chunk sizes exhibit a load-dependent trade-off and form a
+Pareto frontier; (b) Optimus adapts chunk size at runtime
+and outperforms AR and fixed-block baselines.
+batches at every decoding iteration, enabling more flexi-
+ble continuous batching and improved resource utilization.
+LMDeploy also provides an optimized block-wise paged-
+attention kernel, making it a strong and efficient baseline for
+diffusion LLM inference. Similar to SGLang, it adopts FCFS
+scheduling with prefill prioritization.
+To evaluate improvements over autoregressive decoding,
+we additionally include an AR baseline using LMDeploy.
+Since Optimus is implemented on top of LMDeploy, this
+comparison ensures a controlled setting where both systems
+share the same scheduling policy, runtime, and kernel imple-
+mentations, isolating the impact of our proposed chunked
+decoding and elastic scheduling mechanisms.
+7.2
+Model Accuracy
+We first evaluate whether Optimus affects model quality. To
+preserve model accuracy, we adopt streaming only within a
+block, forbidding decoding tokens outside the current block,
+termed in-block streaming. We measure accuracy across mul-
+tiple benchmarks under varying chunk sizes, as shown in
+Figure 7. Overall, Optimus incurs minimal accuracy loss com-
+pared to standard diffusion decoding (BD32). The worst-case
+degradation across all chunk sizes is small, and in some cases
+Optimus even slightly outperforms BD32, indicating that
+modifying decoding granularity through chunked execution
+does not significantly impact model semantics. Interestingly,
+we observe that the average accuracy across different chunk
+sizes often exceeds BD32 and approaches AR performance
+as the chunk size decreases. We attribute this behavior to
+the reduced decoding window in chunked decoding, which
+makes execution more AR-like.
+We further evaluate a more aggressive out-block stream-
+ing (OBS) variant at chunk size 32, allowing streaming across
+blocks. While OBS can achieve higher throughput by allow-
+ing a larger decoding scope, particularly under low-load
+conditions, it introduces slightly larger accuracy degrada-
+tion. This result highlights a controllable trade-off between
+efficiency and model quality, which Optimus can flexibly
+navigate this trade-off through its decoding configuration.
+We attribute the accuracy degradation of OBS to the viola-
+tion of block-wise dependencies assumed during training, as
+cross-block streaming alters the original decoding structure.
+In practice, we only enable OBS for large chunks (e.g., 32),
+while disabling it for smaller chunks where its impact on
+both performance and accuracy is limited. This also suggests
+potential directions for improving diffusion model design.
+7.3
+Throughput Scaling with Batch Size
+We conduct a detailed analysis to understand how chunked
+decoding behaves under different load conditions, which
+manifest as varying batch sizes. Since our focus is on de-
+coding efficiency, we report throughput measured in output
+tokens per second, excluding the prefill phase.
+To systematically study this behavior, we fix the batch
+size and sweep it from 1 to 256, while varying the chunk size
+from 2 to 32, including an additional configuration with a
+chunk size 32 using out-block streaming (OBS). We evaluate
+SDAR-8B on the ShareGPT workload. As shown in the Fig-
+ure 8 (left), no single chunk size is optimal across all batch
+sizes. Larger chunks (e.g., chunk 32 with OBS) achieve higher
+throughput at small batch sizes by exploiting idle GPU re-
+sources. As the batch size increases, the optimal chunk size
+gradually shifts to smaller values (e.g., chunk 16 and then
+chunk 8), reflecting the growing importance of token uti-
+lization. Optimus adapts to these changes and selects the
+best-performing chunk size for each batch size, achieving
+near-optimal throughput across the entire range.
+We compare Optimus with AR and standard block diffu-
+sion baselines in Figure 8 (right). Optimus outperforms all
+baselines in nearly all settings. It achieves a 5.59× speedup
+over AR at batch size 1, and 2.15× and 8.50× speedup over
+LMDeploy-BD32 and SGLang-BD32 at batch size 256. AR
+slightly outperforms Optimus by 9.3% at batch size 256 due
+to the property of diffusion decoding: tokens are predicted
+from masked positions, requiring an additional computa-
+tion round to update the KV cache. As a result, each token
+is effectively computed at least twice, and the minimum
+feasible chunk size is 2 rather than 1. However, such high
+concurrency is uncommon in practical online serving, where
+Optimus consistently achieves superior performance.
+We further evaluate throughput across a range of bench-
+mark datasets and two DLLM models in Figure 9. Despite
+differences in workload characteristics and token utilization
+patterns across datasets and models, Optimus consistently
+achieves higher throughput across all settings. These results
+demonstrate its ability to effectively balance GPU utilization
+and token efficiency across diverse workloads. Overall, Opti-
+mus achieves a geometric mean throughput improvement of
+2.07× (up to 6.08×) over LMDeploy-AR, 1.31× (up to 4.25×)
+over LMDeploy-BD32, and 2.55× over SGLang-BD32 (up to
+9.69×) across all settings.
+10
+
+
+--- Page 11 ---
+1
+2
+4
+8
+16
+32
+64
+128
+256
+0.0
+0.5
+1.0
+Norm. Tput
+1.7
+3.27x
+2.41x
+GSM8K
+(a) SDAR-8B
+1
+2
+4
+8
+16
+32
+64
+128
+256
+2.63x
+1.56x
+(b) LLaDA2.0-16B
+1
+2
+4
+8
+16
+32
+64
+128
+256
+0.0
+0.5
+1.0
+Norm. Tput
+3.69x
+1.95x
+HumanEval
+1
+2
+4
+8
+16
+32
+64
+128
+256
+6.08x
+1.09x
+1
+2
+4
+8
+16
+32
+64
+128
+256
+0.0
+0.5
+1.0
+Norm. Tput
+1.4
+1.8
+1.96x
+3.28x
+MBPP
+1
+2
+4
+8
+16
+32
+64
+128
+256
+3.48x
+1.37x
+1
+2
+4
+8
+16
+32
+64
+128
+256
+Batch size
+0.0
+0.5
+1.0
+Norm. Tput
+1.2
+1.6
+1.92x
+4.25x
+IFEval
+1
+2
+4
+8
+16
+32
+64
+128
+256
+Batch size
+1.4
+1.27x
+2.12x
+SGLang-BD32
+LMDeploy-AR
+LMDeploy-BD32
+Optimus (Ours)
+Figure 9. Throughput comparison across batch sizes.
+7.4
+End-to-End Serving Performance
+We next evaluate Optimus in an end-to-end online serving
+setting, focusing on decoding performance since the prefill
+behavior is largely identical across methods. Following prior
+work [50, 54], we measure the P90 TPOT under gradually
+increasing request rates in Figure 10.
+Overall, Optimus consistently achieves lower TPOT than
+the baselines across most workloads and load conditions. It
+also sustains substantially higher request rates under the
+same SLO. On SDAR-8B with ShareGPT, Optimus improves
+the SLO-compliant request-rate capacity by 10.2×, 1.96×, and
+1.95× over SGLang-BD32, LMDeploy-AR, and LMDeploy-
+BD32, respectively. These show that Optimus translates its
+decoding-level gains in practical online serving.
+Among various models and datasets, several common
+trends emerge. Compared with SGLang-BD32, Optimus per-
+forms similarly at extremely low request rates (e.g., 0.1 re-
+q/s), where the batch size is typically close to one. As the
+request rate increases, SGLang-BD32 becomes less efficient
+because its coarse-grained block-level scheduling leads to
+excessive redundant computation when requests within the
+same batch progress at different speeds. Optimus updates the
+batch at a finer granularity and dynamically adjusts chunk
+size. Compared with AR decoding, Optimus delivers lower
+TPOT across nearly the entire request-rate range, as real-
+world workloads rarely provide enough concurrency for AR
+decoding to fully utilize the GPU. Optimus, by contrast, ex-
+ploits larger decoding granularity under low and moderate
+load to better utilize available GPU resources. Finally, com-
+pared with LMDeploy-BD32, Optimus shows similar TPOT
+under low request rates, where batch sizes remain small and
+large chunk sizes are still effective. As the rate increases, the
+fixed block size of 32 leads to GPU oversaturation, causing
+TPOT to rise rapidly. Optimus adapts by selecting smaller
+chunk sizes under higher load to maintain better token gener-
+ation speed. Optimus improves end-to-end serving capacity
+by 2.1× (up to 3.5×) over AR and 1.4× (up to 2.0×) over
+BD32, and 11.8× (up to 50.7×) over SGLang DLLM imple-
+mentations.
+7.5
+Runtime Scheduling Behavior Analysis
+To better understand the behavior of Optimus during online
+serving, we examine the runtime distributions of batch size
+and chunk size selected by the elastic scheduler. Figure 11
+presents SDAR-8B on ShareGPT under two representative
+request rates: low-load (0.5 req/s) and high-load (4.9 req/s).
+Under low load, the batch size remains small throughout ex-
+ecution (mean 1.8, median 1). In this regime, Optimus almost
+always selects the largest chunk size 32. This is because the
+system is far from GPU saturation, and larger chunk sizes
+maximize GPU utilization and decoded tokens per step.
+Under high load, the runtime behavior changes substan-
+tially. The batch size distribution shifts to much larger values
+(mean 25.0, median 23), occasionally approaching 100. Cor-
+respondingly, Optimus reduces the chunk size dynamically
+to avoid excessive redundant computation. In this setting,
+the selected chunk size averages 20.8 (median 22), while
+spanning a broad range and dropping to as low as 6 in some
+iterations. These results show that Optimus actively adapts
+its decoding granularity to the current system load, using
+large chunks to improve GPU utilization under low load and
+smaller chunks to preserve token efficiency under high load.
+11
+
+
+--- Page 12 ---
+0
+1
+2
+3
+4
+5
+0
+50
+100
+150
+P90 TPOT (ms)
+0.50
+2.58
+2.60
+5.06
+SDAR-8B
+(a) ShareGPT
+0
+2
+4
+6
+8
+0
+50
+100
+150
+0.90
+2.53
+3.64
+6.83
+(b) LMSYS-Chat-1M
+0
+0.5
+1
+1.5
+2
+2.5
+3
+0
+100
+200
+300 0.11
+1.26
+2.54
+2.55
+(c) LongBench
+0
+1
+2
+3
+4
+5
+Request Rate (req/s)
+0
+50
+100
+150
+P90 TPOT (ms)
+0.91
+2.10 2.67
+3.59
+LLaDA2.0-16B
+0
+2
+4
+6
+8
+Request Rate (req/s)
+0
+50
+100
+150
+0.89 1.90
+5.58 6.64
+0
+1
+2
+3
+4
+5
+6
+Request Rate (req/s)
+0
+100
+200
+300 0.13
+4.80
+4.83
+6.34
+SGLang-BD32
+LMDeploy-AR
+LMDeploy-BD32
+Optimus (Ours)
+SLO
+Figure 10. End-to-end online serving evaluation: P90 TPOT over different request rate.
+2
+4
+6
+8
+Batch size
+0.0
+0.2
+0.4
+Probability
+mean = 1.8
+median = 1.0
+Batch size histogram (req/s = 0.5)
+0
+25
+50
+75
+100
+Batch size
+0.00
+0.01
+0.02
+0.03
+0.04
+Probability
+mean = 25.0
+median = 23.0
+Batch size histogram (req/s = 4.9)
+0
+10
+20
+30
+Chunk size
+0.00
+0.25
+0.50
+0.75
+1.00
+Probability
+mean = 32.0
+median = 32.0
+Chunk size histogram (req/s = 0.5)
+0
+10
+20
+30
+Chunk size
+0.0
+0.1
+0.2
+0.3
+Probability
+mean = 20.8
+median = 22.0
+Chunk size histogram (req/s = 4.9)
+Figure 11. Batch size and chunk size distributions under low
+(0.5 req/s) and high (4.9 req/s) request rates.
+7.6
+Scalability Across Models and Tensor Parallelism
+Finally, we evaluate the generality and scalability of Opti-
+mus across different model sizes and tensor-parallel config-
+urations on GSM8K. As shown in Figure 12, Optimus con-
+sistently outperforms the BD32 baseline in output-token
+throughput across models ranging from small variants to
+100B parameters. The performance gains also persist under
+different tensor-parallel (TP) settings, as Optimus operates or-
+thogonally to tensor parallelism. These results demonstrate
+that Optimus generalizes across model scales and deployment
+configurations, and can be incorporated into large-scale pro-
+duction serving systems while retaining its performance
+benefits.
+7.7
+Ablation Study
+To understand the contribution of chunked decoding and
+elastic scheduling, we perform an ablation study by disabling
+these components individually. We first remove both mecha-
+nisms, which reduces Optimus to standard block diffusion
+SDAR-4B
+TP=1
+SDAR-8B
+TP=2
+LLaDA2.0-16B
+TP=2
+SDAR-30B-A3B
+TP=4
+LLaDA2.0-100B
+TP=4
+0
+2000
+4000
+6000
+8000
+Output Tokens Throughput
+2297
+2212
+4248
+4041
+1853
+5733
+2.50x
+4494
+2.03x
+7154
+1.68x
+4600
+1.14x
+3890
+2.10x
+LMDeploy-BD32
+Optimus (Ours)
+Figure 12. Throughput across model scales and tensor-
+parallel settings.
+decoding with block size 32 (BD32). We then enable chunked
+decoding along with fixed chunk sizes, without elastic sched-
+uling, to isolate the effect of chunk granularity. Finally, we
+evaluate the full Optimus design, which combines chunked
+decoding with runtime elastic scheduling. We report P90
+TPOT on ShareGPT using SDAR-8B in Figure 13.
+Chunked decoding alone already provides higher SLO-
+compliant request-rate capacity over BD32 in all fixed chunk
+sizes, and the best fixed configuration (Chunk-8) improves
+capacity from 2.60 to 5.54 req/s (2.13×). This confirms that
+finer granularity reduces the redundant computation of large-
+block diffusion decoding. Adding elastic scheduling further
+improves robustness across request rates. As shown by the
+TPOT curves, Optimus maintains latency close to the best
+fixed-chunk configurations over a wide range of loads, indi-
+cating that the scheduler is effective at adapting chunk size
+online. The elastic policy reaches 5.06 req/s, outperforming
+BD32 and most fixed chunk sizes, and coming within 9.5% of
+the best fixed configuration (Chunk-8). Given that the opti-
+mal chunk size depends on dynamic and difficult-to-predict
+decoding behavior, this result demonstrates that Optimus
+can effectively approximate the best static choice without
+requiring offline tuning for datasets and models.
+12
+
+
+--- Page 13 ---
+1.0
+2.0
+3.0
+4.0
+5.0
+Request Rate (req/s)
+0
+20
+40
+60
+80
+100
+P90 TPOT (ms)
+BD-32C-32 C-24 C-16 C-8
+C-4 Elastic
+0.0
+1.5
+3.0
+4.5
+6.0
+Rate Capacity (req/s)
+2.60
+3.20 3.66
+4.85
+5.54
+4.77 5.06
+BD-32
+Fixed Chunk-4
+Fixed Chunk-8
+Fixed Chunk-16
+Fixed Chunk-24
+Fixed Chunk-32
+Elastic Chunk
+SLO (50 ms)
+Figure 13. Ablation of chunked decoding and elastic sched-
+uling.
+8
+Related Works
+LLM Inference Serving. Prior work on LLM serving im-
+proves efficiency through scheduling, memory management,
+and system design within the autoregressive decoding par-
+adigm. Orca [46] introduces iteration-level scheduling for
+dynamic batching. vLLM [22] improves throughput via Page-
+dAttention and efficient KV-cache management. SGLang [49]
+extends efficient serving with Radix attention for better KV
+reuse. Sarathi-Serve [2] improves throughput–latency trade-
+offs through chunked prefill. DistServe [51] disaggregates
+prefill and decode to improve goodput under latency objec-
+tives. These systems primarily exploit inter-request paral-
+lelism, and may still suffer from low GPU utilization under
+low-load conditions. Optimus is complementary by improv-
+ing intra-request parallelism via diffusion-style decoding.
+Multiple-Token Decoding and Adaptive Serving. Recent
+work on multiple-token decoding accelerates generation by
+advancing multiple tokens per iteration. Speculative decod-
+ing [23] drafts tokens and verifies them in parallel, with ex-
+tensions such as EAGLE [26] and EAGLE-3 [27] improving
+proposal quality. Systems including TurboSpec [30], AdaSpec
+[19], and AdaServe [28] further adapt speculation policies
+online. However, these methods target autoregressive mod-
+els and do not apply to DLLMs, which operate with fixed
+block structures and exhibit a distinct trade-off between GPU
+utilization and redundant computation.
+9
+Conclusion
+We present Optimus, a saturation-aware elastic decoding sys-
+tem for diffusion LLM serving. We show that fixed-granularity
+decoding is inherently suboptimal under dynamic workloads,
+leading to either GPU underutilization or inefficient over-
+saturation. Optimus enables runtime adaptation of decoding
+granularity through chunked decoding and elastic schedul-
+ing, balancing GPU utilization and token efficiency to operate
+near the saturation frontier. Experiments show that Optimus
+achieves up to 6.1× throughput improvement over autore-
+gressive decoding, 4.3× over fixed-block diffusion, and im-
+proves serving capacity by up to 3.5× under SLO constraints,
+while maintaining stable accuracy.
+References
+[1] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge
+Akkaya, Florencia Leoni Aleman, Diogo Almeida, Janko Altenschmidt,
+Sam Altman, Shyamal Anadkat, et al. 2023. Gpt-4 technical report.
+[2] Arney Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun
+Kwatra, Bhargav S. Gulavani, Alexey Tumanov, and Ramachandran
+Ramjee. 2025. Efficient LLM Inference via Chunked Prefills. SIGOPS
+Oper. Syst. Rev. 59, 1 (Aug. 2025), 9–16. doi:10.1145/3759441.3759444
+[3] anon8231489123. 2023.
+ShareGPT Vicuna Unfiltered Dataset.
+https://huggingface.co/datasets/anon8231489123/ShareGPT_
+Vicuna_unfiltered.
+[4] Marianne Arriola, Aaron Gokaslan, Justin T. Chiu, Zhihan Yang, Zhix-
+uan Qi, Jiaqi Han, Subham Sekhar Sahoo, and Volodymyr Kuleshov.
+2025. Block Diffusion: Interpolating Between Autoregressive and Dif-
+fusion Language Models. arXiv:2503.09573 [cs.LG] https://arxiv.org/
+abs/2503.09573
+[5] Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk
+Michalewski, David Dohan, Ellen Jiang, Carrie Cai, Michael Terry,
+Quoc Le, et al. 2021. Program synthesis with large language models.
+[6] Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian
+Huang, Zhengxiao Du, Xiao Liu, Aohan Zeng, Lei Hou, et al. 2024.
+Longbench: A bilingual, multitask benchmark for long context under-
+standing. In Proceedings of the 62nd annual meeting of the association
+for computational linguistics (volume 1: Long papers). 3119–3137.
+[7] Tiwei Bie, Maosong Cao, Kun Chen, Lun Du, Mingliang Gong,
+Zhuochen Gong, Yanmei Gu, Jiaqi Hu, Zenan Huang, Zhenzhong
+Lan, Chengxi Li, Chongxuan Li, Jianguo Li, Zehuan Li, Huabin Liu,
+Lin Liu, Guoshan Lu, Xiaocheng Lu, Yuxin Ma, Jianfeng Tan, Lanning
+Wei, Ji-Rong Wen, Yipeng Xing, Xiaolu Zhang, Junbo Zhao, Da Zheng,
+Jun Zhou, Junlin Zhou, Zhanchao Zhou, Liwang Zhu, and Yihong
+Zhuang. 2025. LLaDA2.0: Scaling Up Diffusion Language Models to
+100B. arXiv:2512.15745 [cs.LG] https://arxiv.org/abs/2512.15745
+[8] Stuart K Card et al. 2018. The psychology of human-computer interaction.
+Crc Press, USA.
+[9] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde
+De Oliveira Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas
+Joseph, Greg Brockman, et al. 2021. Evaluating large language models
+trained on code.
+[10] Xinhua Chen, Sitao Huang, Cong Guo, Chiyue Wei, Yintao He, Jianyi
+Zhang, Hai Li, Yiran Chen, et al. 2025. Dpad: Efficient diffusion lan-
+guage models with suffix dropout.
+[11] Shuang Cheng, Yihan Bian, Dawei Liu, Linfeng Zhang, Qian Yao,
+Zhongbo Tian, Wenhai Wang, Qipeng Guo, Kai Chen, Biqing Qi, and
+Bowen Zhou. 2025. SDAR: A Synergistic Diffusion-AutoRegression
+Paradigm for Scalable Sequence Generation. arXiv:2510.06303 [cs.LG]
+https://arxiv.org/abs/2510.06303
+[12] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Hee-
+woo Jun, Lukasz Kaiser, Matthias Plappert, Jerry Tworek, Jacob Hilton,
+Reiichiro Nakano, et al. 2021. Training verifiers to solve math word
+problems, 2021.
+[13] LMDeploy Contributors. 2023. LMDeploy: A Toolkit for Compressing,
+Deploying, and Serving LLM. https://github.com/InternLM/lmdeploy.
+[14] Kamaluddeen Usman Danyaro, Maged Nasser, Abubakar Zakari,
+Shamsu Abdullahi, Atika Khanzada, Muhammad Muntasir Yakubu,
+Sara Shoaib, et al. 2025. LLM-Based Code Generation: A Systematic
+Literature Review With Technical and Demographic Insights. IEEE
+Access 13 (2025), 194915–194939.
+13
+
+
+--- Page 14 ---
+[15] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer.
+2022. Gpt3. int8 (): 8-bit matrix multiplication for transformers at
+scale. Advances in neural information processing systems 35 (2022),
+30318–30332.
+[16] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova.
+2019. Bert: Pre-training of deep bidirectional transformers for lan-
+guage understanding. In Proceedings of the 2019 conference of the North
+American chapter of the association for computational linguistics: human
+language technologies, volume 1 (long and short papers). Association
+for Computational Linguistics, Minneapolis, Minnesota, 4171–4186.
+[17] Shengyue Guan, Jindong Wang, Jiang Bian, Bin Zhu, Jian-Guang Lou,
+and Haoyi Xiong. 2026. Evaluating LLM-based Agents for Multi-Turn
+Conversations: A Survey. ACM Trans. Intell. Syst. Technol. (Feb. 2026).
+doi:10.1145/3793671 Just Accepted.
+[18] Connor Holmes, Masahiro Tanaka, Michael Wyatt, Ammar Ah-
+mad Awan, Jeff Rasley, Samyam Rajbhandari, Reza Yazdani Am-
+inabadi, Heyang Qin, Arash Bakhtiari, Lev Kurilenko, et al. 2024.
+Deepspeed-fastgen: High-throughput text generation for llms via mii
+and deepspeed-inference.
+[19] Yuezhou Hu, Jiaxin Guo, Xinyu Feng, and Tuo Zhao. 2025. AdaSPEC:
+Selective Knowledge Distillation for Efficient Speculative Decoders.
+arXiv:2510.19779 [cs.CL] https://arxiv.org/abs/2510.19779
+[20] Zhanqiu Hu, Jian Meng, Yash Akhauri, Mohamed S Abdelfattah, Jae-
+sun Seo, Zhiru Zhang, and Udit Gupta. 2025. Accelerating diffusion
+language model inference via efficient kv caching and guided diffusion.
+arXiv–2505 pages.
+[21] Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bam-
+ford, Devendra Singh Chaplot, Diego de las Casas, Florian Bressand, Gi-
+anna Lengyel, Guillaume Lample, Lucile Saulnier, Lélio Renard Lavaud,
+Marie-Anne Lachaux, Pierre Stock, Teven Le Scao, Thibaut Lavril,
+Thomas Wang, Timothée Lacroix, and William El Sayed. 2023. Mistral
+7B. arXiv:2310.06825 [cs.CL] https://arxiv.org/abs/2310.06825
+[22] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Sto-
+ica. 2023. Efficient Memory Management for Large Language Model
+Serving with PagedAttention. In Proceedings of the ACM SIGOPS 29th
+Symposium on Operating Systems Principles. Association for Comput-
+ing Machinery, New York, NY, USA, 611–626.
+[23] Yaniv Leviathan, Matan Kalman, and Yossi Matias. 2023. Fast inference
+from transformers via speculative decoding. In Proceedings of the 40th
+International Conference on Machine Learning (Honolulu, Hawaii, USA)
+(ICML’23). JMLR.org, USA, Article 795, 13 pages.
+[24] Pengxiang Li, Yefan Zhou, Dilxat Muhtar, Lu Yin, Shilin Yan, Li Shen,
+Yi Liang, Soroush Vosoughi, and Shiwei Liu. 2025. Diffusion Language
+Models Know the Answer Before Decoding.
+[25] Xiang Li, John Thickstun, Ishaan Gulrajani, Percy S Liang, and Tat-
+sunori B Hashimoto. 2022. Diffusion-lm improves controllable text
+generation. Advances in neural information processing systems 35 (2022),
+4328–4343.
+[26] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. 2024.
+Eagle: Speculative sampling requires rethinking feature uncertainty.
+[27] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. 2025.
+Eagle-3: Scaling up inference acceleration of large language models
+via training-time test.
+[28] Zikun Li, Zhuofu Chen, Remi Delacourt, Gabriele Oliaro, Zeyu Wang,
+Qinghan Chen, Shuhuai Lin, April Yang, Zhihao Zhang, Zhuoming
+Chen, Sean Lai, Xinhao Cheng, Xupeng Miao, and Zhihao Jia. 2025.
+AdaServe: Accelerating Multi-SLO LLM Serving with SLO-Customized
+Speculative Decoding. arXiv:2501.12162 [cs.CL] https://arxiv.org/abs/
+2501.12162
+[29] Aiwei Liu, Minghua He, Shaoxun Zeng, Sijun Zhang, Linhao Zhang,
+Chuhan Wu, Wei Jia, Yuan Liu, Xiao Zhou, and Jie Zhou. 2025. Wedlm:
+Reconciling diffusion language models with standard causal attention
+for fast inference.
+[30] Xiaoxuan Liu, Jongseok Park, Langxiang Hu, Woosuk Kwon, Zhuohan
+Li, Chen Zhang, Kuntai Du, Xiangxi Mo, Kaichao You, Alvin Cheung,
+Zhijie Deng, Ion Stoica, and Hao Zhang. 2025. TurboSpec: Closed-loop
+Speculation Control System for Optimizing LLM Serving Goodput.
+arXiv:2406.14066 [cs.AI] https://arxiv.org/abs/2406.14066
+[31] Zhiyuan Liu, Yicun Yang, Yaojie Zhang, Junjie Chen, Chang Zou,
+Qingyuan Wei, Shaobo Wang, and Linfeng Zhang. 2025. dllm-cache:
+Accelerating diffusion large language models with adaptive caching.
+[32] Xinyin Ma, Runpeng Yu, Gongfan Fang, and Xinchao Wang. 2025.
+dkv-cache: The cache for diffusion language models.
+[33] Mehran Nasseri, Patrick Brandtner, Robert Zimmermann, Taha Fala-
+touri, Farzaneh Darbanian, and Tobechi Obinwanne. 2023. Applica-
+tions of large language models (llms) in business analytics–exemplary
+use cases in data preparation tasks. In International conference on
+human-computer interaction. Springer, Springer-Verlag, Berlin, Heidel-
+berg, 182–198.
+[34] Shen Nie, Fengqi Zhu, Zebin You, Xiaolu Zhang, Jingyang Ou, Jun
+Hu, Jun Zhou, Yankai Lin, Ji-Rong Wen, and Chongxuan Li. 2025.
+Large Language Diffusion Models. arXiv:2502.09992 [cs.CL] https:
+//arxiv.org/abs/2502.09992
+[35] NVIDIA. 2026.
+Matrix Multiplication Background User’s Guide.
+https://docs.nvidia.com/deeplearning/performance/dl-performance-
+matrix-multiplication/index.html
+[36] Noam Shazeer. 2019. Fast Transformer Decoding: One Write-Head
+is All You Need. arXiv:1911.02150 [cs.NE] https://arxiv.org/abs/1911.
+02150
+[37] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley,
+Jared Casper, and Bryan Catanzaro. 2019. Megatron-lm: Training
+multi-billion parameter language models using model parallelism.
+[38] Gemini Team, Rohan Anil, Sebastian Borgeaud, Jean-Baptiste Alayrac,
+Jiahui Yu, Radu Soricut, Johan Schalkwyk, Andrew M Dai, Anja Hauth,
+Katie Millican, et al. 2023. Gemini: a family of highly capable multi-
+modal models.
+[39] Changxin Tian, Kunlong Chen, Jia Liu, Ziqi Liu, Zhiqiang Zhang, and
+Jun Zhou. 2025. Towards Greater Leverage: Scaling Laws for Efficient
+Mixture-of-Experts Language Models. arXiv:2507.17702 [cs.CL] https:
+//arxiv.org/abs/2507.17702
+[40] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion
+Jones, Aidan N. Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017.
+Attention is all you need. In Proceedings of the 31st International Con-
+ference on Neural Information Processing Systems (Long Beach, Cali-
+fornia, USA) (NIPS’17). Curran Associates Inc., Red Hook, NY, USA,
+6000–6010.
+[41] Xu Wang, Chenkai Xu, Yijie Jin, Jiachun Jin, Hao Zhang, and Zhijie
+Deng. 2025. Diffusion llms can do faster-than-ar inference via discrete
+diffusion forcing.
+[42] Samuel Williams, Andrew Waterman, and David Patterson. 2009.
+Roofline: an insightful visual performance model for multicore ar-
+chitectures. Commun. ACM 52, 4 (April 2009), 65–76. doi:10.1145/
+1498765.1498785
+[43] Chengyue Wu, Hao Zhang, Shuchen Xue, Shizhe Diao, Yonggan Fu,
+Zhijian Liu, Pavlo Molchanov, Ping Luo, Song Han, and Enze Xie. 2025.
+Fast-dllm v2: Efficient block-diffusion llm.
+[44] Chengyue Wu, Hao Zhang, Shuchen Xue, Zhijian Liu, Shizhe Diao,
+Ligeng Zhu, Ping Luo, Song Han, and Enze Xie. 2025. Fast-dllm:
+Training-free acceleration of diffusion llm by enabling kv cache and
+parallel decoding.
+[45] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo
+Zheng, Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, Chujie
+Zheng, Dayiheng Liu, Fan Zhou, Fei Huang, Feng Hu, Hao Ge, Haoran
+Wei, et al. 2025. Qwen3 Technical Report. arXiv:2505.09388 [cs.CL]
+https://arxiv.org/abs/2505.09388
+[46] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and
+Byung-Gon Chun. 2022.
+Orca: A distributed serving system for
+14
+
+
+--- Page 15 ---
+{Transformer-Based} generative models. In 16th USENIX symposium
+on operating systems design and implementation (OSDI 22). USENIX
+Association, USA, 521–538.
+[47] Ailing Zeng, Muxi Chen, Lei Zhang, and Qiang Xu. 2023. Are trans-
+formers effective for time series forecasting?. In Proceedings of the
+Thirty-Seventh AAAI Conference on Artificial Intelligence and Thirty-
+Fifth Conference on Innovative Applications of Artificial Intelligence and
+Thirteenth Symposium on Educational Advances in Artificial Intelli-
+gence (AAAI’23/IAAI’23/EAAI’23). AAAI Press, Article 1248, 8 pages.
+doi:10.1609/aaai.v37i9.26317
+[48] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Tianle Li, Siyuan Zhuang,
+Zhanghao Wu, Yonghao Zhuang, Zhuohan Li, Zi Lin, Eric P Xing,
+et al. 2023. Lmsys-chat-1m: A large-scale real-world llm conversation
+dataset.
+[49] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff
+Huang, Cody H Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E
+Gonzalez, et al. 2024. Sglang: Efficient execution of structured lan-
+guage model programs. Advances in neural information processing
+systems 37 (2024), 62557–62583.
+[50] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-
+anzhe Liu, Xin Jin, and Hao Zhang. 2024. {DistServe}: Disaggregating
+prefill and decoding for goodput-optimized large language model
+serving. In 18th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 24). USENIX Association, USA, 193–210.
+[51] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-
+anzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: disaggregating
+prefill and decoding for goodput-optimized large language model serv-
+ing. In Proceedings of the 18th USENIX Conference on Operating Systems
+Design and Implementation (Santa Clara, CA, USA) (OSDI’24). USENIX
+Association, USA, Article 11, 18 pages.
+[52] Jeffrey Zhou, Tianjian Lu, Swaroop Mishra, Siddhartha Brahma, Sujoy
+Basu, Yi Luan, Denny Zhou, and Le Hou. 2023. Instruction-following
+evaluation for large language models.
+[53] Fengqi Zhu, Rongzhen Wang, Shen Nie, Xiaolu Zhang, Chunwei Wu,
+Jun Hu, Jun Zhou, Jianfei Chen, Yankai Lin, Ji-Rong Wen, and Chongx-
+uan Li. 2025. LLaDA 1.5: Variance-Reduced Preference Optimiza-
+tion for Large Language Diffusion Models. arXiv:2505.19223 [cs.LG]
+https://arxiv.org/abs/2505.19223
+[54] Kan Zhu, Yufei Gao, Yilong Zhao, Liangyu Zhao, Gefei Zuo, Yile Gu,
+Dedong Xie, Zihao Ye, Keisuke Kamahori, Chien-Yu Lin, et al. 2025.
+{NanoFlow}: Towards optimal large language model serving through-
+put. In 19th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 25). USENIX Association, USA, 749–765.
+15
