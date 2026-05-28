@@ -1,10 +1,21 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-05-26
+**Last Updated:** 2026-05-28
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-28 (1 papers)
+
+### [Vector Policy Optimization: Training for Diversity Improves Test-Time Search](https://arxiv.org/abs/2605.22817)
+
+**2026-05-21** | MIT, Sakana AI, Improbable AI Lab, MIT-IBM Computing Research Lab | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Vector Policy Optimization (VPO) combining multi-answer autoregressive generation with stochastic reward scalarization within a GRPO framework | *LLM role:* solution_generator_for_search
+
+> Bahlous-Boldi et al. introduce Vector Policy Optimization (VPO), an RL post-training method that trains LLMs to generate diverse candidate sets by combining multi-answer autoregressive generation with stochastic reward scalarization. The results are rigorously backed by empirical data, demonstrating that VPO continuously scales with test-time compute and successfully solves hard LiveCodeBench problems inside an AlphaEvolve-style evolutionary loop where standard GRPO completely stalls. The key insight is that collapsing vector rewards (such as per-test-case correctness) into a single scalar during RL causes mode collapse; instead, sampling random weightings from a Dirichlet distribution forces the policy to maintain a Pareto-diverse set of strategies. This is a fundamental advance for LLM evolutionary search, as applying VPO to mutator or generator models directly addresses sample efficiency and prevents premature convergence in automated algorithm design.
+
 
 #### 2026-05-24 (3 papers)
 

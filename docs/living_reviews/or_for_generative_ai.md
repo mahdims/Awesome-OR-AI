@@ -1,10 +1,21 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-05-26
+**Last Updated:** 2026-05-28
 
 ---
 
 ## Recent Papers
+
+#### 2026-05-28 (1 papers)
+
+### [Tokenization with Split Trees](https://arxiv.org/abs/2605.22705)
+
+**2026-05-21** | MIT, Kensho Technologies, Ben-Gurion University | M=6 P=5 I=7 *discuss*
+
+*Method:* Integer Programming (IP) for vocabulary selection, solved via Linear Programming (LP) relaxation and rounding heuristic, combined with greedy split tree construction and recursive inference | *LLM role:* code_writer, wording_improvement
+
+> Schmidt et al. introduce ToaST, a tokenization method that replaces greedy heuristics like BPE by formulating vocabulary selection as an Integer Program to minimize total token count. The results are rigorously backed by numbers, demonstrating an 11% compression improvement over BPE and significantly better downstream language model performance. The key insight is that formulating the selection problem over a root-to-leaf tree structure yields an exceptionally tight Linear Programming relaxation, allowing exact OR solvers to scale to massive AI infrastructure problems. This is highly relevant to our work in applying operations research to optimize LLM serving, as it proves formal mathematical programming can successfully replace entrenched AI heuristics to improve inference efficiency.
+
 
 #### 2026-05-24 (5 papers)
 
