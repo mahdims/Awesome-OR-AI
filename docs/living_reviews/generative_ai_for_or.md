@@ -1,6 +1,6 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-05-26
+**Last Updated:** 2026-06-02
 
 ---
 
@@ -238,22 +238,54 @@
 
 ## Research Fronts
 
-*3 fronts detected — snapshot 2026-05-26*
+*3 fronts detected — snapshot 2026-06-02*
 
-### Front 1 (38 papers) — STABLE
+### Front 0 (34 papers) — STABLE
 
-**Density:** 0.15 | **Methods:** llm_code_generation, llm_in_the_loop, llm_as_evaluator, program_synthesis, llm_as_heuristic | **Problems:** linear_programming, optimization_modeling, mixed_integer_linear_programming, milp_general, combinatorial_optimization
+**Density:** 0.19 | **Methods:** llm_in_the_loop, llm_code_generation, llm_as_evaluator, llm_as_heuristic, program_synthesis | **Problems:** linear_programming, optimization_modeling, combinatorial_optimization, mixed_integer_linear_programming, milp_general
 
-*Unique methods:* ADMM, actor_critic, adam_optimizer, adaptive_algorithms, agentic_workflow, apollo_milp, asymmetric_validation, attention_mechanism, augmented_lagrangian_method, automated_algorithm_design, autonomous_coding_agents, bayesian_optimization, beam_search, behavioral_verification, benchmark_creation, bi_gcn, bin_packing_heuristics, bipartite_graphs, bootstrapping, causal_discovery, centralized_training_decentralized_execution, clustergcn, clustering, code_interpreter_feedback, competitive_analysis, compiler_in_the_loop, conditional_flow_matching, continual_learning, data_augmentation, deep_q_networks, deep_reinforcement_learning, deterministic_parser, diagnosis_guided_repair, differentiable_optimization, differentiable_physics, differential_attention, digital_replicas, distributionally_robust_optimization, dual_reward_system, dynamic_path_reconstruction, dynamic_weight_adjustment, empirical_study, ensemble_methods, epsilon_greedy_search, evolutionary_algorithms, evolutionary_computation, exact_optimization, execution_aware_modeling, few_shot_learning, fixed_point_relaxation, flow_matching, gat, gaussian_reparameterization, generative_process_supervision, global_local_search, gradient_based_optimization, gradient_descent, graph_isomorphism, graph_neural_networks, graph_representation, graph_theory, greedy_algorithm, greedy_search, hashing, heuristic_design, heuristic_filtering, hierarchical_decomposition, hierarchical_reinforcement_learning, hierarchical_retrieval_augmented_generation, hyperparameter_optimization, iis_diagnostics, imitation_learning, instance_generation, iterative_adaptive_revision, kahneman_tversky_optimization, l1_regularization, lagrangian_duality, lagrangian_relaxation, literate_programming, llm_as_data_synthesizer, llm_as_expert, llm_as_meta_optimizer, llm_as_model_generator, llm_as_semantic_generator, llm_as_solver, llm_as_verifier, logsumexp_approximation, lookahead_mechanism, lower_bound_estimation, lp_duality, mathematical_modeling, mathematical_optimization, mathematical_programming, mdp_modeling, memory_driven_planning, meta_optimization, minimum_bayes_risk_decoding, monte_carlo_tree_search, multi_agent_reinforcement_learning, multi_armed_bandit, multi_head_attention, mutation_testing, neural_diving, nonlinear_programming, offline_adaptation, online_scheduling, optimization_model_validation, options_framework, ordered_eviction, pairwise_preference_model, partial_kl_divergence, particle_swarm, pmvb, predict_and_search, prioritized_experience_replay, problem_formulation, pyscipopt, reflexion, reinforce_plus_plus, rejection_sampling, retrieval_augmented_reasoning, reverse_socratic_method, robust_optimization, rsome, sample_average_approximation, sampling_and_reweighting, self_improving_search, self_refinement, semi_markov_decision_process, sensitivity_analysis, sibling_aware_expansion, simulation_optimization, smt_solvers, software_testing, solver_based_perturbation, sparse_state_storage, stochastic_optimization, symbolic_pruning, symmetric_decomposable_graphs, systematic_literature_review, test_case_generation, test_time_adaptation, test_time_reinforcement_learning, test_time_scaling, tool_augmented_llm, topological_sort, tree_of_thought, tri_gcn, two_stage_reward_system, uct, vector_embedding, warm_starting, wasserstein_metric, weighted_direct_preference_optimization, weighted_sum_method, weisfeiler_lehman_test
-*Shared methods:* benchmark_design, chain_of_thought, data_cleaning, data_synthesis, evolution_of_heuristics, expectation_maximization, generative_models, genetic_algorithm, group_relative_policy_optimization, gurobi, in_context_learning, instruction_tuning, iterative_refinement, linear_programming, llm_as_evaluator, llm_as_heuristic, llm_code_generation, llm_evolutionary_search, llm_fine_tuned, llm_in_the_loop, llm_iterative_refinement, llm_prompt_optimization, llm_research_agent, metaheuristics, milp_solver, mixed_integer_linear_programming, mixture_of_experts, multi_agent_llm, multi_agent_llm_system, multi_agent_system, neuro_symbolic_ai, process_reward_model, program_synthesis, prompt_engineering, proximal_policy_optimization, reinforcement_learning, retrieval_augmented_generation, self_consistency, self_correction, supervised_fine_tuning, supervised_learning, synthetic_data_generation, tree_of_thoughts
+*Unique methods:* ADMM, CP_SAT, absolute_value_linearization, agentic_workflow, apollo_milp, automated_algorithm_design, bayesian_optimization, beam_search, behavioral_verification, benchmark_creation, benchmark_design, bi_gcn, bilinear_linearization, bin_packing_heuristics, bipartite_graphs, bootstrapping, causal_discovery, clustergcn, code_interpreter_feedback, compiler_in_the_loop, conditional_flow_matching, continual_learning, data_augmentation, data_synthesis, dataset_generation, deterministic_parser, diagnosis_guided_repair, digital_replicas, discrete_monotonic_optimization, dual_reward_system, dynamic_supervised_fine_tuning_policy_optimization, dynamic_weight_adjustment, empirical_study, ensemble_methods, epsilon_greedy_search, error_driven_learning, evolutionary_algorithms, evolutionary_computation, exact_linearization, exact_optimization, expert_in_the_loop, fine_tuning, flow_matching, formal_verification, gat, gating_network, gdp_transformation, generative_process_supervision, graph_isomorphism, graph_neural_networks, graph_representation, graph_theory, greedy_search, harness_engineering, hashing, heuristic_design, heuristic_filtering, hierarchical_decomposition, hierarchical_reinforcement_learning, human_llm_interaction, hyperparameter_optimization, iis_diagnostics, instance_generation, intent_classification, irreducible_infeasible_subsystem_analysis, iterative_correction, kahneman_tversky_optimization, linear_fractional_linearization, literate_programming, llm_as_data_synthesizer, llm_as_meta_optimizer, llm_as_model_generator, llm_as_solver, lookahead_mechanism, loop_based_structure_recovery, mathematical_modeling, meta_optimization, milp_reformulation, min_max_linearization, model_data_separation, modeling_language, monotone_transformation_linearization, multi_armed_bandit, multimodal_ai, natural_language_generation, neural_diving, nonlinear_programming, optimization_solver, options_framework, pairwise_preference_model, partial_kl_divergence, particle_swarm, pattern_detection, pmvb, predict_and_search, probabilistic_guarantee, problem_formulation, proximal_policy_optimization, pyscipopt, reinforce_plus_plus, rejection_sampling, reverse_data_synthesis, reverse_engineering, reverse_socratic_method, rule_based_reformulation, sac_opt, sampling_and_reweighting, self_refinement, semantic_alignment, semantic_validation, semi_markov_decision_process, sensitivity_analysis, sentence_embedding, simulation_optimization, smt_solvers, solver_based_perturbation, solver_in_the_loop, star, structure_aware_modeling, symbolic_planning, symbolic_pruning, symmetric_decomposable_graphs, systematic_literature_review, test_time_adaptation, test_time_reinforcement_learning, test_time_scaling, textgrad, tool_augmented_llm, tree_of_thought, tri_gcn, two_stage_reward_system, uct, uncertainty_estimation, warm_starting, weighted_direct_preference_optimization, weighted_sum_method, weisfeiler_lehman_test
+*Shared methods:* chain_of_thought, constraint_programming, contrastive_learning, data_cleaning, direct_preference_optimization, evolution_of_heuristics, expectation_maximization, generative_models, genetic_algorithm, gradient_based_optimization, group_relative_policy_optimization, grpo, gurobi, in_context_learning, instruction_tuning, linear_programming, llm_as_evaluator, llm_as_heuristic, llm_code_generation, llm_evolutionary_search, llm_fine_tuned, llm_in_the_loop, llm_iterative_refinement, llm_prompt_optimization, llm_research_agent, metaheuristics, milp_solver, mixed_integer_linear_programming, mixture_of_experts, monte_carlo_tree_search, multi_agent_llm_system, multi_agent_system, neurosymbolic_ai, process_reward_model, program_synthesis, prompt_engineering, reinforcement_learning, retrieval_augmented_generation, self_consistency, self_correction, self_improving_search, supervised_fine_tuning, supervised_learning, synthetic_data_generation
 
-This research front centers on developing advanced LLM-driven frameworks for the automated synthesis and rigorous verification of executable optimization models and solver code from natural language descriptions. A core unifying theme is the pursuit of semantic correctness and operational reliability, moving beyond mere syntactic validity. Approaches leverage sophisticated multi-agent systems, search-based methods, and memory-augmented architectures to iteratively refine and validate generated solutions, ensuring feasibility and optimality in complex Operations Research (OR) domains.
+This research front unifies advancements in leveraging Large Language Models (LLMs) for automated optimization modeling, problem formulation, and solver component generation. A core theme is the shift from basic code generation to ensuring semantic correctness, robustness, and continuous self-improvement. Key frameworks like ReLoop, OptiMUS, SIRL, AlphaOPT, and StepORLM emphasize structured generation, advanced verification techniques, and adaptive agentic architectures for complex Operations Research (OR) domains, including multi-period retail inventory, optimal power flow, and Mixed-Integer Linear Programming (MILP) solver plugins.
 
-Key contributions include novel frameworks for automated model generation and rigorous validation. NEMO [3] introduces execution-aware agents with an asymmetric simulator-optimizer loop, achieving state-of-the-art on 8/9 optimization benchmarks. ORGEval [8] proposes a graph-theoretic evaluation using the Weisfeiler-Lehman test, offering 100% consistency in seconds for model isomorphism. ReLoop [17] employs behavioral verification via perturbation testing to detect 'silent failures' in LLM-generated models, demonstrating significant improvements in accuracy on the RetailOpt-190 benchmark. For learning and refinement, StepORLM [5] utilizes a Generative Process Reward Model and Weighted DPO for co-evolution, boosting Pass@1 accuracy by 29.6% over GPT-4o. CALM [16] introduces an 'Intervener' model to inject corrective hints, enabling a 4B model to match DeepSeek-R1 on OR benchmarks. Search-based approaches are advanced by SolverLLM [37] and Astorga et al. [12], which integrate LLM-guided Monte Carlo Tree Search with prompt backpropagation and symbolic pruning, yielding substantial gains. EvoOR-Agent [25] co-evolves agent architectures using Activity-on-Edge networks, improving performance by up to 17%. Furthermore, new data synthesis methods like OptMATH [20] and ReSocratic [26] leverage solver-verified reverse generation to create high-quality, scalable training datasets, while critical surveys [13] highlight and address significant error rates in existing benchmarks.
+Key contributions include ReLoop's behavioral verification, which exposed a 90% gap between execution feasibility and semantic correctness on RetailOpt-190, and ORGEval's graph-theoretic evaluation, achieving 100% consistency in seconds for model isomorphism. Self-improvement is driven by methods like OptiRepair's RL-trained agents with a 'Rationality Oracle' achieving 81.7% success in model repair, and SIRL's Reinforcement Learning with Verifiable Reward (RLVR) using 'Partial KL' for enhanced LLM proficiency. Structured generation is advanced by OptiMUS's 'Connection Graph' for multi-agent orchestration (+31.5% accuracy on NL4OPT) and SolverLLM's LLM-guided MCTS with 'Prompt Backpropagation' for dynamic prompt modification. Benchmarking efforts like MIPLIB-NL revealed that SOTA models drop from ~90% accuracy on toy benchmarks to ~18% on industrial-scale MILPs, highlighting the need for more robust evaluation. Notably, Agentic MIP Research used an AlphaEvolve-like framework to generate SCIP constraint handlers, discovering five novel patterns that solved previously unsolved instances on MIPLIB 2017.
 
-This front is rapidly maturing, characterized by a shift from basic LLM code generation to sophisticated, verifiable, and self-improving systems. The emphasis on robust validation (e.g., graph isomorphism, behavioral perturbation, mutation testing) and iterative refinement loops (e.g., generative process supervision, memory-augmented learning, prompt backpropagation) suggests a trajectory towards deployable, high-assurance AI for OR. Future work is likely to focus on scaling these frameworks to larger, more complex real-world problems, enhancing their ability to handle ambiguous or incomplete natural language specifications, and integrating deeper domain-specific knowledge and specialized solvers for non-linear and stochastic optimization.
+This front is rapidly emerging and maturing, with a clear trajectory towards integrating more sophisticated formal verification methods and adaptive, self-correcting multi-agent architectures. Future work will likely focus on tackling larger-scale, more ambiguous industrial problems through robust data synthesis and evaluation, moving beyond purely outcome-based rewards to leverage process-level feedback and structured representations. The emphasis is on developing LLM agents that can not only generate solutions but also rigorously verify, diagnose, and iteratively refine them, leading to more reliable and scalable OR automation.
 
 **Papers:**
+
+### [ReLoop: Structured Modeling and Behavioral Verification for Reliable LLM-Based Optimization](https://arxiv.org/abs/2602.15983)
+
+**2026-02-17** | National University of Singapore, Northwestern University, City University of Hong Kong, Wenzhou University, Wenzhou Buyi Pharmacy Chain Co., Ltd. | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Structured generation (understand, formalize, synthesize, verify) with two-layer behavioral verification (L1 execution recovery, L2 solver-based perturbation testing) and diagnosis-guided repair. | *LLM role:* code_writer
+
+> ReLoop proposes a verification pipeline for LLM-generated optimization models that detects 'silent failures' (code that runs but solves the wrong problem) by perturbing input parameters and checking for expected solver objective shifts. They demonstrate that standard execution feasibility is a poor proxy for correctness (90% gap) on their new RetailOpt-190 benchmark, and that this perturbation testing significantly improves reliability. The critical takeaway is the use of sensitivity analysis as a ground-truth-free process reward signal: we can validate evolved algorithms in AlgoEvo by asserting that specific input perturbations *must* trigger output changes, filtering out semantically invalid candidates before expensive evaluation.
+
+### [LLMOPT: Learning to Define and Solve General Optimization Problems from Scratch](https://arxiv.org/abs/2410.13213)
+
+**2024-10-17** | Ant Group, East China Normal University, Nanjing University | M=5 P=7 I=6 *discuss*
+
+*Method:* Multi-instruction supervised fine-tuning and KTO model alignment with self-correction | *LLM role:* Generates problem formulations, writes solver code, and performs error analysis for self-correction
+
+> The authors fine-tune Qwen1.5-14B to translate natural language optimization problems into Pyomo code via a structured 'five-element' intermediate representation (Sets, Parameters, Variables, Objective, Constraints) and KTO alignment. They achieve ~11% accuracy gains over GPT-4o and ORLM on benchmarks like NL4Opt and IndustryOR, primarily by reducing formulation hallucinations through the structured intermediate step and preference optimization. For our OR-Bench work, the key takeaway is the concrete recipe for using KTO to align symbolic modeling agents, which appears more effective than standard SFT for enforcing constraints in smaller models. While not an evolutionary search paper, it provides a strong, locally runnable baseline for our OR modeling evaluations.
+
+### [ORGEval: Graph-Theoretic Evaluation of LLMs in Optimization Modeling](https://arxiv.org/abs/2510.27610)
+
+**2025-10-31** | The Chinese University of Hong Kong, Shenzhen, Shenzhen Research Institute of Big Data, Shenzhen International Center for Industrial and Applied Mathematics, Shenzhen Loop Area Institute | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Graph-theoretic evaluation framework using Weisfeiler-Lehman (WL) test with Symmetric Decomposable (SD) graph condition for model isomorphism detection | *LLM role:* none
+
+> Wang et al. propose ORGEval, a framework that evaluates LLM-generated optimization models by converting them into bipartite graphs and using the Weisfeiler-Lehman (WL) test to detect isomorphism with a ground truth, rather than solving the instances. They prove that for 'symmetric decomposable' graphs, this method is guaranteed to detect equivalence correctly, achieving 100% consistency and running in seconds compared to hours for solver-based checks on hard MIPLIB instances. The critical takeaway is the shift from execution-based to **structural evaluation**: we can validate model logic via graph topology ($O(k(m+n)^2)$) without incurring the cost of solving NP-hard problems. This is immediately actionable for our OR benchmarking pipelines and could serve as a rapid 'pre-solve' filter in our evolutionary search loops to reject structurally invalid candidates instantly.
+
+### [OptiBench Meets ReSocratic: Measure and Improve LLMs for Optimization Modeling](https://arxiv.org/abs/2407.09887)
+
+**2024-07-13** | The Hong Kong University of Science and Technology, ETH Zurich, Huawei Noah’s Ark Lab, City University of Hong Kong, Sun Yat-sen University, MBZUAI, University of California Merced, Chongqing University | M=6 P=9 I=7 **MUST-READ** *discuss*
+
+*Method:* ReSocratic data synthesis for optimization problems, followed by Supervised Fine-Tuning of LLMs for Python code generation using PySCIPOpt solver | *LLM role:* evolutionary_search
+
+> The authors propose OptiBench, a benchmark of 605 optimization problems (linear/nonlinear, tabular/text), and ReSocratic, a data synthesis method that generates formal models first and back-translates them into natural language questions. Results are strong: fine-tuning Llama-3-8B on their 29k synthetic samples improves accuracy from 13.6% to 51.1%, validating the data quality. **Key Takeaway:** The 'Reverse Socratic' synthesis pipeline (Formal Model → Code → NL Question) is the superior strategy for generating synthetic OR datasets because it guarantees solvability and ground truth by construction, unlike forward generation. We should steal this pipeline for generating robust test instances for OR-Bench and potentially for training our OR agents.
 
 ### [Solver-Independent Automated Problem Formulation via LLMs for High-Cost Simulation-Driven Design](https://arxiv.org/abs/2512.18682)
 
@@ -263,21 +295,173 @@ This front is rapidly maturing, characterized by a shift from basic LLM code gen
 
 > Li et al. propose APF, a framework to fine-tune LLMs for translating engineering requirements into optimization code without running expensive simulations during training. They generate synthetic training data and filter it by checking if the generated code ranks historical data instances similarly to how an LLM 'judge' ranks them based on the text requirements. Results show 7B models outperforming GPT-4o on antenna design tasks, validated by actual simulation. **Key Takeaway:** We can replace expensive ground-truth evaluations in our process reward models by checking consistency between generated code outputs and LLM-predicted rankings on cached historical data—a direct method to improve sample efficiency in AlgoEvo.
 
-### [Adaptively Robust LLM Inference Optimization under Prediction Uncertainty](https://arxiv.org/abs/2508.14544)
+### [OptimAI: Optimization from Natural Language Using LLM-Powered AI Agents](https://arxiv.org/abs/2504.16918)
 
-**2025-08-20** | Stanford University, Peking University, HKUST | M=7 P=9 I=6 **MUST-READ** *changes-thinking* *discuss*
+**2025-04-23** | University of Maryland at College Park | M=7 P=7 I=8 *discuss*
 
-*Method:* Adaptive online scheduling with dynamic lower bound estimation, ordered eviction, and greedy batch formation (Amin algorithm) | *LLM role:* none
+*Method:* LLM-powered multi-agent system (formulator, planner, coder, code critic, decider, verifier) with UCB-based debug scheduling for adaptive plan selection and iterative code refinement. | *LLM role:* decomposition_guide, code_writer, evaluator, evolutionary_search
 
-> Chen et al. propose $A_{min}$, an online scheduling algorithm for LLM inference that handles unknown output lengths by optimistically assuming the lower bound and evicting jobs (based on accumulated length) if memory overflows. They prove a logarithmic competitive ratio and show via simulations on LMSYS-Chat-1M that this approach nearly matches hindsight-optimal scheduling, vastly outperforming conservative upper-bound baselines. **Key Takeaway:** For our **GPUSched** project, we should abandon conservative memory reservation for output tokens; instead, implement an optimistic scheduler that oversubscribes memory and handles overflows via their ordered eviction policy, as the cost of restart is theoretically bounded and empirically negligible compared to the throughput gains.
+> OptimAI introduces a multi-agent framework for translating natural language to optimization models, featuring a 'plan-before-code' stage and a novel **UCB-based debug scheduler**. Instead of linearly debugging a single solution, it treats debugging as a multi-armed bandit problem, dynamically allocating compute to different solution strategies based on a 'Decider' score and exploration term. While the combinatorial results (TSP a280) are trivial, the bandit mechanism is a highly effective heuristic for search control. We should steal this UCB scheduling logic for AlgoEvo to prevent agents from wasting tokens debugging fundamentally flawed heuristics.
 
-### [NEMO: Execution-Aware Optimization Modeling via Autonomous Coding Agents](https://arxiv.org/abs/2601.21372)
+### [OptiRepair: Closed-Loop Diagnosis and Repair of Supply Chain Optimization Models with LLM Agents](https://arxiv.org/abs/2602.19439)
 
-**2026-01-29** | Carnegie Mellon University, C3 AI | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+**2026-02-23** | Massachusetts Institute of Technology, Alibaba Group | M=8 P=7 I=9 **MUST-READ** *changes-thinking* *discuss*
 
-*Method:* Execution-Aware Optimization Modeling via Autonomous Coding Agents (ACAs) with asymmetric simulator-optimizer validation loop | *LLM role:* code_writer
+*Method:* Two-phase closed-loop LLM agent with IIS-guided diagnosis, domain-specific rationality oracle, iterative STaR, and GRPO refinement | *LLM role:* diagnosis_and_repair
 
-> NEMO achieves SOTA on 8/9 optimization benchmarks by deploying autonomous coding agents that generate both a declarative optimizer (solver code) and an imperative simulator (verification code). The key innovation is using the simulator to validate the optimizer's results in a closed loop, detecting logical errors without ground truth—a technique that beats fine-tuned models like SIRL by up to 28%. The most stealable insight is this asymmetric validation: imperative Python simulation is often less error-prone than declarative constraint formulation, making it a robust 'critic' for generated solvers. This is immediately applicable to our OR-Bench and AlgoEvo projects for generating reliable reward signals.
+> Ao et al. introduce OptiRepair, a closed-loop framework that repairs infeasible LPs using solver IIS feedback (Phase 1) and validates them with a 'Rationality Oracle' based on domain theory (Phase 2). Results are exceptionally strong: fine-tuned 8B models trained via iterative STaR and GRPO achieve 81.7% success, outperforming GPT-5.2 (42.2%) by a massive margin. **Key Takeaway:** We should steal the 'Rationality Oracle' concept—evaluating solution *properties* (e.g., monotonicity, variance bounds) rather than just raw fitness—to serve as a dense signal for our Process Reward Models in AlgoEvo. Additionally, their success with solver-verified GRPO confirms we should prioritize training specialized operators over prompting general LLMs.
+
+### [ProOPF: Benchmarking and Improving LLMs for Professional-Grade Power Systems Optimization Modeling](https://arxiv.org/abs/2602.03070)
+
+**2026-02-03** |  | M=7 P=6 I=7 *discuss*
+
+*Method:* LLM-based code synthesis for optimization modeling from natural language | *LLM role:* code_writer
+
+> Shen et al. propose a benchmark (ProOPF) for translating natural language into Optimal Power Flow (OPF) models, treating instances as parametric or structural modifications to a canonical base model rather than generating code from scratch. They introduce a rigorous data synthesis pipeline using 'scenario trees' to map qualitative descriptions (e.g., 'heatwave') to quantitative parameter deltas, and define structural extensions (e.g., adding security constraints) as modular patches. Results are sobering: SOTA models (GPT-4, Claude 3.5) score 0% on the hardest level (semantic inference + structural change), though SFT recovers ~11-35%. **Key Takeaway:** We should steal their 'Base + Delta' synthesis approach for our VRP variant generation and OR-Bench work; it allows for scalable, physically valid data generation without requiring an LLM to hallucinate full solvers, and effectively benchmarks 'ambiguity' handling.
+
+### [Solver-Informed RL: Grounding Large Language Models for Authentic Optimization Modeling](https://arxiv.org/abs/2505.11792)
+
+**2025-05-17** | Stanford University, Shanghai Jiao Tong University, The University of Hong Kong, Shanghai University of Finance and Economics, Cardinal Operations | M=9 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Reinforcement Learning with Verifiable Reward (RLVR) using REINFORCE++ with a Partial KL surrogate function | *LLM role:* code_writer
+
+> Chen et al. introduce SIRL, a framework for training LLMs to generate optimization models using Reinforcement Learning with Verifiable Rewards (RLVR) and a novel 'Partial KL' surrogate objective. By removing the KL penalty from the reasoning (CoT) section while retaining it for the code generation section, they balance exploration with syntactic stability, achieving SOTA on OptMATH and IndustryOR against OpenAI-o3 and DeepSeek-R1. The critical takeaway for us is the Partial KL strategy: it allows the model to 'think' freely outside the reference distribution while adhering to strict coding standards—a technique we should immediately test in AlgoEvo. Furthermore, their method of parsing .lp files to extract structural features (variable counts, constraint types) for 'instance-enhanced self-consistency' provides a much richer signal than our current binary success/failure metrics.
+
+### [OR-R1: Automating Modeling and Solving of Operations Research Optimization Problem via Test-Time Reinforcement Learning](https://arxiv.org/abs/2511.09092)
+
+**2025-11-12** | The Hong Kong University of Science and Technology, Arizona State University, University of North Carolina at Chapel Hill | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Supervised Fine-tuning (SFT) followed by Test-Time Group Relative Policy Optimization (TGRPO) with a composite reward function | *LLM role:* code_writer, heuristic_generator, evaluator
+
+> OR-R1 introduces a data-efficient framework that fine-tunes Qwen3-8B using Supervised Fine-Tuning (SFT) followed by Test-Time Group Relative Policy Optimization (TGRPO) on unlabeled data. The results are empirically strong: it outperforms ORLM and LLMOPT while using only 1/10th of the synthetic training data, specifically narrowing the consistency gap between Pass@1 and Pass@8. The key takeaway for us is the effectiveness of GRPO (normalizing rewards within a sampled group to estimate baselines) combined with majority-voting rewards; this eliminates the need for a separate critic model while significantly improving code generation consistency. We should immediately evaluate GRPO as a lightweight alternative to PPO for the 'RL-infused' components of our evolutionary search methods.
+
+### [OptiMUS: Scalable Optimization Modeling with (MI)LP Solvers and Large Language Models](https://arxiv.org/abs/2402.10172)
+
+**2024-02-15** | Stanford University | M=7 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Modular LLM-based multi-agent system (OptiMUS) with connection graph | *LLM role:* multi-agent orchestration for model formulation, code generation, evaluation, and debugging
+
+> OptiMUS is a multi-agent framework for translating natural language into Gurobi code, achieving SOTA performance by using a 'Connection Graph' to map variables and parameters to specific constraints. This graph allows the agents to dynamically filter context and construct minimal prompts, enabling success on problems with long descriptions where baselines like Chain-of-Experts fail. They release NLP4LP, a hard benchmark of 67 complex instances, which we must immediately compare against our OR-Bench efforts. The **Connection Graph** is the key stealable insight: a structured dependency tracking mechanism that solves context pollution in iterative code generation, directly applicable to our AlgoEvo and HERMES memory designs.
+
+### [Formalize, Don't Optimize: The Heuristic Trap in LLM-Generated Combinatorial Solvers](https://arxiv.org/abs/2605.12421)
+
+**2026-05-12** | Google DeepMind, University of Pennsylvania, University of Toronto, Oracle AI | M=6 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* LLM-driven program synthesis for combinatorial solvers (Python, Python + OR-Tools API, MiniZinc) | *LLM role:* code_writer
+
+> Wang et al. evaluate frontier LLMs on a new 4,577-instance combinatorial optimization benchmark to compare solver-generation paradigms (Python, Python+OR-Tools, MiniZinc) and the impact of efficiency-oriented prompting. The results, backed by rigorous instance-level evaluation, demonstrate that LLMs achieve the highest correctness using the Python+OR-Tools API, whereas native Python suffers from high rates of silent failures. The key insight is the identification of the 'heuristic trap': prompting LLMs to optimize search zero-shot yields minimal speedups but sharply degrades correctness by injecting unverified bounds, local approximations, or overcomplicated constraints. This is highly relevant to our work in OR benchmarking and LLM evolutionary search. Specifically, the six documented failure modes provide a precise taxonomy of errors that our process reward models and evolutionary evaluators must be explicitly designed to detect and penalize.
+
+### [Grammar-Aware Literate Generative Mathematical Programming with Compiler-in-the-Loop](https://arxiv.org/abs/2601.17670)
+
+**2026-01-25** | University of Edinburgh, University College Cork | M=7 P=9 I=7 **MUST-READ** *discuss*
+
+*Method:* Iterative generate–compile–assess–revise loop with compiler-in-the-loop and LLM-based alignment judge | *LLM role:* generator, evaluator, revision policy
+
+> SyntAGM is a framework for translating natural language into Algebraic Modeling Language (PyOPL) code using a 'compiler-in-the-loop' approach, where the LLM is constrained by an in-context BNF grammar and iteratively repairs code based on compiler diagnostics. They demonstrate that this approach matches the accuracy of expensive multi-agent systems (like Chain-of-Experts) while being significantly faster and cheaper. The immediate takeaways for us are the **StochasticOR benchmark** (which we should adopt for RobustMAS) and the technique of **injecting explicit BNF grammars** into prompts to enforce syntax in evolutionary search without fine-tuning. The 'literate modeling' approach—embedding reasoning as comments directly next to code constraints—is also a clever memory mechanism we could steal for AlgoEvo.
+
+### [Automated Optimization Modeling via a Localizable Error-Driven Perspective](https://arxiv.org/abs/2602.11164)
+
+**2026-01-17** | Huawei Noah’s Ark Lab, Fudan University, University of Science and Technology of China | M=8 P=7 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Error-driven learning framework (MIND) combining Dynamic Supervised Fine-Tuning Policy Optimization (DFPO) with an error-driven reverse data synthesis pipeline | *LLM role:* code_writer, decomposition_guide, evolutionary_search, prompt_optimizer
+
+> This paper introduces MIND, a framework for automated optimization modeling that combines error-driven data synthesis with a novel post-training method called DFPO. Instead of standard RLVR which suffers from sparse rewards on hard problems, DFPO uses a teacher model to minimally correct the student's *failed* rollouts, converting them into on-policy(ish) positive samples for SFT/RL. Results show a 7B model outperforming GPT-4 on IndustryOR and OptMATH benchmarks. **Key Takeaway:** We should steal the DFPO mechanism for AlgoEvo: rather than wasting failed evolutionary samples, use a stronger model (or oracle) to fix the code and feed it back as a reward signal, drastically improving sample efficiency in our RL loops.
+
+### [Autoformulation of Mathematical Optimization Models Using LLMs](https://arxiv.org/abs/2411.01679)
+
+**2024-11-03** | University of Cambridge, University of Hawaii at Manoa | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* LLM-enhanced Monte-Carlo Tree Search with symbolic pruning and LLM-based evaluation | *LLM role:* conditional_hypothesis_generator, evaluator
+
+> Astorga et al. frame optimization modeling as a hierarchical Monte-Carlo Tree Search (MCTS) problem, using LLMs to generate components and—crucially—employing SMT solvers to prune mathematically equivalent branches (e.g., recognizing `x+y` and `y+x` as identical). They achieve SOTA results on NL4OPT and IndustryOR, outperforming fine-tuned models like ORLM while using significantly fewer samples than naive approaches. **Key Takeaway:** The integration of symbolic equivalence checking (SMT) to prune the search tree is a technique we should immediately steal; implementing this in AlgoEvo would allow us to discard functionally identical code/math mutants before expensive evaluation, directly addressing our sample efficiency bottleneck.
+
+### [SolverLLM: Leveraging Test-Time Scaling for Optimization Problem via LLM-Guided Search](https://arxiv.org/abs/2510.16916)
+
+**2025-10-19** | NEC Labs America, Baylor University, University of Texas at Dallas, Augusta University, Southern Illinois University | M=8 P=7 I=8 **MUST-READ** *discuss*
+
+*Method:* LLM-guided Monte Carlo Tree Search (MCTS) with dynamic expansion, prompt backpropagation, and uncertainty backpropagation for optimization problem formulation and code generation | *LLM role:* decomposition_guide, heuristic_generator, evaluator, code_writer, evolutionary_search
+
+> SolverLLM frames optimization problem formulation as a hierarchical Monte Carlo Tree Search (MCTS), decomposing the task into six layers (variables, constraints, etc.) and using test-time compute to beat fine-tuned baselines like LLMOPT. The results appear robust, showing ~10% gains on complex datasets, though inference cost is high. **The critical takeaway for us is the 'Prompt Backpropagation' mechanism:** instead of just updating numerical values, they propagate textual error analysis from leaf nodes back up the tree to dynamically modify the prompts of parent nodes, effectively creating 'short-term memory' for the search. We should immediately test this technique in AlgoEvo to prevent the recurrence of failed code patterns during mutation steps. Additionally, their use of semantic entropy to down-weight uncertain rewards in MCTS is a practical solution to the noisy evaluation problem we face in process reward models.
+
+### [LinearizeLLM: An Agent-Based Framework for LLM-Driven Exact Linear Reformulation of Nonlinear Optimization Problems](https://arxiv.org/abs/2510.15969)
+
+**2025-10-12** | Karlsruhe Institute of Technology, Reutlingen University | M=7 P=8 I=7 *discuss*
+
+*Method:* Agent-based LLM framework with specialized reformulation agents and a depth-based processing policy | *LLM role:* decomposition_guide, reformulation_expert
+
+> LinearizeLLM is a multi-agent framework that converts LaTeX nonlinear optimization problems into exact MILP formulations by detecting nonlinear terms and processing them bottom-up based on nesting depth. On 40 benchmark instances, it achieves 73% end-to-end success compared to <15% for one-shot LLMs and Pyomo baselines, demonstrating that structural decomposition is essential for handling complex nested terms. The key takeaway is the 'Structural Policy': rather than letting the LLM plan the reformulation order, they enforce a deterministic bottom-up traversal (linearizing children before parents). We should steal this hybrid approach—using deterministic graph traversal to orchestrate LLM manipulation steps—to improve reliability in our symbolic modeling and EvoCut pipelines.
+
+### [Agentic MIP Research: Accelerated Constraint Handler Generation](https://arxiv.org/abs/2605.09186)
+
+**2026-05-09** | Zuse Institute Berlin, Technische Universität Berlin | M=8 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Agentic framework for generating, verifying, and evaluating SCIP constraint handlers using LLM agents, solver-aware harness, and in-context learning. | *LLM role:* research_agent
+
+> Xu et al. propose an LLM agentic framework that autonomously generates, verifies, and tunes propagation-only constraint handlers for the SCIP MIP solver. Backed by rigorous numbers on MIPLIB 2017, the zero-shot exploration mode discovered five novel constraint patterns that solved five previously unsolved instances, a significant achievement given the maturity of SCIP. The key insight is their use of 'synthetic verification via reverse sampling'—generating synthetic MIP instances with known global constraints to cheaply verify the LLM's detector and propagator logic before running expensive full-scale solver evaluations. This is highly relevant to our work in LLM evolutionary search and automated algorithm design for integer programming, offering a concrete architectural pattern to improve sample efficiency and intermediate reward signaling.
+
+### [CALM Before the STORM: Unlocking Native Reasoning for Optimization Modeling](https://arxiv.org/abs/2510.04204)
+
+**2025-10-05** | Qwen Team, Alibaba Inc., The Chinese University of Hong Kong, Shenzhen, Southern University of Science and Technology, Shanghai University of Finance and Economics, Shenzhen Loop Area Institute (SLAI) | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Corrective Adaptation with Lightweight Modification (CALM) framework with two-stage training (SFT + RL) | *LLM role:* generates optimization models and solver code, performs reflective reasoning, and receives corrective hints from an expert LLM (Intervener)
+
+> Tang et al. propose CALM, a framework that uses an expert 'Intervener' model to inject corrective hints into a small LRM's reasoning trace (e.g., forcing it to use Python instead of manual calculation), followed by SFT and RL (GRPO). Results are strong and verified: a 4B model matches DeepSeek-R1 (671B) on OR benchmarks, specifically fixing the 'Code Utilization Distrust' we see in our own agents. The key takeaway is the 'Intervener' loop: instead of discarding failed traces, they repair them with hints to create a 'golden' reasoning dataset that preserves the 'thinking' process while enforcing tool use. This is a direct, actionable method for improving our AlgoEvo agents' reliability in generating executable heuristics without massive human annotation.
+
+### [Co-evolving Agent Architectures and Interpretable Reasoning for Automated Optimization](https://arxiv.org/abs/2604.17708)
+
+**2026-04-20** | Harbin Institute of Technology, Nanjing University of Information Science and Technology | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Co-evolutionary framework using Activity-on-Edge (AOE) networks for agent architecture and reasoning trajectory evolution | *LLM role:* problem_interpreter, heuristic_generator, code_writer, decomposition_guide, evolutionary_search_operator, evaluator
+
+> Huang et al. propose EvoOR-Agent, a co-evolutionary framework that represents LLM agent workflows as Activity-on-Edge (AOE) networks to simultaneously evolve the agent's architectural topology and its reasoning trajectories for operations research tasks. The results are backed by strong empirical evidence, showing up to 17% improvement over fixed-pipeline OR agents and 15% over general evolutionary agents on complex benchmarks like IndustryOR and BWOR. The key insight is that abstracting agent workflows into an explicit, evolvable AOE graph allows for path-conditioned recombination and structural pruning, enabling the evolutionary search to optimize the problem-solving process (e.g., formulation decomposition, solver routing, debugging loops) rather than just the prompt text or final code. This is highly relevant for our work in LLM evolutionary search and multi-agent optimization, as the AOE graph representation provides a concrete, implementable mechanism for dynamically adapting and evolving agent pipelines.
+
+### [OptMATH: A Scalable Bidirectional Data Synthesis Framework for Optimization Modeling](https://arxiv.org/abs/2502.11102)
+
+**2025-02-16** | Peking University | M=7 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Scalable bidirectional data synthesis framework integrating feedback-driven PD generation, LLM-based backtranslation with self-criticism/refinement, and AutoFormulator with rejection sampling. | *LLM role:* data synthesizer
+
+> The authors introduce OptMATH, a framework for generating synthetic optimization datasets by creating mathematical instances from seed generators, back-translating them to natural language via LLMs, and validating the pairs using a solver-based rejection sampling loop (checking if the re-generated model yields the same optimal value). They demonstrate that a Qwen-32B model fine-tuned on this data beats GPT-4 on NL4Opt and MAMO benchmarks. The critical takeaway is the **solver-verified reverse generation pipeline**: we should immediately steal this workflow to populate OR-Bench and generate diverse, verified training environments for AlgoEvo, replacing manual curation with scalable synthesis.
+
+### [A Survey of Optimization Modeling Meets LLMs: Progress and Future Directions](https://arxiv.org/abs/2508.10047)
+
+**2024-08-01** | Zhejiang University, Huawei Noah’s Ark Lab, Singapore University of Social Sciences, Hangzhou High-Tech Zone (Binjiang) Institute of Blockchain and Data Security | M=5 P=9 I=6 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Systematic Literature Review and Empirical Re-evaluation | *LLM role:* evaluator
+
+> This survey and empirical audit reveals that standard optimization modeling benchmarks (NL4Opt, IndustryOR) suffer from critical error rates ranging from 16% to 54%, rendering prior leaderboards unreliable. The authors manually cleaned these datasets and re-evaluated methods, finding that Chain-of-Thought (CoT) often degrades performance compared to standard prompting, while fine-tuned models (ORLM) and multi-agent systems (Chain-of-Experts) perform best. The immediate takeaway is that we must adopt their cleaned datasets for our OR-Bench project; using the original open-source versions is no longer defensible. Additionally, the failure of CoT on these tasks suggests we should prioritize multi-agent or fine-tuned approaches for symbolic formulation tasks.
+
+### [SOCRATES: Simulation Optimization with Correlated Replicas and Adaptive Trajectory Evaluations](https://arxiv.org/abs/2511.00685)
+
+**2025-11-01** | Columbia, UC Berkeley, Amazon | M=8 P=7 I=8 **MUST-READ** *discuss*
+
+*Method:* Two-stage procedure: Stage 1 constructs an ensemble of Operational AI Replicas (OARs) via LLM-guided causal skeleton inference and EM-type structural learning. Stage 2 employs an LLM as a trajectory-aware meta-optimizer to iteratively revise and compose a hybrid SO algorithm schedule on the OAR ensemble. | *LLM role:* causal_discovery, meta_optimizer, schedule_reviser
+
+> SOCRATES introduces a two-stage framework: first constructing 'Operational AI Replicas' (surrogates) via LLM-guided causal discovery, then using an LLM to analyze optimization trajectories on these surrogates to schedule hybrid algorithms (e.g., running BO then switching to GA). While the benchmarks (inventory, queuing) are simple and the causal inference step seems fragile, the core innovation of **trajectory-based reasoning** is highly transferable. We can steal this mechanism for AlgoEvo: instead of blind evolution, our planner agent should consume the optimization trajectory to dynamically swap operators or restart populations when stagnation is detected, effectively using the LLM as a process reward model.
+
+### [SAC-Opt: Semantic Anchors for Iterative Correction in Optimization Modeling](https://arxiv.org/abs/2510.05115)
+
+**2025-09-28** | Huawei Noah’s Ark Lab, Huawei’s Supply Chain Management Department, City University of Hong Kong | M=7 P=8 I=6 *discuss*
+
+*Method:* Backward-guided iterative semantic alignment and correction using LLM agents | *LLM role:* code_writer, evaluator, decomposition_guide
+
+> SAC-Opt introduces a verification loop where generated Gurobi code is back-translated into natural language ('semantic anchors') to check for alignment with the original problem description. Empirical results are strong, demonstrating a ~22% accuracy improvement on the ComplexLP dataset over OptiMUS-0.3 by catching logic errors that solver feedback misses. The primary takeaway is the utility of granular, constraint-level back-translation as a process reward signal, which we should adopt to improve the reliability of our automated modeling agents.
+
+### [Learning Virtual Machine Scheduling in Cloud Computing through Language Agents](https://arxiv.org/abs/2505.10117)
+
+**2025-05-15** | Shanghai Jiao Tong University, East China Normal University, Tongji University | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Hierarchical Language Agent Framework (MiCo) for LLM-driven heuristic design, formulated as Semi-Markov Decision Process with Options (SMDP-Option), using LLM-based function optimization for policy discovery and composition. | *LLM role:* heuristic_generator, evolutionary_search, decomposition_guide
+
+> Wu et al. introduce MiCo, a hierarchical framework that uses LLMs to evolve both a library of scenario-specific scheduling heuristics ('Options') and a master policy ('Composer') that dynamically switches between them based on system state. Tested on large-scale Huawei/Azure VM traces, it achieves a 96.9% competitive ratio against Gurobi, significantly outperforming Deep RL (SchedRL) by ~11% in dynamic scenarios. **Key Insight:** Instead of evolving a single robust heuristic (which often fails in non-stationary environments), explicitly evolve a *portfolio* of specialized heuristics and a separate *selector* function. This SMDP-based decomposition is a concrete architectural pattern we should adopt in AlgoEvo to handle diverse problem instances and non-stationary distributions effectively.
+
+### [Constructing Industrial-Scale Optimization Modeling Benchmark](https://arxiv.org/abs/2602.10450)
+
+**2026-02-11** | Peking University, Huawei Technologies Co., Ltd., Great Bay University | M=7 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Structure-aware reverse construction methodology from MIPLIB 2017 | *LLM role:* linguistic_polisher, interactive_assistant
+
+> Li et al. introduce MIPLIB-NL, a benchmark of 223 industrial-scale MILP instances (up to 10^7 variables) reverse-engineered from MIPLIB 2017, enforcing strict model-data separation. Results are sobering: SOTA models like GPT-4 and fine-tuned OR-LLMs drop from ~90% accuracy on existing toy benchmarks to ~18% here, failing primarily on structural consistency and index handling at scale. For us, the key takeaway is their "Loop-Based Structural Scaffold" taxonomy—a method to compress massive industrial formulations into compact LLM prompts via model-data separation. This is a mandatory read for our OR-Bench project, as it demonstrates that current evaluations are effectively measuring overfitting to toy problems rather than genuine modeling capability.
 
 ### [FMIP: Joint Continuous-Integer Flow For Mixed-Integer Linear Programming](https://arxiv.org/abs/2507.23390)
 
@@ -295,133 +479,21 @@ This front is rapidly maturing, characterized by a shift from basic LLM code gen
 
 > Zhou et al. propose StepORLM, a framework where an 8B policy and a **Generative Process Reward Model (GenPRM)** co-evolve. Unlike standard discriminative PRMs that score steps in isolation, their GenPRM generates a reasoning trace to evaluate the full trajectory's logic before assigning credit, addressing the interdependency of OR constraints. They align the policy using **Weighted DPO**, where preference weights are derived from the GenPRM's process scores. They claim to beat GPT-4o and DeepSeek-V3 on 6 OR benchmarks (e.g., NL4Opt, MAMO) with an 8B model. **Key Takeaway:** We should test **Generative PRMs** immediately for AlgoEvo; asking the critic to 'explain then score' (generative) rather than just 'score' (discriminative) likely fixes the credit assignment noise in our long-horizon search.
 
-### [Solver-Informed RL: Grounding Large Language Models for Authentic Optimization Modeling](https://arxiv.org/abs/2505.11792)
+### [Optimization Problem Solving Can Transition to Evolutionary Agentic Workflows](https://arxiv.org/abs/2505.04354)
 
-**2025-05-17** | Stanford University, Shanghai Jiao Tong University, The University of Hong Kong, Shanghai University of Finance and Economics, Cardinal Operations | M=9 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+**2025-05-07** | University of Minnesota, Tongji University, East China Normal University | M=5 P=9 I=6 *discuss*
 
-*Method:* Reinforcement Learning with Verifiable Reward (RLVR) using REINFORCE++ with a Partial KL surrogate function | *LLM role:* code_writer
+*Method:* Evolutionary Agentic Workflow combining Foundation Agents (Memory, Reasoning, World Modeling, Action modules) and Evolutionary Search (Distributed Population Management, Solution Diversity Preservation, Knowledge-Guided Evolution) | *LLM role:* evolutionary_search
 
-> Chen et al. introduce SIRL, a framework for training LLMs to generate optimization models using Reinforcement Learning with Verifiable Rewards (RLVR) and a novel 'Partial KL' surrogate objective. By removing the KL penalty from the reasoning (CoT) section while retaining it for the code generation section, they balance exploration with syntactic stability, achieving SOTA on OptMATH and IndustryOR against OpenAI-o3 and DeepSeek-R1. The critical takeaway for us is the Partial KL strategy: it allows the model to 'think' freely outside the reference distribution while adhering to strict coding standards—a technique we should immediately test in AlgoEvo. Furthermore, their method of parsing .lp files to extract structural features (variable counts, constraint types) for 'instance-enhanced self-consistency' provides a much richer signal than our current binary success/failure metrics.
+> Li et al. propose an 'Evolutionary Agentic Workflow' that combines LLMs (DeepSeek) with evolutionary search to automate algorithm design, demonstrating it on VM scheduling and ADMM parameter tuning. The empirical rigor is low; they compare against weak baselines (BestFit for bin packing, a 2000-era heuristic for ADMM) and frame it as a position paper. However, the application of LLM-evolution to discover symbolic mathematical update rules (for ADMM step sizes) rather than just procedural code is a concrete use case we should consider for our EvoCut work. This serves primarily as competitor intelligence—validating our AlgoEvo direction—rather than a source of novel methodology.
 
-### [EngiAgent: Fully Connected Coordination of LLM Agents for Solving Open-ended Engineering Problems with Feasible Solutions](https://arxiv.org/abs/2605.02289)
+### [Foundation Models for Logistics: Toward Certifiable, Conversational Planning Interfaces](https://arxiv.org/abs/2507.11352)
 
-**2026-05-04** | Nanyang Technological University, The Chinese University of Hong Kong, Shenzhen, The University of Sydney, INSAIT Sofia University “St. Kliment Ohridski”, AIRS | M=7 P=8 I=8 **MUST-READ** *discuss*
+**2026-01-30** | Neurosymbolic Intelligence, The University of Texas at Austin, University of Colorado Boulder | M=6 P=5 I=7 *discuss*
 
-*Method:* Multi-agent system with a fully connected coordinator for iterative problem analysis, modeling, verification, solving, and solution evaluation | *LLM role:* multi-role agent coordination
+*Method:* Neurosymbolic Vision-Language Logistics (VLL) agent with uncertainty-aware intent-verification loop, using latent space learning, probabilistic guarantees, DPO, and TextGrad for refinement. | *LLM role:* goal_interpreter_and_refiner
 
-> EngiAgent is a multi-agent LLM framework that uses a fully connected coordinator to dynamically route debugging feedback across specialized agents (Analyzer, Modeler, Verifier, Solver) to generate feasible Pyomo models for open-ended engineering problems. The results are strongly backed by empirical data on a new 53-problem benchmark, achieving up to 75.4% feasibility with DeepSeek-V3—a massive improvement over fixed-pipeline baselines like DS-Agent. The key insight is that rigid multi-agent pipelines fail on complex OR tasks because errors can stem from semantic extraction, mathematical formulation, or solver execution; dynamically routing specific error traces to the responsible agent significantly improves the rate of physically and mathematically feasible solutions. This is highly relevant for our work in symbolic OR benchmarking and multi-agent optimization, as the benchmark's strict focus on executable feasibility over text-based evaluation aligns perfectly with our evaluation methodology.
-
-### [ORGEval: Graph-Theoretic Evaluation of LLMs in Optimization Modeling](https://arxiv.org/abs/2510.27610)
-
-**2025-10-31** | The Chinese University of Hong Kong, Shenzhen, Shenzhen Research Institute of Big Data, Shenzhen International Center for Industrial and Applied Mathematics, Shenzhen Loop Area Institute | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Graph-theoretic evaluation framework using Weisfeiler-Lehman (WL) test with Symmetric Decomposable (SD) graph condition for model isomorphism detection | *LLM role:* none
-
-> Wang et al. propose ORGEval, a framework that evaluates LLM-generated optimization models by converting them into bipartite graphs and using the Weisfeiler-Lehman (WL) test to detect isomorphism with a ground truth, rather than solving the instances. They prove that for 'symmetric decomposable' graphs, this method is guaranteed to detect equivalence correctly, achieving 100% consistency and running in seconds compared to hours for solver-based checks on hard MIPLIB instances. The critical takeaway is the shift from execution-based to **structural evaluation**: we can validate model logic via graph topology ($O(k(m+n)^2)$) without incurring the cost of solving NP-hard problems. This is immediately actionable for our OR benchmarking pipelines and could serve as a rapid 'pre-solve' filter in our evolutionary search loops to reject structurally invalid candidates instantly.
-
-### [Automated Reformulation of Robust Optimization via Memory-Augmented Large Language Models](https://arxiv.org/abs/2605.11813)
-
-**2026-05-12** | National University of Singapore, The University of Hong Kong, A*STAR | M=7 P=8 I=8 **MUST-READ** *discuss*
-
-*Method:* Tuning-free memory-augmented framework (AutoREM) with Unit-level Experience (ULE), Structured Memory Operators (SMO), Dual-Check Commit (DCC), and Validation-Based Acceptance (VBA) | *LLM role:* reformulator, coder, reflector
-
-> This paper introduces AutoRO-Bench for evaluating LLM robust optimization reformulation and proposes AutoREM, a tuning-free memory-augmented LLM framework that uses offline adaptation to build a structured reformulation memory. The results are backed by strong empirical evidence, with AutoREM achieving 97.4% accuracy on in-distribution and 94.8% on out-of-distribution datasets, significantly outperforming baselines like ACE and ReasoningBank while using fewer tokens. The key insight is the offline memory adaptation pipeline—specifically the Dual-Check Commit (DCC) for mini-batch validation and Validation-Based Acceptance (VBA) for epoch-level rollbacks—which prevents the accumulation of harmful memory edits and ensures high-quality, reusable reasoning templates. This is highly relevant for our work in OR benchmarking and LLM evolutionary search, as the structured memory operators and validation gates offer a concrete blueprint for improving persistent memory and sample efficiency in self-improving LLM agents.
-
-### [MIRROR: A Multi-Agent Framework with Iterative Adaptive Revision and Hierarchical Retrieval for Optimization Modeling in Operations Research](https://arxiv.org/abs/2602.03318)
-
-**2026-02-03** | Xi'an Jiaotong University, Northwestern Polytechnical University | M=5 P=9 I=6 *discuss*
-
-*Method:* Multi-Agent Framework with Iterative Adaptive Revision (IAR) and Hierarchical Retrieval-Augmented Generation (HRAG) | *LLM role:* code_writer, decomposition_guide, evaluator
-
-> MIRROR is a multi-agent framework that translates natural language OR problems into Gurobi code using Hierarchical RAG (metadata filtering + semantic search) and an iterative repair loop. It achieves ~72% pass@1 across five benchmarks, outperforming Chain-of-Experts and fine-tuned models like LLMOPT without task-specific training. The key takeaway is their **structured revision tip mechanism**: upon execution failure, the agent generates a JSON object explicitly isolating the `error_statement`, `incorrect_code_snippet`, and `correct_code_snippet`, which serves as a precise memory artifact for subsequent retries. This structured reflection pattern is superior to raw error logs and could be immediately adopted in our own code generation pipelines.
-
-### [OptiMUS: Scalable Optimization Modeling with (MI)LP Solvers and Large Language Models](https://arxiv.org/abs/2402.10172)
-
-**2024-02-15** | Stanford University | M=7 P=8 I=8 **MUST-READ** *discuss*
-
-*Method:* Modular LLM-based multi-agent system (OptiMUS) with connection graph | *LLM role:* multi-agent orchestration for model formulation, code generation, evaluation, and debugging
-
-> OptiMUS is a multi-agent framework for translating natural language into Gurobi code, achieving SOTA performance by using a 'Connection Graph' to map variables and parameters to specific constraints. This graph allows the agents to dynamically filter context and construct minimal prompts, enabling success on problems with long descriptions where baselines like Chain-of-Experts fail. They release NLP4LP, a hard benchmark of 67 complex instances, which we must immediately compare against our OR-Bench efforts. The **Connection Graph** is the key stealable insight: a structured dependency tracking mechanism that solves context pollution in iterative code generation, directly applicable to our AlgoEvo and HERMES memory designs.
-
-### [Autoformulation of Mathematical Optimization Models Using LLMs](https://arxiv.org/abs/2411.01679)
-
-**2024-11-03** | University of Cambridge, University of Hawaii at Manoa | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* LLM-enhanced Monte-Carlo Tree Search with symbolic pruning and LLM-based evaluation | *LLM role:* conditional_hypothesis_generator, evaluator
-
-> Astorga et al. frame optimization modeling as a hierarchical Monte-Carlo Tree Search (MCTS) problem, using LLMs to generate components and—crucially—employing SMT solvers to prune mathematically equivalent branches (e.g., recognizing `x+y` and `y+x` as identical). They achieve SOTA results on NL4OPT and IndustryOR, outperforming fine-tuned models like ORLM while using significantly fewer samples than naive approaches. **Key Takeaway:** The integration of symbolic equivalence checking (SMT) to prune the search tree is a technique we should immediately steal; implementing this in AlgoEvo would allow us to discard functionally identical code/math mutants before expensive evaluation, directly addressing our sample efficiency bottleneck.
-
-### [A Survey of Optimization Modeling Meets LLMs: Progress and Future Directions](https://arxiv.org/abs/2508.10047)
-
-**2024-08-01** | Zhejiang University, Huawei Noah’s Ark Lab, Singapore University of Social Sciences, Hangzhou High-Tech Zone (Binjiang) Institute of Blockchain and Data Security | M=5 P=9 I=6 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Systematic Literature Review and Empirical Re-evaluation | *LLM role:* evaluator
-
-> This survey and empirical audit reveals that standard optimization modeling benchmarks (NL4Opt, IndustryOR) suffer from critical error rates ranging from 16% to 54%, rendering prior leaderboards unreliable. The authors manually cleaned these datasets and re-evaluated methods, finding that Chain-of-Thought (CoT) often degrades performance compared to standard prompting, while fine-tuned models (ORLM) and multi-agent systems (Chain-of-Experts) perform best. The immediate takeaway is that we must adopt their cleaned datasets for our OR-Bench project; using the original open-source versions is no longer defensible. Additionally, the failure of CoT on these tasks suggests we should prioritize multi-agent or fine-tuned approaches for symbolic formulation tasks.
-
-### [AI4S-SDS: A Neuro-Symbolic Solvent Design System via Sparse MCTS and Differentiable Physics Alignment](https://arxiv.org/abs/2603.03686)
-
-**2026-03-04** | Nanjing University, Suzhou Laboratory, Shanghai Artificial Intelligence Laboratory | M=8 P=4 I=8 **MUST-READ** *discuss*
-
-*Method:* Neuro-symbolic framework integrating Sparse Monte Carlo Tree Search (MCTS) with Sibling-Aware Expansion, Memory-Driven Global Planning, and a Differentiable Physics Engine for continuous ratio optimization. | *LLM role:* semantic_generator
-
-> Chen et al. introduce a neuro-symbolic MCTS framework for mixed discrete-continuous optimization, applying it to solvent design. They solve the LLM context bottleneck via 'Sparse State Storage' (storing only state abstractions and reconstructing paths on-demand) and fix mode collapse using 'Sibling-Aware Expansion' (conditioning the generator on sibling nodes to force orthogonality). While the chemical application is niche, the search architecture is highly relevant: we should steal the sibling-aware conditioning to improve diversity in our evolutionary code generation and adopt their sparse storage pattern to scale our search horizons.
-
-### [Learning Virtual Machine Scheduling in Cloud Computing through Language Agents](https://arxiv.org/abs/2505.10117)
-
-**2025-05-15** | Shanghai Jiao Tong University, East China Normal University, Tongji University | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Hierarchical Language Agent Framework (MiCo) for LLM-driven heuristic design, formulated as Semi-Markov Decision Process with Options (SMDP-Option), using LLM-based function optimization for policy discovery and composition. | *LLM role:* heuristic_generator, evolutionary_search, decomposition_guide
-
-> Wu et al. introduce MiCo, a hierarchical framework that uses LLMs to evolve both a library of scenario-specific scheduling heuristics ('Options') and a master policy ('Composer') that dynamically switches between them based on system state. Tested on large-scale Huawei/Azure VM traces, it achieves a 96.9% competitive ratio against Gurobi, significantly outperforming Deep RL (SchedRL) by ~11% in dynamic scenarios. **Key Insight:** Instead of evolving a single robust heuristic (which often fails in non-stationary environments), explicitly evolve a *portfolio* of specialized heuristics and a separate *selector* function. This SMDP-based decomposition is a concrete architectural pattern we should adopt in AlgoEvo to handle diverse problem instances and non-stationary distributions effectively.
-
-### [CALM Before the STORM: Unlocking Native Reasoning for Optimization Modeling](https://arxiv.org/abs/2510.04204)
-
-**2025-10-05** | Qwen Team, Alibaba Inc., The Chinese University of Hong Kong, Shenzhen, Southern University of Science and Technology, Shanghai University of Finance and Economics, Shenzhen Loop Area Institute (SLAI) | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Corrective Adaptation with Lightweight Modification (CALM) framework with two-stage training (SFT + RL) | *LLM role:* generates optimization models and solver code, performs reflective reasoning, and receives corrective hints from an expert LLM (Intervener)
-
-> Tang et al. propose CALM, a framework that uses an expert 'Intervener' model to inject corrective hints into a small LRM's reasoning trace (e.g., forcing it to use Python instead of manual calculation), followed by SFT and RL (GRPO). Results are strong and verified: a 4B model matches DeepSeek-R1 (671B) on OR benchmarks, specifically fixing the 'Code Utilization Distrust' we see in our own agents. The key takeaway is the 'Intervener' loop: instead of discarding failed traces, they repair them with hints to create a 'golden' reasoning dataset that preserves the 'thinking' process while enforcing tool use. This is a direct, actionable method for improving our AlgoEvo agents' reliability in generating executable heuristics without massive human annotation.
-
-### [ReLoop: Structured Modeling and Behavioral Verification for Reliable LLM-Based Optimization](https://arxiv.org/abs/2602.15983)
-
-**2026-02-17** | National University of Singapore, Northwestern University, City University of Hong Kong, Wenzhou University, Wenzhou Buyi Pharmacy Chain Co., Ltd. | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Structured generation (understand, formalize, synthesize, verify) with two-layer behavioral verification (L1 execution recovery, L2 solver-based perturbation testing) and diagnosis-guided repair. | *LLM role:* code_writer
-
-> ReLoop proposes a verification pipeline for LLM-generated optimization models that detects 'silent failures' (code that runs but solves the wrong problem) by perturbing input parameters and checking for expected solver objective shifts. They demonstrate that standard execution feasibility is a poor proxy for correctness (90% gap) on their new RetailOpt-190 benchmark, and that this perturbation testing significantly improves reliability. The critical takeaway is the use of sensitivity analysis as a ground-truth-free process reward signal: we can validate evolved algorithms in AlgoEvo by asserting that specific input perturbations *must* trigger output changes, filtering out semantically invalid candidates before expensive evaluation.
-
-### [LLM-Enhanced Multi-Agent Reinforcement Learning with Expert Workflow for Real-Time P2P Energy Trading](https://arxiv.org/abs/2507.14995)
-
-**2025-07-20** | China Agricultural University, University of Glasgow, Guangdong University of Foreign Studies | M=7 P=6 I=7 *discuss*
-
-*Method:* LLM-Enhanced Multi-Agent Reinforcement Learning (MARL) with CTDE-based imitative expert MARL algorithm, using a differential multi-head attention-based critic network and Wasserstein metric for imitation | *LLM role:* heuristic_generator
-
-> This paper proposes a neurosymbolic MARL framework for P2P energy trading where LLMs generate CVXPY optimization models to act as 'experts' for RL agents to imitate via Wasserstein distance. They introduce a 'Differential Attention' mechanism in the critic that subtracts attention maps to filter noise, enabling scalability to 100 agents where standard baselines fail. **Takeaway:** We should steal the Differential Attention architecture for our multi-agent critics to handle irrelevant interactions in large-scale optimization. The workflow of using LLMs to write the *solver* (generating reliable synthetic data) rather than the *solution* is a transferable strategy for bootstrapping RL in our OR domains.
-
-### [OptimAI: Optimization from Natural Language Using LLM-Powered AI Agents](https://arxiv.org/abs/2504.16918)
-
-**2025-04-23** | University of Maryland at College Park | M=7 P=7 I=8 *discuss*
-
-*Method:* LLM-powered multi-agent system (formulator, planner, coder, code critic, decider, verifier) with UCB-based debug scheduling for adaptive plan selection and iterative code refinement. | *LLM role:* decomposition_guide, code_writer, evaluator, evolutionary_search
-
-> OptimAI introduces a multi-agent framework for translating natural language to optimization models, featuring a 'plan-before-code' stage and a novel **UCB-based debug scheduler**. Instead of linearly debugging a single solution, it treats debugging as a multi-armed bandit problem, dynamically allocating compute to different solution strategies based on a 'Decider' score and exploration term. While the combinatorial results (TSP a280) are trivial, the bandit mechanism is a highly effective heuristic for search control. We should steal this UCB scheduling logic for AlgoEvo to prevent agents from wasting tokens debugging fundamentally flawed heuristics.
-
-### [OptMATH: A Scalable Bidirectional Data Synthesis Framework for Optimization Modeling](https://arxiv.org/abs/2502.11102)
-
-**2025-02-16** | Peking University | M=7 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Scalable bidirectional data synthesis framework integrating feedback-driven PD generation, LLM-based backtranslation with self-criticism/refinement, and AutoFormulator with rejection sampling. | *LLM role:* data synthesizer
-
-> The authors introduce OptMATH, a framework for generating synthetic optimization datasets by creating mathematical instances from seed generators, back-translating them to natural language via LLMs, and validating the pairs using a solver-based rejection sampling loop (checking if the re-generated model yields the same optimal value). They demonstrate that a Qwen-32B model fine-tuned on this data beats GPT-4 on NL4Opt and MAMO benchmarks. The critical takeaway is the **solver-verified reverse generation pipeline**: we should immediately steal this workflow to populate OR-Bench and generate diverse, verified training environments for AlgoEvo, replacing manual curation with scalable synthesis.
-
-### [OR-R1: Automating Modeling and Solving of Operations Research Optimization Problem via Test-Time Reinforcement Learning](https://arxiv.org/abs/2511.09092)
-
-**2025-11-12** | The Hong Kong University of Science and Technology, Arizona State University, University of North Carolina at Chapel Hill | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Supervised Fine-tuning (SFT) followed by Test-Time Group Relative Policy Optimization (TGRPO) with a composite reward function | *LLM role:* code_writer, heuristic_generator, evaluator
-
-> OR-R1 introduces a data-efficient framework that fine-tunes Qwen3-8B using Supervised Fine-Tuning (SFT) followed by Test-Time Group Relative Policy Optimization (TGRPO) on unlabeled data. The results are empirically strong: it outperforms ORLM and LLMOPT while using only 1/10th of the synthetic training data, specifically narrowing the consistency gap between Pass@1 and Pass@8. The key takeaway for us is the effectiveness of GRPO (normalizing rewards within a sampled group to estimate baselines) combined with majority-voting rewards; this eliminates the need for a separate critic model while significantly improving code generation consistency. We should immediately evaluate GRPO as a lightweight alternative to PPO for the 'RL-infused' components of our evolutionary search methods.
+> Yang et al. introduce a neurosymbolic agent that translates natural language into PDDL goals, using a learned latent space to estimate 'intent uncertainty' (distance to class centroids) which gates downstream execution. They use this uncertainty signal to drive both Direct Preference Optimization (DPO) and prompt optimization (TextGrad), achieving higher accuracy than GPT-5 on a lightweight model. **Takeaway:** The concept of deriving a 'probabilistic guarantee' from latent embeddings to serve as a cheap proxy reward or filter is a concrete technique we should test in AlgoEvo to reduce expensive evaluations. However, be skeptical of the topline results as they rely on a simplistic 3-class classification task rather than complex reasoning.
 
 ### [ORLM: A Customizable Framework in Training Large Models for Automated Optimization Modeling](https://arxiv.org/abs/2405.17743)
 
@@ -431,85 +503,13 @@ This front is rapidly maturing, characterized by a shift from basic LLM code gen
 
 > The authors propose OR-Instruct, a framework that uses GPT-4 to synthesize over 32k optimization modeling pairs (natural language to COPT code) to fine-tune 7B-scale models (ORLM). They demonstrate that these fine-tuned models outperform GPT-4 on their new 'IndustryOR' benchmark, a result that appears robust given the specialized nature of the task. The most valuable takeaway is their specific data augmentation strategy—iteratively altering constraints and injecting specific modeling techniques (e.g., Big M)—which provides a concrete recipe we can steal to generate diverse instances for our OR-Bench project. While the methodology is standard instruction tuning, the resulting artifacts (benchmark and model) establish a new baseline for automated OR modeling that we cannot ignore.
 
-### [BPP-Search: Enhancing Tree of Thought Reasoning for Mathematical Modeling Problem Solving](https://arxiv.org/abs/2411.17404)
+### [MoE2: Optimizing Collaborative Inference for Edge Large Language Models](https://arxiv.org/abs/2501.09410)
 
-**2024-11-26** | Huawei, The University of Hong Kong | M=7 P=8 I=7 **MUST-READ** *discuss*
+**2025-01-16** | Zhejiang University, University of Illinois at Urbana–Champaign Institute, Zhejiang Key Laboratory of Medical Imaging Artificial Intelligence | M=6 P=7 I=5 
 
-*Method:* BPP-Search: Tree-of-Thought with Beam Search, Process Reward Model, and Pairwise Preference Algorithm | *LLM role:* policy_model_for_generation, evaluator_for_search_guidance, data_generator
+*Method:* Mixture-of-Edge-Experts (MoE2) framework with a two-level expert selection mechanism (coarse-grained discrete monotonic optimization and fine-grained Top-k selection) and a gating network | *LLM role:* expert_submodels
 
-> Wang et al. propose BPP-Search, combining Beam Search, a Process Reward Model (PRM), and a final Pairwise Preference Model to generate LP/MIP models from natural language. While their new 'StructuredOR' dataset is small (38 test instances), it uniquely provides intermediate modeling labels (sets, parameters, variables) essential for training PRMs in this domain. The key takeaway is their finding that PRMs are effective for pruning but imprecise for final ranking; they solve this by adding a pairwise preference model at the leaf layer—a technique we should immediately steal to improve selection robustness in our MASPRM and evolutionary search pipelines. This is a competent execution of 'LLM + Search' applied specifically to our OR niche.
-
-### [Grammar-Aware Literate Generative Mathematical Programming with Compiler-in-the-Loop](https://arxiv.org/abs/2601.17670)
-
-**2026-01-25** | University of Edinburgh, University College Cork | M=7 P=9 I=7 **MUST-READ** *discuss*
-
-*Method:* Iterative generate–compile–assess–revise loop with compiler-in-the-loop and LLM-based alignment judge | *LLM role:* generator, evaluator, revision policy
-
-> SyntAGM is a framework for translating natural language into Algebraic Modeling Language (PyOPL) code using a 'compiler-in-the-loop' approach, where the LLM is constrained by an in-context BNF grammar and iteratively repairs code based on compiler diagnostics. They demonstrate that this approach matches the accuracy of expensive multi-agent systems (like Chain-of-Experts) while being significantly faster and cheaper. The immediate takeaways for us are the **StochasticOR benchmark** (which we should adopt for RobustMAS) and the technique of **injecting explicit BNF grammars** into prompts to enforce syntax in evolutionary search without fine-tuning. The 'literate modeling' approach—embedding reasoning as comments directly next to code constraints—is also a clever memory mechanism we could steal for AlgoEvo.
-
-### [Co-evolving Agent Architectures and Interpretable Reasoning for Automated Optimization](https://arxiv.org/abs/2604.17708)
-
-**2026-04-20** | Harbin Institute of Technology, Nanjing University of Information Science and Technology | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Co-evolutionary framework using Activity-on-Edge (AOE) networks for agent architecture and reasoning trajectory evolution | *LLM role:* problem_interpreter, heuristic_generator, code_writer, decomposition_guide, evolutionary_search_operator, evaluator
-
-> Huang et al. propose EvoOR-Agent, a co-evolutionary framework that represents LLM agent workflows as Activity-on-Edge (AOE) networks to simultaneously evolve the agent's architectural topology and its reasoning trajectories for operations research tasks. The results are backed by strong empirical evidence, showing up to 17% improvement over fixed-pipeline OR agents and 15% over general evolutionary agents on complex benchmarks like IndustryOR and BWOR. The key insight is that abstracting agent workflows into an explicit, evolvable AOE graph allows for path-conditioned recombination and structural pruning, enabling the evolutionary search to optimize the problem-solving process (e.g., formulation decomposition, solver routing, debugging loops) rather than just the prompt text or final code. This is highly relevant for our work in LLM evolutionary search and multi-agent optimization, as the AOE graph representation provides a concrete, implementable mechanism for dynamically adapting and evolving agent pipelines.
-
-### [OptiBench Meets ReSocratic: Measure and Improve LLMs for Optimization Modeling](https://arxiv.org/abs/2407.09887)
-
-**2024-07-13** | The Hong Kong University of Science and Technology, ETH Zurich, Huawei Noah’s Ark Lab, City University of Hong Kong, Sun Yat-sen University, MBZUAI, University of California Merced, Chongqing University | M=6 P=9 I=7 **MUST-READ** *discuss*
-
-*Method:* ReSocratic data synthesis for optimization problems, followed by Supervised Fine-Tuning of LLMs for Python code generation using PySCIPOpt solver | *LLM role:* evolutionary_search
-
-> The authors propose OptiBench, a benchmark of 605 optimization problems (linear/nonlinear, tabular/text), and ReSocratic, a data synthesis method that generates formal models first and back-translates them into natural language questions. Results are strong: fine-tuning Llama-3-8B on their 29k synthetic samples improves accuracy from 13.6% to 51.1%, validating the data quality. **Key Takeaway:** The 'Reverse Socratic' synthesis pipeline (Formal Model → Code → NL Question) is the superior strategy for generating synthetic OR datasets because it guarantees solvability and ground truth by construction, unlike forward generation. We should steal this pipeline for generating robust test instances for OR-Bench and potentially for training our OR agents.
-
-### [From Soliloquy to Agora: Memory-Enhanced LLM Agents with Decentralized Debate for Optimization Modeling](https://arxiv.org/abs/2604.25847)
-
-**2026-04-28** | Tsinghua University, University of Chicago Booth School of Business, Shanghai Jiao Tong University, The Chinese University of Hong Kong, Shenzhen (CUHK-Shenzhen) | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Modular agentic framework combining decentralized debate with a read-write memory bank | *LLM role:* Formulator, Programmer, and Debugger agents for generating and refining optimization models and solver code
-
-> This paper introduces Agora-Opt, a multi-agent framework for optimization modeling that combines decentralized debate across heterogeneous LLMs with a read-write memory bank. The results are backed by strong empirical evidence, achieving state-of-the-art Pass@1 accuracy (84.6%) across 7 OR benchmarks and outperforming both frontier zero-shot models and fine-tuned OR models. The key insight is that decentralized debate, where consensus is driven by solver-verified endpoints rather than a centralized LLM judge, can synthesize correct formulations even when all initial agent proposals are flawed. Furthermore, storing the trajectories of how these disagreements are resolved in a dedicated 'debate memory' allows the system to continuously improve its collaborative reasoning without parameter updates. This is highly relevant for our research in multi-agent optimization and memory architectures; the decentralized consensus mechanism and debate memory structure offer immediate, actionable upgrades for our multi-agent debate systems.
-
-### [DAOpt: Modeling and Evaluation of Data-Driven Optimization under Uncertainty with LLMs](https://arxiv.org/abs/2511.11576)
-
-**2025-09-24** | Zhejiang University, University of Toronto, Peking University | M=6 P=8 I=7 **MUST-READ** *discuss*
-
-*Method:* LLM-based multi-agent framework for optimization modeling, integrating few-shot learning with OR domain knowledge (RSOME toolbox) and a Reflexion-based checker | *LLM role:* code_writer
-
-> Zhu et al. propose DAOpt, a framework for modeling optimization under uncertainty that integrates LLMs with the RSOME library to handle robust and stochastic formulations. Their experiments on a new dataset (OptU) convincingly demonstrate that standard LLM-generated deterministic models suffer from the 'optimizer's curse,' achieving only ~27% out-of-sample feasibility, whereas their robust approach achieves >70%. The critical takeaway for us is to **stop asking LLMs to derive mathematical duals or robust counterparts**; instead, we should train them to use high-level DSLs (like RSOME) that handle the duality internally. This is an immediate action item for our RobustMAS project to ensure generated solutions are actually executable in stochastic environments.
-
-### [GauS: Differentiable Scheduling Optimization via Gaussian Reparameterization](https://arxiv.org/abs/2602.20427)
-
-**2026-02-23** | Cornell University, University of Maryland, College Park | M=7 P=5 I=7 *discuss*
-
-*Method:* Differentiable Scheduling Optimization via Gaussian Reparameterization with Augmented Lagrangian Method | *LLM role:* none
-
-> GauS replaces the standard categorical (Gumbel-Softmax) relaxation in differentiable scheduling with Gaussian variables defined by mean and variance, reducing parameter space from O(N*D) to O(N). Results are strong: it scales to 57k nodes where previous differentiable methods OOM and exact solvers timeout, while maintaining near-100% GPU utilization. The key takeaway is a specific modeling technique: using Gaussian distributions to represent discrete ordinal values (like time steps) naturally captures temporal proximity and provides smoother gradients than categorical buckets. We should test this representation in our continuous latent-space optimization work to replace categorical relaxations for ordered parameters.
-
-### [Dual-Cluster Memory Agent: Resolving Multi-Paradigm Ambiguity in Optimization Problem Solving](https://arxiv.org/abs/2604.20183)
-
-**2026-04-22** | Xi’an Jiaotong University, Ministry of Education Key Laboratory of Intelligent Networks and Network Security, Shaanxi Province Key Laboratory of Big Data Knowledge Engineering | M=7 P=8 I=8 **MUST-READ** *discuss*
-
-*Method:* Dual-Cluster Memory Agent (DCM-Agent) with Dual-Cluster Memory Construction and Memory-Augmented Inference | *LLM role:* knowledge_synthesizer_code_generator_verifier
-
-> This paper introduces a training-free Dual-Cluster Memory Agent that resolves multi-paradigm ambiguity in optimization modeling by decoupling abstract mathematical modeling from concrete coding implementation into separate memory clusters linked by a bipartite graph. The results are backed by strong empirical evidence, showing 11-21% average accuracy improvements across 7 OR benchmarks (including OptiBench and NLP4LP) over baselines like OptiMUS and OptiTree, while reducing inference time compared to heavy tree-search methods. The key insight is the structured extraction of 'Pitfalls' from persistent failures and the resulting 'knowledge inheritance'—using a large model to build a high-quality bipartite memory graph allows smaller, cheaper models to achieve SOTA performance during inference. This is highly relevant for our work in symbolic OR modeling and multi-agent memory architectures, as the decoupled memory structure and failure-driven pitfall extraction could directly improve our agentic modeling workflows and LLM reasoning evaluation.
-
-### [ProOPF: Benchmarking and Improving LLMs for Professional-Grade Power Systems Optimization Modeling](https://arxiv.org/abs/2602.03070)
-
-**2026-02-03** |  | M=7 P=6 I=7 *discuss*
-
-*Method:* LLM-based code synthesis for optimization modeling from natural language | *LLM role:* code_writer
-
-> Shen et al. propose a benchmark (ProOPF) for translating natural language into Optimal Power Flow (OPF) models, treating instances as parametric or structural modifications to a canonical base model rather than generating code from scratch. They introduce a rigorous data synthesis pipeline using 'scenario trees' to map qualitative descriptions (e.g., 'heatwave') to quantitative parameter deltas, and define structural extensions (e.g., adding security constraints) as modular patches. Results are sobering: SOTA models (GPT-4, Claude 3.5) score 0% on the hardest level (semantic inference + structural change), though SFT recovers ~11-35%. **Key Takeaway:** We should steal their 'Base + Delta' synthesis approach for our VRP variant generation and OR-Bench work; it allows for scalable, physically valid data generation without requiring an LLM to hallucinate full solvers, and effectively benchmarks 'ambiguity' handling.
-
-### [LLMOPT: Learning to Define and Solve General Optimization Problems from Scratch](https://arxiv.org/abs/2410.13213)
-
-**2024-10-17** | Ant Group, East China Normal University, Nanjing University | M=5 P=7 I=6 *discuss*
-
-*Method:* Multi-instruction supervised fine-tuning and KTO model alignment with self-correction | *LLM role:* Generates problem formulations, writes solver code, and performs error analysis for self-correction
-
-> The authors fine-tune Qwen1.5-14B to translate natural language optimization problems into Pyomo code via a structured 'five-element' intermediate representation (Sets, Parameters, Variables, Objective, Constraints) and KTO alignment. They achieve ~11% accuracy gains over GPT-4o and ORLM on benchmarks like NL4Opt and IndustryOR, primarily by reducing formulation hallucinations through the structured intermediate step and preference optimization. For our OR-Bench work, the key takeaway is the concrete recipe for using KTO to align symbolic modeling agents, which appears more effective than standard SFT for enforcing constraints in smaller models. While not an evolutionary search paper, it provides a strong, locally runnable baseline for our OR modeling evaluations.
+> Jin et al. introduce MoE2, a collaborative inference framework that uses discrete monotonic optimization to route queries to heterogeneous edge LLMs under latency and energy constraints. The results are backed by physical hardware experiments on NVIDIA Jetson and RTX 4090 devices, demonstrating up to 14.4% accuracy improvements on MMLU over single-agent baselines while respecting strict energy and delay budgets. The key insight is a theoretical proof showing that optimal gating parameters for a full set of LLM experts are preserved for any subset, allowing the decoupling of gating network training from the combinatorial expert selection process. While this is a competent application of operations research to LLM serving optimization, it is a lower priority read as it does not advance our primary focus on LLM evolutionary search or multi-agent optimization.
 
 ### [AlphaOPT: Formulating Optimization Programs with Self-Improving LLM Experience Library](https://arxiv.org/abs/2510.18428)
 
@@ -519,37 +519,125 @@ This front is rapidly maturing, characterized by a shift from basic LLM code gen
 
 > AlphaOPT introduces a 'Library Evolution' mechanism that iteratively refines the *applicability conditions* of cached optimization insights based on solver feedback, allowing it to learn from answers alone (no gold programs). On OOD benchmarks like OptiBench, it beats fine-tuned models (ORLM) by ~13% and shows consistent scaling with data size. **Key Takeaway:** The specific mechanism of diagnosing 'unretrieved' vs. 'negative' tasks to rewrite retrieval triggers is a transferable technique for our AlgoEvo memory; it solves the problem of heuristic misapplication in long-term search. We should implement this 'condition refinement' loop immediately to improve our multi-agent memory systems.
 
-### [Optimization Problem Solving Can Transition to Evolutionary Agentic Workflows](https://arxiv.org/abs/2505.04354)
+### [BPP-Search: Enhancing Tree of Thought Reasoning for Mathematical Modeling Problem Solving](https://arxiv.org/abs/2411.17404)
 
-**2025-05-07** | University of Minnesota, Tongji University, East China Normal University | M=5 P=9 I=6 *discuss*
+**2024-11-26** | Huawei, The University of Hong Kong | M=7 P=8 I=7 **MUST-READ** *discuss*
 
-*Method:* Evolutionary Agentic Workflow combining Foundation Agents (Memory, Reasoning, World Modeling, Action modules) and Evolutionary Search (Distributed Population Management, Solution Diversity Preservation, Knowledge-Guided Evolution) | *LLM role:* evolutionary_search
+*Method:* BPP-Search: Tree-of-Thought with Beam Search, Process Reward Model, and Pairwise Preference Algorithm | *LLM role:* policy_model_for_generation, evaluator_for_search_guidance, data_generator
 
-> Li et al. propose an 'Evolutionary Agentic Workflow' that combines LLMs (DeepSeek) with evolutionary search to automate algorithm design, demonstrating it on VM scheduling and ADMM parameter tuning. The empirical rigor is low; they compare against weak baselines (BestFit for bin packing, a 2000-era heuristic for ADMM) and frame it as a position paper. However, the application of LLM-evolution to discover symbolic mathematical update rules (for ADMM step sizes) rather than just procedural code is a concrete use case we should consider for our EvoCut work. This serves primarily as competitor intelligence—validating our AlgoEvo direction—rather than a source of novel methodology.
+> Wang et al. propose BPP-Search, combining Beam Search, a Process Reward Model (PRM), and a final Pairwise Preference Model to generate LP/MIP models from natural language. While their new 'StructuredOR' dataset is small (38 test instances), it uniquely provides intermediate modeling labels (sets, parameters, variables) essential for training PRMs in this domain. The key takeaway is their finding that PRMs are effective for pruning but imprecise for final ranking; they solve this by adding a pairwise preference model at the leaf layer—a technique we should immediately steal to improve selection robustness in our MASPRM and evolutionary search pipelines. This is a competent execution of 'LLM + Search' applied specifically to our OR niche.
 
-### [An Agent-Based Framework for the Automatic Validation of Mathematical Optimization Models](https://arxiv.org/abs/2511.16383)
 
-**2025-11-20** | IBM Research | M=7 P=8 I=7 **MUST-READ** *discuss*
+### Front 2 (34 papers) — STABLE
 
-*Method:* Multi-agent LLM framework for automatic validation of optimization models using problem-level API generation, unit test generation, and optimization-specific mutation testing | *LLM role:* code_writer
+**Density:** 0.09 | **Methods:** llm_code_generation, llm_in_the_loop, llm_as_heuristic, llm_as_evaluator, program_synthesis | **Problems:** linear_programming, scheduling, resource_allocation, mixed_integer_linear_programming, milp_general
 
-> Zadorojniy et al. introduce a multi-agent framework for validating LLM-generated optimization models by generating a test suite and verifying the suite's quality via mutation testing (ensuring tests detect deliberate errors injected into the model). On 100 NLP4LP instances, they achieve a 76% mutation kill ratio and successfully classify external models where simple objective value comparisons fail. The critical takeaway is the 'bootstrapped validation' workflow: using mutation analysis to validate the generated unit tests themselves before using them to score the model. We should steal this mutation-based verification loop to create a robust, ground-truth-free fitness signal for our evolutionary search and OR benchmarking pipelines.
+*Unique methods:* GRPO, adam_optimizer, adaptive_algorithms, agentic_framework, agentic_model, aide, anytime_algorithm, asymmetric_validation, auction_algorithm, augmented_lagrangian_method, autonomous_coding_agents, backward_generation, best_of_n_sampling, bestofn_sampling, bilevel_optimization, branch_and_bound, canonical_intermediate_representation, chain_of_experts, closed_loop_control, competitive_analysis, compositional_prompting, constraint_programming_solver, cp_sat, cpmpy, crossover, cutting_planes, dapo, deep_q_networks, differentiable_optimization, differentiable_physics, distributionally_robust_optimization, diversity_aware_rank_based_sampling, dualreflect, dynamic_path_reconstruction, dynamic_programming, eoh, evolutionary_algorithm, execution_aware_modeling, few_shot_learning, fixed_point_relaxation, forward_generation, function_calling, funsearch, gaussian_reparameterization, global_local_search, gradient_descent, grammar_constrained_generation, greedy_algorithm, greedy_decoding, greedy_refinement, ipython_kernel, iterative_refinement, k_means_clustering, karp_reductions, knowledge_graphs, l1_regularization, lagrangian_duality, lexicographical_optimization, llm_agent, llm_agents, llm_as_code_generator, llm_as_optimizer, llm_as_semantic_generator, llm_objective_formulation, logsumexp_approximation, low_rank_adaptation, lower_bound_estimation, makespan_minimization, marge_loss, mathematical_programming, mdp_modeling, memory_driven_planning, metacognition, milp_general, minimum_bayes_risk_decoding, minizinc, minizinc_modeling, mixed_integer_programming, model_context_protocol, mstc_ahd, multi_agent_llm, multi_robot_task_allocation, multimodal_llm, mutation, mutation_testing, neuro_symbolic_ai, nsga_ii, online_scheduling, optimization_model_validation, ordered_eviction, parameter_efficient_fine_tuning, ppo, preference_learning, progressive_specialization_training, propen, qlora, random_forest, react_framework, reevo, reflected_cot, reflection_mechanism, reflexion, reinforce, reinforcement_learning_alignment, reinforcement_learning_with_verifiable_rewards, relation_modeling, repeated_sampling, retrieval_augmented_in_context_learning, reward_design, reward_modeling, rl_ppo, rl_with_verifiable_rewards, rlhf, robust_optimization, rsome, sample_average_approximation, sandboxed_execution, segment_weighted_grpo, self_instruct, self_reflection, self_verification, sibling_aware_expansion, simulation_environment, software_testing, solution_majority_voting, sparse_state_storage, stochastic_optimization, surrogate_assisted_evolutionary_algorithms, temperature_sampling, test_case_generation, tool_use, tool_use_agents, topological_sort, tree_of_thoughts, utpc_framework, vanilla_prompting, variable_fixing_heuristic, vector_embedding, virtual_reinforcement_learning
+*Shared methods:* chain_of_thought, constraint_programming, contrastive_learning, curriculum_learning, debugging, direct_preference_optimization, evolution_of_heuristics, genetic_algorithm, gradient_based_optimization, group_relative_policy_optimization, grpo, in_context_learning, instruction_tuning, linear_programming, llm_as_evaluator, llm_as_heuristic, llm_code_generation, llm_evolutionary_search, llm_fine_tuned, llm_in_the_loop, llm_iterative_refinement, llm_prompt_optimization, llm_research_agent, majority_voting, metaheuristics, milp_solver, mixture_of_experts, monte_carlo_tree_search, multi_agent_llm_system, multi_agent_system, neurosymbolic_ai, process_reward_model, program_synthesis, prompt_engineering, reinforcement_learning, retrieval_augmented_generation, self_consistency, self_correction, supervised_fine_tuning, supervised_learning, synthetic_data_generation
 
-### [SOCRATES: Simulation Optimization with Correlated Replicas and Adaptive Trajectory Evaluations](https://arxiv.org/abs/2511.00685)
+This research front focuses on developing sophisticated LLM agents for Operations Research, moving beyond simple code generation to encompass full problem formalization, algorithm design, and solution verification. It highlights frameworks like NEMO, OptiTrust, and ConstraintLLM that leverage LLMs for generating executable optimization models (MILP, CP, DP) from natural language descriptions. A core unifying theme is the integration of solver feedback and execution verification within multi-agent architectures to ensure the correctness and performance of generated OR artifacts.
 
-**2025-11-01** | Columbia, UC Berkeley, Amazon | M=8 P=7 I=8 **MUST-READ** *discuss*
+Key contributions include the establishment of rigorous benchmarks such as CO-Bench (36 combinatorial optimization problems), HeuriGym (9 hard combinatorial optimization problems), OptiVerse (1,000 problems across six domains), and ORCOpt-Bench, which provide standardized metrics for evaluating LLM capabilities. Methodologically, papers like EVOM and SAGE utilize Group Relative Policy Optimization (GRPO) with solver outcomes for robust model generation, achieving state-of-the-art Pass@1 accuracies (e.g., SAGE improving 72.7% to 80.3% on OR benchmarks). Other innovations include EquivaMap for automatic equivalence checking of formulations, EvoCut for LLM-generated MILP acceleration cuts (demonstrating 17-57% gap reductions), and DPLM's DualReflect pipeline for generating verifiable synthetic Dynamic Programming data. Multi-agent systems like Agora-Opt and EngiAgent achieve superior performance (e.g., Agora-Opt 84.6% Pass@1) by employing decentralized debate and dynamic feedback routing for complex engineering and OR problems.
 
-*Method:* Two-stage procedure: Stage 1 constructs an ensemble of Operational AI Replicas (OARs) via LLM-guided causal skeleton inference and EM-type structural learning. Stage 2 employs an LLM as a trajectory-aware meta-optimizer to iteratively revise and compose a hybrid SO algorithm schedule on the OAR ensemble. | *LLM role:* causal_discovery, meta_optimizer, schedule_reviser
+This research front is rapidly maturing, characterized by a significant shift from basic prompting to sophisticated feedback-driven learning and multi-agent architectures. The strong emphasis on execution-verified rewards (e.g., GRPO, Pipeline-Adapted Reward Models like PARM) and robust benchmarking (e.g., Multi-Instance Accuracy in DCP-Bench-Open) indicates a clear trajectory towards reliability and practical applicability. Future work will likely focus on scaling these methods to larger, more complex industrial problems, integrating more advanced domain-specific knowledge, and developing more efficient training paradigms such as Virtual Reinforcement Learning (VisionCreator) to reduce the substantial computational costs associated with extensive execution feedback loops.
 
-> SOCRATES introduces a two-stage framework: first constructing 'Operational AI Replicas' (surrogates) via LLM-guided causal discovery, then using an LLM to analyze optimization trajectories on these surrogates to schedule hybrid algorithms (e.g., running BO then switching to GA). While the benchmarks (inventory, queuing) are simple and the causal inference step seems fragile, the core innovation of **trajectory-based reasoning** is highly transferable. We can steal this mechanism for AlgoEvo: instead of blind evolution, our planner agent should consume the optimization trajectory to dynamically swap operators or restart populations when stagnation is detected, effectively using the LLM as a process reward model.
+**Papers:**
 
-### [SolverLLM: Leveraging Test-Time Scaling for Optimization Problem via LLM-Guided Search](https://arxiv.org/abs/2510.16916)
+### [Generalists vs. Specialists: Evaluating LLMs on Highly-Constrained Biophysical Sequence Optimization Tasks](https://arxiv.org/abs/2410.22296)
 
-**2025-10-19** | NEC Labs America, Baylor University, University of Texas at Dallas, Augusta University, Southern Illinois University | M=8 P=7 I=8 **MUST-READ** *discuss*
+**2024-10-29** | Genentech, New York University | M=8 P=6 I=8 **MUST-READ** *changes-thinking* *discuss*
 
-*Method:* LLM-guided Monte Carlo Tree Search (MCTS) with dynamic expansion, prompt backpropagation, and uncertainty backpropagation for optimization problem formulation and code generation | *LLM role:* decomposition_guide, heuristic_generator, evaluator, code_writer, evolutionary_search
+*Method:* LLOME (Language Model Optimization with Margin Expectation) bilevel optimization with Margin-Aligned Expectation (MargE) loss | *LLM role:* optimization_driver
 
-> SolverLLM frames optimization problem formulation as a hierarchical Monte Carlo Tree Search (MCTS), decomposing the task into six layers (variables, constraints, etc.) and using test-time compute to beat fine-tuned baselines like LLMOPT. The results appear robust, showing ~10% gains on complex datasets, though inference cost is high. **The critical takeaway for us is the 'Prompt Backpropagation' mechanism:** instead of just updating numerical values, they propagate textual error analysis from leaf nodes back up the tree to dynamically modify the prompts of parent nodes, effectively creating 'short-term memory' for the search. We should immediately test this technique in AlgoEvo to prevent the recurrence of failed code patterns during mutation steps. Additionally, their use of semantic entropy to down-weight uncertain rewards in MCTS is a practical solution to the noisy evaluation problem we face in process reward models.
+> The authors propose LLOME, a bilevel optimization framework that fine-tunes an LLM using 'MargE' (Margin-Aligned Expectation), a loss function that weights gradient updates by the magnitude of reward improvement (margin) rather than simple preference rankings. Results are rigorous and demonstrate that while DPO leads to generator collapse and infeasibility in constrained spaces, MargE maintains diversity and significantly improves sample efficiency, matching specialized solvers like LaMBO-2 on medium-difficulty tasks. The critical takeaway is that standard alignment methods (DPO/RLHF) are ill-suited for optimization because they discard information about *how much* better a solution is; MargE fixes this by satisfying the Strong Interpolation Criteria. We should immediately evaluate replacing the RL/update component in AlgoEvo with the MargE objective to improve the stability and quality of our evolved heuristics.
+
+### [Toward a Trustworthy Optimization Modeling Agent via Verifiable Synthetic Data Generation](https://arxiv.org/abs/2508.03117)
+
+**2025-08-05** | IBM Research AI | M=6 P=7 I=7 *discuss*
+
+*Method:* Verifiable Synthetic Data Generation (SDG) pipeline combined with a modular LLM agent (OptiTrust) employing multi-stage translation, multi-language inference, and majority-vote cross-validation | *LLM role:* data_generator, code_writer, decomposition_guide, formulation_generator, evaluator
+
+> Lima et al. introduce a pipeline to generate synthetic optimization datasets by starting with symbolic MILP instances (ground truth) and using LLMs to generate natural language descriptions, ensuring full verifiability. They fine-tune a small model (Granite 8B) that beats GPT-4 on 6/7 benchmarks, largely due to a 'majority vote' mechanism where the agent generates code in 5 different modeling languages (Pyomo, Gurobi, etc.) and checks for result consistency. **Takeaway:** We should steal the multi-language execution voting to boost robustness in our code generation agents. Furthermore, their reverse-generation (Symbolic $\to$ NL) strategy is the correct approach for generating infinite, error-free test cases for our OR-Bench work.
+
+### [EquivaMap: Leveraging LLMs for Automatic Equivalence Checking of Optimization Formulations](https://arxiv.org/abs/2502.14760)
+
+**2025-02-20** | Stanford University, The University of Texas at Austin | M=7 P=9 I=7 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* LLM-based discovery of linear mapping functions between decision variables, followed by MILP solver-based verification of feasibility and optimality | *LLM role:* heuristic_generator
+
+> Zhai et al. propose EquivaMap, a framework that evaluates whether two MILP formulations are equivalent by using an LLM to discover a linear mapping between their decision variables, which is then rigorously verified by a solver. Unlike 'execution accuracy' (which fails on unit scaling) or 'canonical accuracy' (which fails on variable permutation), they achieve 100% accuracy on a new dataset of equivalent formulations including cuts and slack variables. The core insight is replacing output comparison with a 'propose-mapping-and-verify' loop, effectively using the LLM to construct a proof of equivalence. We must adopt this methodology for the OR-Bench evaluation pipeline immediately, as it eliminates the false negatives currently plaguing our generation benchmarks.
+
+### [Relation Reasoning with LLMs in Expensive Optimization](https://arxiv.org/abs/2605.02933)
+
+**2026-04-30** | Shanghai Institute of AI for Education, East China Normal University | M=7 P=6 I=8 **MUST-READ** *discuss*
+
+*Method:* Reinforcement-trained Qwen2.5 LLM with GRPO for relation-based surrogate modeling, using anchor-based iterative context construction and voting-based aggregation | *LLM role:* surrogate_model
+
+> This paper proposes R2SAEA, an evolutionary algorithm that uses a compact LLM (Qwen2.5) fine-tuned via GRPO as a zero-shot, relation-based surrogate model to rank offspring in expensive optimization problems. The results are rigorously backed by numerical experiments on standard continuous benchmarks (LZG, DTLZ), demonstrating that the fine-tuned model outperforms both traditional surrogate models and prompted frontier LLMs (GPT-4o) while running efficiently via quantization. The key insight is to cast surrogate evaluation as an in-context pairwise relation reasoning task, utilizing an anchor-based iterative prompt strategy to reduce $O(N^2)$ comparisons to $O(N)$ before aggregating them via voting. This is highly relevant for LLM evolutionary search; the team can adapt the GRPO relation-training pipeline and anchor-based voting mechanism to improve candidate evaluation and sample efficiency when evolving algorithms or heuristics.
+
+### [HeuriGym: An Agentic Benchmark for LLM-Crafted Heuristics in Combinatorial Optimization](https://arxiv.org/abs/2506.07972)
+
+**2025-06-09** | Cornell University, Harvard University, NVIDIA | M=5 P=9 I=7 **MUST-READ** *discuss*
+
+*Method:* Agentic framework for evaluating and iteratively refining LLM-generated heuristic algorithms via code execution feedback | *LLM role:* heuristic_generator
+
+> The authors introduce HeuriGym, a benchmark suite of 9 hard combinatorial optimization problems (including PDPTW, EDA scheduling, and routing) coupled with an agentic evaluation loop. Results are backed by extensive experiments showing that SOTA LLMs saturate at ~60% of expert performance and, significantly, that existing evolutionary frameworks (ReEvo, EoH) perform *worse* than simple prompting on these large-context tasks (300+ lines of code). The key takeaway is the failure mode of current evolutionary methods: they cannot handle the context fragmentation and feedback integration required for complex heuristic design. We should immediately adopt this benchmark to demonstrate AlgoEvo's superiority, as the current baselines are weak and the problem set aligns perfectly with our focus.
+
+### [CO-Bench: Benchmarking Language Model Agents in Algorithm Search for Combinatorial Optimization](https://arxiv.org/abs/2504.04310)
+
+**2025-04-06** | Carnegie Mellon University | M=4 P=9 I=7 **MUST-READ** *discuss*
+
+*Method:* LLM-based algorithm search using agentic frameworks with iterative refinement and evolutionary search | *LLM role:* evolutionary_search
+
+> Sun et al. introduce CO-Bench, a suite of 36 diverse combinatorial optimization problems (packing, scheduling, routing) designed specifically to benchmark LLM agents in generating algorithms (code), not just solutions. They evaluate 9 frameworks (including FunSearch, ReEvo, AIDE), finding that FunSearch combined with reasoning models (o3-mini) yields the most robust performance, though agents still struggle significantly with strict feasibility constraints (valid solution rates often <60%). **Takeaway:** We should immediately integrate CO-Bench into our pipeline to benchmark AlgoEvo against ReEvo and FunSearch; this saves us months of data curation and provides a standardized metric to prove our method's superiority.
+
+### [Solver-in-the-Loop: MDP-Based Benchmarks for Self-Correction and Behavioral Rationality in Operations Research](https://arxiv.org/abs/2601.21008)
+
+**2026-02-08** | Massachusetts Institute of Technology, Alibaba Group | M=9 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Domain-specific Group Relative Policy Optimization (GRPO) with composite reward and three-stage curriculum learning | *LLM role:* agent_for_debugging_and_decision_making
+
+> Ao et al. introduce a framework for iterative OR model debugging that trains an 8B model using Group Relative Policy Optimization (GRPO) and a Process Reward Model (PRM) to outperform GPT-4o-mini. They utilize Gurobi's Irreducible Infeasible Subsystem (IIS) not just as text feedback, but as a dense reward signal (IIS size reduction) for the PRM, achieving a 95.3% recovery rate versus 86.2% for frontier APIs. **Key Takeaway:** We should steal their PRM construction method—specifically using solver diagnostics (like IIS reduction or compiler error counts) as dense step-level rewards—and their 'faithfulness penalty' to prevent overfitting in our evolutionary search. This is a direct validation of RLVR (Reinforcement Learning with Verifiable Rewards) for OR, proving it superior to large-scale prompting.
+
+### [REMoH: A Reflective Evolution of Multi-objective Heuristics approach via Large Language Models](https://arxiv.org/abs/2506.07759)
+
+**2025-06-09** | Vicomtech Foundation, University of the Basque Country, Universidad EAFIT, HiTZ Basque Center for Language Technology | M=7 P=6 I=7 **MUST-READ** *discuss*
+
+*Method:* Hybrid framework integrating NSGA-II with LLM-based heuristic generation and a reflection mechanism | *LLM role:* evolutionary_search
+
+> Forniés-Tabuenca et al. propose REMoH, an LLM-driven evolutionary framework for multi-objective FJSSP that uses K-Means to cluster the population by objective performance before generating reflections. While their optimality gaps (~12%) trail behind state-of-the-art CP solvers (~1.5%), the ablation study confirms that their reflection mechanism significantly improves Pareto front diversity (Hypervolume). **The killer feature is the phenotypic clustering step:** instead of reflecting on a random or elitist subset, they group solutions by trade-offs (e.g., 'low makespan' vs 'balanced') to generate targeted prompts. We should implement this clustering-based context construction in AlgoEvo to improve diversity maintenance in multi-objective search without exploding token costs.
+
+### [ConstraintLLM: A Neuro-Symbolic Framework for Industrial-Level Constraint Programming](https://arxiv.org/abs/2510.05774)
+
+**2025-10-07** | University of Oxford, University of Chinese Academy of Sciences, Hangzhou Institute for Advanced Study, ISCAS, University of Science and Technology Beijing | M=7 P=8 I=7 **MUST-READ** *discuss*
+
+*Method:* Neuro-Symbolic Framework integrating Multi-Instruction Supervised Fine-Tuning (SFT) of an open-source LLM, Constraint-Aware Retrieval Module (CARM), Tree-of-Thoughts (ToT) exploration, and Iterative Self-Correction with Guided Retrieval. | *LLM role:* code_writer
+
+> ConstraintLLM fine-tunes a 32B model for Constraint Programming (CP) modeling, utilizing a "Constraint-Aware Retrieval Module" (CARM) that retrieves few-shot examples based on extracted constraint signatures (e.g., `AllDifferent`, `Cumulative`) rather than text embeddings. They also employ a Tree-of-Thoughts search pruned by test case execution and an iterative self-correction mechanism that retrieves "correction paths" (error-to-fix trajectories). Results are strong: on their new industrial benchmark (IndusCP), they achieve ~51% accuracy with a 32B model, matching or beating GPT-4o and DeepSeek-V3. **Key Takeaway:** The shift from semantic retrieval to *structural* retrieval (matching constraint profiles) is the "stealable" insight; we should implement this for our OR modeling tasks immediately, ignoring surface-level problem descriptions in favor of logical signatures. This directly impacts our OR-Bench and automated formulation work.
+
+### [VisionCreator: A Native Visual-Generation Agentic Model with Understanding, Thinking, Planning and Creation](https://arxiv.org/abs/2603.02681)
+
+**2026-03-03** | Tencent Hunyuan, Hong Kong University of Science and Technology | M=8 P=2 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Native visual-generation agentic model (VisionCreator) unifying Understanding, Thinking, Planning, and Creation (UTPC) capabilities, optimized via Progressive Specialization Training (PST) and Virtual Reinforcement Learning (VRL) with LtrReward in VisGenEnv. | *LLM role:* agentic_model
+
+> This paper introduces VisionCreator, an agent trained via 'Virtual Reinforcement Learning' (VRL) where tool outputs and logic are simulated to train long-horizon planning policies without incurring expensive real-world execution costs. They employ a 'Plan-Driven Reward' model (combining LLM-based plan verification with rule-based execution checks) and prove theoretical bounds for the sim-to-real transfer, achieving performance superior to GPT-5 on visual tasks. **Key Takeaway:** We should steal the VRL architecture for AlgoEvo. By constructing a 'Virtual OR Environment' that simulates code validity and approximate heuristic performance, we can train our evolutionary search policies (RL-infused evolution) at a fraction of the current compute cost, bypassing the bottleneck of running full benchmarks during the search policy optimization phase.
+
+### [AI4S-SDS: A Neuro-Symbolic Solvent Design System via Sparse MCTS and Differentiable Physics Alignment](https://arxiv.org/abs/2603.03686)
+
+**2026-03-04** | Nanjing University, Suzhou Laboratory, Shanghai Artificial Intelligence Laboratory | M=8 P=4 I=8 **MUST-READ** *discuss*
+
+*Method:* Neuro-symbolic framework integrating Sparse Monte Carlo Tree Search (MCTS) with Sibling-Aware Expansion, Memory-Driven Global Planning, and a Differentiable Physics Engine for continuous ratio optimization. | *LLM role:* semantic_generator
+
+> Chen et al. introduce a neuro-symbolic MCTS framework for mixed discrete-continuous optimization, applying it to solvent design. They solve the LLM context bottleneck via 'Sparse State Storage' (storing only state abstractions and reconstructing paths on-demand) and fix mode collapse using 'Sibling-Aware Expansion' (conditioning the generator on sibling nodes to force orthogonality). While the chemical application is niche, the search architecture is highly relevant: we should steal the sibling-aware conditioning to improve diversity in our evolutionary code generation and adopt their sparse storage pattern to scale our search horizons.
+
+### [Fine-tuning Large Language Model for Automated Algorithm Design](https://arxiv.org/abs/2507.10614)
+
+**2025-07-13** | City University of Hong Kong | M=7 P=10 I=8 **MUST-READ** *discuss*
+
+*Method:* Direct Preference Optimization (DPO) with Diversity-Aware Rank-based (DAR) Sampling for LLM fine-tuning | *LLM role:* code_writer
+
+> Liu et al. introduce a fine-tuning pipeline for LLMs in automated algorithm design, utilizing a 'Diversity-Aware Rank-based' sampling strategy to construct DPO preference pairs from evolutionary search histories. By partitioning the population into ranked subsets and sampling pairs with a guaranteed quality gap (skipping adjacent tiers), they ensure training signals are both clear and diverse. Empirically, they show that a fine-tuned Llama-3.2-1B matches the performance of a base Llama-3.1-8B on ASP and CVRP tasks, effectively compressing the search capability into a much cheaper model. We should implement this sampling strategy to recycle our AlgoEvo run logs into specialized 'mutator' models, potentially allowing us to downscale to 1B/3B models for the inner search loop without losing quality.
 
 ### [A-LAMP: Agentic LLM-Based Framework for Automated MDP Modeling and Policy Generation](https://arxiv.org/abs/2512.11270)
 
@@ -559,21 +647,29 @@ This front is rapidly maturing, characterized by a shift from basic LLM code gen
 
 > A-LAMP decomposes the translation of natural language task descriptions into executable RL environments via a multi-agent pipeline, separating parameter extraction, variable definition, and constraint formulation before code generation. The results show that this structured approach allows a 27B model to rival GPT-4o on simple tasks, though the benchmarks (e.g., grid-world drone delivery, trivial wireless scheduling) are toy-scale and the RL application is sometimes forced. The primary takeaway is the specific decomposition schema for symbolic modeling: we should steal their granular extraction pipeline (Parameters -> Objectives -> Variables -> Constraints) to improve the reliability of our automated problem instantiation in OR-Bench and AlgoEvo without relying solely on expensive frontier models.
 
+### [Execution-Verified Reinforcement Learning for Optimization Modeling](https://arxiv.org/abs/2604.00442)
 
-### Front 2 (30 papers) — STABLE
+**2026-04-01** | Chinese Academy of Sciences, Nanjing University, Nanjing University of Science and Technology | M=7 P=8 I=7 **MUST-READ** *discuss*
 
-**Density:** 0.11 | **Methods:** llm_in_the_loop, llm_code_generation, llm_as_heuristic, program_synthesis, llm_as_evaluator | **Problems:** combinatorial_optimization, resource_allocation, program_synthesis, linear_programming, job_shop_scheduling
+*Method:* Execution-Verified Reinforcement Learning (EVOM) with GRPO and DAPO for solver-conditioned code generation | *LLM role:* code_writer
 
-*Unique methods:* GRPO, RL_GRPO, absolute_value_linearization, agentic_framework, aide, automated_experimentation, backtranslation, backward_generation, best_of_n_sampling, bestofn_sampling, bilevel_optimization, bilinear_linearization, black_box_optimization, branch_and_bound, chain_of_experts, compositional_prompting, constraint_programming_solver, cp_sat, cpmpy, crossover, curriculum_learning, cutting_planes, dapo, dataset_generation, dirichlet_process_mixture_model, discrete_monotonic_optimization, diversity_aware_rank_based_sampling, domain_specific_languages, dualreflect, dynamic_programming, dynamic_supervised_fine_tuning_policy_optimization, eoh, error_driven_learning, evolutionary_algorithm, evolutionary_search, exact_linearization, expert_in_the_loop, fine_tuning, forward_generation, funsearch, gating_network, gaussian_process, gdp_transformation, grammar_constrained_generation, greedy_decoding, greedy_refinement, harness_engineering, human_llm_interaction, hyper_heuristics, ipython_kernel, irreducible_infeasible_subsystem_analysis, iterative_correction, k_means_clustering, karp_reductions, knowledge_graphs, large_language_models, lexicographical_optimization, linear_fractional_linearization, llm_agent, llm_agents, llm_as_code_generator, llm_as_optimizer, llm_objective_formulation, loop_based_structure_recovery, low_rank_adaptation, marge_loss, memory_compression, milp_reformulation, min_max_linearization, minizinc, minizinc_modeling, mixed_integer_programming, model_context_protocol, model_data_separation, modeling_language, monotone_transformation_linearization, mstc_ahd, mutation, natural_language_generation, non_parametric_modeling, nsga_ii, optimization_solver, parameter_efficient_fine_tuning, pattern_detection, ppo, preference_learning, propen, pushdown_automaton, qlora, random_forest, react_framework, reevo, reflected_cot, reflection, reflection_mechanism, reinforce, reinforcement_learning_alignment, reinforcement_learning_with_verifiable_rewards, relation_modeling, repeated_sampling, retrieval_augmented_in_context_learning, reverse_data_synthesis, reverse_engineering, reward_modeling, rl_ppo, rl_with_verifiable_rewards, rlhf, rule_based_reformulation, sac_opt, sandboxed_execution, self_instruct, self_reflection, self_verification, semantic_alignment, semantic_validation, sentence_embedding, solution_majority_voting, solver_in_the_loop, star, structure_aware_modeling, surrogate_assisted_evolutionary_algorithms, temperature_sampling, tree_search, vanilla_prompting, variable_fixing_heuristic
-*Shared methods:* benchmark_design, chain_of_thought, constraint_programming, contrastive_learning, data_synthesis, debugging, direct_preference_optimization, evolution_of_heuristics, expectation_maximization, generative_models, genetic_algorithm, group_relative_policy_optimization, grpo, in_context_learning, instruction_tuning, iterative_refinement, linear_programming, llm_as_evaluator, llm_as_heuristic, llm_code_generation, llm_evolutionary_search, llm_fine_tuned, llm_in_the_loop, llm_iterative_refinement, llm_prompt_optimization, llm_research_agent, majority_voting, metaheuristics, milp_solver, mixed_integer_linear_programming, mixture_of_experts, multi_agent_system, neuro_symbolic_ai, neurosymbolic_ai, process_reward_model, program_synthesis, prompt_engineering, proximal_policy_optimization, reinforcement_learning, retrieval_augmented_generation, self_correction, supervised_fine_tuning, supervised_learning, synthetic_data_generation, tool_use, tree_of_thoughts
+> EVOM trains LLMs for operations research modeling using execution-verified reinforcement learning (GRPO/DAPO) based solely on solver outcomes, bypassing expensive process-level supervision. The results are backed by solid empirical evaluations on OptiBench, NL4OPT, and IndustryOR, demonstrating that it matches or beats process-supervised SFT (ORLM) and enables zero-shot transfer to new solvers (e.g., Gurobi to OR-Tools). The key takeaway is that outcome-only RL prevents the model from overfitting to solver-specific syntax (a major flaw in SFT), forcing it to learn invariant mathematical structures; additionally, their two-stage cold-start trick (LLM-translate 100 samples -> SFT -> RL) is a highly stealable technique for adapting to new environments. This is highly relevant for our OR-Bench project, and we should consider implementing execution-verified RL baselines and leveraging their cold-start adaptation trick when targeting new solvers in our evolutionary search pipelines.
 
-This research front focuses on developing advanced LLM-driven frameworks and agentic systems for automating complex Operations Research tasks, including optimization problem modeling, algorithm design, and iterative model diagnosis and repair. A central theme is the integration of reinforcement learning (e.g., GRPO, DPO, MargE) to align LLMs with solver feedback and the use of sophisticated synthetic data generation techniques (e.g., DualReflect, backward generation, structure-aware reverse construction) to overcome data scarcity and ensure verifiability. The goal is to create robust, scalable, and trustworthy LLM-based systems that can generate and refine OR models and algorithms with high accuracy and efficiency, often outperforming larger, general-purpose LLMs.
+### [Auto-Formulating Dynamic Programming Problems with Large Language Models](https://arxiv.org/abs/2507.11737)
 
-Key contributions include PARM and MIND, which introduce pipeline-adapted reward models and error-driven learning for multi-stage LLM pipelines, achieving significant solving accuracy improvements (3.6-17.3x over GPT-4o) on OR benchmarks. OptiRepair and Solver-in-the-Loop leverage solver diagnostics like Irreducible Infeasible Subsystem (IIS) feedback and domain-specific rationality oracles with GRPO, demonstrating up to 81.7% repair success and outperforming GPT-5.2. For algorithm design, OR-Agent and EvoCut utilize tree-structured research workflows and LLM agents to generate novel heuristics and MILP cuts, leading to substantial performance gains (2x normalized scores, 17-57% gap reductions). Automated modeling efforts like DPLM, AutoOR, and ConstraintLLM employ synthetic data pipelines and structural retrieval to achieve high accuracy on Dynamic Programming, MILP, and Constraint Programming problems, with 7B models matching or exceeding GPT-4o. EquivaMap provides a solver-verified mapping approach for 100% accurate equivalence checking of OR formulations, addressing a critical verification bottleneck, while LLOME introduces the MargE loss for stable RL in constrained optimization. Benchmarks such as Text2Zinc, DCP-Bench-Open, HeuriGym, CO-Bench, and MIPLIB-NL highlight the challenges and progress in evaluating these systems, revealing issues like overfitting to toy problems and the need for multi-instance accuracy.
+**2025-07-15** | University of Chicago, Cornell University, Shanghai Jiao Tong University, Shanghai University of Finance and Economics, Cardinal Operations | M=8 P=7 I=8 **MUST-READ** *discuss*
 
-This front is rapidly emerging and maturing, characterized by a clear shift from generic prompting to highly specialized, fine-tuned, and agentic LLMs that integrate deeply with OR solvers and domain knowledge. The trajectory indicates a strong focus on developing verifiable and scalable solutions for industrial-scale problems, as underscored by the challenges identified in MIPLIB-NL. Future work will likely concentrate on scaling these methods to real-world, complex industrial problems, improving robustness to ambiguous natural language, and developing more efficient architectures for relational inference and multi-modal integration. The next generation of research will likely present unified frameworks that combine advanced synthetic data generation, multi-stage RL alignment, and structural verification to tackle large-scale, multi-objective industrial optimization problems.
+*Method:* DPLM, a 7B-parameter specialized model fine-tuned on Qwen-2.5-7B-Instruct using synthetic data generated by DualReflect, combining Supervised Fine-Tuning (SFT) with Reinforcement Learning (GRPO/DPO) alignment. | *LLM role:* model_formulator, code_writer, synthetic_data_generator, refinement_agent
 
-**Papers:**
+> Zhou et al. introduce DPLM, a 7B model fine-tuned to formulate Dynamic Programming models, achieving performance comparable to o1 on their new DP-Bench. Their key contribution is 'DualReflect,' a synthetic data pipeline that combines Forward Generation (Problem→Code) for diversity with Backward Generation (Code→Problem) for correctness. **Takeaway:** We should steal the Backward Generation approach for AlgoEvo: instead of relying on noisy forward generation, we can take valid heuristics/OR code (which we have in abundance) and reverse-engineer problem descriptions to create massive, verifiable synthetic datasets for fine-tuning our code generation models. The paper proves this method is superior for 'cold-starting' small models in data-scarce domains.
+
+### [RideAgent: An LLM-Enhanced Optimization Framework for Automated Taxi Fleet Operations](https://arxiv.org/abs/2505.06608)
+
+**2025-05-10** | Tsinghua University, McGill University, George Washington University, JD Intelligent Cities Research, Beijing Technology and Business University | M=7 P=6 I=7 *discuss*
+
+*Method:* LLM-guided variable fixing heuristic for Mixed-Integer Programming (MIP) with an embedded Random Forest (RF) objective, solved lexicographically | *LLM role:* objective_formulation
+
+> RideAgent employs an LLM to analyze a small set of historical optimal solutions, identifying and fixing 'low-sensitivity' decision variables to shrink the MIP search space before handing it to Gurobi. The results are empirically solid, showing a ~50% time reduction with <2.5% optimality gap, outperforming standard cutting plane baselines on NYC taxi data. **Key Takeaway:** We should adapt their 'Small-Sample Guided Optimization' strategy—specifically using LLMs to infer *variable fixing constraints* from elite archive solutions—to accelerate the inner solvers in our AlgoEvo and EvoCut pipelines. This offers a concrete, data-driven way to prune search spaces that complements our current evolutionary approaches.
 
 ### [PARM: Pipeline-Adapted Reward Model](https://arxiv.org/abs/2604.18327)
 
@@ -591,69 +687,21 @@ This front is rapidly emerging and maturing, characterized by a clear shift from
 
 > This paper introduces Text2Zinc, a solver-agnostic benchmark of 1,775 natural language combinatorial problems, and evaluates various LLM copilot strategies (CoT, knowledge graphs, grammar validation) for generating formal MiniZinc models. The results are backed by extensive empirical evaluation, demonstrating that even advanced models like GPT-4o struggle, achieving only ~40-50% solution accuracy despite much higher execution (compilation) accuracy. The key insight is that decoupling syntax enforcement from generation via post-hoc grammar validation significantly improves execution accuracy without requiring constrained decoding, though capturing the underlying optimization logic remains a major bottleneck. This work is highly relevant for our OR benchmarking and evaluation efforts, as the dataset schema and the clear demonstration of the execution-solution accuracy gap provide a strong foundation for evaluating LLM reasoning in symbolic OR modeling.
 
-### [OptiRepair: Closed-Loop Diagnosis and Repair of Supply Chain Optimization Models with LLM Agents](https://arxiv.org/abs/2602.19439)
+### [NEMO: Execution-Aware Optimization Modeling via Autonomous Coding Agents](https://arxiv.org/abs/2601.21372)
 
-**2026-02-23** | Massachusetts Institute of Technology, Alibaba Group | M=8 P=7 I=9 **MUST-READ** *changes-thinking* *discuss*
+**2026-01-29** | Carnegie Mellon University, C3 AI | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
 
-*Method:* Two-phase closed-loop LLM agent with IIS-guided diagnosis, domain-specific rationality oracle, iterative STaR, and GRPO refinement | *LLM role:* diagnosis_and_repair
+*Method:* Execution-Aware Optimization Modeling via Autonomous Coding Agents (ACAs) with asymmetric simulator-optimizer validation loop | *LLM role:* code_writer
 
-> Ao et al. introduce OptiRepair, a closed-loop framework that repairs infeasible LPs using solver IIS feedback (Phase 1) and validates them with a 'Rationality Oracle' based on domain theory (Phase 2). Results are exceptionally strong: fine-tuned 8B models trained via iterative STaR and GRPO achieve 81.7% success, outperforming GPT-5.2 (42.2%) by a massive margin. **Key Takeaway:** We should steal the 'Rationality Oracle' concept—evaluating solution *properties* (e.g., monotonicity, variance bounds) rather than just raw fitness—to serve as a dense signal for our Process Reward Models in AlgoEvo. Additionally, their success with solver-verified GRPO confirms we should prioritize training specialized operators over prompting general LLMs.
+> NEMO achieves SOTA on 8/9 optimization benchmarks by deploying autonomous coding agents that generate both a declarative optimizer (solver code) and an imperative simulator (verification code). The key innovation is using the simulator to validate the optimizer's results in a closed loop, detecting logical errors without ground truth—a technique that beats fine-tuned models like SIRL by up to 28%. The most stealable insight is this asymmetric validation: imperative Python simulation is often less error-prone than declarative constraint formulation, making it a robust 'critic' for generated solvers. This is immediately applicable to our OR-Bench and AlgoEvo projects for generating reliable reward signals.
 
-### [REMoH: A Reflective Evolution of Multi-objective Heuristics approach via Large Language Models](https://arxiv.org/abs/2506.07759)
+### [Canonical Intermediate Representation for LLM-based optimization problem formulation and code generation](https://arxiv.org/abs/2602.02029)
 
-**2025-06-09** | Vicomtech Foundation, University of the Basque Country, Universidad EAFIT, HiTZ Basque Center for Language Technology | M=7 P=6 I=7 **MUST-READ** *discuss*
+**2026-02-02** | The Hong Kong Polytechnic University, InfiX.ai | M=7 P=8 I=7 **MUST-READ** *discuss*
 
-*Method:* Hybrid framework integrating NSGA-II with LLM-based heuristic generation and a reflection mechanism | *LLM role:* evolutionary_search
+*Method:* Multi-agent pipeline with Canonical Intermediate Representation (CIR) and Retrieval-Augmented Generation (RAG) | *LLM role:* Decomposition guide, paradigm selector, code writer, and verifier
 
-> Forniés-Tabuenca et al. propose REMoH, an LLM-driven evolutionary framework for multi-objective FJSSP that uses K-Means to cluster the population by objective performance before generating reflections. While their optimality gaps (~12%) trail behind state-of-the-art CP solvers (~1.5%), the ablation study confirms that their reflection mechanism significantly improves Pareto front diversity (Hypervolume). **The killer feature is the phenotypic clustering step:** instead of reflecting on a random or elitist subset, they group solutions by trade-offs (e.g., 'low makespan' vs 'balanced') to generate targeted prompts. We should implement this clustering-based context construction in AlgoEvo to improve diversity maintenance in multi-objective search without exploding token costs.
-
-### [Auto-Formulating Dynamic Programming Problems with Large Language Models](https://arxiv.org/abs/2507.11737)
-
-**2025-07-15** | University of Chicago, Cornell University, Shanghai Jiao Tong University, Shanghai University of Finance and Economics, Cardinal Operations | M=8 P=7 I=8 **MUST-READ** *discuss*
-
-*Method:* DPLM, a 7B-parameter specialized model fine-tuned on Qwen-2.5-7B-Instruct using synthetic data generated by DualReflect, combining Supervised Fine-Tuning (SFT) with Reinforcement Learning (GRPO/DPO) alignment. | *LLM role:* model_formulator, code_writer, synthetic_data_generator, refinement_agent
-
-> Zhou et al. introduce DPLM, a 7B model fine-tuned to formulate Dynamic Programming models, achieving performance comparable to o1 on their new DP-Bench. Their key contribution is 'DualReflect,' a synthetic data pipeline that combines Forward Generation (Problem→Code) for diversity with Backward Generation (Code→Problem) for correctness. **Takeaway:** We should steal the Backward Generation approach for AlgoEvo: instead of relying on noisy forward generation, we can take valid heuristics/OR code (which we have in abundance) and reverse-engineer problem descriptions to create massive, verifiable synthetic datasets for fine-tuning our code generation models. The paper proves this method is superior for 'cold-starting' small models in data-scarce domains.
-
-### [MoE2: Optimizing Collaborative Inference for Edge Large Language Models](https://arxiv.org/abs/2501.09410)
-
-**2025-01-16** | Zhejiang University, University of Illinois at Urbana–Champaign Institute, Zhejiang Key Laboratory of Medical Imaging Artificial Intelligence | M=6 P=7 I=5 
-
-*Method:* Mixture-of-Edge-Experts (MoE2) framework with a two-level expert selection mechanism (coarse-grained discrete monotonic optimization and fine-grained Top-k selection) and a gating network | *LLM role:* expert_submodels
-
-> Jin et al. introduce MoE2, a collaborative inference framework that uses discrete monotonic optimization to route queries to heterogeneous edge LLMs under latency and energy constraints. The results are backed by physical hardware experiments on NVIDIA Jetson and RTX 4090 devices, demonstrating up to 14.4% accuracy improvements on MMLU over single-agent baselines while respecting strict energy and delay budgets. The key insight is a theoretical proof showing that optimal gating parameters for a full set of LLM experts are preserved for any subset, allowing the decoupling of gating network training from the combinatorial expert selection process. While this is a competent application of operations research to LLM serving optimization, it is a lower priority read as it does not advance our primary focus on LLM evolutionary search or multi-agent optimization.
-
-### [CP-Agent: Agentic Constraint Programming](https://arxiv.org/abs/2508.07468)
-
-**2025-08-10** | TU Wien | M=5 P=9 I=7 **MUST-READ** *discuss*
-
-*Method:* Agentic Python coding agent using ReAct framework with persistent IPython kernel for iterative refinement of CPMpy constraint models | *LLM role:* code_writer
-
-> Szeider implements a standard ReAct agent with a persistent IPython kernel to iteratively generate and refine CPMpy models, claiming 100% accuracy on CP-Bench. However, this perfect score is achieved on a *modified* version of the benchmark where the author manually fixed 31 ambiguous problem statements and 19 ground-truth errors—making the '100%' result an artifact of dataset cleaning rather than pure model capability. The most actionable takeaways are the negative result for explicit 'task management' tools (which hurt performance on hard problems) and the effectiveness of a minimal (<50 lines) domain prompt over complex scaffolding. We should review their clarified benchmark for our OR-Bench work.
-
-### [OR-Agent: Bridging Evolutionary Search and Structured Research for Automated Algorithm Discovery](https://arxiv.org/abs/2602.13769)
-
-**2026-02-14** | Tongji University | M=9 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Multi-agent research framework with evolutionary-systematic ideation, tree-structured research workflow, and hierarchical optimization-inspired reflection system | *LLM role:* heuristic_generator, code_writer, evaluator, decomposition_guide, evolutionary_search, prompt_optimizer
-
-> OR-Agent replaces flat evolutionary loops with a tree-structured research workflow that prioritizes deep iterative refinement and debugging over broad population sampling. The results are compelling, showing a ~2x improvement in normalized scores over ReEvo and FunSearch across 12 OR benchmarks (TSP, CVRP, etc.). The single most actionable takeaway is the **Experiment Agent's environment probing**: instead of relying on scalar fitness, the agent writes custom callbacks to log intermediate states (e.g., 'lane change attempts' in SUMO), enabling genuine diagnosis of failure modes. We should immediately implement this 'instrumentation-via-code' pattern in our own evaluation pipelines to improve signal quality.
-
-### [Automated Optimization Modeling via a Localizable Error-Driven Perspective](https://arxiv.org/abs/2602.11164)
-
-**2026-01-17** | Huawei Noah’s Ark Lab, Fudan University, University of Science and Technology of China | M=8 P=7 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Error-driven learning framework (MIND) combining Dynamic Supervised Fine-Tuning Policy Optimization (DFPO) with an error-driven reverse data synthesis pipeline | *LLM role:* code_writer, decomposition_guide, evolutionary_search, prompt_optimizer
-
-> This paper introduces MIND, a framework for automated optimization modeling that combines error-driven data synthesis with a novel post-training method called DFPO. Instead of standard RLVR which suffers from sparse rewards on hard problems, DFPO uses a teacher model to minimally correct the student's *failed* rollouts, converting them into on-policy(ish) positive samples for SFT/RL. Results show a 7B model outperforming GPT-4 on IndustryOR and OptMATH benchmarks. **Key Takeaway:** We should steal the DFPO mechanism for AlgoEvo: rather than wasting failed evolutionary samples, use a stronger model (or oracle) to fix the code and feed it back as a reward signal, drastically improving sample efficiency in our RL loops.
-
-### [EvoCut: Strengthening Integer Programs via Evolution-Guided Language Models](https://arxiv.org/abs/2508.11850)
-
-**2025-08-16** | Huawei Technologies Canada, University of British Columbia, University of Toronto | M=9 P=10 I=9 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Evolutionary algorithm powered by multiple LLM-based agents for iterative generation and refinement of acceleration cuts | *LLM role:* heuristic_generator
-
-> Yazdani et al. introduce EvoCut, an evolutionary framework where LLMs generate Python code for MILP cuts, filtered by a 'usefulness check' (does it cut the current LP relaxation?) and an 'empirical validity check' (does it preserve known integer optima?). They report 17-57% gap reductions on TSPLIB and JSSP compared to Gurobi defaults, backed by strong ablation studies on the evolutionary operators. **Key Takeaway:** The reliance on 'acceleration cuts'—constraints verified empirically on small datasets rather than formally proven—bypasses the bottleneck of automated theorem proving while still delivering valid speedups. We should immediately adopt their 'LP separation' check as a cheap, high-signal reward for our own evolutionary search loops.
+> Lyu et al. propose a 'Canonical Intermediate Representation' (CIR) to decouple natural language operational rules from their mathematical instantiation, explicitly forcing the LLM to select modeling paradigms (e.g., time-indexed vs. continuous flow) before coding. They achieve state-of-the-art accuracy (47.2% vs 22.4% baseline) on a new, complex benchmark (ORCOpt-Bench) by using a multi-agent pipeline that retrieves and adapts constraint templates. The key takeaway is the 'Mapper' agent's paradigm selection logic, which prevents common formulation errors in VRPs and scheduling; we should evaluate CIR as a structured mutation space for AlgoEvo to replace brittle code evolution. The new benchmark is immediately relevant for our OR-Bench evaluation suite.
 
 ### [DCP-Bench-Open: Evaluating LLMs for Constraint Modelling of Discrete Combinatorial Problems](https://arxiv.org/abs/2506.06052)
 
@@ -663,6 +711,38 @@ This front is rapidly emerging and maturing, characterized by a clear shift from
 
 > This paper introduces DCP-Bench-Open, a benchmark of 164 discrete combinatorial problems, to evaluate LLMs on translating natural language into constraint models (CPMpy, MiniZinc, OR-Tools). The results are rigorous and highlight a critical failure mode: LLMs overfit to the specific data values in the prompt's example instance, causing a ~30% performance drop when evaluated on hidden instances (Multi-Instance Accuracy). Crucially for our pipeline design, they find that Retrieval-Augmented In-Context Learning (RAICL) is ineffective or harmful compared to simply including library documentation in the system prompt. We should adopt their 'Multi-Instance Accuracy' metric immediately for OR-Bench and switch any MiniZinc generation efforts to Python-based frameworks like CPMpy or OR-Tools, which LLMs handle much better.
 
+### [Strategy-Aware Optimization Modeling with Reasoning LLMs](https://arxiv.org/abs/2605.02545)
+
+**2026-05-04** | Beihang University, JIUTIAN Research | M=8 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Supervised Fine-Tuning followed by Segment-Weighted Group Relative Policy Optimization (GRPO) | *LLM role:* reasoning_guide
+
+> SAGE is a framework for automated optimization modeling that explicitly separates high-level modeling strategy from concrete formulation, training an LLM via supervised fine-tuning and Segment-Weighted GRPO with solver feedback. The results are backed by strong empirical evidence, improving average pass@1 from 72.7% to 80.3% over the strongest open-source baseline across eight OR benchmarks, while also producing more compact, solver-efficient constraint systems. The key insight is the use of Segment-Weighted GRPO, which assigns higher optimization weights to early, high-level strategic reasoning tokens than to later surface-level tokens, effectively mitigating the credit assignment problem in long-horizon reasoning. This is highly relevant for our work in symbolic OR modeling and RL-infused LLM search; the segment-weighted RL approach and efficiency-aware composite reward are concrete techniques we should adapt for our process reward models.
+
+### [An Agent-Based Framework for the Automatic Validation of Mathematical Optimization Models](https://arxiv.org/abs/2511.16383)
+
+**2025-11-20** | IBM Research | M=7 P=8 I=7 **MUST-READ** *discuss*
+
+*Method:* Multi-agent LLM framework for automatic validation of optimization models using problem-level API generation, unit test generation, and optimization-specific mutation testing | *LLM role:* code_writer
+
+> Zadorojniy et al. introduce a multi-agent framework for validating LLM-generated optimization models by generating a test suite and verifying the suite's quality via mutation testing (ensuring tests detect deliberate errors injected into the model). On 100 NLP4LP instances, they achieve a 76% mutation kill ratio and successfully classify external models where simple objective value comparisons fail. The critical takeaway is the 'bootstrapped validation' workflow: using mutation analysis to validate the generated unit tests themselves before using them to score the model. We should steal this mutation-based verification loop to create a robust, ground-truth-free fitness signal for our evolutionary search and OR benchmarking pipelines.
+
+### [From Soliloquy to Agora: Memory-Enhanced LLM Agents with Decentralized Debate for Optimization Modeling](https://arxiv.org/abs/2604.25847)
+
+**2026-04-28** | Tsinghua University, University of Chicago Booth School of Business, Shanghai Jiao Tong University, The Chinese University of Hong Kong, Shenzhen (CUHK-Shenzhen) | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Modular agentic framework combining decentralized debate with a read-write memory bank | *LLM role:* Formulator, Programmer, and Debugger agents for generating and refining optimization models and solver code
+
+> This paper introduces Agora-Opt, a multi-agent framework for optimization modeling that combines decentralized debate across heterogeneous LLMs with a read-write memory bank. The results are backed by strong empirical evidence, achieving state-of-the-art Pass@1 accuracy (84.6%) across 7 OR benchmarks and outperforming both frontier zero-shot models and fine-tuned OR models. The key insight is that decentralized debate, where consensus is driven by solver-verified endpoints rather than a centralized LLM judge, can synthesize correct formulations even when all initial agent proposals are flawed. Furthermore, storing the trajectories of how these disagreements are resolved in a dedicated 'debate memory' allows the system to continuously improve its collaborative reasoning without parameter updates. This is highly relevant for our research in multi-agent optimization and memory architectures; the decentralized consensus mechanism and debate memory structure offer immediate, actionable upgrades for our multi-agent debate systems.
+
+### [OptiVerse: A Comprehensive Benchmark towards Optimization Problem Solving](https://arxiv.org/abs/2604.21510)
+
+**2026-04-23** | Xi'an Jiaotong University, Lenovo Research | M=6 P=8 I=7 **MUST-READ** *discuss*
+
+*Method:* Dual-View Auditor Agent (DVA-Agent) with Semantic Triangulation | *LLM role:* adversarial_evaluator
+
+> This paper introduces OptiVerse, a 1,000-problem benchmark spanning six optimization domains (including stochastic and dynamic optimization) to evaluate LLM reasoning, alongside a Dual-View Auditor Agent that detects semantic modeling errors. Extensive evaluation of 22 LLMs shows severe performance degradation on hard problems (under 27% accuracy even for frontier models), while the proposed agent improves accuracy by 1.3-6.3% over baselines like OptiMUS. The key insight is the 'blind code abstraction' technique: forcing the LLM to reverse-engineer mathematical logic solely from its generated code without seeing the original prompt, which effectively mitigates the confirmation bias that plagues standard LLM self-correction. This is highly relevant for our OR benchmarking and evaluation work, as it represents a direct competitor/complement to our datasets. Furthermore, the blind abstraction trick is a highly transferable mechanism that could be adopted to improve the verification and reward modeling steps in our multi-agent optimization and LLM evolutionary search frameworks.
+
 ### [Text2Zinc: A Cross-Domain Dataset for Modeling Optimization and Satisfaction Problems in MiniZinc](https://arxiv.org/abs/2503.10642)
 
 **2025-02-22** | Brown University, Fidelity Investments | M=3 P=8 I=4 **MUST-READ** *discuss*
@@ -671,29 +751,61 @@ This front is rapidly emerging and maturing, characterized by a clear shift from
 
 > Singirikonda et al. introduce TEXT2ZINC, a dataset of 110 Natural Language-to-MiniZinc problems, and benchmark GPT-4 using Vanilla, CoT, and Compositional prompting. Their results are poor (max ~25% solution accuracy), confirming that off-the-shelf LLMs struggle significantly with MiniZinc syntax and logical translation. Crucially, they attempt using Knowledge Graphs as an intermediate representation, but report that it actually *reduced* solution accuracy compared to basic CoT—a valuable negative result for our symbolic modeling work. We should examine their dataset for inclusion in OR-Bench, but their prompting methods are rudimentary baselines we should easily outperform.
 
-### [Execution-Verified Reinforcement Learning for Optimization Modeling](https://arxiv.org/abs/2604.00442)
+### [EngiAgent: Fully Connected Coordination of LLM Agents for Solving Open-ended Engineering Problems with Feasible Solutions](https://arxiv.org/abs/2605.02289)
 
-**2026-04-01** | Chinese Academy of Sciences, Nanjing University, Nanjing University of Science and Technology | M=7 P=8 I=7 **MUST-READ** *discuss*
+**2026-05-04** | Nanyang Technological University, The Chinese University of Hong Kong, Shenzhen, The University of Sydney, INSAIT Sofia University “St. Kliment Ohridski”, AIRS | M=7 P=8 I=8 **MUST-READ** *discuss*
 
-*Method:* Execution-Verified Reinforcement Learning (EVOM) with GRPO and DAPO for solver-conditioned code generation | *LLM role:* code_writer
+*Method:* Multi-agent system with a fully connected coordinator for iterative problem analysis, modeling, verification, solving, and solution evaluation | *LLM role:* multi-role agent coordination
 
-> EVOM trains LLMs for operations research modeling using execution-verified reinforcement learning (GRPO/DAPO) based solely on solver outcomes, bypassing expensive process-level supervision. The results are backed by solid empirical evaluations on OptiBench, NL4OPT, and IndustryOR, demonstrating that it matches or beats process-supervised SFT (ORLM) and enables zero-shot transfer to new solvers (e.g., Gurobi to OR-Tools). The key takeaway is that outcome-only RL prevents the model from overfitting to solver-specific syntax (a major flaw in SFT), forcing it to learn invariant mathematical structures; additionally, their two-stage cold-start trick (LLM-translate 100 samples -> SFT -> RL) is a highly stealable technique for adapting to new environments. This is highly relevant for our OR-Bench project, and we should consider implementing execution-verified RL baselines and leveraging their cold-start adaptation trick when targeting new solvers in our evolutionary search pipelines.
+> EngiAgent is a multi-agent LLM framework that uses a fully connected coordinator to dynamically route debugging feedback across specialized agents (Analyzer, Modeler, Verifier, Solver) to generate feasible Pyomo models for open-ended engineering problems. The results are strongly backed by empirical data on a new 53-problem benchmark, achieving up to 75.4% feasibility with DeepSeek-V3—a massive improvement over fixed-pipeline baselines like DS-Agent. The key insight is that rigid multi-agent pipelines fail on complex OR tasks because errors can stem from semantic extraction, mathematical formulation, or solver execution; dynamically routing specific error traces to the responsible agent significantly improves the rate of physically and mathematically feasible solutions. This is highly relevant for our work in symbolic OR benchmarking and multi-agent optimization, as the benchmark's strict focus on executable feasibility over text-based evaluation aligns perfectly with our evaluation methodology.
 
-### [Constructing Industrial-Scale Optimization Modeling Benchmark](https://arxiv.org/abs/2602.10450)
+### [DAOpt: Modeling and Evaluation of Data-Driven Optimization under Uncertainty with LLMs](https://arxiv.org/abs/2511.11576)
 
-**2026-02-11** | Peking University, Huawei Technologies Co., Ltd., Great Bay University | M=7 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+**2025-09-24** | Zhejiang University, University of Toronto, Peking University | M=6 P=8 I=7 **MUST-READ** *discuss*
 
-*Method:* Structure-aware reverse construction methodology from MIPLIB 2017 | *LLM role:* linguistic_polisher, interactive_assistant
+*Method:* LLM-based multi-agent framework for optimization modeling, integrating few-shot learning with OR domain knowledge (RSOME toolbox) and a Reflexion-based checker | *LLM role:* code_writer
 
-> Li et al. introduce MIPLIB-NL, a benchmark of 223 industrial-scale MILP instances (up to 10^7 variables) reverse-engineered from MIPLIB 2017, enforcing strict model-data separation. Results are sobering: SOTA models like GPT-4 and fine-tuned OR-LLMs drop from ~90% accuracy on existing toy benchmarks to ~18% here, failing primarily on structural consistency and index handling at scale. For us, the key takeaway is their "Loop-Based Structural Scaffold" taxonomy—a method to compress massive industrial formulations into compact LLM prompts via model-data separation. This is a mandatory read for our OR-Bench project, as it demonstrates that current evaluations are effectively measuring overfitting to toy problems rather than genuine modeling capability.
+> Zhu et al. propose DAOpt, a framework for modeling optimization under uncertainty that integrates LLMs with the RSOME library to handle robust and stochastic formulations. Their experiments on a new dataset (OptU) convincingly demonstrate that standard LLM-generated deterministic models suffer from the 'optimizer's curse,' achieving only ~27% out-of-sample feasibility, whereas their robust approach achieves >70%. The critical takeaway for us is to **stop asking LLMs to derive mathematical duals or robust counterparts**; instead, we should train them to use high-level DSLs (like RSOME) that handle the duality internally. This is an immediate action item for our RobustMAS project to ensure generated solutions are actually executable in stochastic environments.
 
-### [Toward a Trustworthy Optimization Modeling Agent via Verifiable Synthetic Data Generation](https://arxiv.org/abs/2508.03117)
+### [Adaptively Robust LLM Inference Optimization under Prediction Uncertainty](https://arxiv.org/abs/2508.14544)
 
-**2025-08-05** | IBM Research AI | M=6 P=7 I=7 *discuss*
+**2025-08-20** | Stanford University, Peking University, HKUST | M=7 P=9 I=6 **MUST-READ** *changes-thinking* *discuss*
 
-*Method:* Verifiable Synthetic Data Generation (SDG) pipeline combined with a modular LLM agent (OptiTrust) employing multi-stage translation, multi-language inference, and majority-vote cross-validation | *LLM role:* data_generator, code_writer, decomposition_guide, formulation_generator, evaluator
+*Method:* Adaptive online scheduling with dynamic lower bound estimation, ordered eviction, and greedy batch formation (Amin algorithm) | *LLM role:* none
 
-> Lima et al. introduce a pipeline to generate synthetic optimization datasets by starting with symbolic MILP instances (ground truth) and using LLMs to generate natural language descriptions, ensuring full verifiability. They fine-tune a small model (Granite 8B) that beats GPT-4 on 6/7 benchmarks, largely due to a 'majority vote' mechanism where the agent generates code in 5 different modeling languages (Pyomo, Gurobi, etc.) and checks for result consistency. **Takeaway:** We should steal the multi-language execution voting to boost robustness in our code generation agents. Furthermore, their reverse-generation (Symbolic $\to$ NL) strategy is the correct approach for generating infinite, error-free test cases for our OR-Bench work.
+> Chen et al. propose $A_{min}$, an online scheduling algorithm for LLM inference that handles unknown output lengths by optimistically assuming the lower bound and evicting jobs (based on accumulated length) if memory overflows. They prove a logarithmic competitive ratio and show via simulations on LMSYS-Chat-1M that this approach nearly matches hindsight-optimal scheduling, vastly outperforming conservative upper-bound baselines. **Key Takeaway:** For our **GPUSched** project, we should abandon conservative memory reservation for output tokens; instead, implement an optimistic scheduler that oversubscribes memory and handles overflows via their ordered eviction policy, as the cost of restart is theoretically bounded and empirically negligible compared to the throughput gains.
+
+### [EvoCut: Strengthening Integer Programs via Evolution-Guided Language Models](https://arxiv.org/abs/2508.11850)
+
+**2025-08-16** | Huawei Technologies Canada, University of British Columbia, University of Toronto | M=9 P=10 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Evolutionary algorithm powered by multiple LLM-based agents for iterative generation and refinement of acceleration cuts | *LLM role:* heuristic_generator
+
+> Yazdani et al. introduce EvoCut, an evolutionary framework where LLMs generate Python code for MILP cuts, filtered by a 'usefulness check' (does it cut the current LP relaxation?) and an 'empirical validity check' (does it preserve known integer optima?). They report 17-57% gap reductions on TSPLIB and JSSP compared to Gurobi defaults, backed by strong ablation studies on the evolutionary operators. **Key Takeaway:** The reliance on 'acceleration cuts'—constraints verified empirically on small datasets rather than formally proven—bypasses the bottleneck of automated theorem proving while still delivering valid speedups. We should immediately adopt their 'LP separation' check as a cheap, high-signal reward for our own evolutionary search loops.
+
+### [FLEET: Formal Language-Grounded Scheduling for Heterogeneous Robot Teams](https://arxiv.org/abs/2510.07417)
+
+**2025-10-08** | JHU APL, JHU, DEVCOM ARL | M=5 P=7 I=6 *discuss*
+
+*Method:* Hybrid generative–formal framework combining LLM-based task decomposition and fitness estimation with Mixed-Integer Linear Programming (MILP) for makespan minimization. | *LLM role:* decomposition_guide
+
+> FLEET implements a hybrid pipeline where an LLM extracts a task dependency graph and a 'fitness matrix' (capability scores) from natural language, which then populate a standard MILP for multi-robot scheduling. Results on the PARTNR benchmark show it outperforms pure LLM planners (SMART-LLM) by ~7% on heterogeneous tasks, though overall gains are modest. The actionable takeaway is the **fitness matrix extraction**: using the LLM to generate dense cost coefficients ($c_{ij}$) for the optimization model rather than just binary constraints. We should adopt this technique for handling soft semantic preferences in our heterogeneous VRP formulations.
+
+### [CP-Agent: Agentic Constraint Programming](https://arxiv.org/abs/2508.07468)
+
+**2025-08-10** | TU Wien | M=5 P=9 I=7 **MUST-READ** *discuss*
+
+*Method:* Agentic Python coding agent using ReAct framework with persistent IPython kernel for iterative refinement of CPMpy constraint models | *LLM role:* code_writer
+
+> Szeider implements a standard ReAct agent with a persistent IPython kernel to iteratively generate and refine CPMpy models, claiming 100% accuracy on CP-Bench. However, this perfect score is achieved on a *modified* version of the benchmark where the author manually fixed 31 ambiguous problem statements and 19 ground-truth errors—making the '100%' result an artifact of dataset cleaning rather than pure model capability. The most actionable takeaways are the negative result for explicit 'task management' tools (which hurt performance on hard problems) and the effectiveness of a minimal (<50 lines) domain prompt over complex scaffolding. We should review their clarified benchmark for our OR-Bench work.
+
+### [GauS: Differentiable Scheduling Optimization via Gaussian Reparameterization](https://arxiv.org/abs/2602.20427)
+
+**2026-02-23** | Cornell University, University of Maryland, College Park | M=7 P=5 I=7 *discuss*
+
+*Method:* Differentiable Scheduling Optimization via Gaussian Reparameterization with Augmented Lagrangian Method | *LLM role:* none
+
+> GauS replaces the standard categorical (Gumbel-Softmax) relaxation in differentiable scheduling with Gaussian variables defined by mean and variance, reducing parameter space from O(N*D) to O(N). Results are strong: it scales to 57k nodes where previous differentiable methods OOM and exact solvers timeout, while maintaining near-100% GPU utilization. The key takeaway is a specific modeling technique: using Gaussian distributions to represent discrete ordinal values (like time steps) naturally captures temporal proximity and provides smoother gradients than categorical buckets. We should test this representation in our continuous latent-space optimization work to replace categorical relaxations for ordered parameters.
 
 ### [LLaMoCo: Instruction Tuning of Large Language Models for Optimization Code Generation](https://arxiv.org/abs/2403.01131)
 
@@ -703,157 +815,21 @@ This front is rapidly emerging and maturing, characterized by a clear shift from
 
 > LLaMoCo fine-tunes small LLMs (down to 350M) to generate executable Python optimization code by training on a synthetic dataset where the 'ground truth' is the empirically best-performing solver identified via exhaustive benchmarking. The results are compelling: the fine-tuned 350M model achieves ~85% normalized performance on benchmarks where GPT-4 Turbo only reaches ~14-30%, largely because the small model learns to select specialized evolutionary strategies (like BIPOP-CMA-ES) while GPT-4 defaults to generic gradient-based solvers. **Key Takeaway:** We can replace the expensive GPT-4 calls in our evolutionary search loop with a specialized, fine-tuned local model (CodeLlama-7B) trained on our historical search successes, significantly improving both sample efficiency and scalability. The paper's 'contrastive warm-up' strategy for aligning diverse problem descriptions is also a transferable technique for our problem encoding work.
 
-### [HeuriGym: An Agentic Benchmark for LLM-Crafted Heuristics in Combinatorial Optimization](https://arxiv.org/abs/2506.07972)
 
-**2025-06-09** | Cornell University, Harvard University, NVIDIA | M=5 P=9 I=7 **MUST-READ** *discuss*
+### Front 1 (12 papers) — EMERGING
 
-*Method:* Agentic framework for evaluating and iteratively refining LLM-generated heuristic algorithms via code execution feedback | *LLM role:* heuristic_generator
+**Density:** 0.11 | **Methods:** llm_code_generation, llm_in_the_loop, llm_as_evaluator, program_synthesis, llm_as_heuristic | **Problems:** optimization_modeling, mixed_integer_linear_programming, linear_programming, facility_location, job_shop_scheduling
 
-> The authors introduce HeuriGym, a benchmark suite of 9 hard combinatorial optimization problems (including PDPTW, EDA scheduling, and routing) coupled with an agentic evaluation loop. Results are backed by extensive experiments showing that SOTA LLMs saturate at ~60% of expert performance and, significantly, that existing evolutionary frameworks (ReEvo, EoH) perform *worse* than simple prompting on these large-context tasks (300+ lines of code). The key takeaway is the failure mode of current evolutionary methods: they cannot handle the context fragmentation and feedback integration required for complex heuristic design. We should immediately adopt this benchmark to demonstrate AlgoEvo's superiority, as the current baselines are weak and the problem set aligns perfectly with our focus.
+*Unique methods:* RL_GRPO, actor_critic, ai_agents, attention_mechanism, automated_experimentation, automatic_symbolic_dualization, backtranslation, black_box_optimization, callbacks, canonical_graph_edit_distance, canonicalization, centralized_training_decentralized_execution, clustering, cross_encoder_reranking, deep_reinforcement_learning, differential_attention, dirichlet_process_mixture_model, domain_specific_languages, error_analysis, evaluation_framework, evolutionary_search, expert_prompting, gaussian_process, global_constraints, graph_edit_distance, hierarchical_chunking, hierarchical_retrieval_augmented_generation, hyper_heuristics, imitation_learning, indicator_variables, iterative_adaptive_revision, lagrangian_relaxation, large_language_models, llm_as_expert, llm_as_verifier, llm_evaluation, lp_duality, mathematical_optimization, memory_compression, metadata_augmented_indexing, multi_agent_coordination, multi_agent_reinforcement_learning, multi_head_attention, multi_turn_feedback, non_parametric_modeling, offline_adaptation, piecewise_linear_constraints, prioritized_experience_replay, pushdown_automaton, reflection, retrieval_augmented_reasoning, self_reflective_error_correction, sifting, special_ordered_sets, structure_detection, structured_output_parsing, tree_search, two_stage_retrieval, wasserstein_metric
+*Shared methods:* constraint_programming, curriculum_learning, data_cleaning, debugging, expectation_maximization, generative_models, gurobi, in_context_learning, linear_programming, llm_as_evaluator, llm_as_heuristic, llm_code_generation, llm_evolutionary_search, llm_in_the_loop, llm_iterative_refinement, llm_prompt_optimization, llm_research_agent, majority_voting, mixed_integer_linear_programming, multi_agent_llm_system, multi_agent_system, program_synthesis, retrieval_augmented_generation, self_consistency, self_improving_search, supervised_fine_tuning, synthetic_data_generation
 
-### [Relation Reasoning with LLMs in Expensive Optimization](https://arxiv.org/abs/2605.02933)
+This front unifies research on leveraging advanced LLM architectures, particularly multi-agent systems and sophisticated memory/retrieval mechanisms, for symbolic Operations Research modeling, code generation, and automated problem reformulation. Key frameworks like OptiMUS-0.3, MIRROR, AutoREM, and DCM-Agent are central, demonstrating how LLMs are being engineered to translate natural language descriptions into executable optimization models (MILP, LP, MiniZinc), reformulate complex problems (e.g., Robust Optimization), and even generate expert-level heuristics. The emphasis is on improving the reliability and accuracy of LLM-generated OR artifacts beyond simple prompting.
 
-**2026-04-30** | Shanghai Institute of AI for Education, East China Normal University | M=7 P=6 I=8 **MUST-READ** *discuss*
+OptiMUS-0.3 and MIRROR establish new SOTA for MILP formulation, with OptiMUS-0.3 outperforming GPT-4o by ~40% on NLP4LP using a connection graph and self-reflection, and MIRROR achieving ~72% pass@1 with hierarchical RAG and structured revision. AutoREM introduces a tuning-free memory-augmented framework for robust optimization reformulation, achieving 97.4% accuracy on in-distribution and 94.8% on out-of-distribution datasets. AutoOR demonstrates scalable RL-trained LLMs for autoformalization, with an 8B model matching Gemini 3 Pro on several benchmarks and achieving a 48.98% leap on non-linear pump network tasks via backtranslation. Other notable contributions include CHORUS's metadata-augmented RAG for LP code generation (+147.9% accuracy for Llama3.3-70B), OptiMind's fine-tuning and class-based error analysis for MILP formulation (up to +23% accuracy), and OR-Agent's tree-structured research workflow for algorithm discovery, showing a ~2x improvement over FunSearch. The Dual-Cluster Memory Agent (DCM-Agent) achieves SOTA on symbolic OR modeling benchmarks with 11-21% average accuracy improvements by decoupling abstract modeling from concrete coding.
 
-*Method:* Reinforcement-trained Qwen2.5 LLM with GRPO for relation-based surrogate modeling, using anchor-based iterative context construction and voting-based aggregation | *LLM role:* surrogate_model
-
-> This paper proposes R2SAEA, an evolutionary algorithm that uses a compact LLM (Qwen2.5) fine-tuned via GRPO as a zero-shot, relation-based surrogate model to rank offspring in expensive optimization problems. The results are rigorously backed by numerical experiments on standard continuous benchmarks (LZG, DTLZ), demonstrating that the fine-tuned model outperforms both traditional surrogate models and prompted frontier LLMs (GPT-4o) while running efficiently via quantization. The key insight is to cast surrogate evaluation as an in-context pairwise relation reasoning task, utilizing an anchor-based iterative prompt strategy to reduce $O(N^2)$ comparisons to $O(N)$ before aggregating them via voting. This is highly relevant for LLM evolutionary search; the team can adapt the GRPO relation-training pipeline and anchor-based voting mechanism to improve candidate evaluation and sample efficiency when evolving algorithms or heuristics.
-
-### [Solver-in-the-Loop: MDP-Based Benchmarks for Self-Correction and Behavioral Rationality in Operations Research](https://arxiv.org/abs/2601.21008)
-
-**2026-02-08** | Massachusetts Institute of Technology, Alibaba Group | M=9 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Domain-specific Group Relative Policy Optimization (GRPO) with composite reward and three-stage curriculum learning | *LLM role:* agent_for_debugging_and_decision_making
-
-> Ao et al. introduce a framework for iterative OR model debugging that trains an 8B model using Group Relative Policy Optimization (GRPO) and a Process Reward Model (PRM) to outperform GPT-4o-mini. They utilize Gurobi's Irreducible Infeasible Subsystem (IIS) not just as text feedback, but as a dense reward signal (IIS size reduction) for the PRM, achieving a 95.3% recovery rate versus 86.2% for frontier APIs. **Key Takeaway:** We should steal their PRM construction method—specifically using solver diagnostics (like IIS reduction or compiler error counts) as dense step-level rewards—and their 'faithfulness penalty' to prevent overfitting in our evolutionary search. This is a direct validation of RLVR (Reinforcement Learning with Verifiable Rewards) for OR, proving it superior to large-scale prompting.
-
-### [ConstraintLLM: A Neuro-Symbolic Framework for Industrial-Level Constraint Programming](https://arxiv.org/abs/2510.05774)
-
-**2025-10-07** | University of Oxford, University of Chinese Academy of Sciences, Hangzhou Institute for Advanced Study, ISCAS, University of Science and Technology Beijing | M=7 P=8 I=7 **MUST-READ** *discuss*
-
-*Method:* Neuro-Symbolic Framework integrating Multi-Instruction Supervised Fine-Tuning (SFT) of an open-source LLM, Constraint-Aware Retrieval Module (CARM), Tree-of-Thoughts (ToT) exploration, and Iterative Self-Correction with Guided Retrieval. | *LLM role:* code_writer
-
-> ConstraintLLM fine-tunes a 32B model for Constraint Programming (CP) modeling, utilizing a "Constraint-Aware Retrieval Module" (CARM) that retrieves few-shot examples based on extracted constraint signatures (e.g., `AllDifferent`, `Cumulative`) rather than text embeddings. They also employ a Tree-of-Thoughts search pruned by test case execution and an iterative self-correction mechanism that retrieves "correction paths" (error-to-fix trajectories). Results are strong: on their new industrial benchmark (IndusCP), they achieve ~51% accuracy with a 32B model, matching or beating GPT-4o and DeepSeek-V3. **Key Takeaway:** The shift from semantic retrieval to *structural* retrieval (matching constraint profiles) is the "stealable" insight; we should implement this for our OR modeling tasks immediately, ignoring surface-level problem descriptions in favor of logical signatures. This directly impacts our OR-Bench and automated formulation work.
-
-### [SAC-Opt: Semantic Anchors for Iterative Correction in Optimization Modeling](https://arxiv.org/abs/2510.05115)
-
-**2025-09-28** | Huawei Noah’s Ark Lab, Huawei’s Supply Chain Management Department, City University of Hong Kong | M=7 P=8 I=6 *discuss*
-
-*Method:* Backward-guided iterative semantic alignment and correction using LLM agents | *LLM role:* code_writer, evaluator, decomposition_guide
-
-> SAC-Opt introduces a verification loop where generated Gurobi code is back-translated into natural language ('semantic anchors') to check for alignment with the original problem description. Empirical results are strong, demonstrating a ~22% accuracy improvement on the ComplexLP dataset over OptiMUS-0.3 by catching logic errors that solver feedback misses. The primary takeaway is the utility of granular, constraint-level back-translation as a process reward signal, which we should adopt to improve the reliability of our automated modeling agents.
-
-### [Automated Constraint Specification for Job Scheduling by Regulating Generative Model with Domain-Specific Representation](https://arxiv.org/abs/2510.02679)
-
-**2025-10-03** | Peking University, The Hong Kong University of Science and Technology, Huazhong University of Science and Technology, University of Science and Technology of China | M=7 P=6 I=7 *discuss*
-
-*Method:* Constraint-centric architecture regulating LLMs with Domain-Specific Languages (DSLs) and an automated DSL adaptation algorithm | *LLM role:* constraint_generator
-
-> This paper proposes a constraint-centric architecture that translates natural language manufacturing descriptions into Job Shop Scheduling (JSP) constraints by mediating through a learned Domain-Specific Language (DSL). Unlike standard prompting, they implement an automated DSL adaptation algorithm using non-parametric modeling (DPMM) and Expectation-Maximization to learn the syntax and semantics of the intermediate representation from data, which is then verified via a Pushdown Automaton. While the experiments rely on synthetic data augmented from standard benchmarks (a weakness), the methodology for **automatically deriving the intermediate representation** rather than hand-coding it is a transferable insight. We could steal this 'automated DSL design' approach to dynamically construct search spaces for AlgoEvo or to improve the robustness of NL-to-OR translation in OR-Bench.
-
-### [LinearizeLLM: An Agent-Based Framework for LLM-Driven Exact Linear Reformulation of Nonlinear Optimization Problems](https://arxiv.org/abs/2510.15969)
-
-**2025-10-12** | Karlsruhe Institute of Technology, Reutlingen University | M=7 P=8 I=7 *discuss*
-
-*Method:* Agent-based LLM framework with specialized reformulation agents and a depth-based processing policy | *LLM role:* decomposition_guide, reformulation_expert
-
-> LinearizeLLM is a multi-agent framework that converts LaTeX nonlinear optimization problems into exact MILP formulations by detecting nonlinear terms and processing them bottom-up based on nesting depth. On 40 benchmark instances, it achieves 73% end-to-end success compared to <15% for one-shot LLMs and Pyomo baselines, demonstrating that structural decomposition is essential for handling complex nested terms. The key takeaway is the 'Structural Policy': rather than letting the LLM plan the reformulation order, they enforce a deterministic bottom-up traversal (linearizing children before parents). We should steal this hybrid approach—using deterministic graph traversal to orchestrate LLM manipulation steps—to improve reliability in our symbolic modeling and EvoCut pipelines.
-
-### [Fine-tuning Large Language Model for Automated Algorithm Design](https://arxiv.org/abs/2507.10614)
-
-**2025-07-13** | City University of Hong Kong | M=7 P=10 I=8 **MUST-READ** *discuss*
-
-*Method:* Direct Preference Optimization (DPO) with Diversity-Aware Rank-based (DAR) Sampling for LLM fine-tuning | *LLM role:* code_writer
-
-> Liu et al. introduce a fine-tuning pipeline for LLMs in automated algorithm design, utilizing a 'Diversity-Aware Rank-based' sampling strategy to construct DPO preference pairs from evolutionary search histories. By partitioning the population into ranked subsets and sampling pairs with a guaranteed quality gap (skipping adjacent tiers), they ensure training signals are both clear and diverse. Empirically, they show that a fine-tuned Llama-3.2-1B matches the performance of a base Llama-3.1-8B on ASP and CVRP tasks, effectively compressing the search capability into a much cheaper model. We should implement this sampling strategy to recycle our AlgoEvo run logs into specialized 'mutator' models, potentially allowing us to downscale to 1B/3B models for the inner search loop without losing quality.
-
-### [EquivaMap: Leveraging LLMs for Automatic Equivalence Checking of Optimization Formulations](https://arxiv.org/abs/2502.14760)
-
-**2025-02-20** | Stanford University, The University of Texas at Austin | M=7 P=9 I=7 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* LLM-based discovery of linear mapping functions between decision variables, followed by MILP solver-based verification of feasibility and optimality | *LLM role:* heuristic_generator
-
-> Zhai et al. propose EquivaMap, a framework that evaluates whether two MILP formulations are equivalent by using an LLM to discover a linear mapping between their decision variables, which is then rigorously verified by a solver. Unlike 'execution accuracy' (which fails on unit scaling) or 'canonical accuracy' (which fails on variable permutation), they achieve 100% accuracy on a new dataset of equivalent formulations including cuts and slack variables. The core insight is replacing output comparison with a 'propose-mapping-and-verify' loop, effectively using the LLM to construct a proof of equivalence. We must adopt this methodology for the OR-Bench evaluation pipeline immediately, as it eliminates the false negatives currently plaguing our generation benchmarks.
-
-### [AutoOR: Scalably Post-training LLMs to Autoformalize Operations Research Problems](https://arxiv.org/abs/2604.16804)
-
-**2026-04-18** | X, University of Oxford | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Reinforcement learning (GRPO) with scalable synthetic data generation and LoRA adapters | *LLM role:* code_writer
-
-> AutoOR trains an 8B LLM to autoformalize linear, mixed-integer, and non-linear optimization problems using a scalable backtranslation data generation pipeline and GRPO with solver-execution rewards. The results are strongly backed by empirical evidence, showing the 8B model outperforming Gemini 2.5 Pro and matching Gemini 3 Pro across 9 benchmarks, including a leap from near 0% to 48.98% on a hard non-linear pump network task. The key insight is the backtranslation pipeline: by instantiating standard OR forms to guarantee ground-truth code and then generating natural language descriptions, the authors bypass the hard problem of verifying code generated from ambiguous text. Furthermore, their curriculum RL strategy—temporarily providing solver syntax as privileged information—successfully breaks the cold-start barrier in hard non-linear domains. This is a must-read for work in OR benchmarking and LLM reasoning evaluation, as the data generation and solver-in-the-loop RL techniques directly address the scalability and verification bottlenecks in symbolic OR modeling.
-
-### [Agentic MIP Research: Accelerated Constraint Handler Generation](https://arxiv.org/abs/2605.09186)
-
-**2026-05-09** | Zuse Institute Berlin, Technische Universität Berlin | M=8 P=8 I=8 **MUST-READ** *discuss*
-
-*Method:* Agentic framework for generating, verifying, and evaluating SCIP constraint handlers using LLM agents, solver-aware harness, and in-context learning. | *LLM role:* research_agent
-
-> Xu et al. propose an LLM agentic framework that autonomously generates, verifies, and tunes propagation-only constraint handlers for the SCIP MIP solver. Backed by rigorous numbers on MIPLIB 2017, the zero-shot exploration mode discovered five novel constraint patterns that solved five previously unsolved instances, a significant achievement given the maturity of SCIP. The key insight is their use of 'synthetic verification via reverse sampling'—generating synthetic MIP instances with known global constraints to cheaply verify the LLM's detector and propagator logic before running expensive full-scale solver evaluations. This is highly relevant to our work in LLM evolutionary search and automated algorithm design for integer programming, offering a concrete architectural pattern to improve sample efficiency and intermediate reward signaling.
-
-### [CO-Bench: Benchmarking Language Model Agents in Algorithm Search for Combinatorial Optimization](https://arxiv.org/abs/2504.04310)
-
-**2025-04-06** | Carnegie Mellon University | M=4 P=9 I=7 **MUST-READ** *discuss*
-
-*Method:* LLM-based algorithm search using agentic frameworks with iterative refinement and evolutionary search | *LLM role:* evolutionary_search
-
-> Sun et al. introduce CO-Bench, a suite of 36 diverse combinatorial optimization problems (packing, scheduling, routing) designed specifically to benchmark LLM agents in generating algorithms (code), not just solutions. They evaluate 9 frameworks (including FunSearch, ReEvo, AIDE), finding that FunSearch combined with reasoning models (o3-mini) yields the most robust performance, though agents still struggle significantly with strict feasibility constraints (valid solution rates often <60%). **Takeaway:** We should immediately integrate CO-Bench into our pipeline to benchmark AlgoEvo against ReEvo and FunSearch; this saves us months of data curation and provides a standardized metric to prove our method's superiority.
-
-### [Generalists vs. Specialists: Evaluating LLMs on Highly-Constrained Biophysical Sequence Optimization Tasks](https://arxiv.org/abs/2410.22296)
-
-**2024-10-29** | Genentech, New York University | M=8 P=6 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* LLOME (Language Model Optimization with Margin Expectation) bilevel optimization with Margin-Aligned Expectation (MargE) loss | *LLM role:* optimization_driver
-
-> The authors propose LLOME, a bilevel optimization framework that fine-tunes an LLM using 'MargE' (Margin-Aligned Expectation), a loss function that weights gradient updates by the magnitude of reward improvement (margin) rather than simple preference rankings. Results are rigorous and demonstrate that while DPO leads to generator collapse and infeasibility in constrained spaces, MargE maintains diversity and significantly improves sample efficiency, matching specialized solvers like LaMBO-2 on medium-difficulty tasks. The critical takeaway is that standard alignment methods (DPO/RLHF) are ill-suited for optimization because they discard information about *how much* better a solution is; MargE fixes this by satisfying the Strong Interpolation Criteria. We should immediately evaluate replacing the RL/update component in AlgoEvo with the MargE objective to improve the stability and quality of our evolved heuristics.
-
-### [RideAgent: An LLM-Enhanced Optimization Framework for Automated Taxi Fleet Operations](https://arxiv.org/abs/2505.06608)
-
-**2025-05-10** | Tsinghua University, McGill University, George Washington University, JD Intelligent Cities Research, Beijing Technology and Business University | M=7 P=6 I=7 *discuss*
-
-*Method:* LLM-guided variable fixing heuristic for Mixed-Integer Programming (MIP) with an embedded Random Forest (RF) objective, solved lexicographically | *LLM role:* objective_formulation
-
-> RideAgent employs an LLM to analyze a small set of historical optimal solutions, identifying and fixing 'low-sensitivity' decision variables to shrink the MIP search space before handing it to Gurobi. The results are empirically solid, showing a ~50% time reduction with <2.5% optimality gap, outperforming standard cutting plane baselines on NYC taxi data. **Key Takeaway:** We should adapt their 'Small-Sample Guided Optimization' strategy—specifically using LLMs to infer *variable fixing constraints* from elite archive solutions—to accelerate the inner solvers in our AlgoEvo and EvoCut pipelines. This offers a concrete, data-driven way to prune search spaces that complements our current evolutionary approaches.
-
-
-### Front 0 (12 papers) — STABLE
-
-**Density:** 0.11 | **Methods:** llm_code_generation, llm_in_the_loop, llm_as_evaluator, llm_iterative_refinement, llm_as_heuristic | **Problems:** optimization_modeling, milp_general, text_to_model_translation, constraint_programming_modeling, natural_language_for_optimization
-
-*Unique methods:* CP_SAT, agentic_model, ai_agents, anytime_algorithm, auction_algorithm, automatic_symbolic_dualization, callbacks, canonical_graph_edit_distance, canonical_intermediate_representation, canonicalization, closed_loop_control, cross_encoder_reranking, error_analysis, evaluation_framework, expert_prompting, formal_verification, function_calling, global_constraints, graph_edit_distance, hierarchical_chunking, indicator_variables, intent_classification, llm_evaluation, makespan_minimization, metacognition, metadata_augmented_indexing, milp_general, multi_agent_coordination, multi_robot_task_allocation, multi_turn_feedback, multimodal_ai, multimodal_llm, piecewise_linear_constraints, probabilistic_guarantee, progressive_specialization_training, reward_design, segment_weighted_grpo, self_reflective_error_correction, sifting, simulation_environment, special_ordered_sets, structure_detection, structured_output_parsing, symbolic_planning, textgrad, tool_use_agents, two_stage_retrieval, uncertainty_estimation, utpc_framework, virtual_reinforcement_learning
-*Shared methods:* chain_of_thought, constraint_programming, contrastive_learning, data_cleaning, debugging, direct_preference_optimization, grpo, gurobi, in_context_learning, linear_programming, llm_as_evaluator, llm_as_heuristic, llm_code_generation, llm_fine_tuned, llm_in_the_loop, llm_iterative_refinement, llm_prompt_optimization, majority_voting, mixed_integer_linear_programming, multi_agent_llm, multi_agent_llm_system, multi_agent_system, neurosymbolic_ai, program_synthesis, reinforcement_learning, retrieval_augmented_generation, self_consistency, supervised_fine_tuning, supervised_learning, tool_use
-
-This research front focuses on advancing Large Language Models (LLMs) for symbolic optimization modeling and code generation from natural language. Central to this theme are frameworks like OptiMUS, SAGE (utilizing Segment-Weighted GRPO), GALA, and the Canonical Intermediate Representation (CIR), which aim to improve the accuracy, reliability, and interpretability of LLM-generated optimization artifacts. The problems addressed span Mixed-Integer Linear Programming (MILP) formulation, constraint programming, and even specialized tasks like primal-to-dual conversion, moving beyond simple code synthesis to deeper semantic understanding and structured output.
-
-Key contributions include the SAGE framework's significant improvement of +7.6% average pass@1 on OR benchmarks by explicitly modeling strategy, and CHORUS's +147.9% accuracy boost for LP code generation using metadata-augmented RAG. OptiMUS-0.3 sets a new state-of-the-art for MILP formulation, outperforming GPT-4o by ~40% on the NLP4LP benchmark through a modular agentic design. The DUALSCHOOL framework introduced Canonical Graph Edit Distance (CGED) for robust structural verification, revealing LLMs' frequent failures in primal-to-dual conversion. Crucially, papers like CP-SynC-XL identified the "heuristic trap" where efficiency-oriented prompting degrades correctness, while OptiMind rigorously audited and cleaned existing benchmarks, improving accuracy by ~20% with expert-written hints. The OptiVerse benchmark and its Dual-View Auditor Agent further push the boundaries of robust LLM evaluation, and VisionCreator's Virtual Reinforcement Learning (VRL) paradigm offers a path to train agentic planning policies efficiently.
-
-This front is maturing, characterized by a strong emphasis on robustness, verifiability, and the integration of structured representations to guide LLM reasoning. The trajectory indicates a shift from generic LLM prompting to highly specialized, neurosymbolic architectures that leverage formal methods and domain expertise. Future work will likely focus on scaling these structured approaches to more complex, real-world optimization paradigms, enhancing certifiability and interpretability, and developing more efficient training and evaluation methodologies, potentially through advanced simulation and self-correction mechanisms. The next papers will likely explore adaptive, multi-agent systems that can dynamically select and refine modeling strategies based on problem characteristics and computational profiles.
+This front is rapidly emerging and maturing, characterized by a shift from basic LLM prompting to highly engineered, multi-agent, and memory-augmented systems. The focus is increasingly on reliability, verification, and scalability, as evidenced by rigorous benchmarking (e.g., OptiMind's benchmark audit, AutoRO-Bench) and advanced training techniques (AutoOR's backtranslation and curriculum RL). The next wave of papers will likely concentrate on integrating these sophisticated LLM agents with real-time data, developing more robust self-correction mechanisms for non-linear and stochastic problems, and exploring online learning for dynamic memory evolution, pushing towards fully autonomous OR problem-solving pipelines.
 
 **Papers:**
-
-### [Gala: Global LLM Agents for Text-to-Model Translation](https://arxiv.org/abs/2509.08970)
-
-**2025-09-10** | University of Southern California, Brown University, Fidelity Investments | M=5 P=8 I=6 *discuss*
-
-*Method:* Multi-agent LLM framework for global constraint detection and assembly | *LLM role:* code_writer
-
-> GALA decomposes text-to-MiniZinc translation into a multi-agent system where specialized agents detect specific Constraint Programming global constraints (e.g., all_different, cumulative) before an assembler unifies them. Results on 110 TEXT2ZINC instances show a modest improvement over CoT (57% vs 52% execution rate with o3-mini), though the sample size is small and lacks statistical rigor. The key takeaway is the architectural shift from generic 'coder/reviewer' roles to 'primitive-specific' agents, which aligns LLM reasoning with the target formalism's structure. We should test this 'primitive-based decomposition' in our OR-Bench pipeline to see if it reduces hallucination of complex constraints better than our current methods.
-
-### [Strategy-Aware Optimization Modeling with Reasoning LLMs](https://arxiv.org/abs/2605.02545)
-
-**2026-05-04** | Beihang University, JIUTIAN Research | M=8 P=8 I=8 **MUST-READ** *discuss*
-
-*Method:* Supervised Fine-Tuning followed by Segment-Weighted Group Relative Policy Optimization (GRPO) | *LLM role:* reasoning_guide
-
-> SAGE is a framework for automated optimization modeling that explicitly separates high-level modeling strategy from concrete formulation, training an LLM via supervised fine-tuning and Segment-Weighted GRPO with solver feedback. The results are backed by strong empirical evidence, improving average pass@1 from 72.7% to 80.3% over the strongest open-source baseline across eight OR benchmarks, while also producing more compact, solver-efficient constraint systems. The key insight is the use of Segment-Weighted GRPO, which assigns higher optimization weights to early, high-level strategic reasoning tokens than to later surface-level tokens, effectively mitigating the credit assignment problem in long-horizon reasoning. This is highly relevant for our work in symbolic OR modeling and RL-infused LLM search; the segment-weighted RL approach and efficiency-aware composite reward are concrete techniques we should adapt for our process reward models.
-
-### [Foundation Models for Logistics: Toward Certifiable, Conversational Planning Interfaces](https://arxiv.org/abs/2507.11352)
-
-**2026-01-30** | Neurosymbolic Intelligence, The University of Texas at Austin, University of Colorado Boulder | M=6 P=5 I=7 *discuss*
-
-*Method:* Neurosymbolic Vision-Language Logistics (VLL) agent with uncertainty-aware intent-verification loop, using latent space learning, probabilistic guarantees, DPO, and TextGrad for refinement. | *LLM role:* goal_interpreter_and_refiner
-
-> Yang et al. introduce a neurosymbolic agent that translates natural language into PDDL goals, using a learned latent space to estimate 'intent uncertainty' (distance to class centroids) which gates downstream execution. They use this uncertainty signal to drive both Direct Preference Optimization (DPO) and prompt optimization (TextGrad), achieving higher accuracy than GPT-5 on a lightweight model. **Takeaway:** The concept of deriving a 'probabilistic guarantee' from latent embeddings to serve as a cheap proxy reward or filter is a concrete technique we should test in AlgoEvo to reduce expensive evaluations. However, be skeptical of the topline results as they rely on a simplistic 3-class classification task rather than complex reasoning.
 
 ### [DualSchool: How Reliable are LLMs for Optimization Education?](https://arxiv.org/abs/2505.21775)
 
@@ -862,22 +838,6 @@ This front is maturing, characterized by a strong emphasis on robustness, verifi
 *Method:* DUALSCHOOL framework for generating and verifying P2DC instances using Canonical Graph Edit Distance (CGED) | *LLM role:* problem_solver
 
 > This paper evaluates LLMs on Primal-to-Dual Conversion (P2DC), introducing a 'Canonical Graph Edit Distance' (CGED) to verify structural correctness while ignoring benign differences like variable ordering or slack conventions. Results show that even strong LLMs often fail (<50% accuracy) and, crucially, that standard execution-based evaluation (checking objective values) produces frequent false positives by missing errors in redundant constraints. The primary takeaway for us is the CGED methodology: a robust way to score symbolic OR model generation that captures structural validity better than execution alone, which we could steal for our benchmarking and evolutionary search fitness functions.
-
-### [OptiMind: Teaching LLMs to Think Like Optimization Experts](https://arxiv.org/abs/2509.22979)
-
-**2025-09-26** | Microsoft Research, Stanford University, University of Washington | M=5 P=9 I=7 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* Supervised fine-tuning (SFT) of a 20B-parameter LLM (GPT-OSS-20B variant) on a semi-automatically cleaned, class-specific error-analyzed training dataset, combined with error-aware prompting and multi-turn self-correction at inference. | *LLM role:* code_writer
-
-> The authors fine-tune a 20B model for MILP formulation, but the critical contribution is a rigorous audit of standard benchmarks (IndustryOR, OptMATH), revealing that 30-50% of instances are flawed (missing data, wrong ground truth, infeasible). They introduce a 'class-based error analysis' where the model classifies a problem (e.g., TSP) and retrieves specific, expert-written hints to avoid common pitfalls, boosting accuracy by ~20%. **Takeaway:** We must immediately replace our benchmark versions with their cleaned sets for the OR-Bench project. Additionally, their library of 'error hints' per problem class is a high-value artifact we can scrape and inject into AlgoEvo's prompt templates to improve initial population quality.
-
-### [Formalize, Don't Optimize: The Heuristic Trap in LLM-Generated Combinatorial Solvers](https://arxiv.org/abs/2605.12421)
-
-**2026-05-12** | Google DeepMind, University of Pennsylvania, University of Toronto, Oracle AI | M=6 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
-
-*Method:* LLM-driven program synthesis for combinatorial solvers (Python, Python + OR-Tools API, MiniZinc) | *LLM role:* code_writer
-
-> Wang et al. evaluate frontier LLMs on a new 4,577-instance combinatorial optimization benchmark to compare solver-generation paradigms (Python, Python+OR-Tools, MiniZinc) and the impact of efficiency-oriented prompting. The results, backed by rigorous instance-level evaluation, demonstrate that LLMs achieve the highest correctness using the Python+OR-Tools API, whereas native Python suffers from high rates of silent failures. The key insight is the identification of the 'heuristic trap': prompting LLMs to optimize search zero-shot yields minimal speedups but sharply degrades correctness by injecting unverified bounds, local approximations, or overcomplicated constraints. This is highly relevant to our work in OR benchmarking and LLM evolutionary search. Specifically, the six documented failure modes provide a precise taxonomy of errors that our process reward models and evolutionary evaluators must be explicitly designed to detect and penalize.
 
 ### [CHORUS: Zero-shot Hierarchical Retrieval and Orchestration for Generating Linear Programming Code](https://arxiv.org/abs/2505.01485)
 
@@ -895,37 +855,77 @@ This front is maturing, characterized by a strong emphasis on robustness, verifi
 
 > OptiMUS-0.3 is a modular multi-agent system that translates natural language into Gurobi code, utilizing a 'connection graph' to manage variable-constraint relationships in long contexts and specialized agents to detect solver-specific structures (SOS, indicators) or implement sifting. The results are rigorous, introducing a new hard benchmark (NLP4LP) where they outperform GPT-4o by ~40% and beat Chain-of-Experts. The most stealable insight is the 'Structure Detection Agent': instead of relying on the LLM to write generic constraints, we should explicitly prompt for and map high-level structures to efficient solver APIs (like SOS constraints) to improve performance in our EvoCut and AlgoEvo pipelines. This is a necessary read for the OR-Bench team.
 
-### [FLEET: Formal Language-Grounded Scheduling for Heterogeneous Robot Teams](https://arxiv.org/abs/2510.07417)
+### [Dual-Cluster Memory Agent: Resolving Multi-Paradigm Ambiguity in Optimization Problem Solving](https://arxiv.org/abs/2604.20183)
 
-**2025-10-08** | JHU APL, JHU, DEVCOM ARL | M=5 P=7 I=6 *discuss*
+**2026-04-22** | Xi’an Jiaotong University, Ministry of Education Key Laboratory of Intelligent Networks and Network Security, Shaanxi Province Key Laboratory of Big Data Knowledge Engineering | M=7 P=8 I=8 **MUST-READ** *discuss*
 
-*Method:* Hybrid generative–formal framework combining LLM-based task decomposition and fitness estimation with Mixed-Integer Linear Programming (MILP) for makespan minimization. | *LLM role:* decomposition_guide
+*Method:* Dual-Cluster Memory Agent (DCM-Agent) with Dual-Cluster Memory Construction and Memory-Augmented Inference | *LLM role:* knowledge_synthesizer_code_generator_verifier
 
-> FLEET implements a hybrid pipeline where an LLM extracts a task dependency graph and a 'fitness matrix' (capability scores) from natural language, which then populate a standard MILP for multi-robot scheduling. Results on the PARTNR benchmark show it outperforms pure LLM planners (SMART-LLM) by ~7% on heterogeneous tasks, though overall gains are modest. The actionable takeaway is the **fitness matrix extraction**: using the LLM to generate dense cost coefficients ($c_{ij}$) for the optimization model rather than just binary constraints. We should adopt this technique for handling soft semantic preferences in our heterogeneous VRP formulations.
+> This paper introduces a training-free Dual-Cluster Memory Agent that resolves multi-paradigm ambiguity in optimization modeling by decoupling abstract mathematical modeling from concrete coding implementation into separate memory clusters linked by a bipartite graph. The results are backed by strong empirical evidence, showing 11-21% average accuracy improvements across 7 OR benchmarks (including OptiBench and NLP4LP) over baselines like OptiMUS and OptiTree, while reducing inference time compared to heavy tree-search methods. The key insight is the structured extraction of 'Pitfalls' from persistent failures and the resulting 'knowledge inheritance'—using a large model to build a high-quality bipartite memory graph allows smaller, cheaper models to achieve SOTA performance during inference. This is highly relevant for our work in symbolic OR modeling and multi-agent memory architectures, as the decoupled memory structure and failure-driven pitfall extraction could directly improve our agentic modeling workflows and LLM reasoning evaluation.
 
-### [VisionCreator: A Native Visual-Generation Agentic Model with Understanding, Thinking, Planning and Creation](https://arxiv.org/abs/2603.02681)
+### [LLM-Enhanced Multi-Agent Reinforcement Learning with Expert Workflow for Real-Time P2P Energy Trading](https://arxiv.org/abs/2507.14995)
 
-**2026-03-03** | Tencent Hunyuan, Hong Kong University of Science and Technology | M=8 P=2 I=9 **MUST-READ** *changes-thinking* *discuss*
+**2025-07-20** | China Agricultural University, University of Glasgow, Guangdong University of Foreign Studies | M=7 P=6 I=7 *discuss*
 
-*Method:* Native visual-generation agentic model (VisionCreator) unifying Understanding, Thinking, Planning, and Creation (UTPC) capabilities, optimized via Progressive Specialization Training (PST) and Virtual Reinforcement Learning (VRL) with LtrReward in VisGenEnv. | *LLM role:* agentic_model
+*Method:* LLM-Enhanced Multi-Agent Reinforcement Learning (MARL) with CTDE-based imitative expert MARL algorithm, using a differential multi-head attention-based critic network and Wasserstein metric for imitation | *LLM role:* heuristic_generator
 
-> This paper introduces VisionCreator, an agent trained via 'Virtual Reinforcement Learning' (VRL) where tool outputs and logic are simulated to train long-horizon planning policies without incurring expensive real-world execution costs. They employ a 'Plan-Driven Reward' model (combining LLM-based plan verification with rule-based execution checks) and prove theoretical bounds for the sim-to-real transfer, achieving performance superior to GPT-5 on visual tasks. **Key Takeaway:** We should steal the VRL architecture for AlgoEvo. By constructing a 'Virtual OR Environment' that simulates code validity and approximate heuristic performance, we can train our evolutionary search policies (RL-infused evolution) at a fraction of the current compute cost, bypassing the bottleneck of running full benchmarks during the search policy optimization phase.
+> This paper proposes a neurosymbolic MARL framework for P2P energy trading where LLMs generate CVXPY optimization models to act as 'experts' for RL agents to imitate via Wasserstein distance. They introduce a 'Differential Attention' mechanism in the critic that subtracts attention maps to filter noise, enabling scalability to 100 agents where standard baselines fail. **Takeaway:** We should steal the Differential Attention architecture for our multi-agent critics to handle irrelevant interactions in large-scale optimization. The workflow of using LLMs to write the *solver* (generating reliable synthetic data) rather than the *solution* is a transferable strategy for bootstrapping RL in our OR domains.
 
-### [OptiVerse: A Comprehensive Benchmark towards Optimization Problem Solving](https://arxiv.org/abs/2604.21510)
+### [Automated Constraint Specification for Job Scheduling by Regulating Generative Model with Domain-Specific Representation](https://arxiv.org/abs/2510.02679)
 
-**2026-04-23** | Xi'an Jiaotong University, Lenovo Research | M=6 P=8 I=7 **MUST-READ** *discuss*
+**2025-10-03** | Peking University, The Hong Kong University of Science and Technology, Huazhong University of Science and Technology, University of Science and Technology of China | M=7 P=6 I=7 *discuss*
 
-*Method:* Dual-View Auditor Agent (DVA-Agent) with Semantic Triangulation | *LLM role:* adversarial_evaluator
+*Method:* Constraint-centric architecture regulating LLMs with Domain-Specific Languages (DSLs) and an automated DSL adaptation algorithm | *LLM role:* constraint_generator
 
-> This paper introduces OptiVerse, a 1,000-problem benchmark spanning six optimization domains (including stochastic and dynamic optimization) to evaluate LLM reasoning, alongside a Dual-View Auditor Agent that detects semantic modeling errors. Extensive evaluation of 22 LLMs shows severe performance degradation on hard problems (under 27% accuracy even for frontier models), while the proposed agent improves accuracy by 1.3-6.3% over baselines like OptiMUS. The key insight is the 'blind code abstraction' technique: forcing the LLM to reverse-engineer mathematical logic solely from its generated code without seeing the original prompt, which effectively mitigates the confirmation bias that plagues standard LLM self-correction. This is highly relevant for our OR benchmarking and evaluation work, as it represents a direct competitor/complement to our datasets. Furthermore, the blind abstraction trick is a highly transferable mechanism that could be adopted to improve the verification and reward modeling steps in our multi-agent optimization and LLM evolutionary search frameworks.
+> This paper proposes a constraint-centric architecture that translates natural language manufacturing descriptions into Job Shop Scheduling (JSP) constraints by mediating through a learned Domain-Specific Language (DSL). Unlike standard prompting, they implement an automated DSL adaptation algorithm using non-parametric modeling (DPMM) and Expectation-Maximization to learn the syntax and semantics of the intermediate representation from data, which is then verified via a Pushdown Automaton. While the experiments rely on synthetic data augmented from standard benchmarks (a weakness), the methodology for **automatically deriving the intermediate representation** rather than hand-coding it is a transferable insight. We could steal this 'automated DSL design' approach to dynamically construct search spaces for AlgoEvo or to improve the robustness of NL-to-OR translation in OR-Bench.
 
-### [Canonical Intermediate Representation for LLM-based optimization problem formulation and code generation](https://arxiv.org/abs/2602.02029)
+### [MIRROR: A Multi-Agent Framework with Iterative Adaptive Revision and Hierarchical Retrieval for Optimization Modeling in Operations Research](https://arxiv.org/abs/2602.03318)
 
-**2026-02-02** | The Hong Kong Polytechnic University, InfiX.ai | M=7 P=8 I=7 **MUST-READ** *discuss*
+**2026-02-03** | Xi'an Jiaotong University, Northwestern Polytechnical University | M=5 P=9 I=6 *discuss*
 
-*Method:* Multi-agent pipeline with Canonical Intermediate Representation (CIR) and Retrieval-Augmented Generation (RAG) | *LLM role:* Decomposition guide, paradigm selector, code writer, and verifier
+*Method:* Multi-Agent Framework with Iterative Adaptive Revision (IAR) and Hierarchical Retrieval-Augmented Generation (HRAG) | *LLM role:* code_writer, decomposition_guide, evaluator
 
-> Lyu et al. propose a 'Canonical Intermediate Representation' (CIR) to decouple natural language operational rules from their mathematical instantiation, explicitly forcing the LLM to select modeling paradigms (e.g., time-indexed vs. continuous flow) before coding. They achieve state-of-the-art accuracy (47.2% vs 22.4% baseline) on a new, complex benchmark (ORCOpt-Bench) by using a multi-agent pipeline that retrieves and adapts constraint templates. The key takeaway is the 'Mapper' agent's paradigm selection logic, which prevents common formulation errors in VRPs and scheduling; we should evaluate CIR as a structured mutation space for AlgoEvo to replace brittle code evolution. The new benchmark is immediately relevant for our OR-Bench evaluation suite.
+> MIRROR is a multi-agent framework that translates natural language OR problems into Gurobi code using Hierarchical RAG (metadata filtering + semantic search) and an iterative repair loop. It achieves ~72% pass@1 across five benchmarks, outperforming Chain-of-Experts and fine-tuned models like LLMOPT without task-specific training. The key takeaway is their **structured revision tip mechanism**: upon execution failure, the agent generates a JSON object explicitly isolating the `error_statement`, `incorrect_code_snippet`, and `correct_code_snippet`, which serves as a precise memory artifact for subsequent retries. This structured reflection pattern is superior to raw error logs and could be immediately adopted in our own code generation pipelines.
+
+### [Automated Reformulation of Robust Optimization via Memory-Augmented Large Language Models](https://arxiv.org/abs/2605.11813)
+
+**2026-05-12** | National University of Singapore, The University of Hong Kong, A*STAR | M=7 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Tuning-free memory-augmented framework (AutoREM) with Unit-level Experience (ULE), Structured Memory Operators (SMO), Dual-Check Commit (DCC), and Validation-Based Acceptance (VBA) | *LLM role:* reformulator, coder, reflector
+
+> This paper introduces AutoRO-Bench for evaluating LLM robust optimization reformulation and proposes AutoREM, a tuning-free memory-augmented LLM framework that uses offline adaptation to build a structured reformulation memory. The results are backed by strong empirical evidence, with AutoREM achieving 97.4% accuracy on in-distribution and 94.8% on out-of-distribution datasets, significantly outperforming baselines like ACE and ReasoningBank while using fewer tokens. The key insight is the offline memory adaptation pipeline—specifically the Dual-Check Commit (DCC) for mini-batch validation and Validation-Based Acceptance (VBA) for epoch-level rollbacks—which prevents the accumulation of harmful memory edits and ensures high-quality, reusable reasoning templates. This is highly relevant for our work in OR benchmarking and LLM evolutionary search, as the structured memory operators and validation gates offer a concrete blueprint for improving persistent memory and sample efficiency in self-improving LLM agents.
+
+### [OR-Agent: Bridging Evolutionary Search and Structured Research for Automated Algorithm Discovery](https://arxiv.org/abs/2602.13769)
+
+**2026-02-14** | Tongji University | M=9 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Multi-agent research framework with evolutionary-systematic ideation, tree-structured research workflow, and hierarchical optimization-inspired reflection system | *LLM role:* heuristic_generator, code_writer, evaluator, decomposition_guide, evolutionary_search, prompt_optimizer
+
+> OR-Agent replaces flat evolutionary loops with a tree-structured research workflow that prioritizes deep iterative refinement and debugging over broad population sampling. The results are compelling, showing a ~2x improvement in normalized scores over ReEvo and FunSearch across 12 OR benchmarks (TSP, CVRP, etc.). The single most actionable takeaway is the **Experiment Agent's environment probing**: instead of relying on scalar fitness, the agent writes custom callbacks to log intermediate states (e.g., 'lane change attempts' in SUMO), enabling genuine diagnosis of failure modes. We should immediately implement this 'instrumentation-via-code' pattern in our own evaluation pipelines to improve signal quality.
+
+### [OptiMind: Teaching LLMs to Think Like Optimization Experts](https://arxiv.org/abs/2509.22979)
+
+**2025-09-26** | Microsoft Research, Stanford University, University of Washington | M=5 P=9 I=7 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Supervised fine-tuning (SFT) of a 20B-parameter LLM (GPT-OSS-20B variant) on a semi-automatically cleaned, class-specific error-analyzed training dataset, combined with error-aware prompting and multi-turn self-correction at inference. | *LLM role:* code_writer
+
+> The authors fine-tune a 20B model for MILP formulation, but the critical contribution is a rigorous audit of standard benchmarks (IndustryOR, OptMATH), revealing that 30-50% of instances are flawed (missing data, wrong ground truth, infeasible). They introduce a 'class-based error analysis' where the model classifies a problem (e.g., TSP) and retrieves specific, expert-written hints to avoid common pitfalls, boosting accuracy by ~20%. **Takeaway:** We must immediately replace our benchmark versions with their cleaned sets for the OR-Bench project. Additionally, their library of 'error hints' per problem class is a high-value artifact we can scrape and inject into AlgoEvo's prompt templates to improve initial population quality.
+
+### [AutoOR: Scalably Post-training LLMs to Autoformalize Operations Research Problems](https://arxiv.org/abs/2604.16804)
+
+**2026-04-18** | X, University of Oxford | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Reinforcement learning (GRPO) with scalable synthetic data generation and LoRA adapters | *LLM role:* code_writer
+
+> AutoOR trains an 8B LLM to autoformalize linear, mixed-integer, and non-linear optimization problems using a scalable backtranslation data generation pipeline and GRPO with solver-execution rewards. The results are strongly backed by empirical evidence, showing the 8B model outperforming Gemini 2.5 Pro and matching Gemini 3 Pro across 9 benchmarks, including a leap from near 0% to 48.98% on a hard non-linear pump network task. The key insight is the backtranslation pipeline: by instantiating standard OR forms to guarantee ground-truth code and then generating natural language descriptions, the authors bypass the hard problem of verifying code generated from ambiguous text. Furthermore, their curriculum RL strategy—temporarily providing solver syntax as privileged information—successfully breaks the cold-start barrier in hard non-linear domains. This is a must-read for work in OR benchmarking and LLM reasoning evaluation, as the data generation and solver-in-the-loop RL techniques directly address the scalability and verification bottlenecks in symbolic OR modeling.
+
+### [Gala: Global LLM Agents for Text-to-Model Translation](https://arxiv.org/abs/2509.08970)
+
+**2025-09-10** | University of Southern California, Brown University, Fidelity Investments | M=5 P=8 I=6 *discuss*
+
+*Method:* Multi-agent LLM framework for global constraint detection and assembly | *LLM role:* code_writer
+
+> GALA decomposes text-to-MiniZinc translation into a multi-agent system where specialized agents detect specific Constraint Programming global constraints (e.g., all_different, cumulative) before an assembler unifies them. Results on 110 TEXT2ZINC instances show a modest improvement over CoT (57% vs 52% execution rate with o3-mini), though the sample size is small and lacks statistical rigor. The key takeaway is the architectural shift from generic 'coder/reviewer' roles to 'primitive-specific' agents, which aligns LLM reasoning with the target formalism's structure. We should test this 'primitive-based decomposition' in our OR-Bench pipeline to see if it reduces hallucination of complex constraints better than our current methods.
 
 
 
@@ -935,31 +935,31 @@ Papers connecting multiple research fronts:
 
 ### [OptiMUS-0.3: Using Large Language Models to Model and Solve Optimization Problems at Scale](https://arxiv.org/abs/2407.19633)
 
-**TRUE SYNTHESIS** | score=0.96 | Front 0 → Front 1, Front 2
+**TRUE SYNTHESIS** | score=0.96 | Front 1 → Front 0, Front 2
 
 > OptiMUS-0.3 is a modular multi-agent system that translates natural language into Gurobi code, utilizing a 'connection graph' to manage variable-constraint relationships in long contexts and specializ
 
 ### [Auto-Formulating Dynamic Programming Problems with Large Language Models](https://arxiv.org/abs/2507.11737)
 
-**TRUE SYNTHESIS** | score=0.81 | Front 2 → Front 1, Front 0
+**TRUE SYNTHESIS** | score=0.81 | Front 2 → Front 0, Front 1
 
 > Zhou et al. introduce DPLM, a 7B model fine-tuned to formulate Dynamic Programming models, achieving performance comparable to o1 on their new DP-Bench. Their key contribution is 'DualReflect,' a synt
 
 ### [Toward a Trustworthy Optimization Modeling Agent via Verifiable Synthetic Data Generation](https://arxiv.org/abs/2508.03117)
 
-**TRUE SYNTHESIS** | score=0.75 | Front 2 → Front 1, Front 0
+**TRUE SYNTHESIS** | score=0.75 | Front 2 → Front 0, Front 1
 
 > Lima et al. introduce a pipeline to generate synthetic optimization datasets by starting with symbolic MILP instances (ground truth) and using LLMs to generate natural language descriptions, ensuring 
 
 ### [Solver-in-the-Loop: MDP-Based Benchmarks for Self-Correction and Behavioral Rationality in Operations Research](https://arxiv.org/abs/2601.21008)
 
-**TRUE SYNTHESIS** | score=0.75 | Front 2 → Front 1
+**TRUE SYNTHESIS** | score=0.75 | Front 2 → Front 0
 
 > Ao et al. introduce a framework for iterative OR model debugging that trains an 8B model using Group Relative Policy Optimization (GRPO) and a Process Reward Model (PRM) to outperform GPT-4o-mini. The
 
 ### [CHORUS: Zero-shot Hierarchical Retrieval and Orchestration for Generating Linear Programming Code](https://arxiv.org/abs/2505.01485)
 
-**TRUE SYNTHESIS** | score=0.75 | Front 0 → Front 1, Front 2
+**TRUE SYNTHESIS** | score=0.75 | Front 1 → Front 0, Front 2
 
 > CHORUS introduces a RAG framework for generating Gurobi code that replaces standard code retrieval with a metadata-based approach, indexing code examples by generated keywords and summaries rather tha
 
