@@ -1,0 +1,1678 @@
+--- Page 1 ---
+dMX: Differentiable Mixed-Precision Assignment for
+Low-Precision Floating-Point Formats
+Giuseppe Franco ∗
+Ian Colbert
+Pablo Monteagudo-Lago
+Felix Marty
+Nicholas Fraser
+AMD
+Abstract
+Quantizing large language models (LLMs) to low-precision floating-point represen-
+tations is central to efficient deployment, yet applying a single bit-width uniformly
+across all layers is sub-optimal when considering the performance/accuracy trade-
+off. This work introduces dMX, a differentiable mixed-precision quantization
+framework for learnable floating-point bit-width assignment. In particular, we
+study its application for the microscaling floating-point (MXFP) family of data
+types defined by the Open Compute Project (OCP) standard. The per-layer bit-
+width assignment is formulated as a continuous optimization problem in which
+each layer’s floating-point format format is parameterized by a scalar parame-
+ter, folding the multi-variate design space into a single learnable offset. During
+training this offset takes continuous values, avoiding sudden oscillations between
+discrete quantization formats. A temperature-based annealing schedule progres-
+sively discretizes the learned offsets, ensuring that the final configuration maps to
+hardware-compatible MXFP formats without abrupt transitions between training
+and inference behavior. A target-aware regularization term steers the average
+bit-width toward a user-specified budget, serving as a coarse-grained proxy for
+inference cost and balancing model quality against deployment efficiency. We
+performed experiments on different families of LLMs, such as Llama, Qwen3, and
+SmolLM2, evaluating perplexity on WikiText-2 and accuracy on four zero-shot
+reasoning benchmarks. Across these settings, dMX consistently yields Pareto-
+dominating models and improves over Kullback-Leibler (KL) divergence-based
+layer-selection heuristics, efficiently navigating trade-offs between model quality
+and average bit-width.
+1
+Introduction
+Deploying large language models (LLMs) at scale demands substantial reductions in both memory
+footprint and computational cost, a challenge that grows with each new generation of model architec-
+tures. Quantization is one of the primary tools for achieving this goal: high-precision parameters
+are replaced with lower-precision representations while aiming to preserve model quality. Full
+quantization-aware training (QAT) can recover much of the lost accuracy in principle, but it remains
+prohibitively expensive for modern LLMs. This practical limitation has motivated the development
+of more expressive data types that can be used post-training [1, 2, 3].
+In this context, floating-point formats such as FP8, FP6, and FP4 offer greater dynamic range than
+integer formats at the same nominal bit-width [4]. Per-group scaling further improves granularity
+∗Correspondence to: giuseppe.franco@amd.com
+Preprint.
+arXiv:2606.04115v1  [cs.LG]  2 Jun 2026
+
+
+--- Page 2 ---
+Figure 1: Comparison of the quantization grids when using continuous values for mantissa and
+exponent bit-widths, compared to a discrete E2M1 configuration.
+relative to per-tensor or per-channel schemes [5], and dynamic activation quantization adapts to the
+statistics of each input at inference time. The microscaling (MX) standard published by the Open
+Compute Project (OCP) [6] formalizes a family of block-scaled floating-point formats (i.e., MXFP8,
+MXFP6, and MXFP4) that are now supported by recent accelerator architectures.
+Despite these advances, applying a single low-precision format uniformly across all layers still
+leads to substantial accuracy loss. Deploying MXFP4 throughout an entire network, for instance,
+often degrades model quality beyond acceptable thresholds [7, 8]. This limitation motivates mixed-
+precision quantization, in which different layers or operators receive different bit-widths so that
+the model can achieve a more favorable balance between accuracy and efficiency. This approach
+introduces its own challenge: the bit-width assignment across layers is a combinatorial optimization
+problem [9, 10], and estimating how quantization errors interact across layers is difficult [11, 12].
+Greedy methods typically evaluate the degradation caused by quantizing each layer in isolation [13],
+or they approximate cross-layer interactions only partially through local proxies of sensitivity [14, 11].
+Their decisions depend strongly on the chosen sensitivity metric and do not account for the nonlinear
+accumulation of quantization errors through the network.
+Gradient-based methods offer a global alternative [10, 15], as they optimize bit-width parameters
+jointly through backpropagation, thereby capturing cross-layer dependencies that greedy approaches
+miss. Learned bit-width representations have been studied primarily for integer quantization [15,
+16, 17]; comparatively little work has explored analogous ideas for floating-point formats. In the
+floating-point setting, optimization must contend with the structure of the data type itself, which
+involves exponent and mantissa bit-widths together with related quantities such as the exponent bias.
+Current hardware supports only a restricted set of format combinations, typically limited to (MX)FP8,
+(MX)FP6, and (MX)FP4, with predefined choices for special-value representation and exponent
+bias [6]. These constraints mean that the continuous search space must ultimately collapse to a small
+discrete set of admissible configurations, making both the parameterization of the search and the
+discretization mechanism central design decisions. Although a more thorough analysis of related
+works will be presented in Sec. 4, to the best of our knowledge, this is the first work that proposes a
+framework for a gradient-based bit-width allocation, focused on the MX format.
+This work introduces a gradient-based framework for learning per-layer floating-point bit-widths. An
+overview of the pipeline is shown in Figure 2. The main contributions are:
+• A differentiable bit-width parameterization for floating-point quantization that enables
+end-to-end gradient-based optimization of per-layer precision assignments.
+• A continuous representation of the floating-point format of the bit-width during calibration
+that produces smoother optimization landscapes compared to discrete alternatives based on
+rounding and straight-through estimators (STEs) [18].
+• A temperature-based annealing mechanism that progressively discretizes the learned bit-
+widths, ensuring convergence to hardware-compatible formats while minimizing the gap
+between calibration-time and inference-time model behavior.
+• Support for targeting specific hardware configurations through mixed-precision quantization
+for floating-point quantization. We focus our experiments on MXFP configurations, in
+particular on MXFP8/MXFP4 and MXFP6/MXFP4 format pairs.
+2
+
+
+--- Page 3 ---
+Layer
+1 learned β1
+Layer
+2 learned β2
+...
+Layer
+L learned βL
+Pre-trained LLM
+Layer 1
+β1
+Layer 2
+β2
+...
+Layer L
+βL
+Forward Pass
+(βi →
+ˆ
+βi)
+Task Loss
+Ltask
+βi Regularization
+R
+Gradient
+Temperature
+Update
+Annealing
+(∇β, ∇w)
+T ↑
+Mixed-Prec.
+MXFP
+LLM
+optimize βi per layer
+T : low→high
+ˆ
+βi = F (βi, T )
+No rounding;
+smooth formats
+Figure 2: Overview of the dMX pipeline. All blue elements highlight the main contributions of
+this work. The pre-trained LLM (left) contains a learned continuous offset βi for each layer i, which
+parameterizes the bit-width used in that layer. During the forward pass these offsets are mapped to
+discrete format assignments ˆβ = F(β, T). A task loss and a user-defined regularization term R on β
+jointly drive the gradient update (red loop), while a temperature annealing schedule progressively
+sharpens the mapping so that every βi converges to a hardware-compatible MXFP format (blue loop).
+• Compatibility with existing post-training quantization (PTQ) algorithms, enabling integra-
+tion with gradient-based weight optimization methods and rotation-based preprocessing
+techniques [19].
+2
+Methodology
+The proposed method rests on three observations. The first is that bit-widths need not be integer-
+valued during optimization. The quantization equations remain well defined when the bit-width is
+treated as a continuous quantity, and no mathematical constraint forces a discrete bit-width.
+The second observation follows directly: although continuous bit-widths are permissible during
+training, the final assignments must map to discrete, hardware-supported formats at deployment time.
+In the case of floating-point quantization, this mapping is more restrictive than in the integer setting.
+The MX format family supports only a specific set of configurations, each with a fixed partition of
+bits between exponent and mantissa [6].
+The third observation is that gradients can be propagated with respect to the bit-width in the same
+way as for any other learnable parameter, provided that the bit-width itself is stored as a floating-point
+variable. This idea has been applied successfully to integer bit-width learning [15, 16]; its extension
+to floating-point quantization remains largely unexplored.
+These observations give rise to three design challenges. The first is how to parameterize the floating-
+point representation so that all quantities entering the quantizer remain differentiable with respect
+to the bit-width. The second is how to ensure that the learned bit-widths converge to hardware-
+compatible values by the end of training. The third is how to constrain the bit-widths within
+user-defined boundaries. The following subsections address each challenge in turn.
+2.1
+Continuous floating-point bit-width parameterization
+The standard formulation of floating-point quantization represents a floating-point value as
+x(FP) = (−1)S × 2u−b ×
+ 
+1 +
+m
+X
+i=1
+Mi · 2−i
+!
+,
+(1)
+where S ∈{0, 1} is the sign bit, u is the unsigned exponent with 0 ≤u < 2e, b = 2e−1 −1
+is the exponent bias, e and m denote the number of exponent and mantissa bits respectively, and
+Mi ∈{0, 1} is the i-th mantissa bit. This formulation is adjusted accordingly in case of subnormal
+values. The representable range of this format is bounded by
+q(FP)
+max = (2 −2−m) · 2 2e−b−1,
+q(FP)
+min = −q(FP)
+max .
+(2)
+3
+
+
+--- Page 4 ---
+Given a tensor X with elements x ∈X and a coarse scale s = t / q(FP)
+max where t = max(|X|), each
+quantized element xq is obtained by scaling, rounding to the nearest representable value, and clipping:
+xq = clip
+
+ss
+x/s
+ss
+
+; q(FP)
+min , q(FP)
+max
+
+,
+(3)
+where ss is a fine-grained power-of-two scale derived from each element’s magnitude and ⌊·⌉denotes
+rounding to the nearest integer. For a fixed input x, the quantized output xq(e, m; x) is differentiable
+with respect to e and m when these quantities are treated as real-valued parameters, since the range
+bounds and bias vary continuously with them. The generalization of Eq. 3 to continuous values and
+the derivation of the bit-widths is provided in Appendix A, and an example on how the quantization
+grid changes when using continuous values is shown in Figure 1.
+Although exponent and mantissa bit-widths could in principle be learned independently, this might
+produce configurations incompatible with existing hardware. To avoid this, the format space is
+simplified by expressing each supported format relative to a shared baseline. The MXFP8, MXFP6,
+and MXFP4 representations correspond to E4M3, E2M3, and E2M1, respectively [6]; the E5M2
+configuration for MXFP8 is not considered here, as it is not typically used for the forward pass [20].
+We can define a generic MXFP(β) configuration as
+E(2+β)M(1+β),
+(4)
+where β is a learnable parameter. When β = 2, we obtain the MXFP8 configuration (i.e., E4M3),
+whilst β = 0 gives us the baseline MXFP4 configuration. During training, β may take any continuous
+value in [0, 2], permitting a smooth transition between configurations and making the optimization
+less sensitive to abrupt changes in the underlying representation. This can be applied in the context
+of MXFP8/MXFP4 mixed precision configuration, where both e and m are optimized, and for the
+MXFP6/MXFP4 configuration, where only m is optimized. Finally, tying weights and activations
+bit-widths reduces the problem to a single learnable scalar per layer.
+2.2
+Temperature-based annealing
+A continuous representation during training benefits optimization stability, but inference requires
+discrete bit-widths that map to hardware-supported formats. The central difficulty lies in managing
+this transition without introducing instabilities; at the same time, it is important to avoid discontinuities
+between training-time and inference-time behavior. A naive approach that applies a rounding operator
+with an STE [18] during each forward pass can cause individual layers to oscillate between MXFP4
+and MXFP8 throughout training. Such oscillations create abrupt changes in the loss landscape and
+generally lead to worse final performance, as the experiments in Section 3.1 confirm.
+To avoid these oscillations, we propose to smooth the bit-width offset through a temperature-regulated
+sigmoid function. The design goal is a mapping that behaves approximately as an identity early in
+training, allowing the optimizer to explore the continuous bit-width space freely, and that gradually
+sharpens into a step-like function toward the end, forcing convergence to one of the two discrete
+endpoints, matching more closely the inference-time behaviour. Our proposed formulation is:
+β = F(ˆβ, T) =
+2
+1 + e−T ·( ˆβ−0.5) ,
+(5)
+where β is the offset parameter used to define the final bit-width as indicated in Sec. 2.1, ˆβ is the raw
+learned offset, and T is a temperature coefficient that increases during training.
+When T is small, the sigmoid is nearly linear and the optimizer can adjust bit-widths with minimal
+restriction. As training proceeds, T increases and the function sharpens into a step centered at
+β = 1. Near the end of training, offsets below 1 are pushed toward β = 0 (MXFP4), while offsets
+above 1 are pushed toward β = 2 (MXFP8 or MXFP6, depending on the chosen format range).
+This annealing scheme ensures that the final precision assignments are compatible with the discrete
+formats supported by the target hardware, while the gradual transition avoids the abrupt format
+switches that characterize the rounding-based alternative.
+2.3
+Bit-width regularization
+Since higher precision generally reduces quantization error and quantization error may limit how
+much the model task loss (e.g., cross-entropy loss) can be minimised, a regularization term is required
+4
+
+
+--- Page 5 ---
+to balance model quality against inference efficiency. We consider two regularization strategies in
+this work: a simple scaling penalty and a target-aware penalty.
+Simple scaling penalty.
+The first strategy multiplies the current average bit-width by a constant
+factor λ:
+R∫= λ · ¯bcurrent.
+(6)
+This form has a straightforward interpretation, with higher values of λ leading to more aggressive
+quantization, and vice-versa. However, it provides only indirect control over the final model config-
+uration, since it is not possible to predict apriori how a given change in λ will affect the resulting
+bit-width allocation.
+Target-aware penalty.
+The second strategy steers optimization toward a specific target bit-width
+through the penalty
+Rt = max
+ 0, λ ·
+ ¯bcurrent −¯btarget
+
+,
+(7)
+where ¯bcurrent is the current average bit-width and ¯btarget is the desired target. When the current
+average lies below the target, the penalty vanishes and the bit-width is driven solely by the task
+loss. When the current average exceeds the target, the penalty grows in proportion to the gap,
+providing a direct incentive to reduce precision. This formulation offers finer control over the
+resulting configuration. A practical limitation arises when ¯bcurrent and ¯btarget are close: the penalty
+approaches zero and the gradient signal weakens, making precise convergence to the target dependent
+on the magnitude of λ.
+Other regularization options could be considered, based on the specific use-case (e.g., accounting
+for stricter memory or compute constraints); we leave this exploration for a future work, while we
+present the results of the two strategies presented above in Section 3.1.
+2.3.1
+Model-wise representative bit-width
+For both regularization losses, we employ a model-wise representative bit-width for the entire model,
+¯bcurrent, for which we propose two formulations.
+Simple average.
+The first computes a simple unweighted average of the per-layer bit-widths:
+¯bw = 1
+N
+N
+X
+i=1
+bw,i,
+¯ba = 1
+N
+N
+X
+i=1
+ba,i,
+¯bcurrent =
+¯bw + ¯ba
+2
+,
+(8)
+where bw,i and ba,i denote the weight and activation bit-widths of the i-th layer, and N is the total
+number of quantized layers.
+Weighted average.
+The second formulation uses a weighted average in which each layer’s con-
+tribution is proportional to the number of elements in its tensor. Larger layers dominate the overall
+model footprint, so weighting by size aligns the regularization penalty with actual memory cost:
+¯b wt
+w =
+PN
+i=1 nw,i · bw,i
+PN
+i=1 nw,i
+,
+¯b wt
+a =
+PN
+i=1 na,i · ba,i
+PN
+i=1 na,i
+,
+¯b wt
+current =
+¯b wt
+w + ¯b wt
+a
+2
+,
+(9)
+where nw,i and na,i denote the number of elements in the weight and activation tensors of the i-th
+layer, respectively. The choice between these two formulations affects how the precision budget is
+distributed: the simple average treats all layers equally, while the weighted average concentrates the
+penalty on layers with the largest parameter counts. We compare these approaches in Section 3.1.
+3
+Experimental Setting
+Experiments are conducted on three language models of comparable scale: Llama 3.2 1B [21],
+Qwen3 1.7B [22], and SmolLM2 1.7B [23]. The training infrastructure we use is similar to the one
+proposed in SpinQuant [19], but we optimize rotations and bit-widths jointly. The main difference,
+alongside all the modifications required to do learned bit-width assignment, is that the calibration uses
+3200 samples drawn from the FineWeb [24] dataset and processed with a batch size of 8, yielding 400
+5
+
+
+--- Page 6 ---
+optimization steps. This is a modest increase in training steps compared to the SpinQuant training
+setup, while still being considerably faster and more convenient than full QAT training.
+We evaluate our approach on perplexity computed on WikiText-2 [25], and accuracy averaged over
+four zero-shot reasoning benchmarks: ARC-Challenge and ARC-Easy [26], HellaSwag [27], and
+WinoGrande [28], measured with the LightEval framework [29]. We quantize all models using
+Brevitas [30].
+On the format side, MXFP8/MXFP4 and MXFP6/MXFP4 are evaluated as the two mixed-precision
+format configurations.
+We also examine several design choices through controlled ablations. Tensor-size-weighted and
+simple-average formulations of the bit-width regularization (Section 2.3) are compared, as are the
+two regularization objectives (simple scaling versus target-aware penalty). Finally, dMX is compared
+against a greedy heuristic for layer selection, in particular KL divergence-based pre-selected precision
+assignments. Finally, we compare dMX with a discretized variant that applies rounding with an STE
+during each forward pass (ROUND+STE). These results are presented in Appendix C. For all the
+experiments described so far, we use MXFP4 as starting configuration for all layers.
+As baseline, we consider identical quantization configuration (i.e., MXFP4, MXFP6, or MXFP8)
+uniformly across all layers. All baselines use the same calibration setup as the learned mixed-precision
+experiments; the only difference is that their bit-widths remain fixed throughout optimization.
+In all figures, each configuration is plotted against its average bit-width computed from the per-layer
+bit-widths of both weights and activations. Unless stated otherwise, average bit-width refers to the
+simple average across layers. Each point corresponds to a different target average bit-width ranging
+from 4.1 to 8.
+Hyper-parameter considerations.
+The proposed formulation introduces several hyper-parameters.
+The temperature schedule of Section 2.2 requires initial and final values for T, as well as a ramp
+profile. In all experiments, the schedule follows an exponential ramp. The initial and final values of
+T are chosen to approximate a near-linear mapping and a near-step function, respectively.
+A warm-up phase is also introduced: for a fixed fraction of calibration steps, denoted Tratio, the
+temperature remains constant so that the mapping stays approximately linear. After this phase, the
+exponential schedule begins and the bit-widths are progressively discretized. Experiments with
+different values of Tratio suggest that the method is fairly robust to this choice.
+Across several models, effective settings were found with relatively modest tuning effort. More
+careful hyper-parameter search may yield further improvements. We defer that exploration to future
+work. The details about the hyper-parameters for our experiments are detailed in Appendix B.
+3.1
+Main Results
+We first present the results associated to the MXFP8 and MXFP6 mixed precision configurations. In
+the following tables we compare against the float baseline, and the relevant MXFP configurations.
+For the sake of brevity, we only report results with target bit-width equal to 4.5, 5, 6, and 8 for
+MXFP8/MXFP4 mixed precision configuration, and 4.5, 5, and 6 for MXFP6/MXFP4 configurations.
+We present the plot with all the different target bit-widths in the Appendix C.
+Tables 1-2 show how even small increase in average bit-width can lead to consistent improvements in
+terms of both perplexity and zero-shot accuracy. Moreover, we are always able to closely match the
+desired target bit-width, with the main exception being the highest bit-width target; we believe this
+could be fixed with a more extensive hyper-parameter search (e.g., adjusting the learning rate).
+3.2
+Ablation Studies
+For the ablation studies, we present the plots with all the different target bit-widths to have a better
+understanding of the various comparisons.
+Regularization function comparison.
+Figure 3 compares the two regularization objectives de-
+scribed in Section 2.3. The target-aware penalty (Rt) produces a denser and more evenly distributed
+6
+
+
+--- Page 7 ---
+Table 1: We compare MXFP8/MXFP4 mixed precision versus three baselines: the base BF16 model,
+and quantization configurations where all layers are quantized to MXFP8 and MXFP4. When using
+dMX, we report four different target bit-widths, using the average bit-width across all layers.
+Model
+Type
+Average Bit-Width
+PPL
+Zero-Shot
+Llama 3.2 1B
+Float
+BF16
+8.94
+51.53
+MXFP4
+4.0
+11.68
+47.82
+MXFP8
+8.0
+9.15
+51.39
+dMX
+4.57
+11.02
+48.11
+5.11
+10.60
+49.27
+6.04
+9.83
+49.61
+8.0
+9.19
+51.46
+SmolLM2 1.7B
+Float
+BF16
+7.61
+59.52
+MXFP4
+4.0
+10.28
+53.42
+MXFP8
+8.0
+7.86
+58.69
+dMX
+4.53
+9.33
+54.41
+5.09
+8.92
+55.36
+6.06
+8.26
+57.28
+7.29
+7.96
+57.90
+Qwen3 1.7B
+Float
+BF16
+15.74
+54.12
+MXFP4
+4.0
+12.57
+51.15
+MXFP8
+8.0
+10.50
+54.08
+dMX
+4.53
+11.91
+52.20
+5.02
+11.58
+51.62
+5.90
+11.02
+53.74
+7.65
+10.47
+54.09
+Table 2: We compare MXFP6/MXFP4 mixed precision versus three baselines: the base BF16 model,
+and quantization configurations where all layers are quantized to MXFP6 and MXFP4. When using
+dMX, we report three different target bit-widths, using the average bit-width across all layers.
+Model
+Type
+Average Bit-Width
+PPL
+Zero-Shot
+Llama 3.2 1B
+Float
+BF16
+8.94
+51.53
+MXFP4
+4.0
+11.68
+47.82
+MXFP6
+6.0
+9.16
+51.39
+dMX
+4.52
+10.76
+49.43
+5.02
+10.02
+50.26
+5.98
+9.48
+50.86
+SmolLM2 1.7B
+Float
+BF16
+7.61
+59.52
+MXFP4
+4.0
+10.28
+53.42
+MXFP6
+6.0
+7.81
+58.18
+dMX
+4.52
+9.78
+56.40
+5.06
+8.50
+57.52
+5.54
+8.26
+58.25
+Qwen3 1.7B
+Float
+BF16
+15.74
+54.12
+MXFP4
+4.0
+12.57
+51.15
+MXFP6
+6.0
+10.67
+54.05
+dMX
+4.52
+11.53
+52.90
+5.03
+11.01
+54.14
+5.69
+10.64
+54.86
+set of operating points across the bit-width range, particularly for Llama 3.2 1B and SmolLM2 1.7B.
+The simple scaling penalty (Rs) tends to cluster configurations at the extremes of the bit-width range.
+As expected the target-aware formulation offers more predictable control over the final bit-width
+allocation, and the extra constraints on the target bit-width does not to negatively impact the training.
+For the rest of the experiments, we use the target-aware cost function, since it allows a better
+understanding of the transition between bit-width configurations.
+7
+
+
+--- Page 8 ---
+4
+5
+6
+7
+8
+9
+9.5
+10
+10.5
+11
+11.5
+12
+Avg Bit-Width
+Perplexity
+Llama-3.2-1B
+Target-aware penalty
+Simple scaling penalty
+Baseline
+4
+5
+6
+7
+8
+8
+8.5
+9
+9.5
+10
+10.5
+Avg Bit-Width
+SmolLM2-1.7B
+Target-aware penalty
+Simple scaling penalty
+Baseline
+4
+5
+6
+7
+8
+10.5
+11
+11.5
+12
+12.5
+Avg Bit-Width
+Qwen3-1.7B
+Target-aware penalty
+Simple scaling penalty
+Baseline
+4
+5
+6
+7
+8
+0.47
+0.48
+0.49
+0.5
+0.51
+0.52
+Avg Bit-Width
+Zero Shot
+Target-aware penalty
+Simple scaling penalty
+Baseline
+4
+5
+6
+7
+8
+0.53
+0.54
+0.55
+0.56
+0.57
+0.58
+0.59
+Avg Bit-Width
+Target-aware penalty
+Simple scaling penalty
+Baseline
+4
+5
+6
+7
+8
+0.51
+0.52
+0.53
+0.54
+0.55
+Avg Bit-Width
+Target-aware penalty
+Simple scaling penalty
+Baseline
+Figure 3: Comparison of the target-aware penalty and the simple scaling penalty for MXFP8–MXFP4
+mixed-precision quantization. Red: target-aware penalty (Rt). Cyan: simple scaling penalty (Rs).
+Black diamonds: homogeneous MXFP baselines. Top row: perplexity (lower is better). Bottom row:
+average zero-shot accuracy (higher is better). The target-aware penalty produces a smoother spread
+of operating points across the bit-width range.
+Cost function comparison.
+As described in Section 2.3, we investigate two cost function strategies,
+a simple average or a tensor-size-weighted average of the per-layer bit-widths. Under the weighted
+formulation, larger layers receive a stronger penalty, which is expected to push the optimizer toward
+assigning them lower precision.
+Figure 4 compares the two strategies. In all panels the x-axis reports the same weighted average
+bit-width, defined as the average bit-width across layers, weighted by the weight tensor size in each
+layer. The results for the two loss functions results largely overlap, showing how the user can easily
+adapt the method to match their use cases.
+Learned vs. pre-selected layer precision.
+An alternative to gradient-based bit-width learning
+is sensitivity-based selection. Each layer is quantized to lower precision in isolation, and the KL
+divergence between the output distributions of the full-precision model and the single-layer-quantized
+model is measured. Layers with larger KL divergence are treated as more sensitive and assigned
+higher precision first. Figure 5 presents the comparison for Llama 3.2 1B.
+At the lowest average bit-widths, the learned and pre-selected approaches perform similarly because
+nearly all layers are forced to MXFP4. The few layers that are quantized to MXFP8 have a high
+sensitivity to quantization, which can also be identified through KL divergence.
+At intermediate bit-widths, roughly between 5.0 and 7.0, the sensitivity approximation becomes
+less reliable, causing the pre-selected curve to remain relatively flat in this region, while the learned
+assignment achieves noticeably lower perplexity. The same trend appears in zero-shot accuracy,
+where the learned approach outperforms the pre-selected baseline across most of the intermediate
+range. At high bit-widths both methods converge toward the MXFP8 baseline. This advantage at
+intermediate operating points is consistent with the expectation that end-to-end optimization captures
+cross-layer dependencies that isolated sensitivity estimates miss.
+8
+
+
+--- Page 9 ---
+4
+5
+6
+7
+8
+9
+9.5
+10
+10.5
+11
+11.5
+Weighted Avg Bit-Width
+Perplexity
+Llama-3.2-1B
+Simple Average
+Weighted Average
+Baseline
+4
+5
+6
+7
+8
+8
+8.5
+9
+9.5
+10
+10.5
+Weighted Avg Bit-Width
+SmolLM2-1.7B
+Simple Average
+Weighted Average
+Baseline
+4
+5
+6
+7
+8
+10.5
+11
+11.5
+12
+12.5
+Weighted Avg Bit-Width
+Qwen3-1.7B
+Simple Average
+Weighted Average
+Baseline
+4
+5
+6
+7
+8
+0.47
+0.48
+0.49
+0.5
+0.51
+Weighted Avg Bit-Width
+Zero Shot
+Simple Average
+Weighted Average
+Baseline
+4
+5
+6
+7
+8
+0.53
+0.54
+0.55
+0.56
+0.57
+0.58
+0.59
+Weighted Avg Bit-Width
+Simple Average
+Weighted Average
+Baseline
+4
+5
+6
+7
+8
+0.51
+0.52
+0.53
+0.54
+0.55
+Weighted Avg Bit-Width
+Simple Average
+Weighted Average
+Baseline
+Figure 4: Comparison of simple-average and tensor-size-weighted bit-width regularization for
+MXFP8/MXFP4 mixed-precision quantization. Red: simple average. Cyan: weighted average. Black
+diamonds: homogeneous MXFP baselines. Top row: perplexity (lower is better). Bottom row:
+average zero-shot accuracy (higher is better). The simple-average formulation tends to reach lower
+perplexity and spans a wider range of operating points.
+4
+5
+6
+7
+8
+9
+9.5
+10
+10.5
+11
+11.5
+12
+Avg Bit-Width
+Perplexity
+Learned
+Preselected
+Baseline
+4
+5
+6
+7
+8
+0.47
+0.48
+0.49
+0.5
+0.51
+Avg Bit-Width
+Zero Shot
+Learned
+Preselected
+Baseline
+Llama-3.2-1B
+Figure 5: Learned bit-width optimization vs. KL divergence-based pre-selected layer precision for
+Llama 3.2 1B. Red: learned. Cyan: pre-selected. Black diamonds: homogeneous MXFP baselines.
+The x-axis reports the weighted average bit-width. Left: perplexity (lower is better). Right: average
+zero-shot accuracy (higher is better). The learned approach achieves lower perplexity and higher
+accuracy at intermediate bit-widths.
+9
+
+
+--- Page 10 ---
+4
+Related Work
+Layer-wise bit-width selection.
+Determining an optimal bit-width allocation across layers is
+a combinatorial optimization problem whose search space grows exponentially with the number
+of layers and candidate precisions [10, 9]. Early sensitivity-based approaches estimate per-layer
+importance through proxies such as the layer’s Hessian spectrum in HAWQ [13] or reinforcement-
+learning-based search over hardware-oriented objectives in HAQ [31]. Subsequent refinements
+have replaced or extended these proxies: HAWQ-V3 [32] casts the allocation as an integer linear
+program, and Chen et al. [33] formulate it as a constrained knapsack problem. In the context of LLMs,
+APTQ [34] combines Hessian-trace sensitivity with attention-aware metrics, ResQ [35] separates
+principal components through PCA to isolate outlier structure. A common finding across these works
+is that mixed-precision quantization is often essential for pushing below four bits per parameter
+without unacceptable degradation, yet they focus almost entirely on integer formats.
+Gradient-based bit-width learning.
+Learning bit-widths through gradient descent has been pre-
+viously explored for integer quantization [10, 36]. FracBits [15] uses linear interpolation between
+adjacent integer bit-widths, while requiring a two-stage process for effective mixed-precision de-
+ployment. while SDQ [16] employs auxiliary learned parameters that represents the probability
+of selecting a specific bit-width, with no continuous transition between values. BSQ [17] recasts
+mixed-precision assignment as bit-level sparsity, and Q-ViT [37] extends differentiable precision
+search to vision transformers. On the discrete-selection side, HMQ [38] relies on a Gumbel-Softmax
+relaxation [39, 40], Bayesian Bits [41] unifies quantization and pruning through stochastic gates, and
+Uhlich et al. [42] demonstrate that the parameterization of the quantizer itself significantly affects
+optimization stability. All of these methods target integer formats. Floating-point and MX-based
+formats are becoming the more prevalent for LLM deployment on recent hardware [5, 20], which
+motivates extending gradient-based techniques to this setting.
+Floating-point quantization.
+Sensitivity-based approaches could in principle be extended to
+floating-point formats, For example, MicroMix [43] performs channel-wise assignment across MX
+formats, using an heuristic approach to perform precision assignment. Gradient-based methods
+are harder to transfer directly because of the floating-point representation. To the best of current
+knowledge, no prior work has addressed this problem through a gradient-based method that learns
+floating-point format selection while using a continuous parameterization to interpolate smoothly
+between hardware-supported formats during calibration.
+5
+Conclusion and Future Works
+This work presented dMX, a differentiable framework for learning per-layer floating-point bit-widths,
+focusing on the MX format family. The method parameterizes each layer’s precision through a single
+continuous offset that interpolates between different hardware-supported MXFP formats, and uses a
+temperature-based annealing schedule to progressively discretize the learned offsets.
+Our experiments on Llama 3.2 1B, Qwen3 1.7B, and SmolLM2 1.7B demonstrated that learned
+mixed-precision assignments consistently outperform both homogeneous MXFP baselines and KL
+divergence-based heuristics, particularly at intermediate bit-widths where the precision budget must
+be allocated carefully across layers.
+Ablation studies examined the roles of initialization strategy, format ranges, and regularization
+formulations, providing guidance for practical deployment.
+Several directions remain open for future work. The current evaluation is limited to models in
+the 1–2 billion parameter range; scaling to larger architectures and to mixture-of-experts models,
+where layer sensitivities can vary more dramatically [44], is a natural next step. A more systematic
+hyper-parameter study, including alternative temperature schedules and regularization forms, may
+also improve robustness across a wider range of models and deployment targets.
+Although we have investigated this approach in the context of gradient-based PTQ, dMX lends itself
+to applications in other domains, such as parameter-efficient fine tuning (PEFT), or QAT setups.
+10
+
+
+--- Page 11 ---
+References
+[1] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. GPTQ: Accurate post-training
+quantization for generative pre-trained transformers. arXiv preprint arXiv:2210.17323, 2022.
+[2] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan
+Xiao, Xingyu Dang, Chuang Gan, and Song Han. AWQ: Activation-aware weight quantization
+for on-device LLM compression and acceleration. In Proceedings of Machine Learning and
+Systems, 2024.
+[3] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han.
+SmoothQuant: Accurate and efficient post-training quantization for large language models. In
+Proceedings of the 40th International Conference on Machine Learning, 2023.
+[4] Mart van Baalen, Andrey Kuzmin, Suparna S Nair, Yuwei Ren, Eric Mahurin, Chirag Patel,
+Sundar Subramanian, Sanghyuk Lee, Markus Nagel, Joseph Soriaga, and Tijmen Blankevoort.
+FP8 versus INT8 for efficient deep learning inference. arXiv preprint arXiv:2303.17951, 2023.
+[5] Bita Darvish Rouhani, Ritchie Zhao, Ankit More, Mathew Hall, Alireza Khodamoradi, Summer
+Deng, Dhruv Choudhary, Marius Cornea, Eric Dellinger, Kristof Denolf, et al. Microscaling
+data formats for deep learning. arXiv preprint arXiv:2310.10537, 2023.
+[6] Bita Darvish Rouhani, Nitin Garegrat, Tom Savell, Ankit More, Kyung-Nam Han, Ritchie Zhao,
+Mathew Hall, Jasmine Klar, Eric Chung, Yuan Yu, Michael Schulte, Ralph Wittig, Ian Bratt,
+Nigel Stephens, Jelena Milanovic, John Brothers, Pradeep Dubey, Marius Cornea, Alexander
+Heinecke, Andres Rodriguez, Martin Langhammer, Summer Deng, Maxim Naumov, Paulius
+Micikevicius, Michael Siu, and Colin Verrilli. OCP microscaling formats (MX) specification.
+Technical report, Open Compute Project, September 2023. Version 1.0.
+[7] Vage Egiazarian, Roberto L. Castro, Denis Kuznedelev, Andrei Panferov, Eldar Kurtic, Shubhra
+Pandit, Alexandre Marques, Mark Kurtz, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh.
+Bridging the gap between promise and performance for microscaling fp4 quantization, 2025.
+[8] Sai Sanjeet, Ian Colbert, Pablo Monteagudo-Lago, Giuseppe Franco, Yaman Umuroglu, and
+Nicholas J Fraser. MixQuant: Pushing the limits of block rotations in post-training quantization.
+arXiv preprint arXiv:2601.22347, 2026.
+[9] Noa Cohen, Omkar Joglekar, Dotan Di Castro, Vladimir Tchuiev, Shir Kozlovsky, and
+Michal Moshkovitz. Gradient-free training of quantized neural networks. arXiv preprint
+arXiv:2410.09734, 2024.
+[10] Bichen Wu, Yanghan Wang, Peizhao Zhang, Yuandong Tian, Peter Vajda, and Kurt Keutzer.
+Mixed precision quantization of ConvNets via differentiable neural architecture search. arXiv
+preprint arXiv:1812.00090, 2018.
+[11] Mehmet Emre Akbulut, Hazem Hesham Yousef Shalby, Fabrizio Pittorino, and Manuel Roveri.
+InfoQ: Mixed-precision quantization via global information flow. In Proceedings of the AAAI
+Conference on Artificial Intelligence, 2026.
+[12] Navin Ranjan and Andreas Savakis. Mix-QSAM: Mixed-precision quantization of the segment
+anything model. In IEEE/CVF Conference on Computer Vision and Pattern Recognition
+Workshops, 2025.
+[13] Zhen Dong, Zhewei Yao, Amir Gholami, Michael W. Mahoney, and Kurt Keutzer. HAWQ:
+Hessian AWare quantization of neural networks with mixed-precision. In Proceedings of the
+IEEE/CVF International Conference on Computer Vision, pages 293–302, 2019.
+[14] Zhen Dong, Zhewei Yao, Yaohui Cai, Daiyaan Arfeen, Amir Gholami, Michael W. Mahoney,
+and Kurt Keutzer. HAWQ-V2: Hessian aware trace-weighted quantization of neural networks.
+In Advances in Neural Information Processing Systems, volume 33, 2020.
+[15] Linjie Yang and Qing Jin. FracBits: Mixed precision quantization via fractional bit-widths. In
+Proceedings of the AAAI Conference on Artificial Intelligence, volume 35, pages 10612–10620,
+2021.
+11
+
+
+--- Page 12 ---
+[16] Xijie Huang, Zhiqiang Shen, Shichao Li, Zechun Liu, Xianghong Hu, Jeffry Wicaksana, Eric
+Xing, and Kwang-Ting Cheng. SDQ: Stochastic differentiable quantization with mixed precision.
+In Proceedings of the 39th International Conference on Machine Learning, pages 9295–9309,
+2022.
+[17] Huanrui Yang, Lin Duan, Yiran Chen, and Hai Li. BSQ: Exploring bit-level sparsity for
+mixed-precision neural network quantization. In Proceedings of the International Conference
+on Learning Representations, 2021.
+[18] Yoshua Bengio, Nicholas L´eonard, and Aaron Courville. Estimating or propagating gradients
+through stochastic neurons for conditional computation. arXiv preprint arXiv:1308.3432, 2013.
+[19] Zechun Liu, Changsheng Zhao, Igor Fedorov, Bilge Soran, Dhruv Choudhary, Raghuraman
+Krishnamoorthi, Vikas Chandra, Yuandong Tian, and Tijmen Blankevoort. Spinquant: Llm
+quantization with learned rotations. arXiv preprint arXiv:2405.16406, 2024.
+[20] Paulius Micikevicius, Dusan Stosic, Neil Burgess, Marius Cornea, Pradeep Dubey, Richard
+Grisenthwaite, Sangwon Ha, Alexander Heinecke, Patrick Judd, John Kamalu, Naveen Mellem-
+pudi, Stuart Oberman, Mohammad Shoeybi, Michael Siu, and Hao Wu. FP8 formats for deep
+learning. arXiv preprint arXiv:2209.05433, 2022.
+[21] Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian,
+Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al. The
+Llama 3 herd of models. arXiv preprint arXiv:2407.21783, 2024.
+[22] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu,
+Chang Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint
+arXiv:2505.09388, 2025.
+[23] Loubna Ben Allal, Anton Lozhkov, Elie Bakouch, Gabriel Mart´ın Bl´azquez, Guilherme Penedo,
+Lewis Tunstall, Andr´es Marafioti, Hynek Kydl´ıˇcek, Agust´ın Piqueres Lajar´ın, Vaibhav Srivastav,
+et al. SmolLM2: When smol goes big – data-centric training of a small language model. arXiv
+preprint arXiv:2502.02737, 2025.
+[24] Guilherme Penedo, Hynek Kydl´ıˇcek, Loubna Ben Allal, Anton Lozhkov, Margaret Mitchell,
+Colin Raffel, Leandro Von Werra, and Thomas Wolf. The FineWeb datasets: Decanting the
+web for the finest text data at scale. arXiv preprint arXiv:2406.17557, 2024.
+[25] Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture
+models. In Proceedings of the International Conference on Learning Representations, 2017.
+[26] Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick,
+and Oyvind Tafjord. Think you have solved question answering? try ARC, the AI2 reasoning
+challenge. arXiv preprint arXiv:1803.05457, 2018.
+[27] Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. HellaSwag: Can
+a machine really finish your sentence?
+In Proceedings of the 57th Annual Meeting of the
+Association for Computational Linguistics, 2019.
+[28] Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi. WinoGrande: An
+adversarial Winograd schema challenge at scale. In Proceedings of the AAAI Conference on
+Artificial Intelligence, volume 34, pages 8732–8740, 2020.
+[29] Nathan Habib, Cl´ementine Fourrier, Hynek Kydl´ıˇcek, Thomas Wolf, and Lewis Tunstall.
+LightEval: A lightweight framework for LLM evaluation, 2023.
+[30] Giuseppe Franco, Alessandro Pappalardo, and Nicholas J Fraser. Xilinx/brevitas, 2025.
+[31] Kuan Wang, Zhijian Liu, Yujun Lin, Ji Lin, and Song Han. HAQ: Hardware-aware automated
+quantization with mixed precision. In Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition, pages 8612–8620, 2019.
+12
+
+
+--- Page 13 ---
+[32] Zhewei Yao, Zhen Dong, Zhangcheng Zheng, Amir Gholami, Jiali Yu, Eric Tan, Leyuan Wang,
+Qijing Huang, Yida Wang, Michael W. Mahoney, and Kurt Keutzer. HAWQ-V3: Dyadic
+neural network quantization. In Proceedings of the 38th International Conference on Machine
+Learning, pages 11875–11886, 2021.
+[33] Weihan Chen, Peisong Wang, and Jian Cheng. Towards mixed-precision quantization of
+neural networks via constrained optimization. In Proceedings of the IEEE/CVF International
+Conference on Computer Vision, pages 5350–5359, 2021.
+[34] Ziyi Guan, Hantao Huang, Yupeng Su, Hong Huang, Ngai Wong, and Hao Yu. APTQ: Attention-
+aware post-training mixed-precision quantization for large language models. In Proceedings of
+the 61st IEEE/ACM Design Automation Conference, 2024.
+[35] Utkarsh Saxena, Sayeh Sharify, Kaushik Roy, and Xin Wang. ResQ: Mixed-precision quan-
+tization of large language models with low-rank residuals. arXiv preprint arXiv:2412.14363,
+2024.
+[36] Zhaowei Cai and Nuno Vasconcelos. Rethinking differentiable search for mixed-precision
+neural networks. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition, pages 2346–2355, 2020.
+[37] Zhexin Li, Tong Yang, Peisong Wang, and Jian Cheng. Q-ViT: Fully differentiable quantization
+for vision transformer. arXiv preprint arXiv:2201.07703, 2022.
+[38] Hai Victor Habi, Roy H. Jennings, and Arnon Netzer. HMQ: Hardware friendly mixed precision
+quantization block for CNNs. In Computer Vision – ECCV 2020, pages 448–463. Springer,
+2020.
+[39] Eric Jang, Shixiang Gu, and Ben Poole. Categorical reparameterization with gumbel-softmax.
+arXiv preprint arXiv:1611.01144, 2016.
+[40] Chris J. Maddison, Andriy Mnih, and Yee Whye Teh. The concrete distribution: A continuous
+relaxation of discrete random variables. In Proceedings of the International Conference on
+Learning Representations, 2017.
+[41] Mart van Baalen, Christos Louizos, Markus Nagel, Rana Ali Amjad, Ying Wang, Tijmen
+Blankevoort, and Max Welling. Bayesian bits: Unifying quantization and pruning. In Advances
+in Neural Information Processing Systems, volume 33, 2020.
+[42] Stefan Uhlich, Lukas Mauch, Fabien Cardinaux, Kazuki Yoshiyama, Javier Alonso Garcia,
+Stephen Tiedemann, Thomas Kemp, and Akira Nakamura. Mixed precision DNNs: All you
+need is a good parametrization. In Proceedings of the International Conference on Learning
+Representations, 2020.
+[43] Wenyuan Liu, Haoqian Meng, Yilun Luo, Yafei Zhao, Peng Zhang, and Xindian Ma. Micromix:
+Efficient mixed-precision quantization with microscaling formats for large language models.
+arXiv preprint arXiv:2508.02343, 2025.
+[44] Wei Huang, Yue Liao, Jianhui Liu, Ruifei He, Haoru Tan, Shiming Zhang, Hongsheng Li,
+Si Liu, and Xiaojuan Qi. Mixture compressor for mixture-of-experts LLMs gains more. In The
+Thirteenth International Conference on Learning Representations, 2025.
+[45] IEEE. Ieee standard for floating-point arithmetic. IEEE Std 754-2019 (Revision of IEEE
+754-2008), pages 1–84, 2019.
+[46] Sambhav R. Jain, Albert Gural, Michael Wu, and Chris H. Dick. Trained quantization thresholds
+for accurate and efficient fixed-point inference of deep neural networks. In Proceedings of the
+3rd Machine Learning and Systems (MLSys) Conference, 2020.
+[47] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan,
+Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Desmaison, Andreas
+K¨opf, Edward Yang, Zachary DeVito, Martin Raison, Alykhan Tejani, Sasank Chilamkurthy,
+Benoit Steiner, Lu Fang, Junjie Bai, and Soumith Chintala. PyTorch: An imperative style,
+high-performance deep learning library. In Advances in Neural Information Processing Systems,
+volume 32, 2019.
+13
+
+
+--- Page 14 ---
+A
+Continuous and Differentiable Float Conversion Function
+This appendix specifies how ss in Eq. 3 is computed from each element’s magnitude, mantissa
+bit-width m, and exponent bias b. Letting ˜x = x/s denote the magnitude-scaled element, Eqs. 2 and
+3 are reproduced here for reference:
+q(FP)
+max = (2 −2−m) · 2 2e−b−1,
+q(FP)
+min = −q(FP)
+max .
+(10)
+xq = clip
+
+ss(˜x)
+
+˜x
+ss(˜x)
+
+; q(FP)
+min , q(FP)
+max
+
+(11)
+where s is a coarse scale.
+The purpose of ss is to represent the mantissa part of the floating-point value as an integer, permitting
+quantization via a standard rounding operator. The resulting expression is differentiable in m and
+e everywhere except in the case of rounding operations. These are handled by straight-through
+estimator, formally defined in Section A.1.
+Inputs and assumptions.
+Recall ˜x from above, with mantissa bit-width m, exponent bit-width e,
+and exponent bias b = 2e−1 −1.
+The subnormal exponent floor is
+emin = 1 −b −m,
+(12)
+the exponent of the unit in the last place (ULP) is defined as
+η(˜x) = max
+
+log2(|˜x|)
+
+−m, emin
+
+,
+(13)
+and the per-element power-of-two scale is
+ss(˜x) = 2 η(˜x).
+(14)
+The sign bit and the zero case (x = 0) are excluded for brevity;
+Interpretation.
+For nonzero ˜x, the quantity ⌊log2 ˜x⌋is the binary exponent of ˜x, so ⌊log2 ˜x⌋−m
+is the exponent of the ULP of a normalized floating-point number with m mantissa bits at that
+magnitude. Clamping the exponent below by emin implements the IEEE-754-style [45] subnormal
+regime: once the true exponent falls below 1 −b, the ULP stays fixed at 2emin and mantissa precision
+degrades toward zero. The mantissa bit-width m enters ss through both η(˜x) and emin, while the
+exponent bias b enters through emin; these are the entry points for the gradient analysis in Section A.1.
+From discrete to continuous.
+At deployment, hardware imposes the constraint m ∈Z+ and
+e ∈Z+. However, Eqs. 10 and 11 remain well defined for m, e ∈R+, and no mathematical
+constraint forces integer values during training. Accordingly, m and e are treated as real-valued
+parameters throughout calibration, subject to the range constraints described in Section 2.1.
+Continuous floating-point interpretation.
+The output of the continuous floating-point conversion
+function exhibits the following properties:
+• It is a non-uniform staircase function whose distinct quantization levels need not be powers
+of two.
+• The number of distinct staircase step sizes, determined by changes in the exponent, likewise
+need not align with powers of two.
+As m increases, the number of quantization levels within each step-size increases; as e increases, the
+number of distinct step sizes increases. See Figure 1 for an example grid and panel 6a of Figure 6 for
+the forward staircase at e = 2, m = 2.
+14
+
+
+--- Page 15 ---
+A.1
+Gradients via the straight-through estimator
+We now derive the gradients of the unscaled inner quantizer Q(˜x) = xq with respect to the mantissa
+bit-width m, the exponent bit-width e, and the shared offset β that parameterizes both via m = 1 + β,
+e = 2 + β (Section 2.1). For this analysis, we consider s to be constant in m and e, so the bit-width
+gradients of xq and of Q differ only by the outer sign(x) · s factor, and we focus on Q throughout.
+STE convention.
+We adopt the straight-through estimator of [18], following the convention used in
+TQT [46]:
+∂
+∂u⌊u⌉=
+∂
+∂u⌊u⌋= 1,
+but
+⌊u⌉̸= u, ⌊u⌋̸= u
+in the backward pass.
+(15)
+That is, the derivative of the rounding and floor operators is approximated by 1, while their values are
+preserved. Crucially, this means the rounded quantity r := ⌊˜x/ss(˜x)⌉does not collapse to ˜x/ss(˜x)
+when applying the chain rule; this distinction is what gives the m-gradient a non-trivial form.
+Setup.
+Let r := ⌊˜x/ss(˜x)⌉and u := ss(˜x) · r, so that Q(˜x) = u on the unclipped range and
+Q(˜x) = q(FP)
+max otherwise. Recall that ss(˜x) = 2η(˜x) with η as in Eq. 13 and emin = 1 −b −m as
+in Eq. 12. The two regimes of η, (i.e., the normal regime when η = ⌊log2 ˜x⌋−m > emin and the
+subnormal regime when η = emin), combined with whether the input exceeds the saturating bound,
+partition the input range into three cases: subnormal, normal-unclipped, and clipped (˜x > q(FP)
+max ).
+Each yields a qualitatively different gradient and is kept explicit below. For ˜x > q(FP)
+max , the bit-width
+gradients ∂Q/∂m and ∂Q/∂e remain non-trivial, since q(FP)
+max depends on m and e through Eq. 10.
+The negative branch follows by the symmetry Q(−˜x) = −Q(˜x). At ˜x = 0, the gradient is defined as
+the limit of the difference quotient from either side, taking the common value when these limits agree,
+and zero otherwise; in our case the bit-width gradients vanish since the rounding gap ˜x −u →0.
+Gradient with respect to m.
+The mantissa bit-width m enters Q through η (via the −m term in
+the normal regime and via emin in the subnormal regime) and, in the clipped regime, through q(FP)
+max .
+For the unclipped range, ∂η/∂m = −1 in both the normal and subnormal regimes, so
+∂ss
+∂m = −ln(2) · ss.
+(16)
+Applying the STE to the round and using the chain rule on r = ⌊˜x/ss⌉at fixed ˜x,
+∂r
+∂m = −˜x
+ss 2
+∂ss
+∂m = ˜x ln(2)
+ss
+.
+(17)
+Combining via the product rule on u = ss · r:
+∂Q
+∂m = ∂ss
+∂m · r + ss · ∂r
+∂m = ln(2) ·
+ ˜x −u
+
+for |˜x| ∈(0, q(FP)
+max ].
+(18)
+This expression has the same form as TQT’s threshold gradient [46, Eq. 7], with m substituted for
+the log-threshold and the exclusion of s.
+For ˜x > q(FP)
+max , Q = q(FP)
+max and the m-derivative passes through the clipping bound. Differentiating
+Eq. 2,
+∂q(FP)
+max
+∂m
+= ln(2) · 2−m · 2 2e−b−1 =
+ln(2)
+2m+1 −1 · q(FP)
+max ,
+(19)
+a positive contribution that pushes m upward to enlarge the representable range and bring saturating
+elements inside it. Combining the two regions yields the complete piecewise gradient
+∂Q
+∂m =
+
+
+
+
+
+ln(2) ·
+ ˜x −u
+
+subnormal/normal regime, |˜x| ∈(0, q(FP)
+max ],
+ln(2)
+2m+1 −1 · q(FP)
+max
+˜x > q(FP)
+max .
+(20)
+15
+
+
+--- Page 16 ---
+Gradient with respect to e.
+The exponent bit-width e enters η only through b = 2e−1 −1, and
+only in the subnormal regime, since ⌊log2 ˜x⌋−m has is not a function of e. Hence ∂η/∂e = 0 in the
+normal regime and ∂η/∂e = −∂b/∂e = −2e−1 ln(2) in the subnormal regime. Following the same
+chain-rule derivation as for m, with the extra factor of ∂η/∂e propagating through ss and r:
+∂Q
+∂e
+=
+(
+0
+normal regime,
+2e−1 (ln 2)2 ·
+ ˜x −u
+
+subnormal regime (η = emin),
+|˜x| ∈(0, q(FP)
+max ].
+(21)
+For ˜x > q(FP)
+max , the gradient passes through q(FP)
+max . With b = 2e−1 −1 so that 2e −b −1 = 2e−1,
+differentiating Eq. 2 yields
+∂q(FP)
+max
+∂e
+= 2(ln 2)2 · 2e−1 · 2 2e−b−1 1 −2−m−1
+= (ln 2)2 · 2e−1 · q(FP)
+max .
+(22)
+Combining the two regions yields the complete piecewise gradient
+∂Q
+∂e
+=
+
+
+
+
+
+
+
+2e−1 (ln 2)2 ·
+ ˜x −u
+
+subnormal regime (η = emin),
+0
+normal regime, |˜x| ∈(0, q(FP)
+max ],
+(ln 2)2 · 2e−1 · q(FP)
+max
+˜x > q(FP)
+max .
+(23)
+The e-gradient is supported at both extremes of the input distribution: in the subnormal regime
+via emin, and in the clipped regime via q(FP)
+max , while in the normal-unclipped regime the gradient
+contribution is zero.
+Gradient with respect to β.
+The shared offset parameterization m = 1+β, e = 2+β (Section 2.1)
+gives ∂m/∂β = ∂e/∂β = 1, so the chain rule yields
+∂Q
+∂β
+= ∂Q
+∂m + ∂Q
+∂e .
+(24)
+Substituting Eqs. 20 and 23 gives
+∂Q
+∂β
+=
+
+
+
+
+
+
+
+
+
+ln(2)
+ 1 + 2e−1 ln 2
+
+·
+ ˜x −u
+
+subnormal regime (η = emin),
+ln(2) ·
+ ˜x −u
+
+normal regime, |˜x| ∈(0, q(FP)
+max ],
+h
+ln(2)
+2m+1 −1 + (ln 2)2 2e−1i
+· q(FP)
+max
+˜x > q(FP)
+max .
+(25)
+The β-gradient inherits the m-component’s density across all three regions, picking up additional e-
+component support at the two extremes (subnormal and clipped). Among the three format parameters
+{m, e, β}, only m and β carry a learning signal in the bulk normal-unclipped regime where most of
+the input mass typically lies, which motivates the β-only training scheme of the main text.
+Remarks.
+Three observations follow from Eqs. 20, 23 and 25, all of which are illustrated by
+Figure 6. First, the chain rule must be applied to the unsimplified product ss · r rather than to its
+forward-equivalent ˜x; the STE preserves the rounding gap ˜x−u, which is the source of the non-trivial
+m- and e-gradients in the unclipped range. Second, the m-gradient is non-zero in all three regions
+(subnormal, normal-unclipped, and clipped) and is the dominant component of the β-gradient, as
+visible in panels 6b and 6d of Figure 6. Third, the e-gradient vanishes in the bulk normal-unclipped
+regime and is supported at both extremes, i.e., below the subnormal cutoff 21−b and above the
+clipping bound q(FP)
+max , so learning e alone requires sufficient mass at one or both extremes of the
+input distribution, while learning the joint offset β does not. In practice these gradients are computed
+automatically by autodifferentiation; we provide the closed forms here for completeness, having
+verified them against PyTorch’s autograd [47], confirmed by the overlap of analytical and autograd
+curves in Figure 6.
+B
+Hyper-Parameters
+B.1
+Temperature Annealing
+We employ a temperature-based sigmoid function to switch from a linear-like approximation to a
+step-like one during training. For the scheduling of the temperature, we employ an exponential
+16
+
+
+--- Page 17 ---
+−10
+−5
+0
+5
+10
+−5
+0
+5
+x
+xq
+(a) forward xq(x)
+−10
+−5
+0
+5
+10
+−0.5
+0
+0.5
+x
+∂xq/∂m
+analytical
+autograd
+(b) ∂xq/∂m
+−10
+−5
+0
+5
+10
+−5
+0
+5
+x
+∂xq/∂e
+analytical
+autograd
+(c) ∂xq/∂e
+−10
+−5
+0
+5
+10
+−5
+0
+5
+x
+∂xq/∂β
+analytical
+autograd
+(d) ∂xq/∂β
+(m=1+β, e=2+β)
+Figure 6: Forward and bitwidth-gradient transfer curves of the inner MX-FP quantizer at e = 2,
+m = 2. The closed-form analytical gradients (black dashed) overlay the Brevitas autograd reference
+(blue dotted) across the entire input range. Panels 6a–6d show the forward xq(x) and the local
+gradients with respect to m, e, and β, respectively.
+function between the values of 8 and 400. These values were picked because they best represent the
+linear-like and the step-like functions.
+As already mentioned, we also employ a warm-up phase during which the temperature value is kept
+constant so that the sigmoid is its linear-like phase. After a fixed fraction of calibration steps, Tratio,
+the exponential schedule starts. For our experiments we set Tratio = 60%. We observed that our
+method is fairly robust to other values of Tratio, although adapting this value to a specific model and
+training pipeline could potentially yield better results.
+B.2
+Bit-Width Cost Function
+When testing the simple scaling penalty defined in Eq.6, we use 15 different values from λ ranging
+from 1e−5 to 7. Similarly, in all the experiments with Eq.7, we fix λ to 5, while testing for 17
+different target bit-width ¯btarget between 4.1 and 8, as mentioned in the Sec.3.
+B.3
+Training Parameters
+We follow a similar set-up employed in SpinQuant [19], using the same hyper-parameters for the
+optimization of the rotation matrices. In particular, we use CayleySGD optimizer with a learning rate
+of 1.5. We merge the Hadamard rotations whenever possible; these are then optimized during training.
+For all layers where they cannot be merged, we leave them as standalone, static rotations. The main
+difference is the number of training steps and training samples used, which has been extended to 400
+and 3200 respectively.
+For the bit-width optimization, we employ SGD as optimized with a learning rate of 1.
+17
+
+
+--- Page 18 ---
+C
+Ablation Studies
+Mixed Precision Results
+In Figure 7 we represent the full set of experiments where we compare
+MXFP8/MXFP4 mixed precision configurations to MXFP6/MXFP4 ones. Although both configu-
+rations perform well, the MXFP6/MXFP4 configurations are able to achieve better perplexity and
+average zero-shot results for similar average bit-widths.
+4
+5
+6
+7
+8
+9
+9.5
+10
+10.5
+11
+11.5
+Avg Bit-Width
+Perplexity
+Llama-3.2-1B
+MXFP8/MXFP4
+MXFP6/MXFP4
+Baseline
+4
+5
+6
+7
+8
+8
+8.5
+9
+9.5
+10
+10.5
+Avg Bit-Width
+SmolLM2-1.7B
+MXFP8/MXFP4
+MXFP6/MXFP4
+Baseline
+4
+5
+6
+7
+8
+10.5
+11
+11.5
+12
+12.5
+Avg Bit-Width
+Qwen3-1.7B
+MXFP8/MXFP4
+MXFP6/MXFP4
+Baseline
+4
+5
+6
+7
+8
+0.47
+0.48
+0.49
+0.5
+0.51
+Avg Bit-Width
+Zero Shot
+MXFP8/MXFP4
+MXFP6/MXFP4
+Baseline
+4
+5
+6
+7
+8
+0.53
+0.54
+0.55
+0.56
+0.57
+0.58
+0.59
+Avg Bit-Width
+MXFP8/MXFP4
+MXFP6/MXFP4
+Baseline
+4
+5
+6
+7
+8
+0.51
+0.52
+0.53
+0.54
+0.55
+Avg Bit-Width
+MXFP8/MXFP4
+MXFP6/MXFP4
+Baseline
+Figure 7: Comparison of the MXFP8/MXFP4 mixed precision quantization and the MXFP6/MXFP4
+ones. Red: MXFP8/MXFP4 configurations. Cyan: MXFP6/MXFP4 configurations. Black diamonds:
+homogeneous MXFP baselines. Top row: perplexity (lower is better). Bottom row: average zero-
+shot accuracy (higher is better). The MXFP6/MXFP4 configurations are more bit-width efficient,
+managing to reach better accuracy for the same average bit-width.
+Continuous vs. discrete bit-width representation.
+Several prior approaches store the bit-width
+as a continuous variable but discretize it during each forward pass, typically through a rounding
+operator with an STE in the backward pass [18]. While effective for integer quantization where all
+bit-widths in a range such as [2, 8] are admissible, this strategy may be less suitable for MXFP8–
+MXFP4 quantization. The gap between FP8 and FP4 is comparatively large, and abrupt format
+switches during calibration can destabilize the training process. The continuous representation used
+in dMXallows the effective format to evolve gradually, with the temperature-based annealing of
+Section 2.2 managing the transition to discrete inference-time values.
+As shown in Figure 8, the continuous representation consistently achieves better perplexity and
+zero-shot than the ROUND+STE alternative across all three models. Even when they are comparable,
+the results show that the ROUND+STE approach struggles more in matching the desired target
+bit-width, thus signaling a reliability issue compared to the continuous representation format.
+We believe that these results support the hypothesis that avoiding abrupt format switches during the
+forward pass leads to a more stable optimization trajectory.
+18
+
+
+--- Page 19 ---
+4
+5
+6
+7
+8
+9
+9.5
+10
+10.5
+11
+11.5
+12
+Avg Bit-Width
+Perplexity
+Llama-3.2-1B
+Continuous Representation
+Round + STE
+Baseline
+4
+5
+6
+7
+8
+8
+8.5
+9
+9.5
+10
+10.5
+Avg Bit-Width
+SmolLM2-1.7B
+Continuous Representation
+Round + STE
+Baseline
+4
+5
+6
+7
+8
+10.5
+11
+11.5
+12
+12.5
+13
+Avg Bit-Width
+Qwen3-1.7B
+Continuous Representation
+Round + STE
+Baseline
+4
+5
+6
+7
+8
+0.47
+0.48
+0.49
+0.5
+0.51
+Avg Bit-Width
+Zero Shot
+Continuous Representation
+Round + STE
+Baseline
+4
+5
+6
+7
+8
+0.52
+0.53
+0.54
+0.55
+0.56
+0.57
+0.58
+0.59
+Avg Bit-Width
+Continuous Representation
+Round + STE
+Baseline
+4
+5
+6
+7
+8
+0.49
+0.5
+0.51
+0.52
+0.53
+0.54
+0.55
+Avg Bit-Width
+Continuous Representation
+Round + STE
+Baseline
+Figure 8: Comparison between continuous forward-pass bit-width learning and a discretized forward
+pass with rounding (ROUND+STE). Red: continuous representation. Cyan: ROUND+STE. Black
+diamonds: homogeneous MXFP baselines. Top row: perplexity (lower is better). Bottom row:
+average zero-shot accuracy (higher is better). The continuous representation consistently achieves
+lower perplexity at a given average bit-width.
+19
