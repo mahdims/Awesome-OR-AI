@@ -1,0 +1,640 @@
+--- Page 1 ---
+EntMTP: Accelerating LLM Inference with
+Entropy Guided Multi Token Prediction
+Carrie Chen
+Cornell University
+cc2864@cornell.edu
+Abstract
+Multi-token prediction has been shown to increase
+data density during training, improve downstream
+text-generation quality, and serves as the defacto
+approach for self-speculative decoding. Existing
+foundation and open source models that use MTP
+heads commit to a static tree-based attention topol-
+ogy throughout the entire generation sequence,
+meaning the speculation depth, and thus the com-
+pute required during verification, stays constant
+regardless of the context. This is fundamentally
+misaligned with the entropy patterns of natural
+language where low-entropy regions often support
+reliable multi-step drafting, while high-entropy
+regions require more conservative speculation. To
+address this, we propose Entropy-guided Multi-
+Token Prediction (EntMTP), a training-free sched-
+uler that toggles between tree-based attention
+topologies from a set of task-specific pareto-
+optimal trees conditioned on a running estimate
+of local generation entropy. By matching spec-
+ulation depth to context predictability, EntMTP
+maximizes expected accepted-token throughput
+across the full distribution of generated text with-
+out sacrificing generation quality. When evaluated
+across Humaneval, ShareGPT, GSM8k, and Lit-
+bench benchmarks, EntMTP consistently achieves
+a 1.09-1.15x speedup against Hydra and peak
+speedup of ∼1.36x against Medusa baselines re-
+spectively.
+1. Introduction
+Large language models (LLMs) have achieved incredible
+performance across a broad range of tasks, however the
+sequential nature of autoregressive decoding remains a bot-
+tleneck to their latency: each generated token requires a
+full forward pass through all model parameters, making in-
+ference memory-bandwidth bound and expensive at scale.
+Speculative decoding (Yaniv et al., 2023; Chen et al., 2023)
+addresses this by drafting k candidate tokens with a cheap
+proposal model and verifying them in a single parallel pass
+of the target model, preserving the target distribution ex-
+actly. Multi-token prediction (MTP) heads (Cai et al., 2024;
+Ankner et al., 2024) implement speculative decoding with-
+out a separate draft model by attaching lightweight modules
+to the target model’s final hidden state and generating a tree
+of candidates for sparse verification.
+For MTP-based decoding, performance is largely deter-
+mined by the realized accept depth at each step. Prior
+work (Cai et al., 2024; Ankner et al., 2024) uses this metric
+to select a draft-tree topology offline on a subsample of
+Alpaca (Wang et al., 2023); the selected topology is then
+reused throughout inference. We show in Appendix A that
+this global selection is too coarse. Draft-token acceptance
+varies with position, local context, and overlap with the
+training distribution. More importantly, both acceptance
+behavior and the throughput frontier over tree topologies
+are task-specific: a topology that is Pareto-optimal for one
+benchmark can be highly suboptimal for another.
+We propose EntMTP, a lightweight runtime tree-selection
+layer that exploits this task dependence rather than treating
+it as noise. EntMTP first builds a throughput-Pareto frontier
+of Hydra tree topologies offline, using greedy expansion
+and self-rollout acceptance estimates. It retains only frontier
+trees that improve the cost–throughput tradeoff, discarding
+dominated topologies.
+At inference time, a precompiled TopologyBank stores the
+attention masks, position offsets, and gather indices for
+each frontier tree. Switching topologies therefore reduces
+to an O(1) pointer swap, with no mask reconstruction or
+kernel rebuild. At each decode step, the scheduler reads
+features off-the-shelf from the model, such as the EAGLE-2
+path value, or the base top-1 probability, and selects a tree
+using one of three policies: ENTMTP-l, a threshold ladder,
+ENTMTP∗, a static-task-optimal tree rule, or ENTMTPτ, a
+hysteretic binary-τ rule with separate on/off thresholds to
+prevent per-step jitter.
+In the batch size = 1 setting, ENTMTPτ dominates both
+1
+arXiv:2606.27550v1  [cs.CL]  25 Jun 2026
+
+
+--- Page 2 ---
+EntMTP: Accelerating LLM Inference with Entropy Guided Multi Token Prediction
+the Hydra and Medusa baselines as well as ENTMTP∗
+across all three evaluation tasks: grade school math, code
+completion, and conversational llm. On GSM8K it achieves
+112.0 tok/s vs. 102.4 for Hydra (+9.4%), with a speedup
+of 3.13× over autoregressive decoding. On HumanEval
+it achieves 124.7 tok/s (+14.0% over Hydra, 3.26× over
+AR). The largest absolute gain is on ShareGPT: 117.5 tok/s
+vs. 109.0 (+7.8%, 3.47× AR). Response perplexity stays
+within 0.022 of Hydra across all settings, confirming that
+gains stem from scheduling, not from changes to the verifi-
+cation rule.
+2. Related Work
+2.1. Speculative Decoding
+Speculative decoding (Yaniv et al., 2023; Chen et al., 2023)
+accelerates autoregressive generation losslessly by alternat-
+ing a low-cost draft stage with a parallel verification stage
+on the target model.
+Given a prefix T1:j, a draft distribution q produces ˆTj+1:j+k
+together with its per-token probabilities ˆpj+i, and the tar-
+get distribution p then evaluates the entire candidate in
+a single forward pass. Tokens are accepted left-to-right
+with probability min(1, pj+i(ˆtj+i)/ˆpj+i(ˆtj+i)); on the
+first rejection, a replacement is drawn from the residual
+norm(max(0, pj+i −ˆpj+i)) and the suffix is discarded.
+This ensures that the marginal distribution of accepted to-
+kens matches the target’s, so the realized speedup depends
+entirely on how well q mimics p and how parallelizable
+verification is.
+2.2. EAGLE and EAGLE-2
+EAGLE (Li et al., 2024a) replaces token-level drafting
+with feature-level autoregression. Given the target model’s
+hidden-state sequence F1:i and token sequence T1:i, a
+lightweight drafter predicts the next hidden state,
+ˆFi+1 = Dθ(T2:i+1, F1:i)
+which is then decoded by the target model’s frozen LM
+head:
+pθ(ti+1 | t≤i) = softmax(WLM ˆFi+1)
+The drafter is trained to match the target model’s next hidden
+state using a feature-regression loss,
+Lreg = SmoothL1 (Fi+1, Dθ(T2:i+1, F1:i))
+By drafting in hidden-state space rather than directly predict-
+ing independent future tokens, EAGLE obtains a stronger
+drafter at comparable parameter cost.
+EAGLE-2 (Li et al., 2024b) keeps this feature-level drafter
+but makes the draft tree dynamic. Instead of committing
+to a fixed topology, it scores each candidate path using the
+drafter’s own confidence. For a node ti in the draft tree, its
+path value is defined as
+Vi =
+Y
+tj∈Path(root,ti)
+pj ≈
+Y
+tj∈Path(root,ti)
+cj
+where pj is the true, unobserved acceptance probability at
+node tj, and cj is the drafter’s local confidence.
+At inference time, EAGLE-2 expands the tree top-down by
+repeatedly selecting the highest-value frontier nodes:
+t⋆= arg max
+ti∈F Vi
+where F denotes the current frontier. Since the scores cj
+are already produced by the drafter, this dynamic tree con-
+struction requires no additional trained components and
+preserves lossless target-model verification.
+2.3. Independent Multi-Head Prediction
+Medusa (Cai et al., 2024) takes a more direct approach to
+speculation by attaching K lightweight prediction heads
+to the target model’s final hidden state. Each head hi pre-
+dicts the token at offset i independently of the other drafted
+tokens, factorizing the draft distribution as
+Y
+i
+phi(tj+i | hj)
+The heads emit top-ki candidates, whose Cartesian product
+is arranged into a draft tree with precomputed attention
+masks, position offsets, and gather indices. Verification then
+reduces to a single sparse forward pass through the target
+model.
+2.4. Sequential Multi-Head Prediction
+Hydra (Ankner et al., 2024) keeps Medusa’s head-on-
+hidden-state design but restores sequential dependence
+across draft heads. Instead of predicting each future to-
+ken independently, head hi conditions on the embeddings
+of tokens already drafted by earlier heads, modeling
+p(tj+i | t≤j, ˆtj+1:j+i−1)
+instead of the marginal p(tj+i | t≤j)
+Each head is implemented as a small causal transformer
+block over the base hidden state and previously drafted
+token embeddings. This preserves an O(K) head cost while
+allowing the draft chain to condition on its own prefix.
+However, Hydra inherits Medusa’s static-tree limitation:
+a single topology is selected offline and reused for every
+decoding step.
+2
+
+
+--- Page 3 ---
+EntMTP: Accelerating LLM Inference with Entropy Guided Multi Token Prediction
+3. Optimizing Task-Specific Greedy Draft
+Trees
+Hydra’s acceptance behavior is workload-dependent in ways
+the verifier and base model cannot absorb. On SHAREGPT,
+recent acceptance history alone predicts the next accept
+length (EMA r=0.49); on GSM8K and HUMANEVAL
+the strongest predictors are entropy-based and at least 2×
+weaker (|r|≤0.22) (Fig. 3; full tables in Appendix 7).
+Since the verifier and base weights are shared across runs,
+this dispersion is a property of the workload-induced token
+distribution, and implies that single draft topology cannot be
+optimal across distributions whose acceptance signal differs
+by more than 2×. We therefore optimize a separate draft
+tree per task, following the two-stage offline procedure of
+Ankner et al. (2024); Cai et al. (2024).
+3.1. Constructing the Acceptance Frontier
+First, a sequence of proposal trees T1, . . . , TN of increasing
+size is constructed greedily:
+Algorithm 1 Greedy construction of the acceptance frontier
+Require: max depth D, budget B, prompts P, verifier V
+1: T ←{(0)}, H ←[ ]
+2: while |T| < B do
+3:
+F ←NEXTCHILDREN(T, D)
+4:
+if F = ∅then
+5:
+break
+6:
+end if
+7:
+Score all T ∪{ν} for ν ∈F using one rollout of T ∪F
+8:
+ν⋆←arg maxν∈F
+ a(ν), −P ν, −|ν|
+
+9:
+T ←T ∪{ν⋆}
+10:
+H.append((|T|, a(ν⋆), T))
+11: end while
+12: return H
+We score all one-node augmentations T ∪{ν} for ν ∈F(T)
+in a single self-rollout over the joint tree T ∪F(T), recover-
+ing each candidate’s accept length by masking verifier logits
+along its path.1 The frontier node with the highest mean
+accept length is added, breaking ties by smaller child-rank
+sum and shallower depth, and repeat until the target budget
+is reached (Fig. 1).
+All runs follow the same format of 100 prompts from the
+target benchmark, T=0.7, posterior threshold 0.09, α=0.3,
+256-token rollouts.
+3.1.1. ONE-STEP SCORING BIAS
+The mean-accept estimate computed inside Algorithm 1
+is mildly optimistic. Candidate T ∪{ν} is scored against
+proposals drawn from the larger joint tree T ∪F, so the
+1The trajectory is advanced using T, not the augmented scoring
+tree, so this is a one-step “what-if” probe.
+Figure 1. Acceptance frontier on HumanEval. Every candidate tree
+generated by greedy node addition, colored by depth; the global
+Pareto hull (red stars, n=49 (number of items) is dominated by
+depth-4 trees when nodes ≥23
+verifier sees draft tokens at positions ν would not have
+proposed on its own. Before the second stage, frontiers are
+recalibrated against a canonical Hydra self-rollout that uses
+each candidate tree’s own proposal, attention mask, and
+KV-cache update (Appendix B).
+3.2. Constructing the Throughput Frontier
+Tree shape also sets the per-step verifier cost through the
+size of the attention mask, the number of candidate paths
+returned by TREE DECODING, and the cost of EVALU-
+ATE POSTERIOR (Ankner et al., 2024). The second stage
+evaluates the entire per-depth acceptance frontier end-to-end
+on the target workload, recording wall-clock output tokens
+per second under the same proposal →tree decoding →
+verification →KV-cache update loop used at inference time,
+including prefill. Selecting the throughput-maximal tree on
+this re-ranked hull gives the task-specific tree topology used
+in ENTMTP∗.
+Figure 2. Re-ranking HumanEval’s acceptance frontier (49 candi-
+date trees plus the published default) over 100 HumanEval-val
+prompts.
+3
+
+
+--- Page 4 ---
+EntMTP: Accelerating LLM Inference with Entropy Guided Multi Token Prediction
+4. Inference-Time Tree Scheduler
+Section 3 produces, for each benchmark, a small throughput-
+Pareto bank of draft trees B = {T1, . . . , TK}. Selecting any
+fixed Tk already beats the published default (Section §6),
+but the regime analysis in Fig. 3 shows the optimal tree size
+is itself step-dependent: long high-acceptance runs reward a
+large tree, while regions of high entropy or recent rejections
+reward a cheap one. We therefore add a per-step policy
+π : Rd →{1, . . . , K} that maps the current decode state to
+an index into B.
+Path-value score.
+The features the policy consumes are
+the EAGLE-2 path values (Li et al., 2024b), computed at
+the verifier’s last position from the base-LM top-1 proba-
+bility p0 and each Hydra head’s top-1 probability pd. The
+depth-d greedy path probability is gd = p0
+Qd
+i=1 pi, and
+the policy uses the scalar s = max(p0, g1, . . . , gD) =
+best path value, which is monotone in the verifier’s
+expected accept length: when the head chain has high mass
+deep, s→1 and a large tree is worth its cost.
+Policy.
+We instantiate π as a binary thresholded selector
+with hysteresis. Two trees from B are designated: a con-
+servative T−(small, shallow) and an aggressive T+ (large,
+depth-4). At each step, π switches to T+ when s > τon
+and back to T−when s ≤τoff, with τoff ≤τon to suppress
+flapping. A single threshold (τon = τoff = τ) is the default,
+and the K-way generalisation threshold ladder bins
+s into K consecutive intervals selecting T1, . . . , TK. Both
+policies are training-free: τ is picked by a one-dimensional
+sweep on the same 100-prompt calibration set used for tree
+search.
+Cost.
+Inserting π into the decode loop is essentially
+free.
+Each tree in B ships with its own precomputed
+generate hydra buffers output (attention mask, po-
+sition ids, retrieve indices), so switching trees is a dictionary
+pointer swap with no GPU work. Computing s from the
+verifier logits already in registers takes one cumulative prod-
+uct over D≤4 scalars and a single .item() sync, adding
+<0.1 ms per step.
+5. Evaluation Methodology
+5.1. Metrics
+EntMTP neither fine-tunes the original LLM nor relaxes
+Hydra’s typical acceptance condition, so it is a lossless
+acceleration method (continuation perplexity matches the
+base LM to within 0.02 nats in all our runs). We therefore
+evaluate acceleration only, with two metrics:
+• Speedup ratio ρ: wall-clock output tokens per second
+relative to vanilla autoregressive decoding of the same
+base LM on the same prompt basket, including prompt
+prefill in the timed region.
+• Average acceptance length τ: expected number of to-
+kens generated per draft-verify cycle. τ is independent
+of hardware and runtime and isolates the quality of the
+draft topology from kernel-level effects.
+5.2. Setup
+We use Vicuna-7B v1.3 (Chiang et al., 2023) as the base
+LM and ankner/hydra-vicuna-7b-v1.3 (Ankner
+et al., 2024) as the Hydra verifier, in FP16 on a single
+NVIDIA A100. All methods share temperature T=0.7,
+posterior threshold ϵ=0.09, mixing coefficient α=0.3, max
+input 1400 tokens, and max generation 256 tokens. Each
+benchmark is timed on 100 prompts (seed 123) drawn from
+HumanEval-val, GSM8K-val, and ShareGPT (Vicuna unfil-
+tered split). Each run begins with one warm-up generation
+to amortise JIT and KV-cache allocation; timings exclude
+this warm-up. The conservative and aggressive trees for the
+scheduler are chosen from the per-task throughput frontier;
+τ is selected from {0.001, 0.005, 0.01, 0.02, 0.05} on the
+calibration set.
+6. Results
+The following reports speedup and average acceptance
+length of both ENTMTP policies across all three bench-
+marks.
+benchmark
+method
+tok/s
+ρ
+τ
+HumanEval
+Vanilla Vicuna
+38.2
+1.00×
+1.00
+Medusa (default)
+91.2
+2.38×
+2.87
+Hydra (default)
+109.0
+2.85×
+3.06
+ENTMTP∗
+123.4
+3.21×
+3.28
+ENTMTPτ
+124.7
+3.26×
+3.20
+GSM8K
+Vanilla Vicuna
+33.7
+1.00×
+1.00
+Medusa (default)
+87.4
+2.59×
+2.51
+Hydra (default)
+102.4
+2.87×
+2.86
+ENTMTP∗
+109.7
+3.07×
+3.08
+ENTMTPτ
+112.0
+3.13×
+3.02
+ShareGPT
+Vanilla Vicuna
+35.4
+1.00×
+1.00
+Medusa (default)
+94.6
+2.72×
+2.86
+Hydra (default)
+109.0
+2.89×
+3.06
+ENTMTP∗
+116.9
+3.42×
+2.97
+ENTMTPτ
+117.5
+3.47×
+2.99
+Table 1. Speedup ρ over vanilla Vicuna-7B and average acceptance
+length τ on 100-prompt baskets at T=0.7. Hydra and Medusa use
+their authors’ published default trees. ENTMTP∗uses the per-task
+throughput-optimal tree; ENTMTPτ switches per step between a
+conservative and an aggressive tree from the same frontier. All
+times include prompt prefill.
+The fixed per-task throughput-optimal tree (ENTMTP∗)
+outperforms Hydra’s published default by 7.1-13.2% in
+4
+
+
+--- Page 5 ---
+EntMTP: Accelerating LLM Inference with Entropy Guided Multi Token Prediction
+tokens/s while using ≥2× fewer draft nodes (28/46/30
+vs. 63 on HumanEval/GSM8K/ShareGPT), and outper-
+forms Medusa’s default by 7.7-32.4%. Adding the runtime
+scheduler (ENTMTPτ) gives a further 0.5-2.1% on top of
+ENTMTP∗and yields the best wall-clock throughput on ev-
+ery benchmark, 3.26× over vanilla Vicuna on HumanEval,
+3.13× on GSM8K, and 3.47× on ShareGPT. Continuation
+perplexity stays within 0.02 nats of the base LM on every
+row, so the gains are lossless.
+6.1. Where did the gains come from?
+The static gain over Hydra’s default decomposes consis-
+tently across workloads: most of the 7-13% comes from a
+smaller per-task tree shrinking per-step verifier cost, with
+0-7% added by a higher τ on the optimized topology (Hu-
+manEval gains both, τ 3.06 →3.28; ShareGPT trades τ
+down by 3% for a smaller tree and still nets +7% tok/s).
+The schedulers residual gain over the static tree is largest
+on GSM8K (+2.1%), where mixing in the conservative tree
+during high-entropy reasoning steps reclaims verifier cycles
+without losing accept length.
+7. Acknowledgements
+We’d like to thank Professor De Sa for all the amazing
+conversations and support throughout the semester for this
+project!!
+References
+Ankner, Z., Parthasarathy, R., Nrusimha, A., Rinard, C.,
+Ragan-Kelley, J., and Brandon, W. Hydra: Sequentially-
+dependent draft heads for medusa decoding. In Work-
+shop on Efficient Systems for Foundation Models II
+at ICML 2024, 2024. URL https://arxiv.org/
+abs/2402.05109.
+Cai, T., Li, Y., Geng, Z., Peng, H., Lee, J. D., Chen, D.,
+and Dao, T. Medusa: Simple LLM inference acceleration
+framework with multiple decoding heads. In Proceedings
+of the 41st International Conference on Machine Learn-
+ing, 2024. URL https://arxiv.org/abs/2401.
+10774.
+Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre,
+L., and Jumper, J. Accelerating large language model
+decoding with speculative sampling. In arXiv preprint
+arXiv:2302.01318, 2023.
+URL https://arxiv.
+org/abs/2302.01318.
+Chiang, W.-L., Li, Z., Lin, Z., Sheng, Y., Wu, Z., Zhang,
+H., Zheng, L., Zhuang, S., Zhuang, Y., Gonzalez, J. E.,
+Stoica, I., and Xing, E. P.
+Vicuna: An open-source
+chatbot impressing gpt-4 with 90%* chatgpt quality,
+March 2023.
+URL https://lmsys.org/blog/
+2023-03-30-vicuna/.
+Li, Y., Wei, F., Zhang, C., and Zhang, H. Eagle: Speculative
+sampling requires rethinking feature extraction. arXiv
+preprint arXiv:2401.15077, 2024a.
+Li, Y., Wei, F., Zhang, C., and Zhang, H. EAGLE-2: Faster
+inference of language models with dynamic draft trees.
+In Proceedings of the 2024 Conference on Empirical
+Methods in Natural Language Processing, 2024b. URL
+https://arxiv.org/abs/2406.16858.
+Wang, Y., Kordi, Y., Mishra, S., Liu, A., Smith, N. A.,
+Khashabi, D., and Hajishirzi, H. Self-instruct: Align-
+ing language models with self-generated instructions.
+In Proceedings of the 61st Annual Meeting of the As-
+sociation for Computational Linguistics, 2023.
+doi:
+10.48550/arXiv.2212.10560. URL https://arxiv.
+org/abs/2212.10560.
+Yaniv, L., Matan, K., and Yossi, M. Fast inference from
+transformers via speculative decoding. In International
+Conference on Learning Representations, 2023.
+5
+
+
+--- Page 6 ---
+EntMTP: Accelerating LLM Inference with Entropy Guided Multi Token Prediction
+A. Entropy regimes across benchmarks
+For each benchmark, we log the following at every Hydra decode step in Fig. 3: block-start entropy with expoential smooth-
+ing (w ∈{4, 8, 12, 16, 24, 32, 64}), recent-acceptance moments (EMA, last-k mean/min/max), Hydra-head agreement,
+confidence statistics, and base-LM token-shape signals producing 13k-320k step rows per task (HumanEval 13k, ARC 12k,
+GSM8K 119k, ShareGPT 160k, LitBench 320k). Pearson-r in Fig. 3(a) is computed against the next step’s accept length
+within the same generation trajectory, and the AUROC bars in (b) come from a small per-task MLP (64→32→1, ReLU +
+dropout 0.4, early-stopped on AUROC) trained to predict ⊮[accept lengtht+1=1]. Splits are taken over generation samples
+(sample idx), not over rows, so adjacent decode steps from the same prompt never appear on both sides of the train/test
+boundary.
+Figure 3. Per-task divergence of speculative-decoding regimes on Vicuna-7B (see Appendix 7 for the full feature lists and model
+configurations). (a) Pearson correlation between curated features and the next-step accept length; gray cells did not enter the per-
+task top-7. History features (left) dominate on SHAREGPT/LITBENCH; entropy features (right) are the strongest predictors on
+GSM8K/HUMANEVAL/ARC. (b) AUROC of an MLP predicting whether the next step accepts only one token. Predictability spans
+0.55-0.70 across tasks, motivating per-task tree selection.
+B. Debiasing greedy acceptance frontier
+To ensure that acceptance rates reflect the actual test-time model performance, we re-evaluate every candidate tree topology
+on the per-depth frontier with a canonical self-rollout that uses the candidate tree’s own proposal, attention mask, and
+KV-cache update to produce unbiased acceptance estimate. Across all four evaluated tasks the correction is small and
+rank-preserving: the biased and unbiased means differ by at most 3.3% on any frontier tree, and the resulting frontier
+topology is unchanged.
+HumanEval
+GSM8K
+ShareGPT
+n
+d
+biased
+self
+∆
+n
+d
+biased
+self
+∆
+n
+d
+biased
+self
+∆
+2
+2
+1.431
+1.403
++2.0%
+2
+2
+1.384
+1.370
++1.0%
+2
+2
+1.427
+1.383
++3.2%
+14
+4
+2.750
+2.783
+−1.2%
+11
+4
+2.593
+2.650
+−2.1%
+12
+4
+2.619
+2.548
++2.8%
+28
+4
+3.095
+3.119
+−0.8%
+23
+4
+2.888
+2.841
++1.6%
+27
+4
+3.009
+2.949
++2.0%
+51
+4
+3.279
+3.266
++0.4%
+41
+4
+3.099
+3.109
+−0.3%
+52
+4
+3.228
+3.186
++1.3%
+85
+4
+3.407
+3.382
++0.7%
+88
+4
+3.291
+3.278
++0.4%
+76
+4
+3.396
+3.332
++1.9%
+Table 2. Biased (Algorithm 1, batched scoring) vs. unbiased (canonical self-rollout) mean accept length per step, on five frontier trees per
+benchmark spanning the node-budget range. ∆is the relative bias of the batched estimator (biased −self)/self. Across all 124 evaluated
+frontier trees the bias stays within ±3.3%, and the resulting frontier topology is unchanged on every benchmark.
+C. More Frontiers
+Fig. 4 and 5 report the same two-stage tree search of §3 applied to GSM8K and ShareGPT, with calibration and timing
+protocols identical to the HumanEval frontier in Fig 1 and 2.
+6
+
+
+--- Page 7 ---
+EntMTP: Accelerating LLM Inference with Entropy Guided Multi Token Prediction
+Figure 4. Two-stage greedy draft tree frontiers on GSM8K, a multi-step reasoning benchmark for grade school mathematics. (a)
+Acceptance-rate Pareto frontier, Medusa’s published default is pareto-dominated by all depth-4 trees after nodes ≥34; (b) the acceptance
+frontier (red) re-evaluated on throughput (tokens/second).
+Figure 5. Two-stage greedy draft tree frontiers on ShareGPT, a collection of real-world multi-round conversations between users and
+ChatGPT. (a) Acceptance-rate Pareto frontier, the published default is once again pareto-dominated on task-calibrated depth-4 trees with
+nodes ≥27; (b) the acceptance frontier mapped onto throughput space.
+7
