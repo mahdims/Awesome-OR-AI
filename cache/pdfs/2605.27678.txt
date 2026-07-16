@@ -1,0 +1,2721 @@
+--- Page 1 ---
+2026-5-28
+Heterogeneous Parallelism for Multimodal Large
+Language Model Training
+Yashaswi Karnati, Kamran Jafari, Akash Mehra, Li Ding, Pranav Prashant Thombre, Ali Roshan
+Ghias, Shifang Xu, Parth Mannan, Yu Yao, Hao Wu, Eric Harper, Ashwath Aithal, Nima
+Tajbakhsh
+Abstract: Foundation model training is becoming multimodal, from post-training pipelines to large-scale
+pretraining. As modality coverage broadens, context windows grow, and encoder–LLM scales diverge, a single
+LLM-centric TP/CP/PP/DP/EP layout increasingly limits throughput. This coupling forces encoders to
+inherit LLM-driven sharding and placement choices that can add communication, limit encoder parallelism,
+or constrain the LLM schedule; the mismatch is most pronounced at long contexts, where LLM context
+parallelism is needed for the fused multimodal sequence but encoder inputs remain bounded. We present
+heterogeneous parallelism for multimodal large language model training, an abstraction that lets modules
+in one end-to-end graph use independent layouts and rank placements, supporting colocated execution on
+shared GPUs and non-colocated execution on disjoint rank sets. The key challenge is preserving boundary
+tensor semantics across independent layouts: forward activations must be materialized for the destination
+layout, while backward gradients must be routed back to the source layout. We address this with boundary
+communicators that implement forward and backward layout transforms, plus scheduling extensions for
+both placement modes. We evaluate optimized homogeneous, colocated heterogeneous, and non-colocated
+heterogeneous configurations across multimodal workloads and GPU scales to characterize when added layout
+and placement freedom exposes a better operating point. Across this sweep, colocated heterogeneity improves
+TFLOPS/GPU by up to 49.3%, while non-colocated heterogeneity improves aggregate token throughput by
+up to 13.0% and TFLOPS/GPU by up to 9.6%. We validate loss convergence parity against homogeneous
+baselines and release the system as an open-source Megatron-LM extension.
+1. Introduction
+As foundation-model training expands from text-only
+transformers to multimodal systems spanning images,
+audio, video, and documents, the training graph has
+grown heterogeneous while the parallelism stack has
+not kept pace. The resulting graph consists of mod-
+ules with fundamentally different depth, width, and
+context size — and therefore different requirements
+for TP, CP, PP, DP, and EP1 — yet in practice all
+modules are constrained to a single shared layout.
+While choosing this layout for the LLM2 is natural,
+encoder and LLM parallelism requirements increas-
+ingly diverge at scale.
+These mismatches motivate heterogeneous multi-
+modal parallelism: layout should be chosen per mod-
+ule rather than as a model-wide constant. First, the
+high TP degrees required by large LLMs introduce
+all-reduce collectives around otherwise local encoder
+computation, and this overhead can outweigh the
+compute and memory savings for small encoders. Sec-
+1TP, CP, PP, DP, and EP denote tensor, context, pipeline,
+data, and expert parallelism, respectively.
+2LLM denotes large language model; MLLM denotes multi-
+modal large language model.
+ond, and most consequentially, CP shards the fused
+language sequence to manage attention memory, but
+encoder sequence length is bounded by modality res-
+olution rather than the LLM context window. As a
+result, inheriting LLM CP shards a fixed-size encoder
+sequence without memory relief, while those ranks
+could instead act as independent encoder DP replicas
+and process more modality samples per step. Third,
+PP confines encoder execution to the first PP stage
+of LLM, forcing the encoder to inherit that stage’s
+TP degree and encoder-heavy workloads can overload
+those ranks and prevent the LLM from using a more
+efficient pipeline layout.
+Which mismatch matters most is workload-dependent.
+Changing encoder and LLM scale, context length,
+modality-token density, world size, or optimizer-state
+sharding shifts the balance among compute, activa-
+tion memory, optimizer-state footprint, communica-
+tion volume, and pipeline balance. Heterogeneous
+parallelism therefore does not prescribe one univer-
+sally better layout; it exposes additional degrees of
+freedom so the system can tune encoder and LLM
+layouts to the workload’s operating point.
+Decoupling module layouts, however, is not just a con-
+© 2026 NVIDIA. All rights reserved.
+arXiv:2605.27678v1  [cs.LG]  26 May 2026
+
+
+--- Page 2 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+figuration change: adjacent modules must still agree
+on boundary tensor semantics. Forward activations
+must be materialized in the destination layout, and
+backward gradients must be returned to the source
+layout. This requirement raises three system chal-
+lenges. First, every inter-module edge needs a paired
+forward and backward layout transform. The central
+correctness challenge is that an incorrect layout map-
+ping can produce tensors with valid shapes, allowing
+training to proceed while silently routing gradients to
+the wrong ranks and corrupting optimization with-
+out a runtime error. Second, colocated placement
+requires each rank to interpret its position in two
+logical grids and apply the correct forward layout
+transform, with the matching reverse transform in
+backward. Third, pipeline scheduling must generalize
+beyond a single linear stage chain: multimodal graphs
+can contain modules with different PP depths and
+boundary edges that require communicators distinct
+from ordinary pipeline P2P. Solving all three together,
+without changing the model or training semantics, is
+the core technical problem this paper addresses.
+We present heterogeneous parallelism for multimodal
+large language model training as an open-source
+Megatron-LM extension that lets each module choose
+its own TP/CP/PP/DP/EP layout and physical rank
+set while preserving a single end-to-end training graph.
+Its core primitive is the boundary communicator, an
+autograd-aware operator attached to an inter-module
+edge: in forward, it materializes the source activation
+in the destination module’s layout; in backward, it
+applies the inverse transform so the gradient returns
+to the source module’s layout. The same abstraction
+supports two complementary placement modes. In
+colocated execution, modules share physical GPUs
+but interpret those ranks under different logical grids,
+which is useful when encoder and LLM can share hard-
+ware but should not share a layout. In non-colocated
+execution, modules occupy disjoint rank sets, which is
+useful when encoder state on the LLM ranks restricts
+the LLM memory or pipeline layout.
+Scheduling extensions compose these boundary trans-
+forms with pipeline-parallel training. A graph-aware
+1F1B3 dispatcher coordinates non-colocated modules,
+while a three-phase schedule for colocated modules
+prevents encoder collectives from conflicting with
+LLM pipeline P2P. Together, boundary communi-
+cators, placement modes, and scheduling extensions
+provide a runtime substrate for module-local paral-
+lelism in one end-to-end MLLM training graph. We
+make the following contributions:
+1. A heterogeneous-parallel runtime abstrac-
+31F1B denotes one-forward-one-backward pipeline schedul-
+ing; P2P denotes point-to-point communication.
+tion for MLLM training. We let modules in
+one end-to-end multimodal graph choose inde-
+pendent TP/CP/PP/DP/EP layouts and phys-
+ical rank placements, covering both colocated
+execution on shared GPUs and non-colocated
+execution on disjoint rank sets.
+2. Boundary communicators and heteroge-
+neous pipeline schedules.
+We introduce
+autograd-aware boundary communicators that
+materialize forward activations in the destina-
+tion layout and return backward gradients to
+the source layout. We compose these transforms
+with pipeline-parallel training using graph-aware
+1F1B dispatch for non-colocated modules and a
+three-phase schedule for colocated modules.
+3. An operating-regime evaluation against op-
+timized homogeneous baselines. We eval-
+uate the two modes in the regimes they tar-
+get:
+shared-GPU colocated workloads across
+encoder size, context length, vision-token den-
+sity, and GPU scale, and workloads that pair
+larger encoders with a 120B LLM, where non-
+colocation separates encoder state from LLM
+ranks. Across these regimes, colocated execution
+improves TFLOPS/GPU4 by up to 49.3%, while
+non-colocated execution improves aggregate to-
+ken throughput by up to 13.0% and TFLOP-
+S/GPU by up to 9.6%.
+4. Correctness, convergence, and open-source
+release.
+Step-level FP32 parity checks and
+FP32/BF165 LLaVA-style training sweeps vali-
+date correctness and convergence, and we release
+the implementation in Megatron-LM for commu-
+nity use in large-scale multimodal training.
+2. Related work
+Large-scale training frameworks such as Megatron-
+LM, DeepSpeed/ZeRO, Megatron-DeepSpeed, and
+PyTorch FSDP provide the core mechanisms for
+scaling modern transformer training, including ten-
+sor, data, pipeline, sequence/context, expert, and
+optimizer-state parallelism [9, 12–14, 21]. These sys-
+tems are highly effective for homogeneous transformer
+stacks, but typically expose a single parallel layout
+for the composed graph.
+In multimodal training,
+this shared-layout assumption can force encoders and
+LLMs into the same TP/DP/PP/CP choices despite
+their different sequence lengths, memory pressure,
+and communication patterns.
+Several recent systems improve the efficiency of het-
+4TFLOPS denotes tera floating-point operations per second;
+TFLOPS/GPU denotes per-GPU throughput.
+5FP32 denotes single-precision 32-bit floating point; BF16
+denotes bfloat16.
+2
+
+
+--- Page 3 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+erogeneous multimodal training graphs without re-
+laxing this shared-layout constraint.
+Prior work
+reduces pipeline bubbles or wavefront overheads
+[3, 6, 16, 18], addresses sequence or workload im-
+balance [7, 8, 10, 15], and mitigates multimodal data-
+plane bottlenecks [17, 20]. These techniques improve
+scheduling, balancing, or data movement around a se-
+lected layout, but do not let adjacent modules choose
+and compose independent parallel layouts inside one
+end-to-end training graph.
+More closely related systems explicitly target multi-
+modal heterogeneity, but their abstractions remain
+tied to particular topologies or placement models.
+DISTMM [4] partitions heterogeneous multimodal
+submodules, but focuses on contrastive or fusion-style
+models where modality towers meet at aggregation,
+interaction, or loss modules. MLLM training instead
+has feed-through boundaries: encoder activations be-
+come projector, embedding, and LLM inputs, and
+gradients must return through those same edges. Dist-
+Train [19] disaggregates the modality encoder, LLM
+backbone, and generator into broker-connected paral-
+lelism units, but centers on physically separated units
+rather than colocated modules that share GPUs while
+using different logical layouts. Cornstarch exposes
+modular MLLM construction and modality-aware par-
+allelism [2, 5], but its public interface still restricts
+independent module layouts, including different en-
+coder/LLM TP sizes, LLM-only CP, and DP inferred
+after composition.
+In contrast, our work makes heterogeneous parallelism
+a first-class runtime abstraction for MLLM training.
+Boundary communicators pair forward activation ma-
+terialization with backward gradient transforms, pre-
+serving tensor semantics across independently par-
+allelized modules. The same abstraction supports
+both shared-rank colocated execution and disjoint-
+rank non-colocated execution, while heterogeneous
+pipeline scheduling composes the modules into one
+end-to-end training graph. By implementing this in
+Megatron-LM, we provide a reusable runtime sub-
+strate for modular MLLM frameworks, disaggregated
+training systems, and future placement planners.
+3. Method
+We view multimodal training as a graph of modules
+and graph operators connected by activation edges.
+As shown in Figure 1(a), the graph contains modality
+encoders, projection layers, an embedding assembly
+step, and an autoregressive language model. Rather
+than assigning one parallel layout to the entire graph,
+our method assigns each module 𝑚its own logical
+layout 𝐺𝑚= (TP𝑚, DP𝑚, PP𝑚, CP𝑚, . . .) and phys-
+ical rank set 𝑅𝑚. The logical layout describes how
+the module shards or replicates its computation; the
+rank set describes where that module executes.
+A boundary edge 𝑢→𝑣carries one tensor with two
+distributed representations. The source module pro-
+duces it according to 𝐺𝑢on ranks 𝑅𝑢, while the
+destination module consumes it according to 𝐺𝑣on
+ranks 𝑅𝑣. A boundary communicator is the runtime
+primitive that converts between these representations:
+forward materializes the activation in the destination
+layout, and backward applies the matching reverse lay-
+out transform so that gradients return to the source
+layout. This preserves boundary tensor semantics
+while allowing adjacent modules to use independent
+TP/DP/PP/CP grids inside one end-to-end training
+graph.
+The boundary communicator implements a logical
+batch-shard transform for every inter-module edge.
+Equal-DP boundaries pair source and destination
+shards one-to-one. Fan-in, where DP𝑢> DP𝑣, maps
+multiple source batch intervals to one destination
+shard; backward splits the destination gradient along
+the same recorded intervals. Fan-out, where DP𝑢<
+DP𝑣, maps one source shard to multiple destination
+intervals; backward concatenates sibling destination-
+gradient intervals to reconstruct the source-layout
+gradient. How this logical transform is physically
+realized depends on whether source and destination
+modules share ranks or occupy disjoint rank sets;
+we therefore introduce colocated and non-colocated
+communicators next.
+3.1. Non-colocated communicator
+A non-colocated boundary realizes the layout trans-
+form through explicit transfer between the source
+module’s last pipeline stage and the destination mod-
+ule’s first pipeline stage. The performance-sensitive
+step is the cross-boundary exchange: module-local
+TP/CP groups are often mapped within a high-
+bandwidth locality domain, while disjoint module
+islands may communicate over lower-bandwidth fab-
+ric. To avoid a cross-product exchange between source
+and destination TP/CP ranks, the communicator
+routes each boundary DP shard through a determinis-
+tic boundary leader, usually the rank with canonical
+TP/CP coordinates on the boundary stage. Leaders
+perform all inter-module P2P; local TP/CP broadcast
+then materializes the activation or gradient on the
+non-leader ranks required by the receiving layout.
+This design makes cross-boundary communication
+follow the logical batch-shard relation rather than
+the product of source and destination TP/CP widths.
+The source and destination leaders are derived from
+3
+
+
+--- Page 4 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+encoder
+LLM PP=2
+(a) multimodal graph
+image
+audio
+video
+proj
+proj
+proj
+text
+embed
+LLM
+(b) colocated ranks
+R0
+R1
+R2
+R3
+enc DP0
+enc DP1
+TP0
+TP1
+TP0
+TP1
+LLM DP0
+TP0
+TP1
+TP2
+TP3
+Enc: TP=2, DP=2; LLM: TP=4, DP=1
+(c) non-colocated ranks
+Enc
+DP0
+Enc
+DP1
+PP0
+TP0
+PP0
+TP1
+PP1
+TP0
+PP1
+TP1
+NC
+bcast
+P2P
+Enc: TP=1, DP=2; LLM: TP=2, PP=2
+Figure 1 | Multimodal graph and heterogeneous placement modes. Modality encoders produce projected
+tokens that are inserted into the LLM input sequence. Colocated execution reinterprets the same physical
+ranks under different encoder and LLM logical grids, while non-colocated execution places encoder and LLM
+on disjoint rank sets and uses non-colocated communicators before ordinary LLM pipeline P2P.
+𝐺𝑢, 𝐺𝑣, 𝑅𝑢, and 𝑅𝑣, so both sides construct the
+same static routing pattern for the edge. Equal-DP
+boundaries use one-to-one P2P between paired source
+and destination leaders. Fan-in uses a many-to-one
+route: source leaders whose batch intervals form one
+destination shard send to the same destination leader,
+which concatenates in batch order. Fan-out uses the
+dual one-to-many route: a source leader partitions
+its shard into destination intervals and sends each
+interval to the corresponding destination leader.
+Backward uses the inverse leader routes. For equal-
+DP, the destination leader returns the gradient shard
+to the paired source leader. For fan-in, the destination
+leader splits the gradient along the recorded batch
+intervals and returns each slice to the source leader
+that supplied the corresponding forward shard. For
+fan-out, the source leader receives sibling destination-
+gradient intervals and concatenates them to recon-
+struct the source-layout gradient. In all cases, the
+reconstructed leader result is broadcast within the
+local TP/CP group required by the receiving side.
+Figure 2 visualizes these leader routes for unequal TP
+widths.
+3.2. Colocated communicator
+A colocated boundary realizes the same layout trans-
+form on a shared rank set. The source and destina-
+tion modules use the same physical ranks but assign
+each rank different logical coordinates under 𝐺𝑢and
+𝐺𝑣. The communicator is an autograd-aware shared-
+rank layout operator: its forward pass constructs the
+destination-layout representation on the shared ranks,
+and its backward pass reconstructs the corresponding
+source-layout gradient representation.
+For each boundary edge, the runtime derives ev-
+ery rank’s source coordinate, destination coordinate,
+batch interval, and local collective group from 𝐺𝑢,
+𝐺𝑣, and the shared rank set. Equal-DP boundaries
+are rank-local: each destination rank consumes the
+source shard already present on that physical rank,
+reinterpreted under the destination layout. Fan-in
+uses local all-gather among ranks whose source inter-
+vals form one destination shard, followed in backward
+by interval selection from the destination-gradient
+shard. Fan-out is the dual: forward selects the des-
+tination batch interval from the larger source shard
+locally, while backward all-gathers sibling destination-
+gradient intervals to reconstruct the original source-
+layout gradient.
+Figure 3 visualizes these shared-rank transforms. Un-
+like the non-colocated protocol, colocated communica-
+tion does not move tensors across rank sets; it changes
+the logical view of the shared rank set and invokes
+local collectives only when the layout transform spans
+multiple batch intervals. We profile these communi-
+cators and find that their overhead is less than 1%;
+Appendix A.4 provides details. Section 3.3 describes
+how this shared-rank layout operator is ordered with
+the LLM pipeline schedule.
+3.3. Pipeline orchestration over heterogeneous
+modules
+The boundary communicators define the layout trans-
+form for one edge; the scheduler decides when those
+edge transforms are invoked inside the full training
+loop. This is not ordinary linear pipeline parallelism.
+A conventional 1F1B schedule assumes one linear PP
+chain, where each stage communicates with a fixed
+predecessor and successor. In a heterogeneous multi-
+modal graph, modules can have different PP depths
+and layouts, a node can have multiple incoming or
+4
+
+
+--- Page 5 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+(a) Fan-in: Enc DP=4, TP=2 →LLM DP=2, TP=4
+Encoder DP leaders
+LLM DP leaders
+TP0 leader
+TP1 member
+DP0
+TP0 leader
+TP1 member
+DP1
+TP0 leader
+TP1 member
+DP2
+TP0 leader
+TP1 member
+DP3
+TP0 leader
+TP1
+TP2
+TP3
+DP0
+TP0 leader
+TP1
+TP2
+TP3
+DP1
+forward: P2P + concat + broadcast
+B/4
+B/4
+concat
+B/2
+backward: split + P2P + broadcast
+B/2
+split
+B/4
+B/4
+(b) Fan-out: Enc DP=2, TP=4 →LLM DP=4, TP=2
+Encoder DP leaders
+LLM DP leaders
+TP0 leader
+TP1
+TP2
+TP3
+DP0
+TP0 leader
+TP1
+TP2
+TP3
+DP1
+TP0 leader
+TP1 member
+DP0
+TP0 leader
+TP1 member
+DP1
+TP0 leader
+TP1 member
+DP2
+TP0 leader
+TP1 member
+DP3
+forward: split + P2P + broadcast
+B/2
+split
+B/4
+B/4
+backward: P2P + concat + broadcast
+B/4
+B/4
+concat
+B/2
+forward P2P
+backward P2P
+local TP/CP broadcast
+Figure 2 | Non-colocated boundary communicator. Source and destination modules occupy disjoint rank
+sets, so boundary tensors cross the module boundary only through deterministic boundary leaders. Solid
+arrows show inter-module P2P among leaders; dashed arrows show local TP/CP broadcast to non-leader
+ranks. 𝐵denotes the global boundary batch. In fan-in, two 𝐵/4 source shards are concatenated into one 𝐵/2
+destination shard in forward, and the 𝐵/2 gradient is split back into two 𝐵/4 source gradients in backward.
+Fan-out is the dual case: one 𝐵/2 source shard is split into two 𝐵/4 destination shards in forward, and the
+returned gradients are concatenated in backward. Unequal TP widths change the local broadcast domains
+around each leader, not the number of cross-boundary rank pairs.
+(a) Fan-in: Enc DP=4, TP=2 →LLM DP=2, TP=4
+Encoder view
+TP=2, DP=4
+LLM view
+TP=4, DP=2
+r0: D0/T0
+r0: D0/T0
+r1: D0/T1
+r1: D0/T1
+r2: D1/T0
+r2: D0/T2
+r3: D1/T1
+r3: D0/T3
+r4: D2/T0
+r4: D1/T0
+r5: D2/T1
+r5: D1/T1
+r6: D3/T0
+r6: D1/T2
+r7: D3/T1
+r7: D1/T3
+D0
+D1
+D2
+D3
+D0
+D1
+B/4
+B/2
+B/4
+B/2
+forward all-gather by TP lane
+{r0,r2}
+{r1,r3}
+B/2
+B/4
+B/2
+B/4
+backward interval select
+(b) Fan-out: Enc DP=2, TP=4 →LLM DP=4, TP=2
+Encoder view
+TP=4, DP=2
+LLM view
+TP=2, DP=4
+r0: D0/T0
+r0: D0/T0
+r1: D0/T1
+r1: D0/T1
+r2: D0/T2
+r2: D1/T0
+r3: D0/T3
+r3: D1/T1
+r4: D1/T0
+r4: D2/T0
+r5: D1/T1
+r5: D2/T1
+r6: D1/T2
+r6: D3/T0
+r7: D1/T3
+r7: D3/T1
+D0
+D1
+D0
+D1
+D2
+D3
+B/2
+B/4
+B/2
+B/4
+forward interval select
+B/4
+B/2
+B/4
+B/2
+backward all-gather by dest TP lane
+{r4,r6}
+{r5,r7}
+forward
+backward
+all-gather pair
+Figure 3 | Colocated boundary communicator. Source and destination modules share the same physical ranks
+but interpret them under different logical layouts. 𝐵denotes the global boundary batch. In fan-in, ranks
+whose source slices form one destination shard all-gather locally: two 𝐵/4 source slices become one 𝐵/2
+destination shard in forward, and backward selects from the 𝐵/2 gradient the batch interval contributed
+by each source rank. In fan-out, forward is rank-local batch-interval selection from a 𝐵/2 source shard to
+a 𝐵/4 destination shard, while backward all-gathers sibling 𝐵/4 gradients to reconstruct the original 𝐵/2
+source-gradient shard. Thus, colocated communication changes the logical view of a shared rank set rather
+than moving tensors across rank sets.
+5
+
+
+--- Page 6 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+(a) non-colocated graph-aware PP
+E1
+PP0
+R0
+E1
+PP1
+R1
+E2
+PP0
+R2
+LLM
+PP0
+R3
+LLM
+PP1
+R4
+LLM
+PP2
+R5
+P2P
+NC
+NC
+P2P
+join
+E1 PP=2
+E2 PP=1
+LLM PP=3
+(b) colocated three-phase schedule
+LLM PP
+CPU
+phase 1
+phase 2
+phase 3
+enc.
+fwd
+coloc.
+fwd
+coloc.
+bwd
+enc.
+bwd
+warm
+steady
+1F1B
+cool
+detached microbatch views
+detach
+grad
+D2H
+H2D
+sync
+time
+Figure 4 | Pipeline orchestration for heterogeneous modules. (a) Non-colocated graph-aware pipeline dispatch:
+Encoder 1 has two PP stages, Encoder 2 has one, and the LLM has three; intra-module edges use module-local
+P2P, while encoder–LLM edges invoke edge-local non-colocated communicators. (b) Colocated LLM-PP
+training uses three phases: encoder forward and colocated forward transform, detached LLM 1F1B, then
+boundary-gradient handoff followed by colocated backward transform and encoder backward.
+outgoing activation edges, and a rank’s next communi-
+cation may be either module-local P2P or a boundary
+communicator that changes layouts across modules.
+A pipeline action is therefore an edge-dispatch deci-
+sion over a PP-stage graph, not simply “send to the
+next PP rank.”
+For non-colocated execution, the runtime expands
+the module graph into PP-stage nodes, as in Fig-
+ure 4(a). At each schedule action and microbatch, it
+resolves the active module edge. Internal edges use
+the module’s ordinary PP communicator; edges cross-
+ing disjoint module rank sets invoke the non-colocated
+communicator from Section 3.1 between the source
+module’s final PP stage and the destination module’s
+first PP stage. Preserving edge identity is essential at
+joins and branches: an LLM join becomes runnable
+only after all required encoder activations have been
+materialized in the LLM layout, and backward routes
+each boundary gradient through the communicator
+attached to the forward edge that produced that ac-
+tivation.
+The scheduler also generalizes warmup, steady state,
+and cooldown. In a linear pipeline, these phases are
+derived from a stage’s position in one chain. In a
+PP-stage graph, different nodes can have different
+downstream distances to the sink, and these distances
+determine when each node warms up, enters paired
+forward/backward actions, and drains.
+At steady
+state, the two halves of a paired schedule call may
+resolve to different edge types: a rank can send a new
+activation through one edge while receiving an older
+gradient through the reverse of another. Appendix D
+expands Figure 4(a) into the corresponding dispatch
+table.
+Colocated execution introduces a different ordering
+constraint.
+The encoder and LLM share physical
+ranks, but their communication order is not the same.
+Encoder execution may require collectives over the
+encoder layout, where all ranks in a collective group
+must enter together. LLM 1F1B deliberately stag-
+gers ranks across PP stages and microbatches. If en-
+coder collectives are invoked inside the LLM pipeline
+loop, ranks in the same encoder collective group can
+arrive at different times; adding global synchroniza-
+tion would avoid the conflict but serialize the LLM
+pipeline.
+We therefore use the three-phase colocated schedule
+in Figure 4(b). First, the runtime batches the sam-
+ples assigned to the colocated rank group for the
+current LLM pipeline window, runs encoder forward
+once over those microbatches, and applies the colo-
+cated forward transform from Section 3.2 to produce
+a packed boundary tensor in the LLM PP0 layout.
+Second, this tensor is detached as a leaf boundary
+variable and exposed to LLM PP0 as per-microbatch
+views; ordinary LLM 1F1B then indexes the active
+view, inserts it into that microbatch’s text embed-
+dings, and proceeds with standard LLM pipeline P2P
+without re-entering encoder collectives. Third, after
+the LLM pipeline drains, accumulated gradients on
+the packed boundary tensor are handed through the
+colocated backward transform, and encoder backward
+runs over the saved batched encoder activations.
+The explicit gradient handoff reconnects the detached
+LLM phase to the encoder-side autograd graph while
+preserving the paired forward/backward layout trans-
+form. The phase boundary also creates a memory
+window: encoder parameters can be offloaded af-
+ter encoder forward, reloaded during LLM cooldown,
+and synchronized before encoder backward consumes
+them.
+6
+
+
+--- Page 7 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+4. Experimental results
+We evaluate how independent encoder and LLM lay-
+outs improve end-to-end MLLM training throughput.
+A homogeneous shared TP/CP/PP/DP grid imposes
+one set of layout choices on both encoder and LLM,
+which can over-constrain the system. Heterogeneous
+parallelism relaxes this constraint by allowing each
+module to use its own layout. This flexibility matters
+because the optimization space is large: encoder scale,
+context length, vision-token density, world size, and
+optimizer-state sharding each shift pressure among
+compute, memory, pipeline balance, and communi-
+cation. As these pressures shift, the best operating
+point can also change, including whether heterogene-
+ity should be colocated or non-colocated. Our evalu-
+ation samples representative points across this land-
+scape to characterize where each execution mode is
+most effective.
+For each workload, we tune homogeneous (H), colo-
+cated heterogeneous (C), and non-colocated heteroge-
+neous (NC) execution to their best valid throughput
+configurations.6 The search includes module layouts,
+recomputation, batch-size constraints, distributed op-
+timizer instances, and LLM pipeline-layer balance.
+Colocated runs use the same physical world size and
+global batch size as homogeneous training, whereas
+non-colocated runs are iso-GBS7; when exact world-
+size matching is infeasible, we keep the LLM world size
+comparable to homogeneous training, add a compact
+encoder island, and report both aggregate tokens/s
+and TFLOPS/GPU. Appendix B shows how these
+module layouts and placements are expressed in the
+user-facing configuration.
+We first evaluate colocated heterogeneous execution,
+which is the relevant setting when the encoder and
+LLM can fit on the same GPUs but should not share
+the same logical grid. In this regime, heterogeneous
+parallelism improves throughput by remapping the
+encoder and LLM to different layouts. The encoder
+can reduce unnecessary TP, avoid unnecessary CP,
+increase useful DP, and choose its own number of
+distributed optimizer instances. This last choice is
+important because increasing encoder DP can improve
+encoder efficiency, but it also changes how optimizer
+state is sharded and how much optimizer communica-
+tion is introduced. Colocated heterogeneity lets the
+encoder make this tradeoff independently of the LLM.
+Figure 5(a) summarizes this shared-GPU regime at 8K
+context, with full measurements in Table A2. Across
+6Throughput is measured as the median over 15 steady-state
+iterations after warmup; repeated measurements on representa-
+tive configurations showed low run-to-run variation, typically
+below 1%.
+7GBS denotes global batch size.
+the short-context model-size sweep, colocated exe-
+cution consistently improves throughput when the
+shared homogeneous grid over-constrains the encoder
+or the LLM pipeline. The tuned 256-GPU rows show
+the same mechanism at larger scale, where encoder
+layout and encoder optimizer instances are selected
+per workload.
+As an example, for the 1B encoder + 14B LLM
+at 8K, 50% vision tokens, and 72 GPUs, the best
+homogeneous configuration uses a shared 4/1/1/18
+TP/CP/PP/DP layout. The best colocated hetero-
+geneous configuration instead uses encoder 2/1/1/36
+and LLM 2/1/2/18. This lets the LLM use PP=2
+with lower TP, while the encoder remains a single-
+stage, higher-DP module rather than being tied to
+the LLM pipeline structure. Step time improves at
+the same GPU count and essentially the same peak
+memory usage.
+As context length grows, the LLM needs CP to fit and
+parallelize the fused multimodal sequence, but the
+encoder sequence length is fixed by image resolution
+and patching; colocated heterogeneity keeps encoder
+CP=1 and converts those ranks into encoder DP
+replicas. This is the strongest colocated setting in our
+sweep (Figure 5(b) and Table A3).
+We next evaluate non-colocated heterogeneous ex-
+ecution, which targets a different bottleneck.
+For
+larger encoders paired with the 120B LLM, the ac-
+tive constraint shifts from logical layout coupling to
+memory residency. Encoder parameters, activations,
+and optimizer state now compete with the LLM for
+the same rank memory and can block a better LLM
+pipeline layout. In this regime, non-colocated het-
+erogeneity becomes the better operating point: the
+encoder runs on a compact island, while the LLM
+recovers an independently optimized layout over the
+remaining ranks.
+Figure 5(c) and (d) show how the best operating
+point for a 120B LLM changes between colocated and
+non-colocated modes, with full measurements in Ta-
+bles A4 and A5. For 1B and 3B encoders, colocated
+execution remains the better operating point because
+the encoder can share the LLM GPUs and benefit
+from layout remapping. Starting at the 6B encoder
+scale, the best mode switches to non-colocated execu-
+tion. The NC rows remain positive despite averaging
+over the additional 8-GPU encoder island. This in-
+dicates that, once encoder residency constrains the
+LLM memory or pipeline layout, separating the en-
+coder can improve both end-to-end throughput and
+normalized per-GPU efficiency.
+Overall, the experiments show that heterogeneous
+parallelism improves MLLM throughput by making
+7
+
+
+--- Page 8 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+(a) Model size: Colocated vs Homogeneous
+(b) Long context: Colocated vs Homogeneous
+8K context, TFLOPS/GPU gain over homogeneous
+0
+10
+20
+Gain (%)
+1B
+3B
+1B
+3B
+1B
+3B
+14B LLM
+70B LLM
+120B LLM
+50% vision
+75% vision
+1B+7B
+0
+10
+20
+30
+40
+50
+16K
+32K
+64K
+128K
+1B+14B
+16K
+32K
+64K
+128K
+TFLOPS/GPU gain (%)
+LLM context length
+50% vision
+75% vision
+(c) Vision tokens: Non-colocated vs Homogeneous
+120B LLM, 8K, 256/264 GPUs
+0
+5
+10
+15
+Tokens/s gain (%)
++5.9
++4.4
+6B
++7.1
++13.0
+7.2B
++7.3
++12.7
+12B
+50% vision
+75% vision
+(d) 120B LLM: Best Heterogeneous Mode
+8K, 50% vision
+0
+10
+20
+30
+Tokens/s gain over H* (%)
+1B
+3B
+6B
+7.2B
+12B
++12.9
++21.5
++5.9
++7.1
++7.3
+C*
+NC*
+Figure 5 | Operating regimes for heterogeneous training. When memory headroom is sufficient, colocated
+execution is the right first step: it gives the encoder and LLM separate logical layouts while keeping them on
+the same GPUs. Long context strengthens this effect because the LLM needs context parallelism while the
+encoder does not; keeping encoder CP = 1 turns LLM context-parallel ranks into encoder data-parallel replicas.
+As encoder pressure grows with a 120B LLM, non-colocated execution becomes the better operating point: it
+separates encoder work from the LLM rank set, and the best heterogeneous mode switches from colocated for
+small encoders to non-colocated from the 6B encoder scale onward. Appendices A.1, A.2, and A.3 report the
+full measurements.
+module-level layout and placement tunable. Colo-
+cated execution extracts more throughput from a fixed
+GPU budget when encoder and LLM can share hard-
+ware but need different logical grids. Non-colocated
+execution becomes effective when encoder residency
+should be separated from the LLM rank set. This
+flexibility lets the system select the right operating
+point for each workload.
+5. Convergence validation
+Heterogeneous parallelism should change only how
+tensors are partitioned, placed, and communicated
+across ranks, not the underlying training seman-
+tics. Because training loss curves can hide subtle
+communicator-level errors, we first validated this in-
+variant with step-level numerical parity tests in FP32.
+Starting from the same initialization and identical
+inputs, the homogeneous baseline, a non-colocated
+variant, and a colocated heterogeneous variant execute
+identical training steps; after each optimizer update,
+we compare all parameters, gradients, and optimizer
+states within tight numerical tolerance. This directly
+checks boundary-communicator correctness, includ-
+ing forward activation materialization and backward
+gradient routing.
+For convergence parity, we compare loss trajectories
+across colocated and non-colocated layouts using a
+LLaVA-1.5-style workload: a CLIP ViT-L/14 vision
+encoder [11], a two-layer projection MLP, and Vicuna-
+7B [1] trained on LLaVA-Pretrain. LLaVA serves
+as a representative validation case, but our bound-
+ary communication mechanism also supports cross-
+attention-based MLLM such as Qwen3VL. We use
+FP32 (vision encoder frozen, projection MLP and
+LLM trainable), disable TF32, and enforce deter-
+ministic PyTorch/cuDNN execution and fixed NCCL
+collective selection to minimize numerical noise. Be-
+cause TP reductions remain layout-order-dependent,
+we compare within numerical tolerance rather than
+requiring bitwise agreement. Appendix C provides
+the full validation protocol and extends the study
+8
+
+
+--- Page 9 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+2
+3
+4
+5
+6
+7
+8
+LM loss
+0
+0.05
+0.10
+0
+25
+50
+75
+100
+abs. diff.
+Colocated homogeneous (baseline)
+Non-colocated homogeneous
+Colocated heterogeneous
+max |non-colo. homo|=0.034
+max |colo. hetero|=0.057
+Training step
+Figure 6 | Controlled FP32 convergence comparison.
+Baseline: colocated homogeneous on four GPUs with
+the vision encoder and LLM both using TP = 4, DP =
+1; non-colocated same-layout keeps TP = 4, DP = 1
+for both modules but places the LLM on ranks 0–
+3 and the vision encoder on ranks 4–7. Colocated
+heterogeneous keeps the same four ranks but uses
+vision TP = 1, DP = 4 and LLM TP = 4, DP = 1;
+both variants follow the baseline loss curve.
+to longer BF16 runs and broader TP/PP/DP layout
+sweeps.
+Figure 6 reports the main controlled convergence com-
+parison. Starting from the homogeneous baseline, the
+same-layout non-colocated variant changes physical
+placement while keeping module layouts fixed, and
+the colocated heterogeneous variant changes module-
+local layout while keeping placement fixed. All other
+training settings are held constant. The loss curves
+closely overlap, supporting convergence parity under
+both placement and layout changes.
+6. Conclusion
+We presented heterogeneous parallelism for multi-
+modal training, a runtime abstraction that lets mod-
+ules in one end-to-end graph use independent layouts
+and rank placements while boundary communicators
+and scheduling extensions preserve activation and gra-
+dient semantics across colocated and non-colocated
+pipeline execution. This flexibility lets the training
+system tune its operating point as model scale, con-
+text length, modality-token density, memory pressure,
+communication volume, and pipeline balance change.
+In our evaluated workloads, colocated execution is
+effective when the same GPU allocation can support
+different module grids, whereas non-colocated exe-
+cution becomes useful when encoder state on the
+LLM ranks restricts the LLM memory or pipeline lay-
+out. Across these workloads, this yields up to 49.3%
+TFLOPS/GPU for colocated execution and 13.0%
+aggregate token throughput for large-encoder 120B
+LLM training. FP32/BF16 validation confirms train-
+ing behavior. The open-source Megatron-LM exten-
+sion already supports multiple encoders, audio/video,
+and MoE; future work will evaluate their performance
+regimes, including how extra encoders and module
+boundaries shift layout and placement choices.
+9
+
+
+--- Page 10 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+References
+[1] W.-L. Chiang, Z. Li, Z. Lin, Y. Sheng, Z. Wu,
+H. Zhang, L. Zheng, S. Zhuang, Y. Zhuang, J. E.
+Gonzalez, I. Stoica, and E. P. Xing. Vicuna: An
+open-source chatbot impressing GPT-4 with 90%*
+ChatGPT quality.
+https://lmsys.org/blog/2023-03-30-vicuna/,
+March 2023.
+[2] Cornstarch Project. Using Cornstarch 5d
+parallelism. https://cornstarch-org.github.io/
+parallelization/cornstarch_parallel/, 2025.
+Accessed: 2026-05-06.
+[3] W. Feng, Y. Chen, S. Wang, Y. Peng, H. Lin, and
+M. Yu. Optimus: Accelerating large-scale
+multi-modal LLM training by bubble exploitation.
+In 2025 USENIX Annual Technical Conference
+(USENIX ATC 25). USENIX Association, 2025.
+URL https://www.usenix.org/conference/atc25/
+presentation/feng.
+[4] J. Huang, Z. Zhang, S. Zheng, F. Qin, and Y. Wang.
+DISTMM: Accelerating distributed multimodal
+model training. In 21st USENIX Symposium on
+Networked Systems Design and Implementation
+(NSDI 24), pages 1157–1171. USENIX Association,
+2024. URL https://www.usenix.org/conference/
+nsdi24/presentation/huang.
+[5] I. Jang, R. Lu, N. Bansal, A. Chen, and
+M. Chowdhury. Efficient distributed MLLM training
+with Cornstarch. arXiv preprint arXiv:2503.11367,
+2025.
+[6] B. Jeon, M. Wu, S. Cao, S. Kim, S. Park,
+N. Aggarwal, C. Unger, D. Arfeen, P. Liao, X. Miao,
+M. Alizadeh, G. R. Ganger, T. Chen, and Z. Jia.
+GraphPipe: Improving performance and scalability
+of DNN training with graph pipeline parallelism.
+arXiv preprint arXiv:2406.17145, 2024.
+[7] C. Jiang, Z. Cai, Y. Tian, Z. Jia, Y. Wang, and
+C. Wu. DCP: Addressing input dynamism in
+long-context training via dynamic context
+parallelism. In ACM SIGOPS 31st Symposium on
+Operating Systems Principles (SOSP 25), 2025. doi:
+10.1145/3731569.3764849.
+[8] H. Li, F. Fu, S. Lin, H. Ge, X. Wang, J. Niu, J. Xue,
+Y. Tao, D. Wang, J. Jiang, and B. Cui. Hydraulis:
+Balancing large transformer model training via
+co-designing parallel strategies and data assignment.
+arXiv preprint arXiv:2412.07894, 2024.
+[9] D. Narayanan et al. Efficient large-scale language
+model training on GPU clusters using Megatron-LM.
+arXiv preprint arXiv:2104.04473, 2021.
+[10] Y. Niu, H. Xiao, D. Liu, W. Zhou, and J. Li. DHP:
+Efficient scaling of MLLM training with dynamic
+hybrid parallelism. arXiv preprint arXiv:2602.21788,
+2026.
+[11] A. Radford, J. W. Kim, C. Hallacy, A. Ramesh,
+G. Goh, S. Agarwal, G. Sastry, A. Askell,
+P. Mishkin, J. Clark, G. Krueger, and I. Sutskever.
+Learning transferable visual models from natural
+language supervision. In Proceedings of the 38th
+International Conference on Machine Learning,
+volume 139 of Proceedings of Machine Learning
+Research, pages 8748–8763. PMLR, 2021. URL
+https:
+//proceedings.mlr.press/v139/radford21a.html.
+[12] S. Rajbhandari, J. Rasley, O. Ruwase, and Y. He.
+ZeRO: Memory optimizations toward training
+trillion parameter models. arXiv preprint
+arXiv:1910.02054, 2020.
+[13] M. Shoeybi et al. Megatron-LM training
+multi-billion parameter language models using
+model parallelism. arXiv preprint arXiv:1909.08053,
+2019.
+[14] S. Smith et al. Using DeepSpeed and Megatron to
+train Megatron-Turing NLG 530B, a large-scale
+generative language model. arXiv preprint
+arXiv:2201.11990, 2022.
+[15] Y. Wang, S. Wang, S. Zhu, F. Fu, X. Liu, X. Xiao,
+H. Li, J. Li, F. Wu, and B. Cui. FlexSP:
+Accelerating large language model training via
+flexible sequence parallelism. arXiv preprint
+arXiv:2412.01523, 2024.
+[16] Y. Wang, S. Zhu, F. Fu, X. Miao, J. Zhang, J. Zhu,
+F. Hong, Y. Li, and B. Cui. Efficient multi-task
+large model training via data heterogeneity-aware
+model management. Proceedings of the VLDB
+Endowment, 18(1), 2025.
+[17] B. Xiao, Y. Zheng, L. Shi, X. Li, F. Wu, T. Li,
+X. Xiao, Y. Zhang, Y. Wang, and S. Liu.
+OrchMLLM: Orchestrate multimodal data with
+batch post-balancing to accelerate multimodal large
+language model training. arXiv preprint
+arXiv:2503.23830, 2025.
+[18] Z. Xue, H. Hu, X. Chen, Y. Jiang, Y. Song, Z. Mi,
+Y. Zhu, D. Jiang, Y. Xia, and H. Chen. PipeWeaver:
+Addressing data dynamicity in large multimodal
+model training with dynamic interleaved pipeline.
+In Proceedings of the 31st ACM International
+Conference on Architectural Support for
+Programming Languages and Operating Systems
+(ASPLOS), 2026. doi: 10.1145/3779212.3790154.
+[19] Z. Zhang, Y. Zhong, Y. Jiang, H. Hu, J. Sun, Z. Ge,
+Y. Zhu, D. Jiang, and X. Jin. DistTrain: Addressing
+model and data heterogeneity with disaggregated
+training for multimodal large language models.
+arXiv preprint arXiv:2408.04275, 2024.
+[20] J. Zhao, Q. Lu, W. Jia, B. Wan, L. Zuo, J. Feng,
+J. Jiang, Y. Chen, S. Cao, J. He, K. Jiang, Y. Hu,
+S. Nong, Y. Peng, H. Lin, and C. Wu.
+MegaScale-Data: Scaling dataloader for multisource
+10
+
+
+--- Page 11 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+large foundation model training. arXiv preprint
+arXiv:2504.09844, 2025.
+[21] Y. Zhao et al. PyTorch FSDP: Experiences on
+scaling fully sharded data parallel. arXiv preprint
+arXiv:2304.11277, 2023.
+11
+
+
+--- Page 12 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+A. Appendix
+This appendix reports the layouts, peak memory, step times, tokens/s gains, and TFLOPS/GPU gains
+supporting Section 4. All parallelism columns use TP/CP/PP/DP. Encoder rows use CP = 1 and PP = 1
+unless otherwise stated. Metric columns report percentage gains over homogeneous, and step-time columns
+report absolute milliseconds. Memory columns report peak max-rank memory in GB. Unless stated otherwise,
+LLM recompute is off. For the encoder-size sweeps, 1B encoder rows run without encoder recompute; larger
+encoder rows use full encoder recompute.
+Notation and acronyms
+Table A1 | Notation and acronyms used in the throughput tables.
+Symbol
+Meaning
+H
+Homogeneous colocated execution
+C
+Heterogeneous colocated execution
+NC
+Heterogeneous non-colocated execution
+H-E / H-L
+Encoder / LLM layout in an H run
+H Layout
+Shared encoder / LLM layout in an H run
+C-E / C-L
+Encoder / LLM layout in a C run
+NC-E / NC-L
+Encoder / LLM layout in an NC run
+TP / CP / PP / DP
+Tensor / context / pipeline / data parallelism
+TP/CP/PP/DP
+Layout tuple order used in all tables
+SP
+Sequence parallelism
+Seq. Len.
+LLM sequence length
+Vis%
+Vision-token percentage
+GBS
+Global batch size
+NMB
+Number of microbatches
+Tokens/s
+Aggregate training throughput in tokens/s
+TFLOPS/GPU
+Per-GPU tera floating-point operations per second
+Peak Mem (GB)
+Peak max-rank GPU memory in GB
+Step (ms)
+Iteration step time in milliseconds
+F+B (ms)
+Forward plus backward time in milliseconds
+Enc. Rec. / LLM Rec.
+Encoder / LLM recomputation setting
+Enc. opt. inst.
+Number of encoder distributed optimizer instances
+W5/S15
+Five warmup steps followed by fifteen measured steps
+Compute infrastructure. The empirical results reported in this paper were measured on a GPU cluster
+with NVIDIA H100 80GB GPUs. Cluster nodes contain eight GPUs; the throughput tables report world size
+directly in GPUs. Within a node, GPUs are connected with fourth-generation NVLink, providing 900 GB/s
+bidirectional GPU-to-GPU NVLink bandwidth with 18 NVLink connections per GPU. Across nodes, each node
+uses eight 400 Gb/s ConnectX-7 InfiniBand cards. This hardware setup is used for all empirical measurements
+reported in the main text and for the tokens/s gain, TFLOPS/GPU gain, and step-time measurements
+reported below.
+12
+
+
+--- Page 13 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+A.1. Colocated results
+Table A2 | Colocated 8K gain, memory, and step-time results. GBS is 288 for the 72-GPU rows and 256 for
+the tuned 256-GPU 70B/120B rows.
+Model
+Vis% GPUs H-E
+H-L
+C-E
+C-L
+Enc. opt. inst.* TFLOPS/GPU Gain Peak Mem (GB)
+Step (ms)
+TP/CP/PP/DP TP/CP/PP/DP TP/CP/PP/DP TP/CP/PP/DP
+Δ%
+H / C
+H / C
+1B+14B
+50
+72
+4/1/1/18
+4/1/1/18
+2/1/1/36
+2/1/2/18
+1
++12.1
+57.2 / 57.1
+7,570 / 6,750
+1B+14B
+75
+72
+4/1/1/18
+4/1/1/18
+1/1/1/72
+2/1/2/18
+1
++13.5
+57.2 / 57.6
+7,780 / 6,840
+1B+14B
+87.5
+72
+4/1/1/18
+4/1/1/18
+1/1/1/72
+2/1/2/18
+1
++12.7
+57.2 / 57.8
+7,660 / 6,800
+3B+14B
+50
+72
+4/1/1/18
+4/1/1/18
+2/1/1/36
+2/1/2/18
+1
++12.9
+59.7 / 57.3
+7,850 / 6,970
+3B+14B
+75
+72
+4/1/1/18
+4/1/1/18
+1/1/1/72
+2/1/2/18
+1
++12.7
+59.7 / 57.7
+8,020 / 7,140
+3B+14B
+87.5
+72
+4/1/1/18
+4/1/1/18
+1/1/1/72
+2/1/2/18
+1
++14.0
+59.7 / 57.9
+8,130 / 7,150
+1B+32B
+75
+72
+4/1/1/18
+4/1/1/18
+1/1/1/72
+4/1/2/9
+1
+on par
+66.2 / 55.2
+14,210 / 14,380
+3B+32B
+50
+72
+4/1/1/18
+4/1/1/18
+1/1/1/72
+4/1/2/9
+1
+on par
+68.7 / 54.2
+14,330 / 14,750
+3B+32B
+75
+72
+4/1/1/18
+4/1/1/18
+1/1/1/72
+4/1/2/9
+1
++11.1
+68.7 / 55.3
+14,370 / 12,950
+3B+32B
+87.5
+72
+4/1/1/18
+4/1/1/18
+1/1/1/72
+4/1/2/9
+1
++13.1
+68.7 / 55.8
+14,630 / 12,910
+1B+70B
+50
+256
+8/1/1/32
+8/1/1/32
+1/1/1/256
+8/1/2/16
+4
++16.5
+61.5 / 47.2
+8,441 / 7,244
+1B+70B
+75
+256
+8/1/1/32
+8/1/1/32
+1/1/1/256
+8/1/2/16
+4
++15.1
+61.5 / 47.8
+8,415 / 7,312
+3B+70B
+50
+256
+8/1/1/32
+8/1/1/32
+1/1/1/256
+8/1/2/16
+4
++13.9
+62.7 / 48.8
+8,471 / 7,434
+3B+70B
+75
+256
+8/1/1/32
+8/1/1/32
+1/1/1/256
+8/1/2/16
+4
++12.7
+62.7 / 49.4
+8,452 / 7,501
+1B+120B
+50
+256
+8/1/1/8
+8/1/4/8
+1/1/1/256
+8/1/4/8
+8
++16.6
+57.2 / 54.0
+15,258 / 13,081
+1B+120B
+75
+256
+8/1/1/8
+8/1/4/8
+1/1/1/256
+8/1/4/8
+8
++13.9
+63.2 / 55.4
+15,169 / 13,319
+3B+120B
+50
+256
+8/1/1/8
+8/1/4/8
+2/1/1/128
+8/1/4/8
+2
++21.5
+60.5 / 66.2
+15,093 / 12,420
+3B+120B
+75
+256
+8/1/1/8
+8/1/4/8
+2/1/1/128
+8/1/4/8
+2
++21.6
+60.5 / 67.6
+15,303 / 12,579
+6B+120B
+50
+256
+8/1/1/8
+8/1/4/8
+2/1/1/128
+8/1/4/8
+1
+−0.7
+53.6 / 68.0
+17,890 / 18,020
+7.2B+120B
+50
+256
+8/1/1/8
+8/1/4/8
+4/1/1/64
+8/1/4/8
+1
+−0.3
+53.6 / 64.4
+17,980 / 18,040
+12B+120B
+50
+256
+8/1/1/8
+8/1/4/8
+4/1/1/64
+8/1/4/8
+1
+−8.0
+66.9 / 69.6
+15,860 / 18,190
+The 8K colocated sweep shows where module-local layout freedom is useful on the same GPUs. The 14B
+LLM rows gain 12.1%–14.0% TFLOPS/GPU; for 32B, gains concentrate at higher vision-token share. The
+tuned 256-GPU rows show a second colocated operating point: reducing encoder TP, adding LLM pipeline
+parallelism where useful, and tuning encoder optimizer instances gives +12.7%–21.6% for the audited 1B/3B
+encoder rows with 70B and 120B LLMs. For larger 120B encoder rows, C converges back toward H or slows
+down, motivating the NC crossover summarized in Table A5.
+Table A3 | Colocated long-context gain, memory, and step-time results. Encoder CP remains 1 under
+heterogeneous parallelism, while homogeneous training forces the encoder to inherit LLM CP. F+B is forward
+plus backward time in ms. Because H and C use the same GPU count, tokens/s and TFLOPS/GPU gains
+are identical; Gain reports both.
+Model
+Seq. Len. Vis% GPUs GBS NMB H Layout
+C-E
+C-L
+Gain Peak Mem (GB)
+F+B (ms)
+TP/CP/PP/DP TP/CP/PP/DP TP/CP/PP/DP
+Δ%
+H / C
+H / C
+1B+7B
+16K
+50
+16
+8
+2
+2/2/1/4
+1/1/1/16
+2/2/1/4
++6.6
+54.5 / 50.2
+1,300 / 1,221
+1B+7B
+16K
+75
+16
+8
+2
+2/2/1/4
+1/1/1/16
+2/2/1/4
++8.5
+59.6 / 52.2
+1,352 / 1,248
+1B+7B
+32K
+50
+16
+4
+2
+2/4/1/2
+1/1/1/16
+2/4/1/2
++11.7
+65.3 / 50.7
+1,836 / 1,644
+1B+7B
+32K
+75
+16
+4
+2
+2/4/1/2
+1/1/1/16
+2/4/1/2
++20.3
+75.6 / 52.7
+1,980 / 1,640
+1B+7B
+64K
+50
+32
+4
+2
+4/8/1/1
+1/1/1/32
+2/8/1/2
++34.3
+54.0 / 48.4
+3,966 / 2,937
+1B+7B
+64K
+75
+32
+4
+2
+4/8/1/1
+1/1/1/32
+2/8/1/2
++49.3
+68.9 / 50.3
+4,457 / 2,973
+1B+7B
+128K
+50
+64
+4
+2
+4/16/1/1
+1/1/1/64
+2/16/1/2
++17.8
+25.1 / 48.6
+6,321 / 5,381
+1B+7B
+128K
+75
+64
+4
+2
+4/16/1/1
+1/1/1/64
+2/16/1/2
++24.8
+26.6 / 50.4
+6,614 / 5,291
+1B+14B
+16K
+50
+16
+4
+1
+4/1/1/4
+2/1/1/8
+4/1/1/4
++0.1
+75.1 / 73.8
+1,202 / 1,205
+1B+14B
+16K
+75
+16
+4
+1
+8/1/1/2
+2/1/1/8
+4/1/1/4
++16.3
+50.4 / 76.3
+1,438 / 1,211
+1B+14B
+32K
+50
+32
+4
+1
+4/2/1/4
+2/1/1/16
+4/2/1/4
++2.9
+76.6 / 67.8
+1,628 / 1,583
+1B+14B
+32K
+75
+32
+4
+1
+8/2/1/2
+2/1/1/16
+4/2/1/4
++21.3
+53.5 / 70.3
+1,962 / 1,585
+1B+14B
+64K
+50
+32
+4
+2
+8/4/1/1
+2/1/1/16
+4/4/1/2
++23.9
+61.2 / 69.1
+5,687 / 4,579
+1B+14B
+64K
+75
+32
+4
+2
+8/4/1/1
+2/1/1/16
+4/4/1/2
++30.3
+73.2 / 71.6
+5,848 / 4,479
+1B+14B
+128K
+50
+64
+4
+2
+4/8/2/1
+2/1/1/32
+4/8/1/2
++29.8
+55.4 / 63.0
+9,397 / 7,184
+1B+14B
+128K
+75
+64
+4
+2
+4/8/2/1
+2/1/1/32
+4/8/1/2
++34.0
+55.8 / 62.9
+9,692 / 7,175
+Long context gives the clearest case for C: the LLM needs context parallelism as sequence length grows, but
+the encoder sequence length is fixed by image resolution rather than LLM context. H makes the encoder
+inherit LLM CP, while C keeps the encoder at CP=1 and converts those ranks into encoder DP replicas.
+Gains therefore grow with context, reaching 34.3%–49.3% for 1B+7B at 64K and 29.8%–34.0% for 1B+14B
+at 128K.
+∗Enc. opt. inst. reports the number of encoder distributed optimizer instances when swept; default is 1.
+13
+
+
+--- Page 14 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+A.2. Non-colocated results
+Table A4 | Non-colocated 120B LLM gain, memory, and step-time results. Rows compare homogeneous
+shared-grid and non-colocated (NC) execution with a dedicated encoder island. H Layout is the shared
+encoder/LLM layout for the H run. Rows are grouped by encoder size. All rows use sequence parallelism (SP)
+on and LLM recompute off; encoder full recompute is enabled.
+Model
+Seq. Len. Vis% GPUs GBS H Layout
+NC-E
+NC-L
+Tokens/s Gain TFLOPS/GPU Gain Peak Mem (GB)
+Step (ms)
+TP/CP/PP/DP TP/CP/PP/DP TP/CP/PP/DP
+Δ%
+Δ%
+H / NC
+H / NC
+6B+120B
+8K
+50
+256/264
+256
+8/1/4/8
+1/1/1/8
+8/1/2/16
++5.9
++2.7
+64.8 / 76.6
+17,700 / 16,710
+6B+120B
+8K
+75
+256/264
+256
+8/1/4/8
+1/1/1/8
+8/1/2/16
++4.4
++1.3
+53.6 / 76.8
+17,600 / 16,860
+6B+120B
+8K
+50
+512/520
+512
+8/1/4/16
+1/1/1/8
+8/1/2/32
++4.0
++2.4
+50.4 / 73.5
+17,870 / 17,180
+6B+120B
+16K
+50
+256/264
+256
+8/2/4/4
+1/1/1/8
+8/2/4/4
++0.7
+−2.3
+53.6 / 53.6
+38,380 / 38,110
+6B+120B
+16K
+75
+256/264
+256
+8/2/4/4
+2/1/1/4
+8/2/4/4
++3.3
++0.2
+53.6 / 63.8
+38,120 / 36,900
+6B+120B
+16K
+50
+512/520
+512
+8/2/4/8
+1/1/1/8
+8/2/2/16
++5.1
++3.5
+50.4 / 74.6
+38,400 / 36,550
+7.2B+120B
+8K
+50
+256/264
+256
+8/1/4/8
+1/1/1/8
+8/1/2/16
++7.1
++3.8
+53.6 / 76.6
+17,980 / 16,790
+7.2B+120B
+8K
+75
+256/264
+256
+8/1/2/16
+1/1/1/8
+8/1/2/16
++13.0
++9.6
+77.2 / 73.3
+16,210 / 14,340
+7.2B+120B
+16K
+50
+256/264
+256
+8/2/4/4
+1/1/1/8
+8/2/4/4
++5.5
++2.3
+53.6 / 63.2
+38,260 / 36,260
+7.2B+120B
+16K
+75
+256/264
+256
+8/2/4/4
+2/1/1/4
+8/2/4/4
++3.6
++0.4
+53.6 / 63.8
+38,380 / 37,070
+7.2B+120B
+16K
+50
+512/520
+512
+8/2/4/8
+1/1/1/8
+8/2/2/16
++4.9
++3.3
+50.4 / 74.6
+38,450 / 36,650
+12B+120B
+8K
+50
+256/264
+256
+8/1/4/8
+2/1/1/4
+8/1/2/16
++7.3
++4.1
+66.9 / 73.1
+15,860 / 14,780
+12B+120B
+8K
+75
+256/264
+256
+8/1/4/8
+2/1/1/4
+8/1/2/16
++12.7
++9.3
+67.0 / 73.3
+16,690 / 14,810
+12B+120B
+8K
+87.5
+256/264
+256
+8/1/4/8
+2/1/1/4
+8/1/2/16
++9.5
++6.2
+67.0 / 73.4
+17,020 / 15,540
+12B+120B
+16K
+50
+256/264
+256
+8/2/4/4
+2/1/1/4
+8/2/4/4
++5.6
++2.4
+56.3 / 63.2
+38,430 / 36,400
+12B+120B
+16K
+50
+512/520
+512
+8/2/4/8
+2/1/1/4
+8/2/2/16
++2.5
++0.9
+52.6 / 74.6
+38,370 / 37,430
+The 120B NC rows show physical separation becoming useful once encoder state constrains the LLM layout.
+At 8K and 50% vision tokens, NC is positive from 6B onward and sharpens for the 7.2B and 12B encoders; at
+16K, the 512/520-GPU rows show the scale-out benefit of preserving the LLM island. Because NC averages
+over the extra 8-GPU encoder island, TFLOPS/GPU gains are conservative relative to the aggregate tokens/s
+gains.
+6B scale-out at 8K
+6B encoder + 120B LLM, H/NC GPUs
+100
+150
+200
+250
+Throughput (K tokens/s)
++5.9%, +2.7%
+50%
++4.4%, +1.3%
+75%
++4.0%, +2.4%
+50%†
+H
+NC
+tokens/s gain, TFLOPS/GPU gain
+(a) 6B+120B 8K scale-out
+512/520-GPU scale-out at 16K
+120B LLM, 50% vision
+210
+220
+230
+Throughput (K tokens/s)
++5.1%, +3.5%
+6B
++4.9%, +3.3%
+7.2B
++2.5%, +0.9%
+12B
+H
+NC
+tokens/s gain, TFLOPS/GPU gain
+(b) 120B LLM 16K scale-out
+Figure 7 | Non-colocated 120B scale-out results. (a) Non-colocation remains positive for the 6B+120B case
+when expanding from 256/264 to 512/520 GPUs. (b) At 512/520 GPUs, NC preserves the PP2 LLM layout
+and gives +5.1%, +4.9%, and +2.5% tokens/s gains for 6B, 7.2B, and 12B encoders. Labels report tokens/s
+and TFLOPS/GPU gains over H.
+A.3. Operating ranges for different modes
+Table A5 | H/C/NC operating-range comparison at 8K. C and NC gains are relative to H for the same
+workload; C vs NC is the gap of C relative to NC. Each gain cell reports tokens/s / TFLOPS/GPU. When
+C converges to H, we report C=H because H is a valid special case of colocated heterogeneous execution.
+Small-encoder rows use 72 total GPUs for all modes, with NC splitting 64 LLM GPUs plus an 8-GPU encoder
+island. The 70B/120B rows use 256 GPUs for H/C and 264 GPUs for NC. The 70B/120B C rows report the
+best tuned colocated configuration, including encoder offload where available.
+14
+
+
+--- Page 15 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+Model
+Vis%
+GPUs
+C-E
+NC-E
+Enc. opt. inst.*
+C Gain
+NC Gain
+C vs NC
+Best
+H / C / NC
+TP/CP/PP/DP TP/CP/PP/DP
+tokens/s / TFLOPS/GPU tokens/s / TFLOPS/GPU tokens/s / TFLOPS/GPU
+1B+14B
+50
+72 / 72 / 72
+2/1/1/36
+1/1/1/8
+1
++12.1 / +12.1
+-11.3 / -11.3
++26.4 / +26.3
+C
+1B+14B
+87.5
+72 / 72 / 72
+1/1/1/72
+1/1/1/8
+1
++12.7 / +12.7
+-10.5 / -10.5
++25.9 / +25.8
+C
+3B+14B
+50
+72 / 72 / 72
+2/1/1/36
+1/1/1/8
+1
++12.9 / +12.9
+-8.6 / -8.6
++23.5 / +23.5
+C
+3B+14B
+87.5
+72 / 72 / 72
+1/1/1/72
+1/1/1/8
+1
++14.0 / +14.0
+-5.4 / -5.4
++20.5 / +20.6
+C
+1B+32B
+75
+72 / 72 / 72
+1/1/1/72
+1/1/1/8
+1
+on par / -0.9
+-10.2 / -10.2
++11.4 / +10.4
+H/C
+3B+32B
+50
+72 / 72 / 72
+1/1/1/72
+1/1/1/8
+1
+on par / -0.1
+-10.1 / -10.1
++11.2 / +11.1
+H/C
+3B+32B
+87.5
+72 / 72 / 72
+1/1/1/72
+1/1/1/8
+1
++13.1 / +13.1
+-7.8 / -7.8
++22.7 / +22.7
+C
+1B+70B
+50
+256 / 256 / 264
+1/1/1/256
+1/1/1/8
+4
++16.5 / +16.5
++7.3 / +4.0
++8.6 / +12.0
+C
+3B+70B
+50
+256 / 256 / 264
+1/1/1/256
+1/1/1/8
+4
++13.9 / +13.9
++9.3 / +6.0
++4.2 / +7.5
+C
+1B+120B
+50
+256 / 256 / 264
+1/1/1/256
+1/1/1/8
+8
++16.6 / +16.6
+-3.0 / -0.5
++20.2 / +17.2
+C
+3B+120B
+50
+256 / 256 / 264
+2/1/1/128
+1/1/1/8
+2
++21.5 / +21.5
+-9.9 / -7.7
++34.9 / +31.6
+C
+6B+120B
+50
+256 / 256 / 264
+H layout
+1/1/1/8
+1
+C=H
++5.9 / +2.7
+-5.6 / -2.6
+NC
+7.2B+120B
+50
+256 / 256 / 264
+H layout
+1/1/1/8
+1
+C=H
++7.1 / +3.8
+-6.6 / -3.7
+NC
+12B+120B
+50
+256 / 256 / 264
+H layout
+2/1/1/4
+1
+C=H
++7.3 / +4.1
+-6.8 / -3.9
+NC
+Table A5 shows the operating ranges of H, C, and NC. When the combined model has enough memory
+headroom, C is the best use of the fixed GPU budget: it remaps the encoder to a module-local layout with
+more data parallelism while keeping the LLM colocated. That larger encoder-DP group increases cross-node
+optimizer communication, so the tuned C rows use multiple encoder optimizer instances where memory allows.
+Because encoder parameters can be offloaded, the added optimizer-state replication is affordable and improves
+throughput. As LLM and encoder memory pressure increase, this colocated flexibility diminishes: C converges
+back to H because H is a valid special case of C, and both modules still share the same physical ranks. NC
+becomes preferable once the encoder and LLM should stop carrying each other’s memory and scheduling
+pressure. At the 120B LLM scale, the verified 1B/3B rows still favor C, while the separation point appears at
+the 6B encoder scale, or equivalent encoder-side compute and memory from multiple encoders: from 6B+120B
+onward, the dedicated encoder island unlocks the PP2 LLM layout and becomes the preferred operating point.
+A.4. Bridge communication
+(a) Bridge communication vs. vision tokens
+0.0
+0.2
+0.4
+0.6
+Bridge communication / step time (%)
+0.08%
+0.15%
+0.23%
+0.46%
+0.62%
+0.56%
+25%
+50%
+75%
+Vision tokens
+(b) Fwd/Bwd payload vs. vision tokens
+0
+2
+4
+6
+Bridge payload / step (GB)
+0.54/0.27
+1.07/1.07
+1.07/0.54
+2.15/2.15
+1.61/0.81
+3.22/3.22
+25%
+50%
+75%
+Vision tokens
+Colocated
+Non-colocated
+Forward
+Backward
+Figure 8 | Bridge communication profile for the 3B encoder + 70B LLM payload sweep at 8K sequence length.
+Panel (a) reports median bridge communication time as a percentage of measured step time. Panel (b) reports
+local bridge payload per step as F/B, where F is forward payload and B is backward payload, both in GB.
+In the 3B+70B colocated setup, the encoder uses DP = 32 and the LLM uses DP = 16, so the fan-in scale is
+2. Each colocated bridge group is therefore a 2-rank all-gather, not a global DP32 or DP16 collective. This
+small-group fan-in explains why colocated forward bridge time is low. NC forward is larger because it includes
+both cross-island activation transfer and LLM-side activation fanout: the encoder island sends activations
+to the LLM receiver ranks, and those activations are then broadcast within the relevant LLM-side group.
+NC backward is simpler in this setup because the encoder island uses TP = 1; there is no encoder-side TP
+broadcast, so the backward bridge is the LLM-to-encoder gradient transport.
+∗Enc. opt. inst. reports the number of encoder distributed optimizer instances when swept; default is 1.
+15
+
+
+--- Page 16 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+B. Open-source user configuration example
+Non-colocated: disjoint GPU sets
+...
+parallelism = MegatronMIMOParallelismConfig(
+module_parallelisms={
+"language": ModuleParallelismConfig(
+tensor_model_parallel_size=2,
+pipeline_model_parallel_size=2,
+data_parallel_size=1,
+rank_offset=0,
+# ranks [0, 4)
+),
+"images": ModuleParallelismConfig(
+tensor_model_parallel_size=1,
+pipeline_model_parallel_size=1,
+data_parallel_size=4,
+rank_offset=4,
+# ranks [4, 8)
+),
+},
+)
+...
+Colocated: shared GPU set
+...
+parallelism = MegatronMIMOParallelismConfig(
+module_parallelisms={
+"language": ModuleParallelismConfig(
+tensor_model_parallel_size=4,
+pipeline_model_parallel_size=1,
+data_parallel_size=2,
+rank_offset=0,
+# ranks [0, 8)
+),
+"images": ModuleParallelismConfig(
+tensor_model_parallel_size=1,
+pipeline_model_parallel_size=1,
+data_parallel_size=8,
+rank_offset=0,
+# ranks [0, 8)
+),
+},
+)
+...
+Figure 9 | Minimal user-facing configuration for heterogeneous parallelism in multimodal training. The left
+example places the language model and vision encoder on disjoint rank ranges, so the runtime uses the
+non-colocated communicator. The right example places both modules on the same physical rank range, so the
+runtime uses colocated execution while still allowing different module-local TP/PP/DP layouts.
+The open-source implementation exposes this layout choice through a compact configuration interface. Users
+provide one entry per module, specifying its TP/PP/DP layout and rank offset; together, these fields determine
+the module’s logical process groups and physical rank range. At model construction time, the runtime uses
+the resulting ranges to select colocated or non-colocated boundary communicators, while keeping the model
+definition, loss, and training loop shared across both placement modes.
+C. LLaVA validation details and additional convergence results
+C.1. Validation setup
+This appendix gives the convergence-validation details that complement Section 5. Appendix C.1 describes the
+LLaVA setup and deterministic FP32 validation protocol, Appendix C.2 reports the additional frozen-LLM and
+BF16 convergence results, and Appendices C.3 and C.4 give the trainable-LLM non-colocated and colocated
+layout sweeps.
+The validation model follows LLaVA-1.5. We use a CLIP ViT-L/14 vision encoder, a two-layer projection
+MLP, and a Vicuna-7B v1.5 language model based on Llama-2-7B. The vision encoder and language model are
+initialized from pretrained CLIP ViT-L/14 and Vicuna-7B checkpoints, respectively. Across all validation runs,
+the vision encoder is frozen and the projection MLP is trainable; the LLM is either frozen for projector-only
+runs or trainable for trainable-LLM runs. The projection MLP initializes the first linear layer weights from
+𝒩(0, 0.02) with zero bias; the second linear layer weights are initialized from 𝒩(0, 0.02/
+√
+2), also with zero
+bias.
+The vision tower has 24 layers and 16 attention heads, processes 336 × 336 images with 14 × 14 patches,
+and contributes 576 patch features of width 1024 after dropping the CLS token. The projection MLP maps
+these features to the 4096-dimensional language-model hidden space. Vicuna-7B v1.5 uses 32 decoder layers,
+32 attention heads, hidden size 4096, RoPE base 10,000, and a 4096-token context length. For TP = 4,
+Megatron-LM pads the Vicuna vocabulary plus the reserved LLaVA image token to 32,256 entries.
+For the FP32 parity runs, we further reduce numerical nondeterminism so loss curves can be compared more
+directly across layouts. We switch these runs to FP32 precision, disable TF32, and enable PyTorch deterministic
+execution with torch.use_deterministic_algorithms(True). We also disable cuDNN autotuning with
+cudnn.benchmark=False and set cudnn.deterministic=True for deterministic cuDNN kernels. For NCCL
+reductions, we pin the algorithm to Ring so collective reductions use a deterministic order across runs. These
+settings reduce loss-curve variation caused by floating-point non-associativity, making discrepancies more
+16
+
+
+--- Page 17 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+likely to reflect communicator errors rather than runtime nondeterminism.
+Table A6 | Optimization hyperparameters for the LLaVA convergence validation.
+Parameter
+Value
+Global batch size
+96
+Optimizer
+Distributed Adam
+Learning rate
+1.0e-3 (1.0e-4 for trainable LLM)
+Min learning rate
+2.0e-5 (1.0e-5 for trainable LLM)
+Schedule / warmup
+Cosine decay / 60 steps
+Weight decay
+0.0
+𝛽1/𝛽2
+0.9 / 0.95
+Gradient clipping
+0.0 (1.0 for BF16 runs)
+C.2. Additional convergence validation results
+Section 5 and Appendices C.3–C.4 focus on FP32 trainable-LLM runs.
+Here we report the remaining
+convergence validation results: the FP32 projector-only frozen-LLM placement/layout comparison, the BF16
+placement/layout comparisons, and the frozen-LLM layout sweeps. The shorter validation runs use 100 training
+steps in FP32 precision, whereas the larger-scale comparisons run for 1K training steps in mixed-precision
+BF16. Runs within each experiment set use the same initialization, data order, and optimization setup, with
+hyperparameters summarized in Table A6. The frozen-LLM layout sweep uses the configurations in Table A7.
+Figure 10 shows the FP32 projector-only placement/layout comparison, Figure 11 reports the corresponding
+BF16 placement/layout comparisons, and Figure 12 summarizes the frozen-LLM layout sweeps.
+Table A7 | Non-colocated parallelism sweep with frozen
+language model. All configurations use 8 GPUs.
+Config name
+LLM
+(TP/PP/DP)
+Vision
+(TP/PP/DP)
+tp4_both
+4 / 1 / 1
+4 / 1 / 1
+tp2_dp2_both
+2 / 1 / 2
+2 / 1 / 2
+tp2_pp2_llm_tp4_vision
+2 / 2 / 1
+4 / 1 / 1
+tp1_dp4_both
+1 / 1 / 4
+1 / 1 / 4
+pp4_llm_tp4_vision
+1 / 4 / 1
+4 / 1 / 1
+pp4_llm_dp4_vision
+1 / 4 / 1
+1 / 1 / 4
+pp2_dp2_llm_tp2_dp2
+1 / 2 / 2
+2 / 1 / 2
+tp4_llm_dp4_vision
+4 / 1 / 1
+1 / 1 / 4
+tp2_pp2_llm_tp2_dp2_vis
+2 / 2 / 1
+2 / 1 / 2
+tp2_dp2_llm_dp4_vision
+2 / 1 / 2
+1 / 1 / 4
+Table A8 | Non-colocated parallelism sweep with train-
+able language model. All configurations use 8 GPUs.
+Config name
+LLM
+(TP/PP/DP)
+Vision
+(TP/PP/DP)
+tp4_both
+4 / 1 / 1
+4 / 1 / 1
+tp2_dp2_both
+2 / 1 / 2
+2 / 1 / 2
+tp2_pp2_llm_tp4_vision
+2 / 2 / 1
+4 / 1 / 1
+tp2_pp2_llm_tp2_dp2_vis
+2 / 2 / 1
+2 / 1 / 2
+pp4_llm_tp4_vision
+1 / 4 / 1
+4 / 1 / 1
+pp4_llm_tp2dp2_vision
+1 / 4 / 1
+2 / 1 / 2
+pp2_dp2_llm_tp2dp2_vis
+1 / 2 / 2
+2 / 1 / 2
+tp4_llm_tp2dp2_vision
+4 / 1 / 1
+2 / 1 / 2
+C.3. Non-colocated layout sweep
+The second experiment set sweeps TP/PP/DP choices for non-colocated layouts across the language model
+and vision encoder. These configurations preserve the same end-to-end LLaVA training task while changing
+the ownership layout presented to the boundary communicator. Each non-colocated sweep configuration
+assigns four GPUs to the LLM and four GPUs to the vision encoder; the listed TP/PP/DP triples show how
+each module partitions its own four-rank group. Table A8 lists the trainable-LLM sweep, which uses micro
+batch size (MBS) 2. Figure 13(a) shows that the loss curves remain aligned across these non-colocated layouts
+when the LLM and projection MLP are trainable.
+C.4. Colocated layout sweep
+The third experiment set validates the colocated communicator under the same trainable-LLM layout patterns
+tested in the non-colocated sweep. We reuse the configurations from Table A8, but run the vision encoder and
+language model on the same eight physical ranks. Because each module now spans the shared 8-GPU rank set
+rather than its own 4-GPU rank set, we keep each module’s TP and PP degrees unchanged and double its DP
+degree. Thus, for example, a non-colocated configuration with TP = 4, PP = 1, DP = 1 for a module becomes
+TP = 4, PP = 1, DP = 2 in the colocated sweep.
+17
+
+
+--- Page 18 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+2
+3
+4
+5
+6
+7
+8
+LM loss
+0
+0.05
+0.10
+0
+25
+50
+75
+100
+abs. diff.
+Colocated homogeneous (baseline)
+Non-colocated homogeneous
+Colocated heterogeneous
+max |non-colo. homo|=0.078
+max |colo. hetero|=0.087
+Training step
+Figure 10 | Frozen-LLM FP32 placement and layout convergence comparison. The vision encoder and LLM
+are frozen, so only the projection MLP is trained. The modified runs follow the corresponding colocated
+homogeneous baseline.
+2
+4
+6
+8
+LM loss
+0
+0.10
+0.20
+0
+250
+500
+750
+1000
+abs. diff.
+Colocated homogeneous (baseline)
+Non-colocated homogeneous
+Colocated heterogeneous
+max |non-colo. homo|=0.134
+max |colo. hetero|=0.100
+Training step
+(a) Frozen LLM, BF16.
+2
+4
+6
+8
+LM loss
+0
+0.20
+0.40
+0
+250
+500
+750
+1000
+abs. diff.
+Colocated homogeneous (baseline)
+Non-colocated homogeneous
+Colocated heterogeneous
+max |non-colo. homo|=0.226
+max |colo. hetero|=0.246
+Training step
+(b) Trainable LLM, BF16.
+Figure 11 | BF16 placement and layout convergence comparisons. Panel (a) uses projector-only training with
+the vision encoder and LLM frozen; panel (b) keeps the vision encoder frozen while training the LLM and
+projection MLP. In both cases, the modified runs follow the corresponding colocated homogeneous baseline.
+Figure 13(b) shows that the colocated loss curves remain tightly aligned across the tested trainable-LLM
+configurations, indicating that colocated rank reinterpretation and the corresponding forward/backward
+ownership transforms preserve the LLaVA training signal across the tested TP/PP/DP layouts.
+18
+
+
+--- Page 19 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+2
+3
+4
+5
+6
+7
+8
+0
+25
+50
+75
+100
+LM loss
+tp1_dp4_both
+tp4_llm_dp4
+tp2_dp2_both
+tp2_dp2_llm_dp4_vision
+tp2_pp2_llm_tp2_dp2_vision
+pp2_dp2_llm_tp2_dp2
+pp4_llm_dp4_vision
+pp4_llm_tp4_vision
+tp4_both
+tp2_pp2_llm_tp4_vision
+max range=0.094
+Training step
+(a) Non-colocated frozen-LLM layout sweep.
+2
+3
+4
+5
+6
+7
+8
+0
+25
+50
+75
+100
+LM loss
+tp1_dp8_both
+tp2_dp4_llm_dp8_vision
+tp4_dp2_llm_dp8_vision
+tp4_dp2_both
+pp4_dp2_llm_tp4_dp2_vision
+tp2_dp4_both
+pp2_dp4_llm_tp2_dp4_vision
+tp2_pp2_dp2_llm_tp2_dp4_vision
+pp4_dp2_llm_dp8_vision
+tp2_pp2_dp2_llm_tp4_dp2_vision
+max range=0.077
+Training step
+(b) Colocated frozen-LLM layout sweep.
+Figure 12 | Frozen-LLM configuration sweeps. Panel (a) sweeps the non-colocated configurations from
+Table A7; panel (b) applies the corresponding colocated layouts by sharing the physical ranks and doubling
+each module’s DP degree. The overlapping curves show that convergence remains insensitive to the tested
+parallelism layout when only the projection MLP is trained.
+2
+3
+4
+5
+6
+7
+8
+0
+25
+50
+75
+100
+LM loss
+tp2_dp2_both
+pp2_dp2_llm_tp2dp2_vision
+tp4_llm_tp2dp2_vision
+tp4_both
+tp2_pp2_llm_tp2_dp2_vision
+pp4_llm_tp2dp2_vision
+pp4_llm_tp4_vision
+tp2_pp2_llm_tp4_vision
+max range=0.199
+Training step
+(a) Non-colocated layout sweep.
+2
+3
+4
+5
+6
+7
+8
+0
+25
+50
+75
+100
+LM loss
+tp4_dp2_llm_tp2_dp4_vision
+pp4_dp2_llm_tp4_dp2_vision
+pp4_dp2_llm_tp2_dp4_vision
+tp2_dp4_both
+pp2_dp4_llm_tp2_dp4_vision
+tp4_dp2_both
+tp2_pp2_dp2_llm_tp2_dp4_vision
+tp2_pp2_dp2_llm_tp4_dp2_vision
+max range=0.172
+Training step
+(b) Colocated layout sweep.
+Figure 13 | Trainable-LLM FP32 configuration sweeps. The vision encoder is frozen, while the LLM and
+projection MLP are trained. Panel (a) sweeps non-colocated TP/PP/DP configurations from Table A8;
+panel (b) sweeps the corresponding colocated configurations by sharing the physical ranks and doubling each
+module’s DP degree. The overlapping trends indicate that convergence is insensitive to the tested parallelism
+layout. The annotations report the maximum step-wise loss range across all plotted configurations.
+D. Pipeline schedule details
+Section 3.3 describes pipeline orchestration at the abstraction level. This appendix gives the execution details
+for both placement modes. In both cases, the boundary communicator defines the layout transform for an
+edge, while the schedule determines when that edge is active and which ranks must participate.
+For non-colocated execution, the scheduler extends ordinary 1F1B by resolving each pipeline action to an
+edge in the expanded module graph. Figure 14 expands the topology in Figure 4(a), where Encoder 1 has
+two PP stages, Encoder 2 has one PP stage, and the LLM has three PP stages. Rows correspond to the
+communication calls issued during warmup, steady state, and cooldown; columns correspond to rank roles in
+the expanded graph. A p2p cell means that the active edge is internal to one module and uses that module’s
+ordinary pipeline communicator. An NC cell means that the active edge crosses from an encoder rank set to
+the LLM rank set and therefore invokes the edge-local non-colocated communicator. Blank cells indicate that
+the rank has no active neighbor for that call.
+Warmup illustrates why the dispatch must be graph-aware. Encoder 1 first sends activations from E1P0 to
+E1P1 through module-local P2P; its next forward send crosses the encoder–LLM boundary and switches
+19
+
+
+--- Page 20 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+phase
+schedule call
+R0
+E1P0
+R1
+E1P1
+R2
+E2P0
+R3
+L0
+R4
+L1
+R5
+L2
+warm
+warm
+end
+steady
+cool
+recv_fwd
+send_fwd
+recv_fwd
+send_fwd
+recv_bwd
+send_bwd
+recv_fwd
+recv_bwd
+send_bwd
+p2p
+NC
+p2p
+p2p
+p2p
+NC
+NC
+p2p
+p2p
+p2p
+NC
+p2p
+p2p
+p2p
+NC
+NC
+p2p
+p2p
+p2p
+NC
+p2p
+p2p
+p2p
+NC
+NC
+p2p
+p2p
+p2p
+NC
+p2p
+p2p
+p2p
+NC = non-colocated comm.
+Figure 14 | Graph-aware communication dispatch for the non-colocated topology in Figure 4(a). Rows
+are pipeline schedule calls during warmup, steady state, and cooldown; columns are rank roles in the
+expanded module graph. Each nonempty cell shows the communicator selected for the active edge: p2p for
+module-internal pipeline communication and NC for an encoder–LLM boundary edge using the non-colocated
+communicator. Paired steady-state calls resolve the forward and backward halves independently, so different
+halves of the same schedule call may use different edge types.
+to the non-colocated communicator. Encoder 2 has only one PP stage, so its first forward send is already
+a boundary transfer. LLM PP0 receives the two encoder boundary tensors through their corresponding
+non-colocated communicators and becomes runnable for a microbatch only after the required activations have
+been materialized in the LLM layout. The remaining LLM stages then proceed with ordinary LLM pipeline
+P2P.
+The steady-state rows apply the same dispatch rule to paired 1F1B calls. A call such as send_fwd/recv_bwd
+contains a forward action for a newer microbatch and a backward action for an older microbatch. The runtime
+resolves the active edge for each half independently. Thus, different ranks in the same schedule phase may use
+different communication paths, and a boundary rank can send a new activation through an NC edge while
+receiving an older gradient through the reverse of an NC edge. The scheduler selects the active edge and
+microbatch; the non-colocated communicator then performs the leader exchange, DP fan-in or fan-out, and
+local TP/CP broadcast described in Section 3.1.
+Cooldown uses the same edge identities in reverse. LLM gradients move by P2P until they reach LLM
+PP0. Boundary gradients then return through the non-colocated communicator attached to the original
+encoder–LLM edge, while encoder-internal gradients continue through module-local P2P, such as from E1P1
+back to E1P0. This is the key invariant at graph joins: even though LLM PP0 consumes multiple encoder
+activations for the same microbatch, backward routes each gradient through the boundary communicator
+20
+
+
+--- Page 21 ---
+Heterogeneous Parallelism for Multimodal Large Language Model Training
+associated with the forward edge that produced that activation.
+For colocated execution, the schedule detail is different because there is no inter-rank boundary P2P between
+modules. The issue is ordering. Encoder execution may require collectives over the encoder layout, while the
+LLM 1F1B schedule staggers ranks across pipeline stages and microbatches. The implementation therefore uses
+the three-phase schedule shown in Figure 4(b). Phase 1 runs encoder forward once over the local microbatch
+group for the current LLM pipeline window, then applies the colocated forward transform to produce a packed
+boundary tensor in the LLM PP0 layout. The runtime records the metadata needed for the reverse colocated
+transform, including the source and destination layout coordinates and the batch intervals used by any fan-in
+or fan-out transform.
+Phase 2 runs the ordinary LLM pipeline schedule on detached boundary views. The packed boundary tensor
+is detached as a leaf variable for the LLM phase and exposed to LLM PP0 as per-microbatch views. As 1F1B
+advances, PP0 selects the view for the active microbatch, inserts it into that microbatch’s text embeddings,
+and then uses standard LLM pipeline P2P for the remaining LLM stages. During this phase, the LLM does
+not enter encoder collectives, which avoids mixing encoder-layout collectives with the staggered LLM pipeline
+order.
+Phase 3 reconnects the LLM phase to the encoder side. After the LLM pipeline drains, gradients accumulated
+on the packed boundary tensor are handed to the colocated backward transform. If the boundary used
+fan-in, the transform selects from the destination-gradient shard the batch interval contributed by each source
+rank. If the boundary used fan-out, sibling destination-gradient slices are all-gathered and concatenated to
+reconstruct the original source-layout gradient shard. The runtime then invokes encoder backward over the
+saved batched encoder activations for the local microbatch group.
+The detach in Phase 2 is therefore only a scheduling device, not a change in training semantics. The LLM
+treats the packed boundary tensor as the leaf input to its pipeline phase, while the encoder-side graph, saved
+activations, and communicator metadata remain live. The explicit gradient handoff at the start of Phase 3
+supplies the boundary gradients needed by the colocated backward transform and reconnects them to the
+encoder backward computation.
+The phase boundary also enables encoder-state offload. Encoder parameters are needed during Phase 1 and
+Phase 3, but not while Phase 2 executes the detached LLM pipeline. When offload is enabled, the runtime
+starts the device-to-host transfer after encoder forward, overlaps it with the LLM warmup and steady-state
+pipeline, starts the host-to-device reload during LLM cooldown, and synchronizes before encoder backward
+consumes the parameters. Optimizer state can use the same split lifecycle when enabled, with transfers
+scheduled around the encoder forward/backward phases rather than inside the LLM pipeline loop.
+21

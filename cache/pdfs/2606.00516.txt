@@ -1,0 +1,5161 @@
+--- Page 1 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Weifang Zhang * 1 Yuzhou Nie * 2 Bowen Pang 3 Guangrui Ma 4 Shining Wu 1
+Abstract
+Mixed batching (MB)—interleaving prefill and
+decode in a single batch—has become the stan-
+dard scheduling strategy for large language model
+(LLM) inference due to its efficiency in maxi-
+mizing compute and memory utilization. How-
+ever, through controlled experiments, we find that
+prefill–decode interference inflates MB’s per-step
+marginal cost above that of pure decode. On the
+high-bandwidth H200 (4.8 TB/s), this occurs only
+when decode tokens exceed 80% of the batch;
+however, on the bandwidth-constrained RTX PRO
+6000 (1.792 TB/s), this threshold plummets to
+just 20%. Consequently, the optimal choice be-
+tween MB and exclusive batching (EB) funda-
+mentally depends on GPU memory bandwidth,
+model size, and workload composition. We de-
+rive a closed-form condition for this EB–MB per-
+formance crossover, along with asymptotically
+optimal phase-switching thresholds and memory-
+safe batch sizing for EB. Optimized EB achieves
+up to 41.9% higher throughput on bandwidth-
+constrained GPUs, while MB retains its advantage
+on high-bandwidth hardware with larger models.
+Our hybrid scheduler EB+ applies this condition
+online to dynamically switch between EB and
+MB without manual intervention. Under non-
+stationary traffic with distribution or concurrency
+shifts, EB+ attains the highest or near-highest
+throughput in every setting, outperforming MB
+by up to 36.4%.1
+1. Introduction
+Large language model (LLM) inference consists of two
+distinct phases with fundamentally different computational
+*Equal contribution 1The Hong Kong Polytechnic University
+2UC Santa Barbara 3Technology and Engineering Center for Space
+Utilization, Chinese Academy of Sciences 4Meituan. Correspon-
+dence to: Shining Wu <sn.wu@polyu.edu.hk>.
+Proceedings of the 43 rd International Conference on Machine
+Learning, Seoul, South Korea. PMLR 306, 2026. Copyright 2026
+by the author(s).
+1Code: https://github.com/weifang231/eb-vllm.
+characteristics. The prefill phase processes input tokens in
+parallel to populate the key-value (KV) cache, making it
+compute-bound. The decode phase generates tokens autore-
+gressively, requiring repeated memory accesses to the KV
+cache, making it memory-bandwidth-bound (Kwon et al.,
+2023; Pope et al., 2023; Wang et al., 2025). This dichotomy
+creates an inherent inefficiency: during decoding, GPU
+compute units remain underutilized, while during prefill,
+memory bandwidth is not fully exploited.
+Two dominant scheduling paradigms have emerged. Mixed
+batching (MB) (Agrawal et al., 2023) interleaves prefill and
+decode operations within the same batch, simultaneously
+utilizing GPU compute for prefill and memory bandwidth
+for decode. Exclusive batching (EB) processes prefill and
+decode in separate batches, alternating phases by a schedul-
+ing rule. In this work we study a capacity-triggered policy
+that switches to the prefill phase whenever k decode slots
+become idle, denoting this family EB(k). MB has gained
+widespread adoption, with major inference engines includ-
+ing vLLM (Kwon et al., 2023) and SGLang (Zheng et al.,
+2024) transitioning to MB as their default scheduling mode.
+Throughout the paper we use v1 to denote vLLM v1 (as
+the MB baseline) and v0 to denote the vLLM v0 exclusive-
+batching scheduler, equivalent to EB(k=1) when saturated.
+In the context of single-GPU deployments, an intriguing
+dichotomy nonetheless persists in practice: while West-
+ern inference engines have largely standardized on MB,
+many large-scale production systems in China continue
+to favor EB. A plausible contributing factor is hardware—
+GPUs accessible in the Chinese market operate under tighter
+memory-bandwidth budgets, owing in part to export restric-
+tions. This raises a concrete question: does memory band-
+width fundamentally alter the EB-vs-MB trade-off, and if
+so, when should each strategy be preferred?
+To probe this question, we examine the marginal cost of
+processing tokens under different batching disciplines. We
+model the iteration time for processing ntok tokens in a
+single batch as Titer = α + β · ntok, where α is the fixed
+overhead and β the marginal cost per token. Crucially, both
+α and β depend on (1) the hardware profile (e.g., available
+memory bandwidth) and (2) the batch composition, which
+we characterize by the decode ratio r := ndecode/ntok, the
+fraction of decode tokens in a batch (r=1 for pure decode;
+1
+arXiv:2606.00516v1  [cs.AI]  30 May 2026
+
+
+--- Page 2 ---
+Threshold-Based Exclusive Batching for LLM Inference
+0<r<1 for a mixed batch).
+Controlled experiments on two GPUs with contrasting
+bandwidth—NVIDIA RTX PRO 6000 (1.792 TB/s) and
+NVIDIA H200 (4.8 TB/s)—reveal a sharp hardware de-
+pendence. The crossover point at which the mixed-batch
+marginal cost exceeds the pure-decode cost falls at r≈20%
+on the RTX PRO 6000 but only at r≈80% on the H200 (Fig-
+ure 1; averaged over 20 runs, variance negligible). These
+observations lead to our central hypothesis: EB with an
+optimized threshold should outperform MB in bandwidth-
+constrained environments, while MB should retain its ad-
+vantage on high-bandwidth hardware, motivating both an
+analysis of the EB–MB crossover and the design of adaptive
+EB scheduling.
+256
+512
+768
+1024 1536 2048 2560 3072 3584 4096
+Total Tokens
+0
+50
+100
+150
+200
+250
+300
+350
+Execution Time (ms)
+Qwen3-4B (NVIDIA RTX PRO 6000)
+Pure Prefill
+20% Decode
+40% Decode
+60% Decode
+80% Decode
+Pure Decode
+256
+512
+768
+1024 1536 2048 2560 3072 3584 4096
+Total Tokens
+20
+40
+60
+80
+100
+Qwen3-4B (NVIDIA H200)
+Pure Prefill
+20% Decode
+40% Decode
+60% Decode
+80% Decode
+Pure Decode
+Figure 1. Execution time for mixed batches (Qwen3-4B, ctx=16)
+on RTX PRO 6000 (left) and H200 (right).
+Kernel profiling (Figure 2) localizes the source of this gap:
+for a fixed total token count, GEMM time is largely invariant
+to r, whereas Attention time grows with r. Mixed-batch
+Attention becomes slower than pure-decode Attention at r≈
+20% on the RTX PRO 6000, but only near 80% on the H200.
+Consistent patterns hold across model scales (Gemma-3-
+1B-IT, Qwen3-8B, Qwen3-30B-A3B) and decode context
+lengths (Appendix A.2): both curves shift uniformly without
+altering their shape or crossover points.
+This cross-GPU gap is consistent with bandwidth limita-
+tions (Williams et al., 2009): decode attention streams the
+full KV-cache context per token and is therefore memory-
+bandwidth-bound. On bandwidth-constrained GPUs, co-
+locating prefills and decodes intensifies bandwidth con-
+tention and disproportionately inflates Attention latency;
+on high-bandwidth GPUs, this interference is weaker. This
+also suggests that current FlashAttention kernels (Dao et al.,
+2022; Dao, 2024; Shah et al., 2024) are not fully optimized
+for mixed-batch inference on bandwidth-limited GPUs, mo-
+tivating a re-examination of the EB-vs-MB trade-off.
+Based on these findings, we derive a closed-form condition
+characterizing when EB outperforms MB, governed by the
+marginal-cost gap between mixed and exclusive batches
+(Section 3). To realize optimal EB in practice, we derive
+an analytical expression for the normalized threshold θ∗=
+k∗/N and develop an adaptive scheduler, denoted EB(ˆk∗),
+that computes ˆk∗online from workload characteristics at
+runtime. We further use the same crossover condition to
+drive online mode selection between EB and MB.
+This paper makes the following contributions:
+• We provide empirical evidence that MB does not
+universally dominate EB, and derive a closed-form
+condition for the EB–MB crossover governed by the
+marginal-cost gap and amortized fixed-cost advantage.
+• We develop an adaptive EB scheduler with closed-form,
+asymptotically optimal phase-switching thresholds un-
+der stochastic output-length distributions, paired with
+memory-aware batch sizing that has probabilistic OOM
+guarantees.
+• We propose EB+, a hybrid scheduler that applies the
+crossover condition online to switch between EB and
+MB at runtime, remaining robust under non-stationary
+traffic and matching or exceeding PD-disaggregation
+throughput without extra hardware.
+• We validate these results on four NVIDIA GPUs span-
+ning 0.9–8.0 TB/s bandwidth: EB(ˆk∗) achieves up
+to 41.9% throughput gains on bandwidth-constrained
+GPUs; on high-bandwidth hardware with larger mod-
+els, v1 retains its advantage; and EB+ delivers the high-
+est joint TTFT/TPOT goodput across traffic regimes.
+RHS
+LHS
+Figure 2. Kernel time breakdown for Qwen3-4B on RTX PRO
+6000 (top) and H200 (bottom) vs. decode ratio r at three total
+token counts. Black line: total mixed-batch cost. Right panels add
+the EB cost (red dashed) and EB-vs-MB threshold (blue dashed,
+Eq. (7)); EB is favored when the black line exceeds the blue.
+2. Related Work
+The decode phase is memory-bandwidth-bound even at large
+batch sizes, leaving over 50% of GPU compute idle (Re-
+casens et al., 2025). Its Byte-per-FLOP demand exceeds
+prefill’s by ∼100×, and this bottleneck deepens across GPU
+2
+
+
+--- Page 3 ---
+Threshold-Based Exclusive Batching for LLM Inference
+generations as compute outpaces bandwidth (Li et al., 2025).
+Three scheduling strategies emerged in response.
+Exclusive Batching processes one phase per iteration (Yu
+et al., 2022; Kwon et al., 2023; NVIDIA, 2023; Aminabadi
+et al., 2022), avoiding intra-iteration prefill–decode inter-
+ference; Pang et al. (2025) extend this regime with a La-
+grangian analysis of prefill-vs-decode insertion.
+Mixed Batching co-locates prefill and decode tokens via
+chunked prefill, splitting long prefills under a fixed to-
+ken budget. Sarathi (Agrawal et al., 2023; 2024) intro-
+duced this with decode-maximal batching, with a simi-
+lar formulation in DeepSpeed-FastGen’s Dynamic Split-
+Fuse (Holmes et al., 2024); it is now the default in
+vLLM (v1), SGLang (Zheng et al., 2024), TGI (Hug-
+gingFace, 2023), TensorRT-LLM (NVIDIA, 2023), and
+LightLLM (ModelTC, 2023). Chunking itself is orthog-
+onal to EB/MB: EB can also chunk prefills to bound itera-
+tion time. MB pays two costs: co-location induces prefill–
+decode interference, and the aggressive chunking it requires
+(forced by sharing the token budget with decode) inflates
+MoE memory traffic by up to 39% via redundant expert
+reloads (Lee et al., 2026) and scales long-context KV-cache
+loads as O(N 2) for N-chunk prompts (Zhong et al., 2024).
+Disaggregated Serving eliminates inter-phase interference
+via dedicated P/D GPU pools (DistServe (Zhong et al.,
+2024), Splitwise (Patel et al., 2024), Mooncake (Qin et al.,
+2025)). The cost is twofold: architecturally, KV-cache trans-
+fer overhead (severe without NVLink/IB) and a doubled
+minimum GPU count; operationally, the static P:D split
+underutilizes decode under imbalance (Shi et al., 2025) and
+cannot adapt to demand shifts (Hong et al., 2025).
+Orthogonal techniques target other layers of the serving
+stack: MoE serving (Rajbhandari et al., 2022; Gale et al.,
+2023) and quantization (Xiao et al., 2023; Lin et al., 2024)
+optimize the model, KV cache management (Zhang et al.,
+2023; Xiao et al., 2024) compresses memory, and specu-
+lative decoding (Leviathan et al., 2023; Miao et al., 2024)
+reduces decode iterations.
+Within the scheduling-policy axis, we optimize EB via a
+closed-form online controller and combine it with MB into
+an adaptive hybrid (EB+) that navigates the EB/MB trade-off
+on a single GPU pool.
+3. Scheduling Model for Exclusive Batching
+We develop a scheduling framework for LLM serving under
+exclusive batching, where prefill and decode operations
+cannot be executed concurrently. We formulate the phase-
+switching decision as an optimization problem, derive opti-
+mal thresholds, and present an online adaptive algorithm.
+3.1. Problem Formulation
+System Model. Consider a system with N slots (the max-
+imum batch size); each slot can hold the state of one in-
+progress request and is either busy (currently occupied by
+a request) or idle (vacated upon completion). The system
+alternates between prefill and decode phases and operates
+in a saturated regime: the queue is consistently backlogged,
+so each batch operates at capacity N.
+During a decode phase, which begins with N busy slots,
+a slot becomes idle whenever its corresponding request
+completes (i.e., generates an end-of-sequence token). A
+phase switch occurs when the number of idle slots reaches a
+predetermined threshold k: the system then enters a prefill
+phase, loading k new requests into the vacated slots.
+During this prefill phase, as the k new requests are pro-
+cessed, the (N −k) incomplete requests remain inactive—
+their KV cache is preserved but no tokens are generated.
+Once the prefill completes, the system resumes decoding
+with a full batch of N requests, consisting of the (N −k)
+ongoing requests and the k newly admitted ones. This dy-
+namic creates a throughput-latency trade-off: large k (late
+switching) leaves completed slots idle longer and inflates
+queued requests’ wait time, while small k (early switching)
+amortizes the fixed prefill overhead αp over fewer requests
+and reduces efficiency.
+Timing Model. Each request has a random input length
+L (i.i.d. with mean µL) and output length O drawn from a
+general distribution F with hazard rate h(t), mean µO, and
+standard deviation σO. Assuming linear iteration time and
+modeling each prefill phase as a single batch, the prefill time
+for a batch of k requests (i.e., the length of a prefill phase)
+is Tp(k) = αp + βp
+Pk
+i=1 Li, where αp is the fixed prefill
+overhead and βp the per-token prefill cost. The decode
+iteration time at a batch size n is td(n) = αd + βdn, and
+the total decode time Td(k; N) is the sum of iteration times
+in a decode phase, depending on both the starting batch size
+N and the number k of requests that complete before the
+phase ends.
+Throughput Optimization Problem. We define throughput
+as the average number of request completions per unit time
+and seek the threshold k and batch size N that maximize
+it subject to a KV-cache memory constraint. Let C denote
+the KV-cache capacity and Xmax(k, N) the peak instan-
+taneous memory footprint of the unconstrained execution.
+The problem is formulated as follows:
+max
+k,N
+TP(k, N) :=
+k
+E[Td(k; N)] + αp + βpkµL
+,
+(1)
+s.t.
+k ∈{1, . . . , N},
+Pr(Xmax(k, N) > C) ≤ϵ,
+(2)
+3
+
+
+--- Page 4 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Approximate Solution Approach. We adopt a decoupled
+approximation that decomposes the joint optimization into
+two sequential steps. First, we derive the optimal normalized
+threshold θ∗= k∗/N in an asymptotic regime as N →∞,
+where k∗is the optimal solution to (1) without the memory
+constraint (2) for a fixed N. We show that θ∗converges to a
+limit θ0 that depends exclusively on the output distribution
+and is independent of N (Section 3.2). Second, we fix
+k = ⌊θ0N⌋and determine the maximum batch size N ∗that
+satisfies (2) (Section 3.3).
+While this decoupled method solves an approximation to
+the original problem (1)—meaning the threshold θ0 is opti-
+mal asymptotically and may not perfectly coincide with the
+exact finite-N solution—it provides significant analytical
+advantages. Specifically, the approximation yields tractable
+closed-form expressions, revealing important structural in-
+sights into LLM inference scheduling and enabling efficient
+online adaptation. We empirically validate its near-optimal
+performance in Section 4.2.
+Furthermore, to derive a closed-form expression for the
+expected duration of a decode phase, E[Td(k; N)], we apply
+fluid approximation. Here, the stochastic decode completion
+process is approximated by its deterministic limit as the
+system scale approaches infinity. This approximation is
+highly accurate in the large-batch regime typical of modern
+LLM serving.
+3.2. Optimal Switching Threshold
+Intuitively, balancing the amortization of the fixed prefill
+cost against the waste of idle decode slots depends funda-
+mentally on how likely additional completions are in the
+near future. Thus, the hazard rate h(t) = f(t)/ ¯F(t) of
+the output-length distribution plays a key role: a higher
+hazard rate means completions arrive faster (favoring de-
+layed switching), while a lower rate makes waiting costly
+(favoring earlier switching).
+We first analyze the constant failure rate (CFR) case, which
+admits a closed-form solution, and then extend the analysis
+to the increasing failure rate (IFR) case, which better cap-
+tures real LLM workloads where longer-running requests
+become progressively more likely to complete.
+3.2.1. BASE THRESHOLD UNDER CFR
+Assume that the decode length distribution exhibits a con-
+stant hazard rate h(t) = p0 (i.e., geometric output lengths),
+implying µO = 1/p0. Under the fluid approximation, the
+scaled number of decode requests decreases according to
+the differential equation ˙n(t) = −p0 n(t) during a decode
+phase, yielding the expected duration:
+E[Td(k; N)] = [βdNθ −αd ln(1 −θ)] p−1
+0 ,
+where θ = k
+N . Substituting E[Td(k; N)] into (1), we obtain
+the throughput under EB:
+TPEB(k, N) =
+h
+αp−αdµO ln(1−θ)
+k
++ βw
+EB(µL + µO)
+i−1
+,
+where βw
+EB
+=
+βpµL+βdµO
+µL+µO
+represents the workload-
+weighted average of the prefill and decode marginal costs.
+Solving k∗= arg maxk TPEB(k, N) yields the optimal
+switching threshold for the unconstrained problem (1). The
+following proposition establishes the limiting behavior of
+k∗as the batch size N →∞.
+Proposition 3.1 (Base Threshold under CFR). Under a
+constant hazard rate h(t) = p0 and the fluid approximation
+of the decode phase duration, the limiting optimal normal-
+ized threshold θ0 := lim
+N→∞θ∗= lim
+N→∞k∗/N is the unique
+solution to
+θ0(1 −θ0)−1 + ln(1 −θ0) = p0αpα−1
+d ,
+(3)
+which depends only on the single ratio p0αp/αd. In par-
+ticular, it is independent of N, µL, and the per-token costs
+βp, βd. We define ζ ≜−ln(1 −θ0) > 0 for brevity in what
+follows. (Proof in Appendix B.)
+This proposition implies that θ∗can be accurately approxi-
+mated by θ0 in the large-batch regime. To facilitate solving
+the capacity-constrained problem in the second step, we
+use the approximated value k∗
+0 := ⌊θ0N⌋as our practical
+solution to the unconstrained first-step problem. The sim-
+plicity of this parameter dependence makes the threshold
+highly practical to deploy: it is computed once from the
+easily measured tuple (αp, αd, p0).
+The optimal throughput for the first-step problem is then
+given by:
+TPEB(k∗
+0, N) =
+αp + αdζµO
+k∗
+0
++ βw
+EB(µL + µO)
+−1
+,
+(4)
+3.2.2. EXTENSION TO IFR
+Real LLM workloads exhibit IFR: as a request generates
+more tokens, it becomes progressively more likely to com-
+plete in the near future. Within a decode phase, this accel-
+erating completion rate reduces the additional wall-clock
+cost of waiting for one more idle slot. Consequently, the
+opportunity cost of delaying the phase switch is lower than
+under CFR, allowing the system to profitably accumulate
+more completions before switching. In short, IFR work-
+loads support higher optimal switching thresholds than the
+CFR baseline.
+Because the strength of IFR varies across workloads, the
+exact optimal limit θ∗can differ substantially from the base
+CFR limit θ0, motivating an analytical correction. We model
+IFR using a linear hazard rate h(t) = p0 + ηt with η > 0.
+4
+
+
+--- Page 5 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Theorem 3.2 (IFR Threshold Correction). Under a linear
+hazard rate h(t) = p0+ηt with η > 0, the optimal threshold
+admits the expansion θ∗= θ0 + ∆θ + O(η2), where θ0 is
+the CFR base threshold from Proposition 3.1 and
+∆θ = η(1 −θ0)2
+p2
+0 θ0
+
+ζ
+
+θ0
+1 −θ0
+−ζ
+2
+
+|
+{z
+}
+duration effect
++ βdN
+αd
+(ζ −θ0)
+|
+{z
+}
+per-token cost effect
+
+,
+(5)
+with ζ = −ln(1 −θ0). The correction satisfies ∆θ > 0 for
+all η > 0. (Proof in Appendix C; empirical validation in
+Appendix E.3.)
+The IFR correction reveals two structural features absent in
+the base case. First, unlike the N-independent θ0, ∆θ de-
+pends explicitly on ρ = βdN/αd, so IFR effects amplify for
+large batches with high per-token overhead (ρ ≫1). Sec-
+ond, the prefactor η/p2
+0 automatically rescales the correction
+across workloads with varying degrees of IFR.
+3.3. Memory-Constrained Batch Sizing
+Given θ0 and setting k = k∗
+0 = ⌊θ0N⌋, we now determine
+the maximum batch size N ∗such that the memory con-
+straint (2) is satisfied. Memory evolves dynamically during
+decode—increasing as tokens are generated and dropping
+abruptly upon request completion—creating a sawtooth pat-
+tern whose peak determines feasibility.
+Proposition 3.3 (Memory-Safe Batch Size). Under the CFR
+model with threshold θ0 (i.e., k = ⌊θ0N⌋), the maximum
+batch size satisfying Pr(Xmax(k, N) > C) ≤ϵ is
+N ∗=
+$
+C −ln(1/ϵ)/(p2
+0µL)
+µL + 1−θ0
+θ0 p0 ln
+1
+1−θ0
+%
+.
+(6)
+(Proof in Appendix D.)
+Here, we utilize the geometric model for analytical tractabil-
+ity. The solution (6) also serves as a conservative bound for
+IFR scenarios, as IFR workloads yield lower peak memory
+due to more predictable completion patterns.
+3.4. Online Adaptive Algorithm
+We design an online controller that jointly adapts (ˆk∗, ˆN ∗)
+by estimating workload parameters (ˆp0, ˆη, ˆµL) from recent
+requests and evaluating the closed-form expressions of Sec-
+tions 3.2–3.3 at the current estimates. Here, the hat notation
+(ˆ·) denotes the empirically estimated values of unknown
+parameters.
+Online estimation. The system maintains sliding windows
+of the most recent output lengths (WO) and input lengths
+(WL). From WO, we estimate the empirical hazard rate
+at step t as the fraction of completions at exactly t among
+those still active at t: ˆh(t) = #{O ∈WO : O=t}/#{O ∈
+WO : O≥t}, and fit ˆh(t) = ˆp0 + ˆηt via weighted least
+squares over t ∈[1, t95], where t95 is the 95th percentile of
+recent output lengths. From WL, we estimate ˆµL via the
+sample mean.
+Threshold and batch-size update. Given (ˆp0, ˆη), we com-
+pute ˆθ0 by solving (3) and apply the IFR correction (5) to ob-
+tain ˆθ∗= ˆθ0+ c
+∆θ (clipped to a practical range [θmin, θmax]).
+Because c
+∆θ depends on N through ρ = βdN/αd, we eval-
+uate (5) using the previous cycle’s ˆN ∗, yielding a one-step
+fixed-point update that we empirically observe to converge
+within a few cycles.
+We then compute a memory-safe
+batch size by applying Proposition 3.3 with θ = ˆθ∗and
+(p0, µL) = (ˆp0, ˆµL), yielding ˆN ∗= N ∗(ˆθ∗, ˆp0, ˆµL; C, ϵ).
+Finally, we set ˆk∗= ⌊ˆθ∗ˆN ∗⌋and apply the updated tu-
+ple (ˆk∗, ˆN ∗). Independent of this periodic update cycle, a
+runtime KV-aware gate (Appendix D.6) monitors memory
+and defers the decode→prefill transition whenever instan-
+taneous KV occupancy leaves insufficient headroom. This
+absorbs any random memory excursions that ˆN ∗may under-
+estimate under high-σO workloads. Pseudo-code is given in
+Algorithm 1 (Appendix D.7).
+3.5. Adaptive Mode Selection: EB+
+Having derived (4) to approximate the throughput of EB(ˆk∗),
+we now formulate the throughput of MB. By comparing the
+two, we deduce the condition (referred to as the crossover
+condition) under which one strategy outperforms the other.
+Building on this analytical foundation, we then design EB+,
+a hybrid scheduler that adaptively switches between EB and
+MB at runtime to globally maximize efficiency.
+MB Versus EB. We first approximate the throughput of MB
+in steady-state. Let Np be the average number of requests
+finishing prefill per iteration. By Little’s Law, the aver-
+age number of tokens decoded in each iteration is NpµO.
+Because the MB discipline generates exactly one decoded
+token per request per iteration, the average number of de-
+coding requests in a batch is directly Nd = NpµO. Con-
+sequently, the average effective batch size per iteration is
+N = Np + Nd = Np(1 + µO).
+The system throughput under MB is thus formulated as:
+TPMB(N) = Np [αMB + βe
+MB(NpµL + Nd)]−1
+=
+
+αMB(1 + µO)N −1 + βe
+MB(µL + µO)
+−1 ,
+where αMB is the fixed overhead for launching a mixed
+batch, and βe
+MB is the empirically measured effective per-
+token marginal cost.
+When standardizing N to be both the maximum batch size
+for EB and the effective average batch size for MB, we can
+directly compare their throughputs.
+Proposition 3.4. Under the steady-state approximations
+5
+
+
+--- Page 6 ---
+Threshold-Based Exclusive Batching for LLM Inference
+above, TPMB(N) > TPEB(k∗
+0, N) if and only if
+βe
+MB −βw
+EB <
+1
+µL + µO
+αp + αdζµO
+k∗
+0
+−αMB(1+µO)
+N
+
+.
+(7)
+In Proposition 3.4, the LHS represents the marginal-cost
+gap incurred by co-locating prefill and decode tokens in
+the same forward pass. The RHS captures the amortized
+fixed-cost advantage of MB, which requires fewer distinct
+kernel launches. Substituting k∗
+0 = θ0N, both terms inside
+the bracket of the RHS scale as 1/N. Therefore, the RHS is
+O(1/N) and naturally vanishes at high utilization. In satu-
+rated regimes, the comparison is entirely governed by the
+marginal-cost gap βe
+MB −βw
+EB. On bandwidth-constrained
+GPUs, prefill–decode interference drastically inflates this
+gap. Figure 2 confirms this empirically: on the H200, the
+mixed-batch marginal cost remains low across most de-
+code ratios, whereas on the RTX PRO 6000, bandwidth
+constraints inflate the cost above the threshold over interme-
+diate ratios, heavily favoring EB.
+Online switching criterion.
+At runtime, EB+ instan-
+tiates (7) using online system estimates and the EMA-
+smoothed active batch occupancy Nobs. To avoid oversen-
+sitivity to the noisy ˆη estimate, we substitute ˆk∗
+0 = ˆθ0Nobs.
+(Because the RHS scales as 1/Nobs and the gap ˆθ∗−ˆθ0 =
+O(η) is bounded, the resulting estimation bias is O(1/Nobs)
+and vanishes under saturation.) By reversing the inequality
+from Proposition 3.4, we formally define the EB+ control
+rule—the system executes an exclusive batch (EB) when:
+ˆβe
+MB(ˆr) −βw
+EB > (αp + αdˆζ ˆµO)/ˆθ0 −αMB(1+ˆµO)
+Nobs(ˆµL + ˆµO)
++ δ,
+(8)
+and defaults to MB otherwise. Here, the parameter ˆβe
+MB(ˆr)
+at the estimated decode ratio ˆr = ˆµO/(ˆµL+ˆµO) is retrieved
+from a one-shot, per-hardware kernel-time profile (see the
+calibration procedure in Appendix A.4). The scalar δ serves
+as a tunable priority margin: setting δ > 0 lowers the thresh-
+old for MB (favoring lower TTFT), while δ < 0 biases the
+system toward EB (favoring higher token throughput).
+Traffic- and workload-awareness. Equation (8) ensures
+adaptation along two distinct axes. First, the RHS scales
+inversely with the observed occupancy Nobs: under light
+traffic loads, the RHS is large, causing EB+ to safely default
+to MB. As traffic load increases and Nobs grows, the RHS
+shrinks; once resource contention dominates, the system dy-
+namically shifts to EB. Independently, ˆβe
+MB(ˆr) continuously
+tracks workload drift via the shifting decode ratio. Through
+these mechanisms, EB+ cleanly subsumes both EB(ˆk∗) and
+MB as theoretical endpoints, seamlessly recovering the su-
+perior scheduling discipline regime-by-regime without the
+need for manual intervention.
+4. Evaluation
+4.1. Experimental Setup
+Hardware. We evaluate on four GPU platforms (Table 1);
+H200 and RTX PRO 6000 serve as primary high-bandwidth
+and bandwidth-constrained baselines, with B300 and L40S
+used for scalability.
+Table 1. Hardware specifications of evaluated GPUs.
+GPU
+BW (TB/s)
+FP16 (TFLOPS)
+FLOP/B
+B300
+8.0
+4,500
+562
+H200
+4.8
+1,979
+412
+RTX PRO 6000
+1.792
+252
+141
+L40S
+0.864
+362.5
+419
+Implementation.
+We implement EB(ˆk∗) by extending
+vLLM (Kwon et al., 2023) with exclusive batching and on-
+line (ˆk∗, ˆN ∗) updates, leaving PagedAttention unchanged.
+We compare three strategies—v0, v1, and EB(ˆk∗)—on the
+same vLLM build in BF16.
+Models. Our primary models are Qwen3-8B and Qwen3-
+30B-A3B (MoE) (Yang et al., 2025), with Gemma-3-1B-
+IT (Gemma Team, 2025) used for supplementary results.
+Scheduling strategies. We compare three strategies. v0:
+the vLLM v0 scheduler, an exclusive-batching variant that
+switches to prefill whenever a slot opens; under our saturated
+regime (batches always full at N) it reduces to EB(k=1). v1:
+the vLLM v1 scheduler, implementing mixed batching with
+decode-maximal allocation. EB(ˆk∗): exclusive batching
+with our online controller from Section 3.4, which adapts
+the phase-switching threshold ˆk∗and the memory-safe batch
+size ˆN ∗from estimated workload statistics.
+Workloads. We evaluate both synthetic and real-world
+workloads to span the prefill–decode mix. Synthetic work-
+loads fix the mean input and output token counts, with per-
+request lengths drawn uniformly between 0.5× and 1.5×
+the corresponding mean: Decode-heavy (128 input / 1024
+output), Balanced (512/512), and Prefill-heavy (1024/128).
+Real-world workloads: ShareGPT (ShareGPT, 2023) (con-
+versational; 105 input / ≤500 output), LongBench (Bai et al.,
+2024) (long-context; 1,000–4,000 / 20), NuminaMath (Li
+et al., 2024) (chain-of-thought reasoning; 122 / 800–4,000),
+and WildChat (Zhao et al., 2024) (multi-turn dialogue; ≥6
+turns). Output lengths are truncated during serving; detailed
+statistics in Appendix E.1.
+Metrics and traffic. We report throughput in tokens/s (pre-
+fill and decode) and requests/s (RPS), and latency as TTFT
+(s), TPOT (ms), and ITL (s). Unless otherwise noted, exper-
+iments operate in a saturated regime (concurrency c=2,048)
+with 4,000 requests per configuration (WildChat: 3,000
+multi-turn, ∼27,900 requests).
+6
+
+
+--- Page 7 ---
+Threshold-Based Exclusive Batching for LLM Inference
+4.2. Model Validation
+We validate the analytical predictions from Section 3 on
+H200 with Qwen3-8B and synthetic geometric workloads.
+Baseline threshold properties. We test the structural prop-
+erties of the CFR baseline threshold θ0 from Proposition 3.1:
+(P1) scale invariance in N, (P2) insensitivity to mean in-
+put length µL, and (P3) monotone decrease in mean out-
+put length µO. All three are empirically confirmed (Ap-
+pendix E.2).
+Validation of decoupled optimization. We validate the
+accuracy of our closed-form, online adaptive controller on
+H200 using synthetic geometric output workloads. We com-
+pare (i) exhaustive sweeps over fixed switching thresholds k
+at a fixed batch size N = 1024 (vLLM default), and (ii) our
+online controller from Section 3.4, which estimates (p0, η)
+online and updates (ˆk∗, ˆN ∗) accordingly.
+Figure 3 plots throughput and time per output token (TPOT)
+as functions of k for three workloads. The closed-form
+choice achieves throughput comparable to, and in our ex-
+periments higher than, the best fixed k in the sweep, im-
+proving throughput by up to 8.0% (decode-heavy), 3.6%
+(balanced), and 0.6% (prefill-heavy) over the best fixed-k
+point at N = 1024. The gain is consistent with EB(ˆk∗)
+co-adapting both ˆθ∗and ˆN ∗, while the sweep is constrained
+to a single batch size. TPOT remains competitive: it is
+close to the best-throughput setting in the decode-heavy
+case and is substantially lower in the balanced and prefill-
+heavy cases. Overall, these results support that the decou-
+pled, closed-form selection eliminates the need for threshold
+search while retaining near-optimal performance.
+14000
+14500
+15000
+15500
+Decode-heavy
+k=1024
+Throughput (tok/s)
+Fixed k
+v1 (13974)
+EB(k * ) (15725)
+30
+40
+50
+60
+70
+TPOT mean (ms)
+Fixed k
+v1 (72.0)
+EB(k * ) (49.24)
+60
+80
+100
+120
+TPOT p99 (ms)
+Fixed k
+v1 (127.31)
+EB(k * ) (57.92)
+19500
+19750
+20000
+20250
+20500
+20750
+21000
+Balanced
+k=896
+Fixed k
+v1 (19509)
+EB(k * ) (20937)
+60
+65
+70
+75
+80
+85
+90
+Fixed k
+v1 (89.06)
+EB(k * ) (60.36)
+100
+200
+300
+400
+Fixed k
+v1 (199.31)
+EB(k * ) (103.41)
+200
+400
+600
+800
+1000
+k
+32200
+32400
+32600
+32800
+Prefill-heavy
+k=896
+Fixed k
+v1 (32228)
+EB(k * ) (32863)
+200
+400
+600
+800
+1000
+k
+120
+140
+160
+180
+200
+Fixed k
+v1 (176.06)
+EB(k * ) (114.23)
+200
+400
+600
+800
+1000
+k
+500
+1000
+1500
+2000
+2500
+3000
+Fixed k
+v1 (230.89)
+EB(k * ) (262.11)
+Figure 3. Validation on H200 (N=1024, geometric outputs):
+EB(ˆk∗) matches the best fixed-k sweep without manual tuning.
+4.3. End-to-End Performance
+We evaluate on RTX PRO 6000 and H200, sweeping the
+token budget B ∈{4096, . . . , 18432} and max batch size
+N ∈{256, . . . , 2048} via grid search and reporting the best-
+throughput configuration per scheduler (per-workload op-
+tima in Appendix F.1.2). For EB(ˆk∗), the adaptive controller
+computes a memory-safe batch size ˆN ∗online (Proposi-
+tion 3.3); the effective batch size is min( ˆN ∗, N).
+4.3.1. SYNTHETIC WORKLOADS
+We first evaluate on synthetic workloads with controlled
+input/output length ratios to isolate how workload composi-
+tion affects scheduling performance.
+Figure 4 compares v0, v1, and EB(ˆk∗) across three in-
+put/output regimes on RTX PRO 6000 and H200. v1 consis-
+tently reduces ITL relative to v0 via phase overlapping, but
+often sacrifices throughput under extreme imbalance (Sun
+et al., 2024). EB(ˆk∗) improves throughput across all regimes
+on RTX PRO 6000 with competitive latency; relative to the
+best of v0/v1, its gains peak in balanced and decode-heavy
+workloads (v0 already excels on prefill-heavy, narrowing
+the margin there). On H200 the throughput gap to v0/v1
+narrows substantially. This confirms EB is particularly ef-
+fective on bandwidth-constrained GPUs, where avoiding
+prefill–decode contention yields clearer throughput benefits.
+0
+2
+4
+6
+8
+10
+12
+14
+RTX PRO 6000
+★
+★
+★
+RPS
+v1
+v0
+EB( ̂k * )
+0.00
+0.05
+0.10
+0.15
+0.20
+★
+★
+★
+ITL (s)
+0
+50
+100
+150
+200
+250
+★
+★
+★
+TTFT (s)
+Decode-heavyBalanced Prefill-heavy
+0
+5
+10
+15
+20
+25
+30
+H200
+★
+★
+★
+Decode-heavyBalanced Prefill-heavy
+0.000
+0.025
+0.050
+0.075
+0.100
+0.125
+0.150
+0.175
+★
+★
+★
+Decode-heavyBalanced Prefill-heavy
+0
+10
+20
+30
+40
+50
+60
+★
+★
+★
+Figure 4. Synthetic workloads (Qwen3-8B): end-to-end perfor-
+mance on RTX PRO 6000 and H200. Stars mark the best strategy
+per workload/metric.
+4.3.2. REAL-WORLD WORKLOADS
+We further evaluate on four real-world workloads that rep-
+resent diverse serving scenarios. Table 2 summarizes re-
+sults for both Qwen models on RTX PRO 6000 and H200;
+Gemma-3-1B-IT results are deferred to Appendix F.2.
+On the bandwidth-constrained RTX PRO 6000, EB(ˆk∗) out-
+performs v1 on every workload for Qwen3-8B (average
++7.9%); on Qwen3-30B-A3B the gain shrinks to +1.4% on
+average, with two workloads slightly negative (see analysis
+below). On the high-bandwidth H200, the performance gap
+narrows considerably and v1 matches or exceeds EB(ˆk∗) on
+several configurations: consistent with our analysis, abun-
+dant memory bandwidth mitigates prefill–decode contention
+and erodes EB’s advantage. These results corroborate our
+7
+
+
+--- Page 8 ---
+Threshold-Based Exclusive Batching for LLM Inference
+central hypothesis that the EB–MB crossover is governed
+by memory bandwidth; we analyze the per-workload spread
+under the Decode-ratio sweet spot below.
+Table 2. Throughput (RPS) on real-world workloads. % Diff.
+denotes the relative improvement of EB(ˆk∗) over v1, computed as
+(EB(ˆk∗) −v1)/v1 × 100%.
+Qwen3-8B
+Qwen3-30B-A3B
+Workload
+v0
+v1
+EB(ˆk∗) % Diff.
+v0
+v1
+EB(ˆk∗) % Diff.
+RTX 6000
+ShareGPT
+15.45 17.07
+19.68
++15.3% 12.38 15.98
+15.48
+−3.1%
+LongBench
+8.17
+8.35
+8.66
++3.7%
+11.48 11.13
+11.67
++4.8%
+WildChat
+10.39 12.75
+14.19
++11.3%
+6.91
+9.39
+10.48
++11.6%
+Numina
+0.68
+0.73
+0.74
++1.4%
+0.42
+0.52
+0.48
+−7.7%
+Average
++7.9%
++1.4%
+H200
+ShareGPT
+19.36 41.93
+42.88
++2.3%
+17.68 48.96
+47.72
+−2.5%
+LongBench 14.22 15.77
+15.81
++0.3%
+21.31 24.43
+24.03
+−1.6%
+WildChat
+17.58 20.87
+21.50
++3.0%
+17.59 26.46
+26.66
++0.8%
+Numina
+1.49
+1.95
+1.96
++0.5%
+1.42
+1.83
+1.68
+−8.2%
+Average
++1.5%
+−2.9%
+Effect of model size. Eq. (7) predicts that larger models,
+which incur higher per-iteration fixed costs αp, αd, αMB,
+inflating the RHS, make v1 (MB) more competitive. Table 2
+aligns with this prediction: as we scale from Qwen3-8B to
+Qwen3-30B-A3B, EB’s average gain over v1 drops from
+7.9% to 1.4% on RTX PRO 6000, and from 1.5% to −2.9%
+on H200. We attribute this diminishing gap to the α scaling
+implied by Eq. (7); the underlying interference-convexity
+analysis is in Appendix A.3.
+Decode-ratio sweet spot.
+A convexity analysis (Ap-
+pendix A.3) predicts EB’s largest gains at intermediate
+decode ratios r, diminishing at the extremes (r →0 or
+r →1).
+Our workloads span this range: LongBench
+(r ≈0.004), ShareGPT/WildChat (r ≈0.5–0.7), and Nu-
+minaMath (r>0.85). On RTX PRO 6000 with Qwen3-8B,
+EB’s gains over v1 indeed peak at moderate r (ShareGPT
++15.3%, WildChat +11.3%) and shrink at the extremes
+(LongBench +3.7%, NuminaMath +1.4%); on Qwen3-30B-
+A3B, the high-r extreme (NuminaMath, −7.7%) is con-
+sistent with the two effects compounding, while mid-r
+workloads split between convexity’s prediction (WildChat
++11.6%) and α-scaling (ShareGPT −3.1%); LongBench
+remains positive (+4.8%).
+4.3.3. LATENCY ANALYSIS
+TTFT (Fig. 5a). v1 generally achieves lower TTFT than
+EB(ˆk∗) on most workloads by interleaving prefill with de-
+code to reduce queuing delays. However, on prefill-heavy
+workloads (LongBench), EB(ˆk∗) achieves lower TTFT
+across both GPUs (e.g., 169.64 s vs. 175.56 s on RTX PRO
+6000 with Qwen3-8B), as EB avoids fine-grained chunk
+scheduling overhead.
+TPOT (Fig. 5b). On RTX PRO 6000, EB(ˆk∗) achieves sub-
+stantially lower TPOT than v1 on most workloads: 65%
+reduction on ShareGPT (93.68 ms vs. 268.97 ms, Qwen3-
+8B), 35% on WildChat (113.22 ms vs. 173.33 ms), and 20%
+on NuminaMath (65.22 ms vs. 81.75 ms). The exception
+is LongBench, where v1 achieves lower TPOT due to its
+prefill-heavy nature. On H200, the differences are smaller,
+though EB(ˆk∗) remains competitive on decode-heavy work-
+loads such as WildChat (79.04 ms vs. 122.97 ms) and Numi-
+naMath (26.87 ms vs. 31.03 ms).
+30
+50
+100
+200
+300
+500
+1000
+2000
+RTX PRO 6000
+★
+★
+★
+★
+Qwen3-8B | TTFT (s)
+v1
+v0
+EB( ̂k * )
+50
+100
+200
+300
+500
+1000
+2000
+3000
+★
+★
+★
+★
+Qwen3-30B-A3B | TTFT (s)
+12.5
+15
+20
+30
+40
+50
+70
+90
+100
+125
+150
+200
+★
+★
+★
+★
+Gemma-3-1B-IT | TTFT (s)
+ShareGPT
+LongBench
+WildChat
+NuminaMath
+10
+20
+30
+50
+100
+200
+300
+500
+1000
+H200
+★
+★
+★
+★
+ShareGPT
+LongBench
+WildChat
+NuminaMath
+5
+10
+20
+30
+50
+100
+200
+300
+500
+★
+★
+★
+★
+ShareGPT
+LongBench
+WildChat
+NuminaMath
+15
+20
+30
+40
+50
+70
+90
+100
+★
+★
+★
+★
+(a) TTFT (s)
+70
+90
+100
+125
+150
+200
+300
+400
+500
+RTX PRO 6000
+★
+★
+★
+★
+Qwen3-8B | TPOT (ms)
+v1
+v0
+EB( ̂k * )
+80
+90
+100
+200
+300
+400
+★
+★
+★
+★
+Qwen3-30B-A3B | TPOT (ms)
+20
+30
+50
+100
+200
+300
+500
+★
+★
+★
+★
+Gemma-3-1B-IT | TPOT (ms)
+ShareGPT
+LongBench
+WildChat
+NuminaMath
+30
+40
+50
+70
+90
+100
+125
+150
+200
+300
+400
+500
+H200
+★
+★
+★
+★
+ShareGPT
+LongBench
+WildChat
+NuminaMath
+50
+70
+90
+100
+125
+150
+200
+300
+400
+★
+★
+★
+★
+ShareGPT
+LongBench
+WildChat
+NuminaMath
+10
+20
+30
+50
+100
+200
+300
+★
+★
+★
+★
+(b) TPOT (ms)
+Figure 5. TTFT (top) and TPOT (bottom) on real-world workloads.
+These results reflect a fundamental trade-off: v1 favors
+TTFT through phase overlapping, while EB favors TPOT
+by avoiding bandwidth contention.
+4.4. Adaptive Mode Selection: EB+
+The results above commit to a single mode (v1 or EB(ˆk∗)).
+We now evaluate the hybrid scheduler EB+ (Section 3.5),
+which switches online via the crossover criterion (8).
+Traffic-level sensitivity. Table 3 (top) sweeps concurrency
+c ∈{32, 512, 2048}. The two hardware columns realize
+different segments of the crossover. On the bandwidth-
+constrained RTX PRO 6000, EB(ˆk∗) is TTFT-handicapped
+at low load (∼1.5× v1’s TTFT), but EB+ selects MB at
+c=32 and recovers v1’s TTFT to within 1 ms; at moderate
+load it improves throughput by +62% over v1 with 1.8×
+lower TPOT; and at high load it commits to EB, attaining
+the best throughput (+50% over v1) with TTFT competitive
+to EB(ˆk∗). On H200, where v1 is already strong, EB+
+8
+
+
+--- Page 9 ---
+Threshold-Based Exclusive Batching for LLM Inference
+reproduces v1’s throughput and TTFT at c=32, 512 via its
+MB choice and matches EB(ˆk∗)’s throughput at c=2048.
+Non-stationary workloads. We test EB+ under (i) a distri-
+bution shift (µL : 1024→512→128, µO : 128→512→1024;
+2k requests/phase, c = 2048) and (ii) a concurrency shift
+(c: 32→512→1024→256→2048). EB+ attains throughput
+within ∼1% of the better of v1 and EB(ˆk∗) in all four
+(hardware×scenario) cells (Table 3, bottom): distribution
+shift gives +36.4% over v1 on RTX PRO 6000 and +3.9%
+on H200, and concurrency shift gives +22.6% and +0.6%
+respectively. The EMA-smoothed Nobs enables rapid adap-
+tation without manual re-tuning.
+Table 3. EB+ under stationary traffic (top three blocks; concurrency
+c, µL=512, µO=256) and non-stationary workloads (bottom two
+blocks). Qwen3-8B. TP in tok/s, TTFT in s, TPOT in ms.
+RTX PRO 6000
+H200
+Scenario Metric
+v1
+EB(ˆk∗)
+EB+
+v1
+EB(ˆk∗)
+EB+
+c=32
+TP
+4,928
+4,728
+4,930
+11,584
+10,779
+11,586
+TTFT
+0.061
+0.090
+0.061
+0.041
+0.062
+0.042
+TPOT
+19.4
+16.5
+19.5
+8.2
+7.1
+8.2
+c=512
+TP
+8,330
+13,549
+13,510 27,464
+27,207
+27,460
+TTFT
+1.2
+8.3
+5.1
+0.7
+4.6
+0.7
+TPOT
+164.2
+77.6
+90.4
+52.7
+36.8
+52.7
+c=2048
+TP
+8,830
+13,179
+13,214 26,368
+27,198
+27,043
+TTFT
+83.8
+70.8
+68.2
+24.4
+34.6
+33.7
+TPOT
+207.3
+82.7
+101.6
+128.1
+72.8
+79.2
+Distrib.
+shift
+TP
+7,025
+9,647
+9,582
+20,396
+20,762
+21,182
+TTFT
+190.7
+157.5
+152.1
+41.2
+66.5
+69.7
+TPOT
+178.5
+105.0
+102.2
+101.0
+42.3
+63.1
+Concur.
+shift
+TP
+8,364
+10,350
+10,250 24,251
+23,374
+24,397
+TTFT
+24.0
+29.8
+26.6
+7.7
+13.7
+9.4
+TPOT
+142.4
+51.6
+77.5
+77.9
+45.6
+66.8
+Goodput and PD-disaggregation. At c=512 with SLO
+(TTFT< 10 s, TPOT< 100 ms), EB+ attains 80.3% joint
+goodput versus 77.3% (EB(ˆk∗)) and 5.8% (v1). On 4× RTX
+PRO 6000 it is best or near-best in 7 of 9 workload×c cells
+against vLLM’s PD-disaggregation scheduler, and matches
+or exceeds v1 on the 2-GPU setup—without P:D tuning or
+OOMs. See Appendices F.3, F.4.
+4.5. Scalability
+Due to the high cost of exhaustive evaluation, we assess
+scalability using the WildChat workload with the same grid
+search procedure as in Section 4.3.
+4.5.1. ACROSS GPU PLATFORMS
+Table 4 extends the GPU comparison to L40S (bandwidth-
+constrained) and B300 (highest bandwidth).
+On L40S,
+EB(ˆk∗) achieves 41.9% higher RPS than v1 (14.70 vs.
+10.36) with lower TTFT and TPOT. On B300, EB(ˆk∗) is on
+par with v1 (52.34 vs. 50.47 RPS) with comparable TTFT
+and TPOT—consistent with the bandwidth-driven crossover
+Table 4. Scalability across GPU platforms (Qwen3-8B, WildChat).
+RPS in requests/s; TTFT/TPOT in s and ms respectively.
+v0
+v1
+EB(ˆk∗)
+GPU
+RPS TTFT
+TPOT RPS
+TTFT
+TPOT RPS
+TTFT TPOT
+B300*
+–
+–
+–
+50.47
+2.08
+24.00 52.34
+2.87
+22.12
+L40S
+4.14 157.21 171.02 10.36 132.47 189.70 14.70 92.16 138.16
+*v0 does not support PyTorch 2.9 and CUDA 13.0, which are required for B300.
+established in Section 4.3.
+4.5.2. ACROSS MODEL ARCHITECTURES
+On RTX PRO 6000 with WildChat, Figure 6 evaluates
+generalization across four model families: Llama-3.1-8B-
+Instruct (Grattafiori et al., 2024), Mathstral-7B-v0.1 (Mis-
+tral AI, 2024), Qwen2.5-Coder-7B (Hui et al., 2024), and
+DeepSeek-R1-Distill-Qwen-7B (Guo et al., 2025). EB(ˆk∗)
+consistently achieves the highest throughput and lowest
+TPOT across all models. Compared to v1, EB(ˆk∗) improves
+RPS by 8–17% and reduces TPOT by 17–47%, with the
+largest gains on Llama-3.1-8B (47% TPOT reduction). On
+this bandwidth-constrained GPU, EB dominates v1 across
+all tested architectures.
+Llama-3.1
+Mathstral
+Qwen2.5-Coder
+DeepSeek-R1-Distill
+10
+12
+14
+16
+RPS (
+ better)
+Llama-3.1
+Mathstral
+Qwen2.5-Coder
+DeepSeek-R1-Distill
+20
+30
+40
+50
+TTFT [s] (
+ better)
+Llama-3.1
+Mathstral
+Qwen2.5-Coder
+DeepSeek-R1-Distill
+150
+200
+250
+300
+350
+TPOT [ms] (
+ better)
+v1
+v0
+EB(k * )
+Figure 6. Scalability across models on RTX PRO 6000.
+4.5.3. ROBUSTNESS TO CONFIGURATION PARAMETERS
+A configuration sweep over (B, N) further shows that all
+three schedulers exhibit comparable robustness, so EB(ˆk∗)
+imposes no additional tuning burden (Appendix F.1).
+5. Conclusion
+This paper shows that neither mixed batching (MB) nor ex-
+clusive batching (EB) universally dominates LLM serving—
+the optimal choice is governed by a closed-form crossover
+condition driven by GPU bandwidth, model size, and work-
+load composition. Our adaptive EB scheduler, with asymp-
+totically optimal phase-switching thresholds and memory-
+safe batch sizing, achieves up to 41.9% throughput im-
+provement on bandwidth-constrained GPUs. The hybrid
+EB+ scheduler instantiates this crossover condition online,
+matching or exceeding both baselines across stationary and
+non-stationary regimes without manual tuning, and rival-
+ing disaggregated serving without extra hardware. Future
+directions include tighter SLO-aware switching and joint
+scheduling with sequence/pipeline parallelism.
+9
+
+
+--- Page 10 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Acknowledgments
+The authors sincerely thank the anonymous reviewers for
+their insightful comments and constructive suggestions,
+which significantly improved the quality of this work. This
+research was supported in part by the Hong Kong Research
+Grants Council under Grants 15508021 and 15511424.
+Impact Statement
+This paper advances the field of machine learning by improv-
+ing the efficiency of LLM inference scheduling. Our work
+is a systems-level optimization: it makes existing models
+cheaper to serve rather than enabling new capabilities, and
+the scheduling strategies are agnostic to generated content.
+A positive consequence is that EB’s gains on bandwidth-
+constrained accelerators broaden the range of hardware on
+which LLMs can be deployed efficiently, lowering the cost
+of access. We do not foresee negative societal consequences
+beyond those well-established for LLM deployment.
+References
+Agrawal, A., Panwar, A., Mohan, J., Kwatra, N., Gulavani,
+B. S., and Ramjee, R. Sarathi: Efficient LLM inference
+by piggybacking decodes with chunked prefills. arXiv
+preprint arXiv:2308.16369, 2023.
+Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra,
+N., Gulavani, B. S., Tumanov, A., and Ramjee, R. Tam-
+ing throughput-latency tradeoff in LLM inference with
+Sarathi-Serve. In USENIX Symposium on Operating Sys-
+tems Design and Implementation (OSDI), pp. 117–134,
+2024.
+Aminabadi, R. Y., Rajbhandari, S., Awan, A. A., Li, C.,
+Li, D., Zheng, E., Ruwase, O., Smith, S., Zhang, M.,
+Rasley, J., and He, Y. DeepSpeed-Inference: Enabling ef-
+ficient inference of transformer models at unprecedented
+scale. In Proceedings of the International Conference for
+High Performance Computing, Networking, Storage and
+Analysis (SC), 2022. doi: 10.1109/SC41404.2022.00051.
+Bai, Y., Lv, X., Zhang, J., Lyu, H., Tang, J., Huang, Z.,
+Du, Z., Liu, X., Zeng, A., Hou, L., Dong, Y., Tang, J.,
+and Li, J. LongBench: A bilingual, multitask benchmark
+for long context understanding. In Annual Meeting of
+the Association for Computational Linguistics (ACL), pp.
+3119–3137, 2024. URL https://aclanthology
+.org/2024.acl-long.172.
+Dao, T. FlashAttention-2: Faster attention with better paral-
+lelism and work partitioning. In International Conference
+on Learning Representations (ICLR), 2024.
+Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and R´e, C. FlashAt-
+tention: Fast and memory-efficient exact attention with
+IO-awareness. In Advances in Neural Information Pro-
+cessing Systems (NeurIPS), 2022.
+Ethier, S. N. and Kurtz, T. G. Markov Processes: Charac-
+terization and Convergence. John Wiley & Sons, 1986.
+Feller, W. An Introduction to Probability Theory and Its
+Applications, volume 2. John Wiley & Sons, New York,
+2nd edition, 1971.
+Gale, T., Narayanan, D., Young, C., and Zaharia, M.
+MegaBlocks: Efficient sparse training with mixture-of-
+experts. In Conference on Machine Learning and Systems
+(MLSys), pp. 288–304, 2023.
+Gemma Team. Gemma 3 technical report. arXiv preprint
+arXiv:2503.19786, 2025.
+Grattafiori, A., Dubey, A., Jauhri, A., et al. The Llama 3
+herd of models. arXiv preprint arXiv:2407.21783, 2024.
+Guo, D., Yang, D., Zhang, H., et al. DeepSeek-R1 incen-
+tivizes reasoning in LLMs through reinforcement learn-
+ing. Nature, 645(8081):633–638, September 2025. doi:
+10.1038/s41586-025-09422-z.
+Holmes, C., Tanaka, M., Wyatt, M., Awan, A. A., Rasley,
+J., Rajbhandari, S., Aminabadi, R. Y., Qin, H., Bakhtiari,
+A., Kurilenko, L., et al.
+DeepSpeed-FastGen: High-
+throughput text generation for LLMs via MII and
+DeepSpeed-Inference. arXiv preprint arXiv:2401.08671,
+2024.
+Hong, K., Chen, L., Wang, Z., Li, X., Mao, Q., Ma, J.,
+Xiong, C., Wu, G., Han, B., Dai, G., Liang, Y., and
+Wang, Y. semi-PD: Towards efficient LLM serving via
+phase-wise disaggregated computation and unified stor-
+age. arXiv preprint arXiv:2504.19867, 2025.
+HuggingFace. Text generation inference. https://gith
+ub.com/huggingface/text-generation-i
+nference, 2023.
+Hui, B., Yang, J., Cui, Z., et al. Qwen2.5-Coder technical
+report. arXiv preprint arXiv:2409.12186, 2024.
+Kurtz, T. G. Solutions of ordinary differential equations as
+limits of pure jump Markov processes. Journal of Applied
+Probability, 7(1):49–58, 1970.
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+memory management for large language model serving
+with PagedAttention. In ACM Symposium on Operating
+Systems Principles (SOSP), pp. 611–626, 2023. doi: 10.1
+145/3600006.3613165.
+10
+
+
+--- Page 11 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Lee, G., Kim, J., Park, J., Lee, Y., and Ahn, J. H. From
+tokens to layers: Redefining stall-free scheduling for MoE
+serving with layered prefill. In Conference on Machine
+Learning and Systems (MLSys), 2026.
+Leviathan, Y., Kalman, M., and Matias, Y. Fast inference
+from transformers via speculative decoding. In Interna-
+tional Conference on Machine Learning (ICML), 2023.
+Li, J., Beeching, E., Tunstall, L., Lipkin, B., Soletskyi, R.,
+Huang, S. C., Rasul, K., Yu, L., Jiang, A., Shen, Z., Qin,
+Z., Dong, B., Zhou, L., Fleureau, Y., Lample, G., and
+Polu, S. NuminaMath. https://huggingface.co
+/AI-MO/NuminaMath-CoT, 2024. Dataset report
+available at https://github.com/project-n
+umina/aimo-progress-prize/blob/main/r
+eport/numina_dataset.pdf.
+Li, J., Qu, L., Zhang, T., Chirkov, G., Xu, S., Cheng, P., and
+Zhou, L. FengHuang: Next-generation memory orchestra-
+tion for AI inferencing. arXiv preprint arXiv:2511.10753,
+2025.
+Lin, J., Tang, J., Tang, H., Yang, S., Chen, W.-M., Wang,
+W.-C., Xiao, G., Dang, X., Gan, C., and Han, S. AWQ:
+Activation-aware weight quantization for on-device LLM
+compression and acceleration. In Conference on Machine
+Learning and Systems (MLSys), 2024. Best Paper Award.
+Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Wang, Z.,
+Zhang, Z., Wong, R. Y. Y., Zhu, A., Yang, L., Shi, X.,
+Shi, C., Chen, Z., Arfeen, D., Abhyankar, R., and Jia,
+Z. SpecInfer: Accelerating large language model serv-
+ing with tree-based speculative inference and verification.
+In ACM International Conference on Architectural Sup-
+port for Programming Languages and Operating Systems
+(ASPLOS), 2024.
+Mistral AI. Mathstral-7B-v0.1. https://huggingfac
+e.co/mistralai/Mathstral-7B-v0.1, July
+2024. Released by Mistral AI, July 2024; announcement
+at https://mistral.ai/news/mathstral/.
+ModelTC. LightLLM: A light and fast inference service for
+LLM. https://github.com/ModelTC/light
+llm, 2023.
+NVIDIA. FasterTransformer. https://github.com
+/NVIDIA/FasterTransformer, 2023.
+NVIDIA. TensorRT-LLM: A TensorRT toolbox for opti-
+mized large language model inference. https://gi
+thub.com/NVIDIA/TensorRT-LLM, 2023.
+Pang, B., Li, K., She, R., and Wang, F. Hybrid offline-online
+scheduling method for large language model inference
+optimization. arXiv preprint arXiv:2502.15763, 2025.
+Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, ´I., Maleki,
+S., and Bianchini, R. Splitwise: Efficient generative
+LLM inference using phase splitting. In International
+Symposium on Computer Architecture (ISCA), pp. 118–
+132, 2024. doi: 10.1109/ISCA59077.2024.00019.
+Pope, R., Douglas, S., Chowdhery, A., Devlin, J., Bradbury,
+J., Heek, J., Xiao, K., Agrawal, S., and Dean, J. Efficiently
+scaling Transformer inference. In Conference on Machine
+Learning and Systems (MLSys), volume 5, pp. 606–624,
+2023.
+Qin, R., Li, Z., He, W., Cui, J., Ren, F., Zhang, M., Wu, Y.,
+Zheng, W., and Xu, X. Mooncake: Trading more storage
+for less computation—a KVCache-centric architecture
+for serving LLM chatbot. In USENIX Conference on File
+and Storage Technologies (FAST), pp. 155–170, 2025.
+Rajbhandari, S., Li, C., Yao, Z., Zhang, M., Aminabadi,
+R. Y., Awan, A. A., Rasley, J., and He, Y. DeepSpeed-
+MoE: Advancing mixture-of-experts inference and train-
+ing to power next-generation AI scale. In International
+Conference on Machine Learning (ICML), pp. 18332–
+18346, 2022.
+Recasens, P. G., Agullo, F., Zhu, Y., Wang, C., Lee, E. K.,
+Tardieu, O., Torres, J., and Berral, J. L. Mind the memory
+gap: Unveiling GPU bottlenecks in large-batch LLM
+inference. In IEEE International Conference on Cloud
+Computing (CLOUD), pp. 277–287, 2025. doi: 10.1109/
+CLOUD67622.2025.00036.
+Shah, J., Bikshandi, G., Zhang, Y., Thakkar, V., Ramani, P.,
+and Dao, T. FlashAttention-3: Fast and accurate atten-
+tion with asynchrony and low-precision. In Advances in
+Neural Information Processing Systems (NeurIPS), 2024.
+ShareGPT. ShareGPT: User-shared ChatGPT conversations
+dataset. https://sharegpt.com/, 2023. Ac-
+cessed: 2024.
+Shi, X., Cai, C., Du, J., and Jia, Z. Nexus: Proactive intra-
+GPU disaggregation of prefill and decode in LLM serving.
+arXiv preprint arXiv:2507.06608, 2025.
+Sun, B., Huang, Z., Zhao, H., Xiao, W., Zhang, X., Li, Y.,
+and Lin, W. Llumnix: Dynamic scheduling for large
+language model serving. In USENIX Symposium on Op-
+erating Systems Design and Implementation (OSDI), pp.
+173–191, 2024.
+Wang, H., Xiao, X., Yan, M., Zhu, Z., Han, D., Wang, D.,
+Li, W., Ye, X., Hu, C., Chen, H., et al. A systematic char-
+acterization of LLM inference on GPUs. arXiv preprint
+arXiv:2512.01644, 2025.
+11
+
+
+--- Page 12 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Williams, S., Waterman, A., and Patterson, D. Roofline:
+An insightful visual performance model for multicore
+architectures. Communications of the ACM, 52(4):65–76,
+2009. doi: 10.1145/1498765.1498785.
+Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., and Han,
+S. SmoothQuant: Accurate and efficient post-training
+quantization for large language models. In International
+Conference on Machine Learning (ICML), 2023.
+Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Effi-
+cient streaming language models with attention sinks. In
+International Conference on Learning Representations
+(ICLR), 2024.
+Yang, A., Yang, A., Yang, B., et al. Qwen3 technical report.
+arXiv preprint arXiv:2505.09388, 2025.
+Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-
+G. Orca: A distributed serving system for Transformer-
+Based generative models. In USENIX Symposium on
+Operating Systems Design and Implementation (OSDI),
+pp. 521–538, 2022.
+Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai, R.,
+Song, Z., Tian, Y., R´e, C., Barrett, C., Wang, Z., and Chen,
+B. H2O: Heavy-hitter oracle for efficient generative in-
+ference of large language models. In Advances in Neural
+Information Processing Systems (NeurIPS), volume 36,
+pp. 34661–34710, 2023.
+Zhao, W., Ren, X., Hessel, J., Cardie, C., Choi, Y., and Deng,
+Y. WildChat: 1M ChatGPT interaction logs in the wild.
+In International Conference on Learning Representations
+(ICLR), 2024.
+Zheng, L., Yin, L., Xie, Z., Sun, C. L., Huang, J., Yu,
+C. H., Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E.,
+et al. SGLang: Efficient execution of structured language
+model programs. In Advances in Neural Information
+Processing Systems (NeurIPS), volume 37, pp. 62557–
+62583, 2024.
+Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin,
+X., and Zhang, H. DistServe: Disaggregating prefill and
+decoding for goodput-optimized large language model
+serving. In USENIX Symposium on Operating Systems
+Design and Implementation (OSDI), pp. 193–210, 2024.
+12
+
+
+--- Page 13 ---
+Threshold-Based Exclusive Batching for LLM Inference
+A. Cost Model: Empirical Validation and Extensions
+A.1. Empirical Verification of the Linear Iteration-Time Model
+Our theoretical derivations (Propositions 3.1, 3.3 and Theorem 3.2) build on the linear iteration-time model Tp(k) =
+αp + βp
+P
+i Li in Section 3.1. Although self-attention has theoretically quadratic complexity in context length, we show
+empirically that the quadratic term is negligible in the regime where our scheduler actually operates.
+Scope: the budget that matters is the per-iteration token budget. Both MB (vLLM v1) and our EB scheduler
+operate under chunked prefilling: a long input is split across multiple iterations, with each iteration processing at most
+B = max num batched tokens tokens (typically 2K–8K, up to 16K on high-end GPUs). The linear model is therefore
+applied per iteration on at most B tokens; it does not need to hold over an entire long input. All experiments in Section 4.3
+respect this budget.
+Per-iteration validation within the practical regime. We profile prefill iteration time on RTX PRO 6000 Blackwell
+(96 GB) across seven models spanning four architectures and hidden dimensions d ∈[2048, 5120]: Qwen3-{4B, 8B, 14B,
+30B-A3B (MoE)}, Llama-{3.2-1B, 3.1-8B}, and Mistral-Nemo-12B. For each model we fit T = α + β ntok to measured
+prefill times and report R2 within three budget ranges (Table 5). Within the practical range B ≤8K, every model achieves
+R2 > 0.986; extending to B ≤16K, R2 stays > 0.979. As a cross-GPU check, repeating the protocol with Qwen3-4B on
+H200 also yields R2 = 0.998, with the quadratic correction improving R2 by only 0.001.
+Table 5. Linear-model R2 within practical token-budget ranges on RTX PRO 6000 Blackwell.
+Qwen3-4B Qwen3-8B Qwen3-14B Qwen3-30B-A3B Llama-3.2-1B Llama-3.1-8B Mistral-Nemo-12B
+B range
+(d=2560)
+(d=4096)
+(d=5120)
+(d=2048)
+(d=2048)
+(d=4096)
+(d=5120)
+≤4K
+0.9993
+0.9999
+0.9998
+0.9939
+0.9993
+0.9996
+0.9988
+≤8K
+0.9957
+0.9994
+0.9977
+0.9863
+0.9971
+0.9996
+0.9990
+≤16K
+0.9870
+0.9907
+0.9960
+0.9790
+0.9913
+0.9918
+0.9930
+The robustness of the linear fit is consistent with the FLOP decomposition of prefill: GEMM dominates, contributing 24d2
+FLOPs per token versus 4Ld for attention. Even at L = 4096 with d = 2560, the attention fraction is L/(6d) ≈27%, and
+GQA further reduces this share, so the quadratic-in-L component is a small fraction of overall prefill cost in the operating
+regime of interest.
+End-to-end serving at 128K context. To verify that per-iteration linearity translates to serving-level gains at long context,
+we run end-to-end benchmarks at 128K input / 64 output tokens on the same GPU under vLLM’s default B = 8192. Each
+request’s prefill is chunked into ∼16 iterations, all within the validated linear regime (R2 > 0.99 at B ≤8K). Concurrency
+is capped at the maximum value that avoids OOM on a single 96 GB GPU, since the KV cache for a 128K-token request is
+large. Even at this low-concurrency regime—where MB’s scheduling overhead is amortized and prefill–decode contention is
+minimal—EB(ˆk∗) achieves +1.4% to +4.0% higher throughput than v1 (MB) across all seven models (Table 6), confirming
+that exclusive batching provides consistent gains at long context.
+Table 6. End-to-end throughput (tok/s) at 128K input / 64 output tokens on RTX PRO 6000 (96 GB). Concurrency is the maximum that
+fits in GPU memory.
+Model
+Concurrency
+v1 (MB)
+EB(ˆk∗)
+∆
+Llama-3.2-1B
+4
+26,664
+27,265
++2.3%
+Qwen3-30B-A3B
+4
+4,826
+5,021
++4.0%
+Qwen3-4B
+4
+6,134
+6,314
++2.9%
+Qwen3-8B
+3
+5,621
+5,764
++2.5%
+Llama-3.1-8B
+3
+6,331
+6,482
++2.4%
+Qwen3-14B
+3
+3,830
+3,883
++1.4%
+Mistral-Nemo-12B
+3
+4,774
+4,877
++2.2%
+Stress test beyond practical settings. For completeness, we additionally probe how the linear model behaves outside
+its intended operating regime by forcing B = 131,072 so that a single iteration processes the entire 128K input without
+chunking. This far exceeds typical deployment configurations, yet even here the linear fit retains R2 ≥0.943 across all
+seven models (Table 7), indicating that the approximation degrades gracefully rather than breaking down. Figure 7 provides
+13
+
+
+--- Page 14 ---
+Threshold-Based Exclusive Batching for LLM Inference
+a visual summary spanning both regimes: the left panel shows the measured prefill time curves, and the right panel traces
+how R2 degrades smoothly as the fit range is extended from the practical budget to the full 128K range.
+Table 7. Linear-model R2 under the stress setting B = 131,072 (one iteration on the full 128K input).
+B range Qwen3-4B Qwen3-8B Qwen3-14B Qwen3-30B-A3B Llama-3.2-1B Llama-3.1-8B Mistral-Nemo-12B
+≤32K
+0.9731
+0.9852
+0.9906
+0.9675
+0.9762
+0.9872
+0.9899
+≤64K
+0.9597
+0.9753
+0.9831
+0.9549
+0.9625
+0.9777
+0.9829
+≤128K
+0.9471
+0.9607
+0.9664
+0.9434
+0.9481
+0.9631
+0.9669
+Figure 7. Linear-model validation across seven models on RTX PRO 6000 Blackwell. (Left) Measured prefill iteration time vs. context
+length L (up to 128K tokens); the shaded band marks the typical per-iteration token budget (≤8K). (Right) Linear-fit R2 as a function
+of the fit-range upper bound. Within the practical budget (≤16K) all models retain R2 > 0.97; even when stretched to 128K the
+approximation degrades gracefully, staying R2 ≥0.94.
+A.2. Additional Marginal Cost and Kernel Breakdown Results
+Section 1 presents marginal cost and kernel breakdown analyses using Qwen3-4B. Here we extend these to Gemma-3-1B-IT,
+Qwen3-8B, and Qwen3-30B-A3B (a Mixture-of-Experts variant) on the same two-GPU setup (RTX PRO 6000 and H200),
+examining how model scale and architecture affect the prefill–decode interference phenomenon.
+Marginal cost. Figure 8 reports execution time vs. total token count at various decode ratios for each model on both GPUs.
+For the two Qwen models, RTX PRO 6000 results are consistent with the Qwen3-4B findings in the main text: mixed-batch
+execution exceeds pure decode at moderate decode ratios. On H200, the mixed-batch curves remain between the pure-prefill
+and pure-decode baselines across most operating points, with crossover only at high decode ratios. The interference effect
+intensifies with model size—Qwen3-30B-A3B exhibits a wider gap between mixed-batch and pure-decode costs than
+Qwen3-8B on RTX PRO 6000, reflecting increased memory-bandwidth pressure from larger (or more numerous) weight
+matrices.
+For Gemma-3-1B-IT, however, the mixed-batch curves remain strictly between the pure-prefill and pure-decode baselines
+on both GPUs, and no crossover is observed. We attribute this to its lightweight architecture: a 1B-parameter dense model
+has fewer weight matrices and attention heads, so even the RTX PRO 6000’s 1.792 TB/s bandwidth is sufficient to serve
+mixed batches without severe contention. This indicates that the interference effect is model-architecture-dependent—it
+emerges when the model’s memory footprint is large enough to saturate the available bandwidth.
+Kernel breakdown. Figure 9 ((a)–(c)) decomposes the iteration time into kernel-level components. We highlight three
+observations:
+(i) GEMM time is insensitive to batch composition. Across all three models and both GPUs, GEMM time remains largely
+invariant to decode ratio, confirming that the linear projection cost depends primarily on total token count rather than the
+prefill–decode composition.
+(ii) Attention is the primary source of composition sensitivity for Qwen models. For both Qwen3-8B and Qwen3-30B-A3B, as
+well as Qwen3-4B in the main text, the Attention component accounts for the majority of the latency increase as decode ratio
+grows, and exhibits the same GPU-dependent crossover behavior: mixed-batch Attention becomes slower than pure-decode
+Attention at a much lower decode ratio on the RTX PRO 6000 than on the H200.
+14
+
+
+--- Page 15 ---
+Threshold-Based Exclusive Batching for LLM Inference
+256
+512
+768
+1024 1536 2048 2560 3072 3584 4096
+Total Tokens
+20
+40
+60
+80
+100
+Execution Time (ms)
+Gemma-3-1B-IT (NVIDIA RTX PRO 6000)
+Pure Prefill
+20% Decode
+40% Decode
+60% Decode
+80% Decode
+Pure Decode
+256
+512
+768
+1024 1536 2048 2560 3072 3584 4096
+Total Tokens
+0
+100
+200
+300
+400
+Execution Time (ms)
+Qwen3-8B (NVIDIA RTX PRO 6000)
+Pure Prefill
+20% Decode
+40% Decode
+60% Decode
+80% Decode
+Pure Decode
+256
+512
+768
+1024
+1536
+2048
+2560
+3072
+Total Tokens
+50
+100
+150
+200
+250
+300
+Execution Time (ms)
+Qwen3-30B-A3B (NVIDIA RTX PRO 6000)
+Pure Prefill
+20% Decode
+40% Decode
+60% Decode
+80% Decode
+Pure Decode
+256
+512
+768
+1024 1536 2048 2560 3072 3584 4096
+Total Tokens
+20
+25
+30
+35
+40
+45
+50
+55
+Execution Time (ms)
+Gemma-3-1B-IT (NVIDIA H200)
+Pure Prefill
+20% Decode
+40% Decode
+60% Decode
+80% Decode
+Pure Decode
+256
+512
+768
+1024 1536 2048 2560 3072 3584 4096
+Total Tokens
+20
+40
+60
+80
+100
+120
+140
+Execution Time (ms)
+Qwen3-8B (NVIDIA H200)
+Pure Prefill
+20% Decode
+40% Decode
+60% Decode
+80% Decode
+Pure Decode
+256
+512
+768
+1024 1536 2048 2560 3072 3584 4096
+Total Tokens
+30
+40
+50
+60
+70
+80
+90
+100
+110
+Execution Time (ms)
+Qwen3-30B-A3B (NVIDIA H200)
+Pure Prefill
+20% Decode
+40% Decode
+60% Decode
+80% Decode
+Pure Decode
+Figure 8. Execution time vs. total token count at various decode ratios for Gemma-3-1B-IT (left), Qwen3-8B (middle), and Qwen3-30B-
+A3B (right) on RTX PRO 6000 (top) and H200 (bottom).
+(iii) Model-specific kernel characteristics. For Qwen3-30B-A3B, MoE routing and expert computation dominate kernel
+time but remain insensitive to batch composition, behaving similarly to GEMM. For Gemma-3-1B-IT, the “Other” category
+(elementwise operations, normalization, memory management) grows noticeably with decode ratio on RTX PRO 6000:
+GEMM and Attention complete quickly for a 1B-parameter model, so per-token overheads (KV-cache management, kernel
+launch latency, synchronization)—which scale with decode tokens—become proportionally significant.
+Taken together, these results show that the prefill–decode interference identified in Section 1 is robust across the Qwen
+model family at different scales, including MoE architectures. The absence of interference for Gemma-3-1B-IT further
+supports our bandwidth-based explanation: the effect manifests when the model’s memory footprint is sufficient to create
+bandwidth contention, making it most relevant for the medium-to-large models that dominate production deployments.
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+0
+10
+20
+30
+40
+50
+60
+70
+80
+Kernel Time (ms)
+Total Tokens = 1024
+GEMM
+Attention
+Other
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+Total Tokens = 2048
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+Total Tokens = 4096
+Gemma-3-1B-IT (NVIDIA RTX PRO 6000)
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+0
+5
+10
+15
+20
+25
+30
+35
+40
+Kernel Time (ms)
+Total Tokens = 1024
+GEMM
+Attention
+Other
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+Total Tokens = 2048
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+Total Tokens = 4096
+Gemma-3-1B-IT (NVIDIA H200)
+(a) Gemma-3-1B-IT
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+0
+100
+200
+300
+400
+Kernel Time (ms)
+Total Tokens = 1024
+GEMM
+Attention
+Other
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+Total Tokens = 2048
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+Total Tokens = 4096
+Qwen3-8B (NVIDIA RTX PRO 6000)
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+0
+20
+40
+60
+80
+100
+120
+140
+Kernel Time (ms)
+Total Tokens = 1024
+GEMM
+Attention
+Other
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+Total Tokens = 2048
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+Total Tokens = 4096
+Qwen3-8B (NVIDIA H200)
+(b) Qwen3-8B
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+0
+20
+40
+60
+80
+100
+Kernel Time (ms)
+Total Tokens = 256
+GEMM
+Attention
+MoE
+Other
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+Total Tokens = 512
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+Total Tokens = 1024
+Qwen3-30B-A3B (NVIDIA RTX PRO 6000)
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+0
+10
+20
+30
+40
+50
+Kernel Time (ms)
+Total Tokens = 512
+GEMM
+Attention
+MoE
+Other
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+Total Tokens = 1024
+0%
+20%
+40%
+60%
+80%
+100%
+Decode %
+Total Tokens = 2048
+Qwen3-30B-A3B (NVIDIA H200)
+(c) Qwen3-30B-A3B
+Figure 9. Kernel time breakdown by decode ratio on RTX PRO 6000 (top) and H200 (bottom) for (a) Gemma-3-1B-IT, (b) Qwen3-8B,
+and (c) Qwen3-30B-A3B.
+Effect of decode context length. Figures 1 and 2 in the main text use ctx= 16. Figure 10 extends those results by varying
+ctx to examine how KV cache length affects iteration time for Qwen3-4B on H200 with a fixed total batch size of 1024
+tokens. Here, decode context length (ctx) denotes the number of tokens already accumulated in each decode request’s KV
+cache: at ctx= c, every decode token must stream c key–value pairs from GPU memory during attention.
+15
+
+
+--- Page 16 ---
+Threshold-Based Exclusive Batching for LLM Inference
+0
+20
+40
+60
+80
+100
+Decode %
+20
+25
+30
+35
+40
+45
+50
+Execution Time (ms)
+Execution Time
+ctx=16
+ctx=64
+ctx=128
+ctx=256
+ctx=512
+0
+20
+40
+60
+80
+100
+Decode %
+10.25
+10.50
+10.75
+11.00
+11.25
+11.50
+11.75
+12.00
+12.25
+GEMM Time (ms)
+GEMM Time
+0
+20
+40
+60
+80
+100
+Decode %
+5
+10
+15
+20
+25
+Attention Time (ms)
+Attention Time
+Qwen3-4B (NVIDIA H200) 
+ Total Tokens = 1024
+Figure 10. Effect of decode context length on (left) iteration time, (middle) GEMM time, and (right) attention time for Qwen3-4B on
+NVIDIA H200 (total batch = 1024 tokens).
+Three patterns emerge. First, Execution time (left) increases with ctx at all decode ratios, with the five curves ordered by
+ctx and diverging as decode percentage grows; at 0% decode (pure prefill) all curves converge because no KV cache is
+accessed. Second, GEMM time (middle) is nearly invariant to ctx—the curves remain tightly clustered across the full decode
+range—confirming that linear-projection cost depends only on the number of tokens, not on KV cache size. Third, attention
+time (right) is the sole driver of context-length sensitivity: it grows monotonically with ctx and accounts for almost all of
+the vertical spread visible in the execution-time panel, with ctx= 512 reaching ∼26 ms at 80% decode versus ∼10 ms for
+ctx= 16.
+Taken together, increasing ctx uniformly lifts the execution-time and attention-time curves without changing their shape or
+crossover structure. This validates the claim in Section 1 that the qualitative conclusions of Figures 1–2 generalize across
+context lengths.
+A.3. Convexity Analysis of Mixed-Batch Cost
+This appendix derives the interference convexity index κ referenced in Section 3.2 and shows that two qualitative predictions
+used in the evaluation—(i) more negative κ favors EB, and (ii) EB’s advantage peaks at intermediate decode ratios—follow
+as direct algebraic consequences of the crossover condition (7).
+Setup. Let K(r) denote the per-iteration kernel time of a mixed batch of fixed total token count, expressed as a function of
+the decode ratio r ∈[0, 1]. Let
+¯K(r) = (1 −r) K(0) + r K(1)
+be the linear interpolation between pure-prefill (r = 0) and pure-decode (r = 1) costs. The marginal-cost gap on the LHS of
+(7) satisfies
+βe
+MB(r) −βw
+EB(r) ∝K(r) −¯K(r),
+(9)
+because βe
+MB(r) is the per-token cost of the mixed batch at ratio r (proportional to K(r)), while βw
+EB(r) is the workload-
+weighted average of the exclusive prefill and decode per-token costs (proportional to ¯K(r)).
+Quadratic fit and κ. Empirically, K(r) is well approximated by a quadratic K(r) = c0 + c1r + c2r2. Direct calculation
+gives
+K(r) −¯K(r) = c2r2 −c2r = −c2 r(1 −r).
+(10)
+The deviation K(r) −¯K(r) is therefore controlled by the single coefficient c2 (the second derivative K′′/2). To obtain a
+dimensionless, hardware-comparable scalar, we normalize c2 by the pure-decode cost K(1) = c0 + c1 + c2 and define the
+interference convexity index
+κ =
+2c2
+c0 + c1 + c2
+.
+(11)
+Consequences. Combining (9), (10), and (11) (rearranged as c2 = κK(1)/2) yields
+βe
+MB −βw
+EB ∝−κ K(1)
+2
+r(1 −r),
+16
+
+
+--- Page 17 ---
+Threshold-Based Exclusive Batching for LLM Inference
+from which two predictions follow:
+(i) More negative κ favors EB. Since K(1) > 0 and r(1 −r) ≥0 on [0, 1], a more negative κ enlarges the LHS of (7), so
+the inequality fails at smaller mismatches and EB outperforms MB more easily. Empirically, κ is negative on most GPUs
+(the kernel-time curve is concave); its magnitude varies substantially across hardware. On Qwen3-4B with 4096 tokens
+we measure κ = −11.6 on the RTX PRO 6000 versus κ = −0.69 on the H200, confirming that bandwidth-constrained
+hardware exhibits substantially stronger prefill–decode interference.
+(ii) EB’s advantage peaks at intermediate decode ratios. The factor r(1 −r) in (10) is maximized at r = 1/2 and vanishes
+at the extremes r ∈{0, 1}. Consequently, even on hardware with strongly negative κ, EB yields its largest gains over MB on
+workloads operating at moderate decode ratios; prefill-heavy (r →0) and decode-heavy (r →1) workloads see diminishing
+returns. This prediction is verified empirically in Section 4.3, where on RTX PRO 6000 with Qwen3-8B, EB(ˆk∗) improves
+over v1 by +15.3% on ShareGPT and +11.3% on WildChat (both r ≈0.5–0.7) but only +3.7% on LongBench (r ≈0.004)
+and +1.4% on NuminaMath (r > 0.85).
+A.4. Empirical Calibration of βe
+MB(r) for EB+
+EB+’s online switching rule in Eq. (8) requires runtime evaluation of βe
+MB(ˆr), the mixed-batch per-token cost as a function
+of decode ratio. Unlike βw
+EB, which derives analytically from the prefill/decode kernel coefficients (αp, βp, αd, βd) already
+calibrated for EB(ˆk∗), βe
+MB(r) captures prefill↔decode interference inside a mixed batch and must be measured empirically.
+When the interference convexity κ has been profiled (Appendix A.3), the coefficients (c0, c1, c2) of βe
+MB(r) = c0+c1r+c2r2
+follow directly from c2 = κ K(1)/2. When κ is not available, (c0, c1, c2) can be obtained from a small set of synthetic
+v1 runs at varying decode ratios: fit 1/throughputv1(r) to a quadratic in r. On H200 with Qwen3-8B, fitting v1 grid
+data at r ∈{0.11, 0.50, 0.89} yields coefficients in the 10−5 s/tok range. The priority margin δ in Eq. (8) should match
+the observed |LHS −RHS| magnitude. For the calibration above, typical |LHS −RHS| at ˆNobs ∈[200, 2000] is in the
+10−6−10−5 range; we set δ = 10−5, yielding stable MB↔EB switching across workload drift (verified on non-stationary
+workloads in Table 3, bottom). With this calibration, EB+ on Qwen3-8B distribution-shift correctly switches MB→EB
+during decode-rich phases and back to MB as concurrency drops near experiment end.
+B. Proof of Proposition 3.1: Baseline Threshold under CFR
+We derive the optimal switching threshold under constant failure rate (CFR), where the hazard rate is h(t) = p0. This
+corresponds to geometric output length distributions, with mean output length µO = 1/p0.
+B.1. Stochastic Model and Fluid Approximation
+Exact stochastic dynamics. Let Nt denote the number of requests still decoding after t iterations. The process {Nt}t≥0 is
+a pure death process: at each iteration, each of the Nt active requests independently completes with probability p0. Thus,
+Nt+1 = Nt −Dt,
+Dt | Nt ∼Binomial(Nt, p0),
+where Dt is the number of completions in iteration t.
+Fluid approximation. For large batch sizes, we approximate the discrete stochastic process by a continuous determin-
+istic flow. Define the scaled process ¯N (N)
+t
+= Nt/N. By the law of large numbers for density-dependent population
+processes (Ethier & Kurtz, 1986; Kurtz, 1970), as N →∞, the scaled process converges uniformly in probability to the
+solution of the ordinary differential equation:
+dn
+dt = −p0 · n(t),
+n(0) = 1,
+(12)
+where t denotes the iteration index (not wall-clock time), consistent with the hazard-rate argument used in the main text.
+Specifically, for any fixed T > 0,
+sup
+0≤t≤T
+ ¯N (N)
+t
+−n(t)
+
+P−→0
+as N →∞.
+The approximation error is O(1/
+√
+N), arising from the central limit theorem for the cumulative martingale differences.
+17
+
+
+--- Page 18 ---
+Threshold-Based Exclusive Batching for LLM Inference
+The ODE (12) has solution:
+n(t) = e−p0t.
+The exact discrete trajectory is (1 −p0)t; the continuous-time fluid limit e−p0t used here introduces an additional O(p0)
+relative error (the gap between −p0 and ln(1 −p0)), enumerated as Source 4 in the error analysis below.
+B.2. Decode Phase Duration
+A phase switch occurs when k = θN requests have completed, i.e., when the batch size drops to N(1 −θ). Under the fluid
+approximation, this occurs at iteration index t∗satisfying n(t∗) = 1 −θ:
+e−p0t∗= 1 −θ
+=⇒
+t∗= −ln(1 −θ)
+p0
+= ζ(θ)
+p0
+,
+where we define ζ(θ) ≜−ln(1 −θ) for notational convenience.
+Wall-clock decode time. The wall-clock time for the decode phase is the sum of iteration times. Each iteration with
+batch size n takes time td(n) = αd + βdn, where αd is the fixed overhead and βd is the per-request cost. Under the fluid
+approximation, the expected decode time is:
+E[Td] =
+Z t∗
+0
+td(N · n(t)) dt =
+Z t∗
+0
+ αd + βdNe−p0t
+dt.
+(13)
+Evaluating the integral:
+E[Td] = αdt∗+ βdN
+Z t∗
+0
+e−p0t dt
+= αd · ζ
+p0
++ βdN · 1 −e−p0t∗
+p0
+= αdζ
+p0
++ βdNθ
+p0
+,
+where the last equality uses 1 −e−p0t∗= θ.
+Remark B.1 (Interpretation of the integral). The integral (13) sums the wall-clock time over iterations. The variable t is the
+iteration index, and dt = 1 represents one iteration. This is the fluid-limit analog of the discrete sum PM
+i=1 td(Ni), where
+M is the (random) number of iterations until k completions.
+B.3. Approximation Error Analysis
+The fluid approximation introduces several sources of error relative to the exact stochastic model. We characterize each
+below and argue that they do not materially affect the optimal threshold.
+Source 1: Stochastic fluctuation. The fluid model replaces the random completions Dt ∼Binomial(Nt, p0) with their
+conditional expectation p0Nt. By Kurtz’s theorem (Kurtz, 1970), the scaled batch size Nt/N converges uniformly to the
+ODE solution n(t) = e−p0t, with fluctuations of order O(1/
+√
+N). Since practical LLM serving systems operate at batch
+sizes N ≥64, this contributes at most a few percent relative error to the decode time estimate.
+Source 2: Discretization and stopping-time mismatch. The fluid model assumes the batch size decreases continuously
+and stops exactly when k requests have completed. In the actual discrete system, this cannot happen for two reasons:
+(i) iterations are discrete, so the system can only stop at integer iteration indices M = ⌈t∗⌉, not at the continuous stopping
+point t∗; and (ii) multiple requests may complete within a single iteration, causing the cumulative completion count to
+overshoot the threshold k rather than hitting it exactly. Both effects share the same root cause—the discrete system cannot
+stop at an arbitrary point—and produce a bounded relative error that does not vanish with N. The bias is more pronounced
+at small θ, because the batch size at the switching point is still large (≈N(1−θ)), leading to larger per-iteration completion
+variance and thus larger overshoot relative to k.
+Source 3: Integer rounding. The continuous threshold θN is rounded to k = ⌊θN⌋in practice. This contributes an
+O(1/N) relative error and is negligible for N ≥32.
+18
+
+
+--- Page 19 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Source 4: Continuous-time fluid limit. The ODE ˙n = −p0n has solution n(t) = e−p0t, whereas the exact discrete
+trajectory is (1 −p0)t = et ln(1−p0). The gap −p0 −ln(1 −p0) = −p2
+0/2 + O(p3
+0) contributes an additional O(p0) relative
+error to E[Td] and to θ0. This source is independent of N, deterministic, and would be absorbed exactly by reparametrizing
+p0 →−ln(1 −p0) in (15). For our operating regime p0 ∈[0.003, 0.01], the numerical impact on θ0 is below 1% and is
+dominated by the O(1/
+√
+N) stochastic fluctuation (Source 1).
+Table 8. Summary of approximation error sources.
+Source
+Origin
+Relative error
+Vanishes as N →∞?
+Stochastic fluctuation
+Binomial →expectation
+O(1/
+√
+N)
+Yes
+Discretization & overshoot
+Discrete stopping
+Bounded
+No
+Integer rounding
+⌊θN⌋
+O(1/N)
+Yes
+Continuous-time fluid limit
+e−p0t vs (1 −p0)t
+O(p0)
+Yes (as p0 →0)
+B.4. Expected Prefill Time
+For the prefill phase, each of the k = θN completed requests generates a new request. The prefill time is:
+E[Tp] = αp + βp · (θN) · µL = αp + βpNµLθ,
+where µL is the mean input length.
+B.5. Complete Cycle Time
+The total cycle time combines decode and prefill phases:
+T (θ) = E[Td] + E[Tp] = αdζ
+p0
++ βdNθ
+p0
++ αp + βpNµLθ.
+Grouping terms:
+T (θ) = αdζ(θ)
+p0
++ αp +
+βdN
+p0
++ βpNµL
+
+θ.
+B.6. Throughput Optimization
+The normalized throughput is:
+R(θ) =
+θ
+T (θ).
+To maximize R, we take the derivative and set it to zero:
+dR
+dθ = T (θ) −θT ′(θ)
+T (θ)2
+= 0.
+This yields the first-order optimality condition:
+T (θ) = θT ′(θ).
+(14)
+Computing T ′(θ). Since ζ(θ) = −ln(1 −θ), we have ζ′(θ) =
+1
+1−θ. Thus:
+T ′(θ) =
+αd
+p0(1 −θ) + βdN
+p0
++ βpNµL.
+Applying the optimality condition. Substituting into (14):
+αdζ
+p0
++ βdNθ
+p0
++ αp + βpNµLθ = θ
+
+αd
+p0(1 −θ) + βdN
+p0
++ βpNµL
+
+.
+19
+
+
+--- Page 20 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Expanding the right-hand side:
+αdζ
+p0
++ βdNθ
+p0
++ αp + βpNµLθ =
+αdθ
+p0(1 −θ) + βdNθ
+p0
++ βpNµLθ.
+The terms βdNθ
+p0
+and βpNµLθ appear on both sides and cancel:
+αdζ
+p0
++ αp =
+αdθ
+p0(1 −θ).
+Multiplying both sides by p0
+αd :
+ζ + p0αp
+αd
+=
+θ
+1 −θ.
+Rearranging and substituting ζ = −ln(1 −θ):
+θ0
+1 −θ0
++ ln(1 −θ0) = p0αp
+αd
+(15)
+B.7. Existence and Uniqueness
+Lemma B.2. Equation (15) has a unique solution θ0 ∈(0, 1) for any γ = p0αp/αd > 0.
+Proof. Define Ψ(θ) =
+θ
+1−θ + ln(1 −θ).
+Step 1: Monotonicity. Computing the derivative:
+Ψ′(θ) = (1 −θ) −θ · (−1)
+(1 −θ)2
+−
+1
+1 −θ =
+1
+(1 −θ)2 −
+1
+1 −θ = 1 −(1 −θ)
+(1 −θ)2
+=
+θ
+(1 −θ)2 .
+Since θ > 0 and (1 −θ)2 > 0 for θ ∈(0, 1), we have Ψ′(θ) > 0, so Ψ is strictly increasing.
+Step 2: Boundary behavior.
+• As θ →0+:
+θ
+1−θ →0 and ln(1 −θ) →0, so limθ→0+ Ψ(θ) = 0.
+• As θ →1−:
+θ
+1−θ →+∞and ln(1 −θ) →−∞, but the first term dominates (it grows like 1/(1 −θ) while the second
+decreases like ln(1 −θ)), so limθ→1−Ψ(θ) = +∞.
+Step 3: Existence and uniqueness. Since Ψ is continuous and strictly increasing on (0, 1) with Ψ(0+) = 0 and
+Ψ(1−) = +∞, by the intermediate value theorem, for any γ > 0, there exists a unique θ0 ∈(0, 1) such that Ψ(θ0) = γ.
+B.8. Parameter Independence
+Corollary B.3. The optimal threshold θ0 depends only on the ratio p0αp/αd and is independent of βd, βp, N, and µL.
+Proof. This follows directly from the cancellation observed in the derivation: the terms involving βd, βp, N, and µL appear
+linearly in θ on both sides of the optimality condition and cancel exactly.
+Intuitively, this occurs because:
+1. The per-token decode cost βdNθ/p0 depends on the number of requests that complete, which equals θN regardless of
+when they complete.
+2. The prefill cost βpNµLθ similarly depends only on the total tokens prefilled, not the timing.
+Thus, the marginal cost-benefit trade-off at the optimal threshold depends only on the timing-related parameters (αd, αp, p0).
+20
+
+
+--- Page 21 ---
+Threshold-Based Exclusive Batching for LLM Inference
+B.9. Second-Order Condition
+To confirm θ0 is a maximum (not a minimum), we verify the second-order condition.
+Lemma B.4. The critical point θ0 satisfying (15) is a global maximum of R(θ).
+Proof. Define Φ(θ) = T (θ) −θT ′(θ). Then:
+Φ′(θ) = T ′(θ) −T ′(θ) −θT ′′(θ) = −θT ′′(θ).
+Since T ′′(θ) =
+αd
+p0(1−θ)2 > 0, we have Φ′(θ) < 0 for θ > 0, so Φ is strictly decreasing.
+Checking boundary values:
+• Φ(0+) = T (0) −0 = αp > 0.
+• Φ(1−) →−∞(since T ′(θ) →+∞as θ →1−).
+Thus Φ has a unique zero at θ0, with Φ(θ) > 0 for θ < θ0 and Φ(θ) < 0 for θ > θ0. Since dR
+dθ = Φ(θ)/T (θ)2, this confirms
+R is increasing for θ < θ0 and decreasing for θ > θ0, so θ0 is the unique global maximum.
+This completes the proof of Proposition 3.1.
+C. Proof of Theorem 3.2: IFR Threshold Correction
+We now extend the analysis to the increasing failure rate (IFR) case with linear hazard h(t) = p0 + ηt, where η ≥0 captures
+the degree of IFR behavior. The proof proceeds by: (1) deriving the modified batch dynamics, (2) computing cycle time as a
+perturbation expansion in η, and (3) applying the implicit function theorem to obtain the threshold correction.
+Scope of the analysis. The argument below operates on the fluid (deterministic) model, treating the decode batch as if every
+request evolved under h(t) = p0 + ηt measured from the start of the current phase. Under CFR (memoryless), this is exact
+because hazards are state-independent; under IFR, continuing requests carry heterogeneous ages across cycles, so successive
+cycles are no longer i.i.d. and the renewal-reward foundation does not apply directly. The fluid argument below does not
+require i.i.d. cycles; the finite-N stochastic analog would require a mixing-time argument for the age-dependent Markov
+chain, which we leave to future work. Empirically, ∆θ > 0 is observed on both synthetic IFR workloads (Appendix E.3)
+and real LLM workloads (Appendix E.4).
+C.1. Batch Size Evolution under IFR
+Under the fluid approximation with linear hazard rate, the batch size evolves according to (for algebraic convenience we use
+n(t) here as the unnormalized batch size with n(0) = N, in contrast to the normalized convention n(0) = 1 adopted in
+Appendix B; the two are related by an overall factor of N):
+dn
+dt = −h(t) · n(t) = −(p0 + ηt) n(t),
+n(0) = N.
+This is a separable ODE. Separating variables:
+dn
+n = −(p0 + ηt) dt.
+Integrating both sides:
+ln n(t) −ln N = −p0t −ηt2
+2 .
+Exponentiating:
+n(t) = N exp
+
+−p0t −ηt2
+2
+
+.
+(16)
+Verification. At η = 0, this reduces to n(t) = Ne−p0t, recovering the CFR solution.
+21
+
+
+--- Page 22 ---
+Threshold-Based Exclusive Batching for LLM Inference
+C.2. Decode Phase Duration
+A phase switch occurs when k = θN requests have completed, i.e., when n(T) = N(1 −θ). Substituting into (16):
+N(1 −θ) = N exp
+
+−p0T −ηT 2
+2
+
+.
+Taking logarithms:
+p0T + ηT 2
+2
+= −ln(1 −θ) = ζ(θ).
+This is a quadratic equation in T. Solving for the positive root:
+T(θ) = −p0 +
+p
+p2
+0 + 2ηζ(θ)
+η
+.
+Perturbation expansion. For small η, we expand T to first order. Define ξ = ηζ/p2
+0 (dimensionless). Then:
+T = p0
+η
+
+−1 +
+p
+1 + 2ξ
+
+= p0
+η
+
+−1 + 1 + ξ −ξ2
+2 + O(ξ3)
+
+= p0ξ
+η
+
+1 −ξ
+2 + O(ξ2)
+
+.
+Substituting ξ = ηζ/p2
+0:
+T(θ) = ζ
+p0
+−ηζ2
+2p3
+0
++ O(η2) ≜T0 + ηT1 + O(η2),
+(17)
+where T0 = ζ/p0 is the CFR decode time and T1 = −ζ2/(2p3
+0) < 0 is the first-order correction (negative because IFR
+reduces decode time).
+C.3. Cumulative Batch Size
+Define the cumulative batch size integral:
+I(θ) =
+Z T (θ)
+0
+n(s) ds =
+Z T
+0
+N exp
+
+−p0s −ηs2
+2
+
+ds.
+Zeroth-order term. At η = 0:
+I0 = N
+Z T0
+0
+e−p0sds = N
+p0
+ 1 −e−p0T0
+= N
+p0
+ 1 −e−ζ
+= N
+p0
+(1 −(1 −θ)) = Nθ
+p0
+.
+First-order correction. To compute the O(η) correction, we use:
+I(θ) =
+Z T0+ηT1
+0
+Ne−p0s · e−ηs2/2ds + O(η2).
+Expanding e−ηs2/2 ≈1 −ηs2/2 and accounting for the change in upper limit:
+I = I0 + η
+"
+Ne−p0T0T1 −N
+2
+Z T0
+0
+s2e−p0sds
+#
++ O(η2).
+Computing the integral
+R T0
+0
+s2e−p0sds by parts (twice) and simplifying:
+I(θ) = Nθ
+p0
++ ηN
+p3
+0
+[(1 −θ)ζ −θ] + O(η2).
+(18)
+Verification. The correction term (1 −θ)ζ −θ = (1 −θ)(−ln(1 −θ)) −θ. For small θ, ζ ≈θ + θ2/2, so the correction
+≈(1 −θ)(θ + θ2/2) −θ = −θ2/2 + O(θ3) < 0, confirming that IFR reduces cumulative batch size.
+22
+
+
+--- Page 23 ---
+Threshold-Based Exclusive Batching for LLM Inference
+C.4. Complete Cycle Time Expansion
+The total cycle time is:
+T (θ) = E[Td] + E[Tp] = αdT + βdI + αp + βpNµLθ.
+Substituting the expansions (17) and (18):
+T (θ) = αd
+ ζ
+p0
+−ηζ2
+2p3
+0
+
++ βd
+Nθ
+p0
++ ηN
+p3
+0
+[(1 −θ)ζ −θ]
+
++ αp + βpNµLθ + O(η2)
+= αdζ
+p0
++ βdNθ
+p0
++ αp + βpNµLθ
+|
+{z
+}
+T0(θ)
++η
+
+−αdζ2
+2p3
+0
++ βdN
+p3
+0
+((1 −θ)ζ −θ)
+
+|
+{z
+}
+T1(θ)
++O(η2).
+We write this as:
+T (θ) = T0(θ) + η T1(θ) + O(η2),
+(19)
+where T0 is the CFR cycle time and T1(θ) is the first-order IFR correction.
+C.5. Optimal Threshold via Implicit Function Theorem
+Setup. Define the residual function (extending Φ from the CFR proof to depend on η):
+Φ(θ, η) = T (θ, η) −θ · ∂T
+∂θ (θ, η).
+The optimal threshold θ∗(η) satisfies the first-order condition Φ(θ∗, η) = 0. At η = 0, we have θ∗(0) = θ0, the CFR
+baseline from Proposition 3.1.
+Implicit differentiation. By the implicit function theorem, if ∂Φ/∂θ ̸= 0 at (θ0, 0), then:
+dθ∗
+dη
+
+η=0
+= −∂Φ/∂η
+∂Φ/∂θ
+
+(θ0,0)
+.
+(20)
+Thus the first-order correction is:
+∆θ = θ∗(η) −θ0 = −∂Φ/∂η
+∂Φ/∂θ
+
+(θ0,0)
+· η + O(η2).
+Computing ∂Φ/∂θ at η = 0.
+From Φ = T −θT ′:
+∂Φ
+∂θ = T ′ −T ′ −θT ′′ = −θT ′′.
+At η = 0:
+T ′′
+0 (θ) = d
+dθ
+
+αd
+p0(1 −θ) + βdN
+p0
++ βpNµL
+
+=
+αd
+p0(1 −θ)2 .
+Thus:
+∂Φ
+∂θ
+
+(θ0,0)
+= −θ0 ·
+αd
+p0(1 −θ0)2 = −
+θ0αd
+p0(1 −θ0)2 .
+Computing ∂Φ/∂η at (θ0, 0).
+From T = T0 + η T1 + O(η2):
+∂T
+∂η
+
+η=0
+= T1(θ).
+23
+
+
+--- Page 24 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Similarly, T ′ = T ′
+0 + η T ′
+1 + O(η2), so:
+∂
+∂η (θT ′)
+
+η=0
+= θ T ′
+1(θ).
+Thus:
+∂Φ
+∂η
+
+(θ0,0)
+= T1(θ0) −θ0 T ′
+1(θ0).
+Computing T1 and T ′
+1. From (19):
+T1(θ) = −αdζ2
+2p3
+0
++ βdN
+p3
+0
+[(1 −θ)ζ −θ] .
+Taking the derivative using ζ′ = 1/(1 −θ):
+T ′
+1(θ) = −αd · 2ζ · ζ′
+2p3
+0
++ βdN
+p3
+0
+[−ζ + (1 −θ)ζ′ −1] = −
+αdζ
+p3
+0(1 −θ) + βdN
+p3
+0
+[−ζ + 1 −1] .
+Simplifying:
+T ′
+1(θ) = −
+αdζ
+p3
+0(1 −θ) −βdNζ
+p3
+0
+.
+Now compute T1 −θ T ′
+1:
+T1(θ0) −θ0 T ′
+1(θ0) = −αdζ2
+2p3
+0
++ βdN
+p3
+0
+[(1 −θ0)ζ −θ0] +
+θ0αdζ
+p3
+0(1 −θ0) + θ0βdNζ
+p3
+0
+= 1
+p3
+0
+
+−αdζ2
+2
++ θ0αdζ
+1 −θ0
++ βdN ((1 −θ0)ζ −θ0 + θ0ζ)
+
+= 1
+p3
+0
+
+−αdζ2
+2
++ θ0αdζ
+1 −θ0
++ βdN(ζ −θ0)
+
+.
+Final expression. Substituting into (20):
+∆θ = −
+1
+p3
+0
+h
+−αdζ2
+2
++ θ0αdζ
+1−θ0 + βdN(ζ −θ0)
+i
+−
+θ0αd
+p0(1−θ0)2
+· η.
+Simplifying:
+∆θ = (1 −θ0)2
+p2
+0θ0αd
+
+−αdζ2
+2
++ θ0αdζ
+1 −θ0
++ βdN(ζ −θ0)
+
+· η.
+Factoring out αd from the first two terms:
+∆θ = η(1 −θ0)2
+p2
+0θ0
+
+ζ
+
+θ0
+1 −θ0
+−ζ
+2
+
++ βdN
+αd
+(ζ −θ0)
+
+(21)
+This is Eq. (5) in the main text.
+C.6. Positivity of the Correction
+Proposition C.1. ∆θ > 0 for all θ0 ∈(0, 1) and η > 0.
+24
+
+
+--- Page 25 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Proof. The prefactor η(1−θ0)2
+p2
+0θ0
+> 0 for all valid parameters.
+For the bracketed term, we show each component is positive:
+Term 1: ζ
+
+θ0
+1−θ0 −ζ
+2
+
+.
+Using the baseline condition (15), we have:
+θ0
+1 −θ0
+= γ + ζ,
+where γ = p0αp
+αd
+> 0.
+Thus:
+θ0
+1 −θ0
+−ζ
+2 = γ + ζ −ζ
+2 = γ + ζ
+2 > 0.
+Since ζ = −ln(1 −θ0) > 0 for θ0 ∈(0, 1):
+ζ
+
+θ0
+1 −θ0
+−ζ
+2
+
+= ζ
+
+γ + ζ
+2
+
+> 0.
+Term 2: βdN
+αd (ζ −θ0).
+We need to show ζ > θ0, i.e., −ln(1 −θ0) > θ0.
+Define q(x) = −ln(1 −x) −x for x ∈[0, 1). Then:
+• q(0) = 0.
+• q′(x) =
+1
+1−x −1 =
+x
+1−x > 0 for x ∈(0, 1).
+Since q is strictly increasing with q(0) = 0, we have q(θ0) > 0 for all θ0 ∈(0, 1), i.e., ζ > θ0.
+Since βd, N, αd > 0, the second term is positive (or zero if βd = 0).
+Conclusion. Both terms are non-negative with the first strictly positive, hence ∆θ > 0.
+C.7. Physical Interpretation
+The correction (21) decomposes into two distinct effects:
+Duration effect (first term). Under IFR, the hazard rate increases over time, meaning later completions occur faster than
+earlier ones. This reduces the expected time to accumulate additional completions beyond the CFR prediction, making it
+beneficial to wait for more completions.
+Mathematically, the term ζ
+
+θ0
+1−θ0 −ζ
+2
+
+captures the reduction in decode phase duration per additional completion achieved.
+Per-token cost effect (second term). Under IFR, the batch size decays faster than exponential (the Gaussian factor e−ηt2/2
+accelerates the decay). This reduces the cumulative per-token cost βd
+R
+n(s)ds for a given number of completions.
+This benefit scales with ρ = βdN/αd, the ratio of total per-token overhead to fixed overhead. For systems with large batches
+and significant per-token costs (ρ ≫1), this effect dominates.
+Special case: βd = 0. When there is no per-token decode cost (pure fixed overhead), only the duration effect contributes:
+∆θ
+
+βd=0 = η(1 −θ0)2
+p2
+0θ0
+· ζ
+
+γ + ζ
+2
+
+.
+C.8. Second-Order Verification
+Lemma C.2. The corrected threshold θ∗= θ0 + ∆θ + O(η2) remains a maximum of the throughput function for sufficiently
+small η > 0.
+25
+
+
+--- Page 26 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Proof. The second-order condition requires ∂2R/∂θ2 < 0 at the optimum.
+At η = 0, we showed in Appendix B that θ0 is a strict local maximum with Φ′(θ0) = −θ0T ′′
+0 (θ0) < 0.
+By continuity, for sufficiently small η, the second derivative remains negative in a neighborhood of θ∗(η), confirming it
+remains a local maximum.
+To verify it is the global maximum, observe that the boundary behavior (R(0+) = 0 and R(1−) bounded) is preserved
+under small perturbations, ensuring the interior maximum is global.
+This completes the proof of Theorem 3.2.
+D. Proof of Proposition 3.3: Memory-Safe Batch Size
+The proof proceeds in four steps: (1) steady-state analysis of request ages, (2) expected initial memory, (3) variance of
+memory increments, and (4) supremum bound. We model the memory process as a random walk with i.i.d. increments and
+apply an infinite-horizon supremum bound—a standard heuristic-conservative approximation; a fully rigorous finite-horizon
+martingale concentration analysis is left to future work.
+D.1. Steady-State Request Age Distribution
+Define the age A of a request as the number of decode phases it has participated in. In each cycle, k out of N requests
+complete and are replaced. At steady state, A follows a geometric distribution:
+Pr(A = a) = θ(1 −θ)a−1,
+a = 1, 2, . . .
+with mean E[A] = 1/θ, where θ = k/N.
+At decode start, the batch contains k new requests (age A = 1) and (N −k) continuing requests (age A ≥2). For continuing
+requests, the memoryless property gives:
+E[A −1 | A ≥2] = E[A] = 1
+θ.
+D.2. Expected Tokens Generated by Continuing Requests
+Under the fluid approximation, starting with N requests and waiting for k completions, the expected decode phase duration
+(in iterations) is
+t∗= 1
+p0
+ln
+1
+1 −θ,
+matching the CFR stopping time from Appendix B.
+A continuing request has survived (A −1) previous phases, generating tokens in each. Thus:
+E[G | continuing] = E[A −1 | A ≥2] · t∗= 1
+θ · 1
+p0
+ln
+1
+1 −θ =
+1
+θp0
+ln
+1
+1 −θ.
+The expected initial memory is:
+E[X0] = k · µL + (N −k) · (µL + E[G]) = NµL + N(1 −θ)
+θp0
+ln
+1
+1 −θ.
+D.3. Variance of Memory Increments
+At each decode iteration with n active requests, the memory change is:
+∆X = n −
+n
+X
+i=1
+ZiSi,
+26
+
+
+--- Page 27 ---
+Threshold-Based Exclusive Batching for LLM Inference
+where Zi ∼Bernoulli(p0) indicates completion and Si = Li + Oi is the total sequence length released upon completion.
+Let J = Pn
+i=1 Zi ∼Binomial(n, p0).
+Expected change. Since completed requests have E[S | complete] = µL + 1/p0:
+E[∆X] = n −np0(µL + 1/p0) = n −np0µL −n = −np0µL = dn.
+Variance via law of total variance. We compute Var(∆X) = E[Var(∆X | J)] + Var(E[∆X | J]).
+For the first term: given J = j completions, the released memory is Pj
+i=1 Si where Si are i.i.d. Thus Var(∆X | J = j) =
+j · Var(S), and:
+E[Var(∆X | J)] = E[J] · Var(S) = np0 · Var(S).
+For the second term: E[∆X | J] = n −J · E[S], so:
+Var(E[∆X | J]) = E[S]2 · Var(J) = (µL + 1/p0)2 · np0(1 −p0).
+Combining and using Var(S) = σ2
+L + (1 −p0)/p2
+0:
+vn = np0
+
+σ2
+L + 1 −p0
+p2
+0
+
++ np0(1 −p0)
+
+µL + 1
+p0
+2
+.
+For p0 ≪1 and outputs dominating inputs (µL ≪1/p0), the dominant terms are:
+vn ≈np0 · 1
+p2
+0
++ np0 · 1
+p2
+0
+= 2n
+p0
+.
+D.4. Supremum Bound
+The memory process Yt = Xt −X0 resembles a random walk with negative drift dn < 0 and per-step variance vn. For
+such walks, the all-time supremum satisfies (Feller, 1971):
+E
+
+sup
+t≥0
+Yt
+
+=
+v
+2|d|,
+Pr
+
+sup
+t≥0
+Yt > x
+
+≤exp
+
+−2|d|x
+v
+
+.
+(22)
+Since the batch size n decreases during decode (from N to N −k), increments are not strictly i.i.d. Using n = N as an
+upper bound yields conservative estimates:
+vN ≈2N
+p0
+,
+|dN| = Np0µL.
+The expected supremum is:
+E
+
+sup
+t≥0
+Yt
+
+≈
+vN
+2|dN| = 2N/p0
+2Np0µL
+=
+1
+p2
+0µL
+≜¯v.
+We introduce ¯v = (p2
+0µL)−1 as shorthand for the remainder of this proof; it characterizes the memory volatility arising from
+stochastic completion timing, and is notably independent of N.
+Probabilistic bound. For OOM probability at most ϵ, we require Pr(sup Yt > C −E[X0]) ≤ϵ. From (22):
+Pr(sup Yt > x) ≤exp
+
+−2|dN|x
+vN
+
+= exp
+
+−x
+¯v
+
+.
+Setting this to ϵ and solving: xϵ = ¯v ln(1/ϵ).
+The constraint E[X0] + xϵ ≤C yields:
+NµL + N(1 −θ)
+θp0
+ln
+1
+1 −θ + ¯v ln 1
+ϵ ≤C.
+Solving for N gives (6).
+27
+
+
+--- Page 28 ---
+Threshold-Based Exclusive Batching for LLM Inference
+D.5. Comparison of Batch Size Bounds
+We present three batch size bounds of increasing conservatism:
+Static bound (ignores decode dynamics):
+N ∗
+static =
+$
+C
+µL + 1−θ
+θp0 ln
+1
+1−θ
+%
+.
+Expected peak bound (uses E[sup Yt] = ¯v):
+N ∗
+expected =
+$
+C −¯v
+µL + 1−θ
+θp0 ln
+1
+1−θ
+%
+.
+Probabilistic bound (OOM probability ≤ϵ):
+N ∗=
+$
+C −¯v ln(1/ϵ)
+µL + 1−θ
+θp0 ln
+1
+1−θ
+%
+.
+These satisfy N ∗≤N ∗
+expected ≤N ∗
+static. The gap depends on ¯v ln(1/ϵ), which is typically small relative to C for practical
+workloads.
+D.6. Runtime Refinement: KV-aware Feasibility Gate
+The design-time bound N ∗above guarantees expected-value memory safety: with N ≤N ∗, the supremum of the memory
+process exceeds the KV capacity with probability at most ϵ under the model assumptions. Under high output-length variance
+(σO large), the realized peak can transiently deviate from E[sup Yt] beyond the ϵ-tolerance, especially for MoE models
+where weight activations leave less headroom (e.g., Qwen3-30B-A3B with σO ∈{153, 245} on ShareGPT/WildChat).
+To handle this at runtime, our scheduler augments the ratio-based phase 1→2 transition condition with an instantaneous
+KV-occupancy check. The original integer-arithmetic condition fillable · (N −k∗) ≥n · k∗is gated by
+free blocks ≥fKV · total blocks,
+fKV = min
+
+0.6, max
+
+0.05, N · µO · sKV
+b · total blocks + f0
+
+,
+(23)
+where b is the block size, sKV a safety multiplier on µO (default sKV = 0.5), and f0 a base reserve (default 0). The
+threshold fKV scales with the expected per-batch decode KV usage and is clipped into [0.05, 0.6] for numerical stability.
+When the gate fires, phase 2 is deferred and the scheduler stays in phase 1, letting existing decodes free KV via natural
+completion before attempting refill. This prevents the DECODE↔REFILL PREFILL oscillation triggered when phase 2
+ratio-eligibility coincides with insufficient KV for prefill block allocation (which would otherwise bounce back through
+the vLLM preemption path). The gate is orthogonal to N ∗: N ∗bounds the static batch parameter, while the gate adds a
+runtime feasibility check at the moment of switching, providing defense-in-depth against transient pressure. Empirically
+(Table 2, H200 block), this reduces the EB(ˆk∗) vs. v1 gap on Qwen3-30B-A3B ShareGPT from −12.0% to −2.5% and on
+NuminaMath from −11.4% to −8.2%.
+D.7. Online Adaptive Algorithm: Pseudo-code
+Algorithm 1 provides the pseudo-code for the online controller described in Section 3.4, which jointly updates (ˆk∗, ˆN ∗)
+from sliding-window estimates of the workload parameters.
+28
+
+
+--- Page 29 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Algorithm 1 Online Joint Adaptation of (ˆk∗, ˆN ∗)
+Require: System parameters (αp, αd, βd); cache budget C; risk level ϵ; window size W; minimum window Wmin; update
+interval Tupd
+Ensure: Continuously updated (ˆk∗, ˆN ∗)
+1: Initialize WO, WL ←∅, j ←0
+2: Initialize (ˆk∗, ˆN ∗) ←(⌊θdefaultNdefault⌋, Ndefault)
+3: for each completed request with input length L and output length O do
+4:
+WO.append(O); WL.append(L); if |WO| > W then pop oldest (same for WL)
+5:
+j ←j + 1
+6:
+if j ≥Tupd and |WO| ≥Wmin then
+7:
+(ˆp0, ˆη) ←FitLinearHazard(WO)
+8:
+ˆµL ←Mean(WL)
+9:
+ˆθ0 ←SolveCFR(ˆp0)
+▷Eq. (3)
+10:
+ˆθ∗←Clip(ˆθ0 + c
+∆θ, θmin, θmax)
+▷Eq. (5)
+11:
+ˆN ∗←MemSafeBatch(ˆθ∗, ˆp0, ˆµL)
+▷Eq. (6)
+12:
+ˆk∗←⌊ˆθ∗ˆN ∗⌋; apply (ˆk∗, ˆN ∗); j ←0
+13:
+end if
+14: end for
+E. Workload Characterization and IFR Validation
+E.1. Workload Distribution Analysis
+Table 9 reports basic input and output-length statistics and whether the workload exhibits increasing failure rate (IFR) in
+this reliable region. Note that WildChat comprises 3000 multi-turn conversations rather than independent requests; with an
+average of 9.3 turns per conversation (range [6, 55]), this yields approximately 27,900 total requests, providing comparable
+scale to the other workloads. Figure 11 summarizes output-length distributions and empirical hazard rates for the real
+workloads used in our evaluation. We estimate the hazard rate as ˆh(t) = #{Oi = t}/#{Oi ≥t}, and only interpret ˆh(t)
+up to the 95th percentile due to tail sparsity.
+Table 9. Input and output length statistics for experimental workloads.
+Input
+Output
+Workload
+Samples
+Range
+µL
+Range
+µO
+σO
+IFR
+ShareGPT
+4000
+[1, 20448]
+105
+[2, 500]
+280
+153
+✓
+LongBench
+4000
+[1000, 4000]
+2492
+[1, 19]
+11
+4
+✓
+NuminaMath
+4000
+[16, 1395]
+122
+[800, 3149]
+1039
+228
+✓
+WildChat
+3000†
+[6, 55]‡
+9.3‡
+[1, 1934]
+310
+245
+✓
+†Conversations. ‡Turns per conversation.
+E.2. Baseline Threshold Validation
+This appendix validates the structural properties of the CFR baseline normalized threshold θ0 implied by Proposition 3.1:
+• (P1) Scale invariance: θ0 is invariant to batch size N.
+• (P2) Input-length independence: θ0 is insensitive to mean input length µL.
+• (P3) Output-length dependence: θ0 decreases with mean output length µO.
+We empirically study how the optimal ˆθ∗varies with these parameters under geometric (CFR) output lengths. All experiments
+use Qwen3-8B on H200 with 4,000 requests per configuration (including a 100-request warmup).
+29
+
+
+--- Page 30 ---
+Threshold-Based Exclusive Batching for LLM Inference
+0
+200
+400
+0.000
+0.025
+0.050
+0.075
+0.100
+0.125
+0.150
+0.175
+=280
+=153
+ShareGPT
+0
+5
+10
+15
+20
+0.00
+0.02
+0.04
+0.06
+0.08
+0.10
+=11
+=4
+LongBench
+1000
+2000
+3000
+0.000
+0.025
+0.050
+0.075
+0.100
+0.125
+0.150
+0.175
+=1039
+=228
+NuminaMath
+0
+500
+1000
+1500
+2000
+0.00
+0.02
+0.04
+0.06
+0.08
+0.10
+0.12
+=310
+=245
+WildChat
+0
+200
+400
+Output Length (tokens)
+0.00
+0.01
+0.02
+0.03
+0.04
+0.05
+0.06
+0.07
+IFR: Yes
+5
+10
+15
+Output Length (tokens)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+IFR: Yes
+1000
+1500
+2000
+2500
+3000
+Output Length (tokens)
+0.00
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+0.35
+IFR: Yes
+0
+500
+1000
+1500
+Output Length (tokens)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+IFR: Yes
+(a) Distribution
+(b) Hazard Rate
+Figure 11. Output length distributions and hazard rates of real workloads (Gemma-3-1B-IT on NVIDIA RTX PRO 6000). (a) Output
+length histograms. (b) Empirical hazard rate ˆh(t) = #{Oi = t}/#{Oi ≥t}. Dashed lines mark the 95th percentile; beyond this point
+estimates become unreliable due to data sparsity.
+E.2.1. SCALE INVARIANCE AND OUTPUT-LENGTH DEPENDENCE (P1, P3)
+Setup. We sweep N ∈{64, 128, 256, 512} and µO ∈{64, 128, 192, 256, 320, 384} with µL = 1. For each configuration,
+we run a threshold sweep (3 runs) and report the empirically optimal ˆθ∗= ˆk∗/N in Table 10.
+Results. Consistent with Proposition 3.1:
+• (P1) For fixed µO, ˆθ∗shows no systematic dependence on N; the row summaries ¯θ∗± std exhibit no trend with N.
+• (P3) The row means decrease from 0.46 at µO = 64 to 0.23 at µO = 384, supporting the predicted monotone
+relationship.
+The remaining variance is expected due to discrete k choices and measurement noise.
+Table 10. Empirical optimal threshold ˆθ∗across batch sizes and output lengths (geometric outputs, µL = 1).
+Batch Size N
+µO
+64
+128
+256
+512
+¯θ∗± std
+64
+0.53
+0.46
+0.40
+0.46
+0.46 ± 0.05
+128
+0.53
+0.33
+0.33
+0.40
+0.40 ± 0.09
+192
+0.39
+0.20
+0.13
+0.60
+0.33 ± 0.21
+256
+0.39
+0.27
+0.27
+0.40
+0.33 ± 0.07
+320
+0.33
+0.27
+0.33
+0.13
+0.26 ± 0.09
+384
+0.33
+0.20
+0.13
+0.27
+0.23 ± 0.08
+E.2.2. INPUT-LENGTH INDEPENDENCE (P2)
+Setup. To probe dependence on µL, we fix N = 128 and µO = 64, vary µL ∈{1, 32, 64, 128}, and sweep k subject to
+kµL ≤16384. Table 11 reports throughput for each k and highlights the best k∗per µL.
+Results. While the optimal discrete k∗shifts with µL under the fixed token-budget constraint, the corresponding normalized
+optimum θ∗remains in a comparable range (0.438–0.625), indicating weak sensitivity to µL as predicted by Proposition 3.1.
+30
+
+
+--- Page 31 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Table 11. Throughput (tokens/s) for varying k∗and µL with N = 128, µO = 64. Bold indicates optimal k∗for each µL. All experiments
+satisfy k × µL ≤16384.
+k∗
+θ
+µL = 1
+µL = 32
+µL = 64
+µL = 128
+8
+0.062
+3036
+3366
+3331
+3047
+16
+0.125
+4223
+4276
+4273
+3867
+24
+0.188
+5091
+4949
+4554
+4278
+32
+0.250
+5266
+5413
+4776
+4421
+40
+0.312
+6094
+5652
+5356
+4427
+48
+0.375
+5943
+5801
+5494
+4578
+56
+0.438
+6627
+5735
+5460
+4701
+64
+0.500
+6368
+5990
+5522
+4580
+72
+0.562
+5830
+6059
+5553
+4825
+80
+0.625
+5986
+6103
+5342
+4701
+88
+0.688
+6337
+6001
+5488
+4637
+96
+0.750
+6330
+5892
+5338
+4563
+104
+0.812
+6150
+5751
+5242
+4460
+112
+0.875
+5874
+5461
+4998
+4241
+120
+0.938
+5543
+5184
+4906
+4300
+128
+1.000
+5626
+5313
+4995
+4315
+Optimal k∗
+56
+80
+72
+72
+Optimal θ∗
+0.438
+0.625
+0.562
+0.562
+E.3. Empirical Evidence for ∆θ > 0 under IFR
+Theorem 3.2 predicts that the IFR correction satisfies ∆θ > 0, i.e., IFR workloads favor later switching than the CFR
+baseline. We empirically validate this prediction through controlled experiments.
+Experimental Setup. We generate synthetic output lengths from Gamma distributions with varying shape parameters to
+simulate different hazard rate behaviors. Specifically, we use O ∼Gamma(a, λ) where:
+• CFR case (a = 1): The Gamma distribution reduces to an exponential distribution, which exhibits a constant hazard
+rate h(t) = λ.
+• IFR case (a = 2): The Gamma distribution with shape parameter a > 1 exhibits an increasing failure rate, where the
+hazard rate h(t) increases monotonically with t.
+To ensure a fair comparison, we adjust the rate parameter λ such that the mean output length µO = a/λ remains constant
+across both settings. This isolates the effect of the hazard rate structure from differences in average workload characteristics.
+For each configuration, we sweep the normalized threshold θ = k∗/N from 0 to 1 and measure the resulting throughput.
+All experiments are repeated three times with different random seeds to assess variability.
+Results. Figure 12 illustrates the throughput as a function of θ under both CFR and IFR output-length distributions. The
+shaded regions represent 95% confidence intervals across the three runs. Under the CFR setting (left panel, a = 1), the
+optimal threshold is θ∗= 0.16. Under the IFR setting (right panel, a = 2), the optimal threshold shifts to θ∗= 0.36,
+representing a substantial increase of ∆θ = 0.20. This empirical observation confirms the theoretical prediction that
+IFR workloads benefit from higher switching thresholds, as later switching allows the system to exploit the accelerating
+completion rate characteristic of IFR distributions.
+E.4. Statistical Tests for IFR in Real Workloads
+Section 3.2 (Theorem 3.2) and Appendix E.1 report empirical hazard rates ˆh(t) that visually appear monotonically increasing
+for our real-world workloads. Here we provide formal statistical tests of CFR vs. IFR. We apply two complementary tests on
+the empirical ˆh(t) for each workload, restricted to the reliable region t ∈[1, t95] where t95 is the 95th percentile of output
+length: (i) the Mann–Kendall non-parametric trend test (H0: no monotonic trend); (ii) a parametric linear regression
+h(t) = p0 + ηt (H0: η = 0).
+31
+
+
+--- Page 32 ---
+Threshold-Based Exclusive Batching for LLM Inference
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Threshold 
+* = k * /N
+0
+2000
+4000
+6000
+8000
+10000
+12000
+14000
+16000
+18000
+Throughput (tokens/s)
+* = 0.16
+(a) CFR (a = 1)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Threshold 
+* = k * /N
+0
+2000
+4000
+6000
+8000
+10000
+12000
+14000
+16000
+18000
+Throughput (tokens/s)
+* = 0.36
+(b) IFR (a = 2)
+Figure 12. Throughput vs. switching threshold θ under CFR (a = 1, left) and IFR (a = 2, right) output-length distributions modeled by
+Gamma distributions with identical mean output lengths. The shaded regions indicate 95% confidence intervals over three runs. The
+optimal θ∗shifts from 0.16 (CFR) to 0.36 (IFR), consistent with ∆θ > 0 in Theorem 3.2.
+Table 12. Statistical tests for IFR on real-world workloads. All three reject CFR (H0: η = 0 or no monotonic trend) at p < 10−5 under
+both tests, supporting Theorem 3.2’s IFR assumption. LongBench is excluded as µO ≈12 is too short for hazard-rate analysis.
+Workload
+n
+p (Mann–Kendall)
+p (regression)
+ShareGPT
+4,000
+6.6 × 10−10
+2.4 × 10−13
+NuminaMath
+4,000
+1.0 × 10−8
+5.2 × 10−10
+WildChat
+3,000
+1.9 × 10−5
+3.7 × 10−7
+E.5. Sensitivity to Hazard-Rate Estimation Accuracy
+Theorem 3.2 and Algorithm 1 estimate ˆp0 online from a sliding window of recent completions; if the estimate drifts during
+transient periods, the resulting ˆθ∗may move off the true optimum. We characterize this sensitivity by sweeping fixed
+θ∗∈[0.1, 0.9] and comparing against the adaptive controller on Qwen3-8B, RTX PRO 6000, with 3,000 requests per
+configuration.
+Table 13 reports throughput under (i) a synthetic Gamma(a=2) workload with µO = 256, and (ii) ShareGPT (µO ≈280).
+Two observations support robustness to estimation error: (1) Wide throughput plateau. The plateau spans θ∗∈[0.6, 0.9]
+on Gamma (≥87% of peak) and [0.5, 0.8] on ShareGPT (≥95%). The optimal θ∗shifts across workloads (0.7 vs. 0.6), but
+any choice within the plateau yields near-peak throughput, so moderate estimation error has limited impact. (2) Adaptive
+estimator stays in the plateau. The online controller achieves 98% of peak on both workloads. Online ˆp0 shows 2.8×10−4
+absolute error (15% relative) on Gamma versus 7 × 10−6 (0.5% relative) on ShareGPT—a 30× gap in relative error—yet
+both attain 98% peak. Combined with the threshold clipping ˆθ∗∈[θmin, θmax] and vLLM’s preemption mechanism, this
+provides defense-in-depth against transient mis-estimation.
+Table 13. Sensitivity to hazard-rate estimation accuracy. “Adaptive” uses the online controller (Algorithm 1); other columns sweep fixed
+θ∗. Throughput in tok/s; “% of peak” below each row.
+Workload
+θ∗
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+Adaptive
+Gamma(a=2) Throughput 3,303 3,351 3,399 3,435 3,472 3,585
+4,129 3,991 3,877
+4,056
+(µO=256)
+% peak
+80%
+81%
+82%
+83%
+84%
+87%
+100%
+97%
+94%
+98%
+ShareGPT
+Throughput 6,133 6,347 6,620 6,676 7,023 7,180
+6,988 6,853 6,544
+7,048
+(µO≈280)
+% peak
+85%
+88%
+92%
+93%
+98%
+100%
+97%
+95%
+91%
+98%
+32
+
+
+--- Page 33 ---
+Threshold-Based Exclusive Batching for LLM Inference
+F. Additional End-to-End Comparisons
+F.1. Sensitivity Analysis Across Workloads and Platforms
+This appendix provides comprehensive sensitivity analyses for all workloads (ShareGPT, LongBench, WildChat, Numina-
+Math) across H200 and RTX PRO 6000 platforms. For each workload-platform combination, we perform a full grid search
+over token budget B and batch size N for v0, v1, and EB(ˆk∗) schedulers. Tables 14 and 15 below report four robustness
+metrics: coefficient of variation (CV), range ratio, B-Sens, and N-Sens, with lower values indicating better stability across
+configurations.
+F.1.1. PARAMETER SENSITIVITY METRICS
+We define the following metrics to quantify scheduling robustness across deployment configurations. Let TP(B, N) denote
+the measured throughput (requests/second) for a scheduler under token budget B and batch size N, and let B and N be the
+sets of evaluated token budgets and batch sizes, respectively.
+Coefficient of Variation (CV). The CV measures overall throughput variability across all configurations:
+CV =
+std(TP(B, N) : B ∈B, N ∈N)
+mean(TP(B, N) : B ∈B, N ∈N)
+where std(·) and mean(·) denote standard deviation and mean, respectively. Lower values indicate greater stability.
+Range Ratio. The range ratio captures the extremes of performance variation:
+Range = maxB,N TP(B, N)
+minB,N TP(B, N)
+Values closer to 1.0 indicate more consistent performance across configurations.
+Token Budget Sensitivity (B-Sens). This metric isolates the effect of varying B while holding N fixed:
+B-Sens =
+1
+|N|
+X
+N∈N
+std(TP(B, N) : B ∈B)
+mean(TP(B, N) : B ∈B)
+Batch Size Sensitivity (N-Sens). This metric isolates the effect of varying N while holding B fixed:
+N-Sens = 1
+|B|
+X
+B∈B
+std(TP(B, N) : N ∈N)
+mean(TP(B, N) : N ∈N)
+F.1.2. OPTIMAL CONFIGURATION DETAILS
+Tables 14 and 15 report the optimal token budget (B) and batch size (N) for each scheduler across all workloads on RTX
+PRO 6000 and H200 respectively. These configurations were selected via grid search to maximize throughput.
+Configuration variability. Optimal configurations vary substantially across workloads, models, and hardware. Token
+budgets range from 4,096 to 18,432, while batch sizes span 256 to 2,048. No single configuration universally dominates,
+highlighting the importance of workload-aware tuning.
+Sensitivity patterns. Prefill-heavy workloads (LongBench) exhibit the lowest sensitivity (CV < 5%, range ratio < 1.2×),
+as throughput is dominated by prefill computation with limited scheduling flexibility. In contrast, balanced workloads
+(ShareGPT) show higher sensitivity, particularly for larger models (Qwen3-30B-A3B: CV up to 35%, range ratio up to
+3.47×), where the prefill–decode balance is more delicate. Decode-heavy workloads (NuminaMath) demonstrate moderate
+sensitivity, with most configurations achieving CV < 8%.
+Scheduler comparison. All three schedulers exhibit comparable sensitivity profiles within each workload category.
+EB(ˆk∗) does not introduce additional tuning burden: its average CV and range ratio are similar to v0 and v1 across most
+configurations. The primary differentiator remains throughput rather than robustness.
+33
+
+
+--- Page 34 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Table 14. Optimal configurations and sensitivity metrics for each scheduler across workloads on RTX PRO 6000. Lower sensitivity values
+indicate greater robustness.
+ShareGPT
+LongBench
+WildChat
+NuminaMath
+Scheduler
+Metric
+Qwen3-8B
+30B-A3B
+Gemma
+Qwen3-8B
+30B-A3B
+Gemma
+Qwen3-8B
+30B-A3B
+Gemma
+Qwen3-8B
+30B-A3B
+Gemma
+v0
+B
+14336
+4096
+18432
+16384
+14336
+16384
+18432
+10240
+14336
+8192
+10240
+16384
+N
+1536
+1024
+512
+512
+256
+1024
+1024
+512
+1536
+256
+512
+512
+CV
+4.7%
+12.5%
+6.3%
+1.2%
+3.9%
+4.7%
+7.8%
+9.4%
+4.6%
+2.3%
+5.7%
+7.2%
+Range
+1.17×
+1.56×
+1.23×
+1.05×
+1.14×
+1.18×
+1.29×
+1.38×
+1.17×
+1.08×
+1.21×
+1.26×
+B-Sens
+1.3%
+0.5%
+2.1%
+1.1%
+3.6%
+4.7%
+3.2%
+4.1%
+2.8%
+0.9%
+1.7%
+3.4%
+N-Sens
+4.9%
+18.7%
+6.8%
+0.7%
+1.8%
+1.3%
+8.3%
+10.2%
+4.3%
+2.4%
+6.1%
+7.9%
+v1
+B
+16384
+8192
+4096
+10240
+14336
+14336
+18432
+14336
+8192
+14336
+14336
+14336
+N
+1536
+1536
+256
+1024
+2048
+512
+1024
+1024
+256
+256
+256
+256
+CV
+3.3%
+15.2%
+3.7%
+1.0%
+2.8%
+3.9%
+6.5%
+13.0%
+2.8%
+3.6%
+6.5%
+6.7%
+Range
+1.12×
+1.57×
+1.13×
+1.04×
+1.09×
+1.13×
+1.24×
+1.54×
+1.12×
+1.11×
+1.20×
+1.22×
+B-Sens
+0.8%
+0.4%
+0.5%
+1.1%
+2.8%
+4.2%
+4.9%
+2.0%
+0.8%
+0.5%
+0.2%
+0.6%
+N-Sens
+3.6%
+16.8%
+4.0%
+0.5%
+1.5%
+0.6%
+5.8%
+14.3%
+2.9%
+3.9%
+7.2%
+7.4%
+EB(ˆk∗)
+B
+14336
+16384
+16384
+16384
+16384
+14336
+10240
+18432
+14336
+4096
+16384
+10240
+N
+1536
+512
+512
+512
+256
+1024
+1024
+512
+2048
+256
+256
+256
+CV
+12.0%
+22.0%
+5.1%
+0.8%
+3.6%
+4.5%
+8.5%
+10.8%
+2.2%
+2.7%
+8.2%
+2.3%
+Range
+1.40×
+2.12×
+1.19×
+1.03×
+1.14×
+1.16×
+1.28×
+1.53×
+1.09×
+1.09×
+1.28×
+1.10×
+B-Sens
+0.4%
+1.9%
+0.6%
+0.9%
+3.7%
+4.9%
+4.5%
+5.7%
+1.7%
+0.8%
+1.3%
+1.4%
+N-Sens
+13.2%
+24.1%
+5.6%
+0.4%
+1.4%
+0.5%
+9.1%
+10.7%
+2.1%
+2.9%
+8.9%
+2.3%
+Table 15. Optimal configurations and sensitivity metrics for each scheduler across workloads on H200. Lower sensitivity values indicate
+greater robustness.
+ShareGPT
+LongBench
+WildChat
+NuminaMath
+Scheduler
+Metric
+Qwen3-8B
+30B-A3B
+Gemma
+Qwen3-8B
+30B-A3B
+Gemma
+Qwen3-8B
+30B-A3B
+Gemma
+Qwen3-8B
+30B-A3B
+Gemma
+v0
+B
+18432
+14336
+16384
+18432
+18432
+18432
+18432
+16384
+16384
+10240
+10240
+14336
+N
+2048
+1536
+1024
+256
+256
+512
+1536
+1024
+1024
+256
+1024
+512
+CV
+2.9%
+35.2%
+5.4%
+0.9%
+4.5%
+3.8%
+2.9%
+5.5%
+4.9%
+3.5%
+2.0%
+6.3%
+Range
+1.12×
+3.47×
+1.19×
+1.03×
+1.15×
+1.13×
+1.20×
+1.21×
+1.18×
+1.11×
+1.08×
+1.22×
+B-Sens
+2.7%
+35.7%
+3.9%
+0.8%
+4.9%
+4.1%
+2.0%
+1.6%
+4.7%
+1.1%
+1.3%
+4.6%
+N-Sens
+2.4%
+29.5%
+4.8%
+0.5%
+0.4%
+0.6%
+1.9%
+5.9%
+4.2%
+3.8%
+1.9%
+5.7%
+v1
+B
+10240
+8192
+14336
+14336
+14336
+16384
+4096
+4096
+18432
+14336
+8192
+16384
+N
+1024
+2048
+512
+256
+2048
+512
+2048
+1536
+256
+256
+512
+1024
+CV
+3.5%
+23.0%
+6.1%
+0.9%
+4.7%
+4.8%
+3.3%
+8.6%
+6.4%
+3.8%
+2.4%
+7.7%
+Range
+1.12×
+2.02×
+1.24×
+1.04×
+1.16×
+1.18×
+1.16×
+1.30×
+1.24×
+1.12×
+1.08×
+1.26×
+B-Sens
+0.9%
+1.4%
+4.5%
+0.9%
+5.0%
+5.1%
+2.9%
+1.3%
+6.1%
+0.7%
+0.6%
+5.4%
+N-Sens
+3.8%
+25.3%
+6.5%
+0.5%
+0.6%
+1.0%
+2.6%
+9.4%
+5.4%
+4.2%
+2.6%
+7.7%
+EB(ˆk∗)
+B
+16384
+4096
+10240
+14336
+16384
+14336
+16384
+14336
+18432
+18432
+10240
+18432
+N
+1536
+1536
+256
+2048
+1024
+1024
+1024
+1024
+1536
+256
+512
+512
+CV
+9.3%
+29.1%
+9.4%
+1.1%
+4.4%
+4.5%
+3.5%
+12.3%
+3.7%
+2.5%
+2.3%
+6.4%
+Range
+1.33×
+2.50×
+1.32×
+1.04×
+1.16×
+1.16×
+1.12×
+1.60×
+1.14×
+1.08×
+1.07×
+1.23×
+B-Sens
+0.8%
+1.2%
+3.2%
+1.1%
+4.7%
+4.9%
+2.0%
+3.4%
+3.6%
+0.6%
+0.9%
+3.6%
+N-Sens
+10.2%
+32.0%
+10.2%
+0.6%
+0.7%
+0.9%
+3.7%
+13.0%
+3.6%
+2.7%
+2.5%
+6.7%
+34
+
+
+--- Page 35 ---
+Threshold-Based Exclusive Batching for LLM Inference
+F.1.3. OPTIMAL CONFIGURATIONS FOR SYNTHETIC WORKLOADS (FIGURE 4)
+Tables 14 and 15 cover the four real-world workloads. The three synthetic workloads used in Figure 4 (decode-heavy,
+balanced, prefill-heavy) have separate optima, obtained from the same grid search over B ∈{4096, . . . , 18432} and
+N ∈{256, . . . , 2048} and reported in Table 16.
+Table 16. Best-throughput (B, N) per scheduler for each synthetic workload (Qwen3-8B). These configurations underlie Figure 4;
+selected from grid search.
+RTX PRO 6000
+H200
+Workload
+Scheduler
+B
+N
+B
+N
+Decode-heavy
+v1
+4096
+256
+18432
+512
+EB(ˆk∗)
+4096
+512
+14336
+1536
+Balanced
+v1
+8192
+256
+10240
+512
+EB(ˆk∗)
+14336
+512
+18432
+1024
+Prefill-heavy
+v1
+10240
+256
+18432
+1024
+EB(ˆk∗)
+18432
+512
+10240
+512
+F.2. End-to-End Results for Gemma-3-1B-IT
+Table 17 reports end-to-end throughput for Gemma-3-1B-IT on both GPUs. The 1B-parameter model sits at a different
+operating point than the Qwen models in the main text: its lightweight Attention avoids bandwidth-induced interference
+(Appendix A.2), so the marginal-cost gap βe
+MB −βw
+EB on the LHS of (7) is small. The RHS is also small at this scale because
+per-iteration fixed overhead α scales with model size. Both sides shrink together, leaving a narrow but consistent margin
+in EB’s favor. On the RTX PRO 6000, EB(ˆk∗) achieves consistent improvements over v1 across all workloads (average
++3.9%), primarily from better scheduling of decode-heavy phases. On the H200, the advantage is larger on ShareGPT
+(+10.6%) and LongBench (+4.4%), while WildChat shows a slight regression (−1.5%).
+Table 17. Throughput (RPS) for Gemma-3-1B-IT on real-world workloads. % Diff. as defined in Table 2.
+RTX PRO 6000
+H200
+Workload
+v0
+v1
+EB(ˆk∗)
+% Diff.
+v0
+v1
+EB(ˆk∗)
+% Diff.
+ShareGPT
+49.31 48.94
+50.84
++3.9%
+51.24
+52.73
+58.33
++10.6%
+LongBench
+51.09 55.08
+55.31
++0.4%
+92.74
+92.84
+96.93
++4.4%
+WildChat
+55.97 53.36
+56.26
++5.4%
+71.82
+75.17
+74.05
+−1.5%
+NuminaMath
+7.01
+8.36
+8.87
++6.1%
+11.25
+12.49
+12.80
++2.5%
+Average
++3.9%
++4.0%
+F.3. SLO-Constrained Goodput for EB+
+Section 4.4 summarizes the SLO-attainment behavior of EB+ at moderate load. Here we report per-request SLO attainment
+(fraction of requests meeting both TTFT and TPOT targets simultaneously) on RTX PRO 6000 with Qwen3-8B at c = 512.
+Under a strict TPOT target (< 50 ms), all schedulers fail because mean TPOT exceeds the target on this bandwidth-
+constrained GPU. Under a relaxed target (<100 ms), v1 collapses to ∼5% attainment because its TPOT distribution is wide;
+EB+ achieves the best balance, attaining 80.3% at TTFT<10 s and 48.4% at TTFT<5 s. On H200 at c = 512, mean TPOT
+is universally low (<53 ms) so TTFT dominates the SLO; EB+ selects v1 there and matches its attainment at all targets.
+F.4. Comparison with Prefill–Decode Disaggregation
+Disaggregated serving (DistServe (Zhong et al., 2024), Splitwise (Patel et al., 2024)) is an alternative to MB that physically
+separates prefill and decode onto dedicated GPU pools. We compare EB+ (which separates phases temporally on the same
+GPUs under data parallelism) against vLLM’s built-in disaggregation scheduler.
+35
+
+
+--- Page 36 ---
+Threshold-Based Exclusive Batching for LLM Inference
+Table 18. SLO attainment (% of requests meeting both TTFT and TPOT targets) on RTX PRO 6000 (Qwen3-8B, c = 512). Under strict
+TPOT all schedulers fail; under relaxed TPOT, EB+ dominates at moderate-to-loose TTFT targets.
+TPOT <50 ms
+TPOT <100 ms
+TTFT target
+v1
+EB(ˆk∗)
+EB+
+v1
+EB(ˆk∗)
+EB+
+<2 s
+0.6
+0.0
+0.0
+4.9
+0.0
+1.2
+<5 s
+0.6
+0.0
+1.1
+5.0
+6.2
+48.4
+<10 s
+0.6
+0.5
+1.3
+5.8
+77.3
+80.3
+Two-GPU setting (DP=2 vs. 1P+1D). Table 19 compares v1, EB+, and vLLM’s 1P+1D disaggregation scheduler on
+2× RTX PRO 6000 and 2× H200 (Qwen3-8B, µL = 512, µO = 256). EB+ matches or exceeds v1 throughput at every
+concurrency on both GPUs. On RTX PRO 6000, EB+ outperforms disaggregation by +31.8% throughput with 3.3× lower
+TTFT at c = 512 and by +22.8% over v1 at c = 2048. On H200, EB+ leads disaggregation by +17.7% at c = 64 and
++14.8% at c = 512, with +4.3% over v1 at c = 2048. Disaggregation OOMs at c = 2048 on both GPUs (“–”) because KV
+blocks remain pinned during prefill-to-decode transfer and the scheduler lacks admission backpressure.
+Table 19. Two-GPU comparison: v1, EB+ (DP=2), and vLLM 1P+1D disaggregation. Throughput in tok/s. “–” denotes OOM.
+2× H200
+2× RTX PRO 6000
+c
+Metric
+v1
+EB+
+Disagg
+v1
+EB+
+Disagg
+64
+Throughput 26,545
+26,857
+22,825
+8,529
+8,691
+8,606
+TTFT (s)
+0.042
+0.040
+0.091
+0.087
+0.084
+0.164
+TPOT (ms)
+7.11
+7.03
+8.08
+22.30
+22.10
+21.10
+512
+Throughput 45,731
+45,539
+39,649
+21,526
+21,710
+16,467
+TTFT (s)
+0.788
+0.779
+3.608
+1.900
+1.900
+6.219
+TPOT (ms)
+29.18
+29.44
+22.81
+58.90
+58.40
+58.64
+2048
+Throughput 46,042
+48,015
+–
+16,228
+19,926
+–
+TTFT (s)
+7.601
+6.330
+–
+45.900
+45.300
+–
+TPOT (ms)
+97.44
+99.71
+–
+150.00
+63.80
+–
+Four-GPU setting across P:D ratios. We further compare DP=4 against disaggregation with 1P+3D, 2P+2D, and 3P+1D
+allocations on 4× RTX PRO 6000 and 4× H200 (Qwen3-8B, vLLM P2P NCCL KV transfer; “–” denotes OOM/timeout on
+the decode GPU). Three workload mixes span the prefill–decode spectrum: prefill-heavy (µL = 1024, µO = 128), balanced
+(µL = 512, µO = 512), and decode-heavy (µL = 128, µO = 1024); 2k requests per setting at c ∈{128, 256, 512}.
+Three observations emerge from Table 20:
+(1) The optimal P:D ratio is workload-dependent and choosing wrong is costly. At c = 128 on 4× RTX PRO 6000:
+prefill-heavy favors 2P+2D (+63% over EB+), balanced favors 1P+3D (+14%), and decode-heavy favors EB+ itself. No
+single ratio dominates: 2P+2D is best for prefill-heavy but worst for decode-heavy among disagg options; 1P+3D is best for
+balanced but worst for prefill-heavy.
+(2) Disaggregation exhibits structural memory fragility. Under disaggregation, a request’s entire prefill KV cache
+(L tokens) is transferred to the decode GPU in bulk upon prefill completion. Multiple prefill GPUs produce completed
+requests faster than a single decode GPU can retire them, causing concurrent KV occupancy on the decode GPU to scale
+as O(L · npending) with no backpressure mechanism. This explains the OOM pattern: at c = 256, 3P+1D OOMs on
+prefill-heavy (L = 1024) but not on decode-heavy (L = 128)—the same number of pending requests consumes 8×
+more KV memory. At c = 512, 3P+1D OOMs on balanced (L = 512) as well; at c = 2048 (Appendix F.4) all disagg
+configurations OOM.
+(3) EB+ is consistently competitive without manual tuning. EB+ achieves the best or near-best throughput in 7 of 9
+(workload × c) settings on RTX PRO 6000, with 2P+2D excelling on prefill-heavy at c = 128 and c = 256. Crucially, EB+
+maintains 3–18× lower TTFT than every disagg configuration across every setting and never OOMs. In a deployment where
+workload mix is unknown or shifts over time, EB+ provides robust performance without operators predicting the optimal
+36
+
+
+--- Page 37 ---
+Threshold-Based Exclusive Batching for LLM Inference
+P:D ratio.
+Table 20. 4-GPU disaggregation comparison across concurrencies c ∈{128, 256, 512} (Qwen3-8B, 2k prompts). Throughput in tok/s.
+“–” denotes OOM/timeout. v1 and EB+ both use DP=4.
+4× RTX PRO 6000
+4× H200
+c
+Workload
+Metric
+v1
+EB+
+1P+3D 2P+2D 3P+1D
+v1
+EB+
+1P+3D 2P+2D 3P+1D
+128
+Prefill-heavy
+Throughput 25,994 26,207 23,245 42,577 31,490
+67,278
+65,297
+40,535 82,400 70,255
+TTFT (ms)
+185
+171
+4,385
+476
+482
+133
+124
+2,763
+662
+412
+TPOT (ms)
+43.0
+42.8
+14.6
+23.1
+32.6
+16.1
+16.7
+6.4
+8.5
+13.1
+Balanced
+Throughput 11,013 11,063 12,629 11,640
+9,023
+28,646
+28,686
+31,341 29,388 21,963
+TTFT (ms)
+121
+116
+316
+229
+272
+75
+74
+249
+178
+233
+TPOT (ms)
+22.6
+22.5
+19.2
+21.1
+27.3
+8.6
+8.6
+7.5
+8.2
+11.0
+Decode-heavy
+Throughput
+7,723
+7,690
+7,469
+6,848
+5,450
+18,245
+19,336
+18,861 17,227 13,536
+TTFT (ms)
+65
+62
+223
+166
+220
+46
+44
+233
+179
+220
+TPOT (ms)
+18.1
+18.2
+18.6
+20.4
+25.6
+7.6
+7.2
+7.2
+7.9
+10.2
+256
+Prefill-heavy
+Throughput 37,623 37,208 23,102 44,892
+–
+88,488
+87,268
+40,638 77,117
+–
+TTFT (ms)
+380
+381
+10,283
+3,369
+–
+304
+307
+6,103
+2,614
+–
+TPOT (ms)
+57.8
+58.5
+14.5
+23.3
+–
+23.4
+23.8
+6.4
+8.3
+–
+Balanced
+Throughput 16,913 16,870 19,831 17,551 11,402
+43,648
+43,729
+47,433 42,016 26,455
+TTFT (ms)
+235
+229
+844
+505
+664
+158
+152
+681
+395
+596
+TPOT (ms)
+28.6
+28.7
+22.9
+26.9
+42.1
+10.9
+10.9
+8.9
+10.9
+17.6
+Decode-heavy
+Throughput 12,678 12,699 12,176 10,595
+7,021
+30,696
+29,763
+29,495 24,820 16,682
+TTFT (ms)
+125
+119
+719
+404
+592
+108
+110
+715
+438
+599
+TPOT (ms)
+21.4
+21.3
+21.7
+25.4
+38.9
+8.7
+8.9
+8.5
+10.6
+16.0
+512
+Prefill-heavy
+Throughput 47,947 47,322 22,531 43,326
+–
+106,324 105,432 39,925 78,486
+–
+TTFT (ms)
+1,141
+1,205
+21,412
+9,245
+–
+805
+843
+12,357
+5,741
+–
+TPOT (ms)
+85.3
+86.1
+14.6
+23.9
+–
+36.2
+36.2
+6.4
+8.2
+–
+Balanced
+Throughput 23,914 24,037 25,080 20,397
+–
+61,106
+60,988
+46,261 48,895
+–
+TTFT (ms)
+697
+697
+4,013
+1,676
+–
+464
+413
+5,753
+1,128
+–
+TPOT (ms)
+38.7
+38.6
+29.9
+43.4
+–
+14.7
+14.9
+9.2
+17.3
+–
+Decode-heavy
+Throughput 18,414 18,396 17,224 13,169
+7,579
+46,622
+46,782
+38,287 30,567 17,544
+TTFT (ms)
+319
+284
+1,842
+1,074
+2,295
+251
+314
+1,908
+1,216
+1,720
+TPOT (ms)
+28.2
+28.2
+28.8
+39.1
+69.4
+10.9
+10.8
+11.9
+16.2
+29.4
+37

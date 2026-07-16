@@ -1,0 +1,1468 @@
+--- Page 1 ---
+Budget-Efficient Automatic Algorithm Design via
+Code Graph
+Maxime Bouscary
+Operations Research Center
+Massachusetts Institute of Technology
+mbscry@mit.edu
+Manxi Wu
+Department of Civil and Environmental Engineering
+University of California, Berkeley
+manxiwu@berkeley.edu
+Saurabh Amin
+Laboratory for Information & Decision Systems
+Massachusetts Institute of Technology
+amins@mit.edu
+Abstract
+Large language models (LLMs) have emerged as powerful tools for automatic algo-
+rithm design (AAD). However, existing pipelines remain inefficient. They operate
+at the granularity of full algorithms, redundantly rewriting recurring substructures
+and discarding low-fitness candidates that may contain valuable algorithmic fea-
+tures. We formalize budget-efficient automatic algorithm design, wherein the
+search policy maximizes realized fitness subject to limited computational cost. We
+propose a directed acyclic graph representation of algorithms and build a search
+framework that fully exploits the LLM’s output. Instead of querying the LLM
+for full algorithms, we use it to obtain corrections: compact operators that add,
+replace, or remove code blocks. Each correction augments the graph, yielding new
+algorithms that compose with prior corrections. This graph structure decomposes
+algorithms into sets of corrections, enabling correction-level credit assignment
+that informs subsequent queries. We complement this framework with theoretical
+insights into the ideal balance between search depth and breadth at different budget
+levels. We validate our method empirically on three combinatorial optimization
+problems, demonstrating consistent superiority of our graph-based search over
+full-algorithm search at equal token budget. Finally, our experiments suggest that
+rich contexts help only when the LLM’s prior knowledge is shallow, and can hinder
+performance otherwise.
+1
+Introduction
+Automatic algorithm design (AAD) has transitioned from classical symbolic search to a paradigm
+where large language models (LLMs) serve as general-purpose search operators. While this shift
+has enabled notable successes in mathematical discovery [1, 2], heuristic design [3, 4, 5], and
+domain-specific algorithm engineering [6, 7], current pipelines remain remarkably wasteful, often
+requiring thousands or even millions of LLM queries. Existing methods typically generate a single,
+full algorithm per query. This full-algorithm paradigm gives rise to two fundamental limitations.
+First, generated algorithms are redundant: generated candidates share substantial substructure, yet
+recurring subroutines are rewritten from scratch in every query. Problems admitting short algorithms,
+such as bin packing or circle packing, are largely shielded from this overhead, but more complex
+combinatorial problems yield algorithms spanning hundreds of lines of code. The full-rewrite
+Preprint.
+arXiv:2605.10598v1  [cs.AI]  11 May 2026
+
+
+--- Page 2 ---
+approach is not only computationally expensive but also error-prone, as it increases the likelihood of
+introducing syntactical or logical mistakes in otherwise valid code blocks [8, 9, 10].
+Second, the resulting algorithms are opaque: the relations between algorithms are only implicit,
+and natural-language descriptions of algorithms are typically too coarse-grained to capture the main
+drivers of performance. The full-algorithm paradigm thus offers no principled way to extract the
+most impactful algorithmic features, and the LLM is forced to rely on costly and inconsistent natural-
+language reflections. These inefficiencies translate directly into wasted tokens at a time when LLM
+inference has become the central cost of AAD.
+Such waste motivates a budget-efficient formulation of AAD that seeks to maximize fitness subject
+to an explicit cap on cumulative inference costs. This budget-efficient view exposes a fundamental
+trade-off that is largely implicit in prior work: while richer LLM queries (e.g., extensive context,
+structured feedback, or in-context examples) yield higher-quality candidate algorithms, they rapidly
+deplete the available budget, restricting the overall depth or breadth of the search. To the best of our
+knowledge, no search architecture has been explicitly designed to navigate this trade-off and optimize
+performance under strict cost constraints.
+We introduce a search framework that addresses these challenges by navigating the algorithm space
+through a directed acyclic graph (DAG), where source-to-sink paths represent complete algorithms.
+Rather than requesting full programs, the system queries the LLM for concise corrections that add,
+replace, or remove specific code blocks. This approach allows a single query to return multiple
+corrections that can be composed with those of previous iterations, significantly increasing the set of
+accessible algorithms without additional LLM queries. Additionally, each algorithm is composed of
+an explicit set of corrections, which enables correction-level credit assignment. We use this granular
+information to construct structured feedback that guides subsequent iterations toward high-performing
+algorithms.
+Our main contributions are as follows.
+• We formalize budget-efficient automatic algorithm design (1) and propose a graph-based
+representation of algorithms as source-to-sink paths in a graph of code blocks. Building on
+this representation, we introduce two budget-efficient AAD methods: a context-agnostic
+variant, and a context-guided variant that additionally conditions the LLM on a summary of
+correction credit estimates.
+• We provide theoretical insights on configuring AAD frameworks under budget constraints,
+focusing on the trade-off between the depth and breadth of search. Under assumptions on the
+mean and dispersion of search trajectories, we show that (i) the set of locally optimal per-run
+budgets is non-decreasing in the total budget, with sufficient conditions for uniqueness; (ii)
+for sufficiently large budgets, the optimal search strictly balances depth and breadth, ruling
+out both pure zero-shot sampling and a single exhaustive run; (iii) this balance favors depth
+for policies whose expected fitness grows faster with the per-run budget.
+• We empirically evaluate our framework on three combinatorial optimization problems with
+varying degrees of pre-training exposure. The graph-based search consistently dominates
+algorithm-based search at equal token budget. Further, our experiments reveal the importance
+of in-context learning when the LLM’s prior is weak, while similar guidance can hurt
+performance when the prior is strong.
+2
+Related Work
+LLM-based AAD has evolved around a few recurring architectural patterns. We organize this line of
+research into three categories: evolutionary methods, tree-search methods, and methods that fine-tune
+the underlying LLM.
+Evolutionary methods.
+The dominant framework couples an LLM generator with a population-
+based selection. Candidate algorithms are sampled, evaluated on a fixed set of instances, and the best
+ones are kept to seed the next generation. FunSearch [1] popularized this framework for mathematical
+discovery, and EoH [3, 11] refined it for general heuristic design by incorporating natural-language
+descriptions of heuristics into the generation prompts. Subsequent work has extended the loop
+along several axes: ReEvo [4] adds reflective self-critique between generations, EvoCut [6] targets
+2
+
+
+--- Page 3 ---
+cutting-plane generation for integer programming, and EvoTune [7] and TIDE [12] integrate online
+tuning of the generator into the evolutionary loop. These methods share a common limitation: each
+generation produces full algorithms, and population diversity is maintained only through prompt-level
+mechanisms, leaving the search prone to paradigm collapse when the LLM’s prior is concentrated
+around a few algorithmic features. AlphaEvolve [2] and OpenEvolve [13] operate at the level of code
+edits rather than full algorithms, substantially reducing inference cost on long programs. However,
+all edits are applied simultaneously and directly to their target algorithm, and only the resulting
+full algorithm is stored as a new candidate. In contrast, our corrections are toggleable and reusable,
+allowing us to yield a greater number of algorithms per LLM query.
+Tree-search methods.
+A second popular approach organizes the algorithms produced during the
+search into a tree, where children represent LLM-proposed refinements of their parent. MCTS-AHD
+[5] and Planning of Heuristics [14] apply Monte Carlo tree search to balance the exploitation of
+high-fitness branches against the exploration of underperforming ones. Similarly, CodeTree [15]
+uses agent-guided tree expansion for general code generation, while Astorga et al. [16] tailors tree
+search to optimization model formulation. These methods preserve the full search history and avoid
+paradigm collapse, but each node remains a complete algorithm, and the difference between a parent
+and its children is obscure, making it impossible to isolate beneficial algorithmic features. Our graph
+structure overcomes this by making the corrections present in any algorithm explicit and observable.
+This enables correction-level credit assignment to better guide the search, a granularity unavailable
+when the unit of analysis is a complete algorithm.
+Fine-tuning and data augmentation.
+A third thread focuses on improving the LLM itself rather
+than the search procedure. ORLM [17] and OptiMind [18] fine-tune LLMs on curated optimization-
+domain corpora, MILP-Evolve [19] generates a large, diverse set of MILP instances to strengthen
+LLM performance on this problem class, and Lima et al. [20] addresses the scarcity of high-quality
+training data through verifiable synthetic generation. These approaches complement our work, as a
+stronger generator inherently improves the search procedures built upon it. Building on these efforts,
+we demonstrate that the optimal, budget-efficient search strategy depends on the LLM’s prior strength:
+extensive search methods compensate for weak priors but often undermine the effectiveness of strong
+ones.
+3
+Problem Setting
+Let P be a combinatorial optimization problem defined over an instance space Z and a solution
+space Y, with instances drawn from a distribution DP over Z. Let A denote the space of algorithms
+a : Z →Y, and let f : Z × Y →R be a scoring function. The fitness of an algorithm a ∈A, where
+higher values indicate better performance, is:
+V (a) ≜Ez∼DP [f(z, a(z))] .
+Since DP is typically unavailable, V is estimated by the empirical mean:
+bV (a) ≜1
+m
+m
+X
+i=1
+f(zi, a(zi)),
+z1, . . . , zm ∼DP,
+computed on a fixed training set of m instances.
+Algorithms are produced by a pre-trained LLM acting as a stochastic generator. Let X denote the
+set of all possible sequences over the LLM’s discrete token vocabulary. Given a context x ∈X, the
+generator induces a conditional distribution L(· | x) over finite, non-empty subsets of A. At each
+iteration t = 1, 2, . . . , a search policy samples a context xt ∈X, prompting the generator to yield a
+stochastic set of candidate algorithms At ∼L(· | xt). Each generated algorithm a ∈At is evaluated
+to obtain its empirical fitness bV (a). We let:
+ht ≜
+t−1
+[
+s=1
+n
+a, bV (a)
+
+| a ∈As
+o
+be the search history at iteration t, and denote by H the space of all search histories. A search policy
+is a mapping π : H →∆(X) returning a probability distribution over contexts given a search history,
+with Π being the set of all such search policies.
+3
+
+
+--- Page 4 ---
+Each iteration incurs a generation cost c : X →R>0, with c(x) ≥c0 > 0, capturing that certain
+contexts induce higher computational costs. Given a total budget B ≥c0, the Budget-Efficient
+Automatic Algorithm Design problem is:
+π⋆(B) ∈arg max
+π∈Π
+Eπ,L [z(π, B)]
+(1)
+with
+z(π, B) ≜
+max
+t∈[T π],a∈Aπ
+t
+bV (a)
+and
+T π ≜max
+(
+s ∈N :
+s
+X
+t=1
+c (xπ
+t ) ≤B
+)
+,
+where z(π, B) is a random variable representing the maximum empirical fitness achieved across all
+algorithms generated under the trajectory induced by policy π constrained by budget B.
+4
+Graph-Based Search
+We propose a search framework that navigates the algorithm space A by evolving a directed acyclic
+graph Gt. In this graph, edges represent code blocks, and source-to-sink paths represent complete
+algorithms. The graph is augmented by corrections: modifications that add, replace, or remove code
+blocks, which translate into new sub-paths in Gt enlarging the set of accessible algorithms.
+Our search framework offers two major advantages:
+• Higher query yield. Standard methods return one algorithm per query. Our approach returns
+m ≥1 corrections for a similar cost, augmenting the graph m times. With Mt being the
+current number of paths in Gt, this results in kt ∈[m, Mt · 2m] new paths per LLM query.
+In the most conservative scenario where overlapping and incompatible corrections limit the
+yield to kt = m, our method maintains an m-fold increase in efficiency.
+• Explicit Credit Assignment. Since algorithms correspond to paths in Gt, the specific
+corrections composing them are explicit. This allows us to estimate each correction’s
+contribution to the fitness and use this information to steer the LLM toward high-impact
+features via in-context learning rather than relying solely on the LLM’s prior.
+4.1
+Graph Code Representation
+We maintain a directed acyclic graph Gt = (Vt, Et) with a unique source and sink, and let a path
+refer to a sequence of edges connecting the source to the sink. Each edge e ∈Et is associated with a
+block of code and the correction that introduced it. Any path translates into an algorithm, obtained by
+concatenating the code blocks along the path. We denote by Pa the path inducing algorithm a. The
+set of algorithms accessible as paths in Gt is denoted At ⊆A. We partition it into Aeval
+t
+and Ut, the
+subsets of evaluated and unevaluated algorithms, respectively.
+A correction is an operator affecting the semantics of an algorithm by introducing or removing
+algorithmic features. It consists of one or more syntactic code modifications. Formally, a correction
+is a mapping:
+ϕ : Dϕ →A,
+Dϕ ⊆A,
+defined on a domain Dϕ of compatible algorithms (those containing the code blocks ϕ removes,
+replaces, or extends). Applying ϕ to a ∈Dϕ replaces sub-paths of Pa with new ones. Incorporating
+the new nodes and edges augments the graph and expands the set of accessible paths.
+Writing Eϕ ⊆Et for the set of edges introduced by correction ϕ, the edges of Gt are partitioned by
+their introducing correction, so the set of corrections used by an algorithm a is directly readable from
+its path:
+C(a) ≜
+
+ϕ : Pa ∩Eϕ ̸= ∅
+	
+.
+Every algorithm extracted from Gt therefore carries an explicit record of the algorithmic features it
+incorporates, which makes the search interpretable and enables correction-level credit assignment.
+4
+
+
+--- Page 5 ---
+4.2
+Search Process
+The complete procedure is outlined in Algorithm 1. At each iteration, we generate a set of corrections
+and cycle through them to extend the graph, evaluate new candidates, and update the surrogate model
+with the newly collected information. Figure 1 illustrates how corrections are processed in this cycle.
+Figure 1: Single iteration of the graph-based search. Each iteration generates multiple corrections. A
+correction augments the graph by inserting sub-paths, enlarging the set of source-to-sink paths. From
+the augmented set of unevaluated paths Ut, we form two evaluation groups: top-scoring algorithms
+re-routed through the new correction (colored group), and highest-ranked unevaluated paths under the
+surrogate model (uncolored group). Evaluated algorithms are added to the dataset, and the surrogate
+is retrained before applying the next correction.
+We propose two graph-based approaches: a context-agnostic and a context-guided variant. Below, we
+detail the core steps, alongside the supplementary step exclusive to the context-guided variant.
+Generating corrections.
+We select the highest-fitness evaluated algorithm as the reference algo-
+rithm:
+aref ∈arg max
+a∈Aeval
+t
+bV (a).
+For the context-agnostic approach, we obtain a new set of corrections Φt by querying LLMcor
+conditioned solely on aref. The LLM analyzes the reference algorithm and proposes performance-
+improving corrections. The context-guided variant additionally provides LLMcor with a natural
+language summary, St, synthesizing the empirical success of corrections applied in prior iterations.
+Evaluating candidate paths.
+The set of unevaluated paths Ut grows combinatorially with each
+correction, making exhaustive evaluation intractable. Therefore, when applying a new correction ϕ to
+the graph, we evaluate at most neval candidates, split into two sets of equal size. The exploration set
+E(1)
+ϕ
+probes the effect of the new correction ϕ at the high end of the fitness distribution. It consists of
+the highest-fitness algorithms compatible with ϕ, with ϕ applied:
+E(1)
+ϕ
+=
+n
+ϕ(a) : a ∈Top
+bV
+neval/2
+ Aeval
+t
+∩Dϕ
+o
+.
+The exploitation set E(2)
+ϕ
+leverages the information accumulated over previous iterations, via the
+surrogate model Mt, to concentrate computation on high-potential unevaluated algorithms:
+E(2)
+ϕ
+= TopMt
+neval/2 (Ut) .
+Evaluations from both sets are appended to Aeval
+t
+and Mt is retrained before the next iteration.
+5
+
+
+--- Page 6 ---
+Algorithm 1 Graph-based context-guided search
+Require: Budget B, evaluation cap per iteration neval
+1: Sample a0 ∼LLMalg(· | ∅), evaluate a0 to obtain bV (a0), and initialize graph G0
+2: t ←0;
+Aeval
+0
+←{a0};
+U0 ←∅;
+Φ ←∅;
+S0 ←∅
+3: while B > 0 do
+4:
+aref ←arg maxa∈Aeval
+t
+bV (a)
+// Select reference algorithm
+5:
+Φt, ccor ←LLMcor(aref) or LLMcor(aref, St);
+B ←B −ccor
+// Generate corrections
+6:
+for all ϕ ∈Φt do
+7:
+// Augment graph
+8:
+Insert ϕ’s sub-paths into Gt
+9:
+Add newly accessible paths to At and Ut
+10:
+// Evaluate candidates
+11:
+Eϕ ←
+n
+ϕ(a) : a ∈Top
+b
+V
+neval/2
+ Aeval
+t
+∩Dϕ
+o
+∪TopMt
+neval/2 (Ut)
+12:
+Evaluate bV (a) for all a ∈Eϕ
+13:
+Aeval
+t
+←Aeval
+t
+∪Eϕ;
+Ut ←Ut \ Eϕ
+14:
+// Update surrogate
+15:
+Φ ←Φ ∪{ϕ}
+16:
+Retrain Mt on
+n
+(r(a), bV (a)) : a ∈Aeval
+t
+o
+17:
+end for
+18:
+// Update search summary
+19:
+Compute {∆ϕ}ϕ∈Φ from Mt
+20:
+St+1, csum ←LLMsummary(St, {(ϕ, ∆ϕ)}ϕ∈Φt);
+B ←B −csum
+21:
+Aeval
+t+1 ←Aeval
+t
+;
+Ut+1 ←Ut;
+Gt+1 ←Gt;
+t ←t + 1
+22: end while
+23: return arg maxa∈Aeval
+t
+bV (a)
+Updating the surrogate model.
+A central benefit of the graph representation is that it enables
+learning the contribution of each individual correction to algorithm fitness. Because the set C(a)
+of corrections used by algorithm a is directly observable from the path of a, each algorithm can
+be mapped to a low-dimensional representation r(a) =
+ 1{ϕ∈C(a)}
+
+ϕ∈Φ. We train a random forest
+regressor Mt : {0, 1}|Φ| →R on the dataset
+n
+(r(a), bV (a)) : a ∈Aeval
+t
+o
+to predict fitness based on
+the presence of corrections in the cumulative set Φ. This model is used to rank unevaluated paths and
+extract high-potential candidates for the next evaluation step.
+Search summary (context-guided variant only).
+To provide the correction-generating LLM with
+actionable context from past search iterations, we maintain a concise natural-language summary St
+that synthesizes the marginal contribution ∆ϕ of generated corrections. Estimating these contributions
+is complicated by noisy evaluations and correction dependencies. We let ψϕ(a) denote the Shapley
+value of correction ϕ in the prediction Mt(a), and quantify the marginal contribution of ϕ via the
+difference in Shapley value between evaluated algorithms that use ϕ and those that do not:
+∆ϕ ≜
+1
+|Aϕ
+t |
+X
+a∈Aϕ
+t
+ψϕ(a) −
+1
+|A¬ϕ
+t |
+X
+a∈A¬ϕ
+t
+ψϕ(a),
+where Aϕ
+t = {a ∈Aeval
+t
+: ϕ ∈C(a)} and A¬ϕ
+t
+= Aeval
+t
+\ Aϕ
+t . This estimate disentangles ϕ’s
+contribution from those of co-occurring corrections and, by averaging over all evaluated algorithms,
+provides a robust measure of corrections’ effectiveness. The new pairs {(ϕ, ∆ϕ)}ϕ∈Φt produced at
+each iteration are passed, along with the current summary St, to LLMsummary to produce an updated
+summary St+1.
+5
+Theoretical Insights
+Existing AAD methods, including our graph-based search, typically leverage multiple parallel runs
+to improve overall performance. In this section, we address the question: given a total budget B,
+how should one allocate this budget across individual runs? We parameterize this allocation using a
+per-run budget ω ∈[c0, B], capturing the search depth of individual runs, where c0 is the minimum
+6
+
+
+--- Page 7 ---
+cost required to generate a single algorithm. Given ω, the policy π performs independent random
+restarts, providing search breadth, with each trial bounded by cost ω until the total budget B is
+exhausted. This allows for N(ω) = ⌊B/ω⌋parallel executions of π. With z(π, ω) being the realized
+fitness of a single run, we define the expected fitness under total budget B of policy π with per-run
+cost cap ω as:
+ZB (π, ω) ≜Eπ,L
+
+max
+i∈[N] z(i)(π, ω)
+
+,
+N =
+B
+ω
+
+,
+where z(1)(π, ω), . . . , z(N)(π, ω) are samples of z(π, ω). These samples are assumed i.i.d., reflecting
+parallel runs with independent random seeds. Writing µπ(ω) ≜E [z(π, ω)] for the per-run mean
+fitness, ZB(π, ω) can be decomposed as:
+ZB (π, ω) = µπ(ω) + E
+
+max
+i∈[N]
+
+z(i)(π, ω) −µπ(ω)
+
+.
+For analytical tractability, we consider a continuous relaxation and assume that the second term
+depends on ω only through the effective number of runs B/ω, yielding the structural decomposition:
+ZB (π, ω) = µπ(ω) + Qπ
+B
+ω
+
+.
+(2)
+which holds when the tail of z(π, ω) −µπ(ω) is independent of ω. This decoupling preserves the
+essential structure: increasing the per-run budget ω improves the expected per-run fitness µπ(ω) at the
+cost of fewer runs, and thus a smaller order-statistic gain Qπ(B/ω). Both µπ and Qπ naturally exhibit
+diminishing returns in how mean performance scales with the per-run budget and in the order-statistic
+maxima achieved across independent runs. We formalize this by assuming that µπ : [c0, ∞) →R
+and Qπ : [1, ∞) →R≥0 are twice differentiable, increasing, and concave on their domain. We
+also assume that µπ(c0) is identical across all policies π, since all runs reduce to sampling a single
+algorithm.
+We let ωπ(B) and ωπ(B) be the smallest and largest elements of Ω∗
+π(B), respectively, where
+Ω∗
+π(B) ≜
+
+ω ∈[c0, B] : ω is a maximizer of ZB(π, ·)
+	
+denote the set of locally optimal per-run budgets.
+Theorem 5.1 (Monotonicity in B and uniqueness). If N 7→NQ′
+π(N) is non-increasing on [1, ∞),
+then both ωπ and ωπ are non-decreasing in B.
+If additionally, N 7→N 2Q′
+π(N) is decreasing on [1, ∞), then Ω∗
+π(B) = {ω⋆(B)} with ω⋆(B)
+non-decreasing in B.
+Theorem 5.1 shows that when the distribution of Qπ is sufficiently light-tailed, one should allocate
+more effort to individual runs as the total budget increases, rather than simply increasing the number
+of runs. The first condition holds for common distributions, including Gaussian and uniform. Under
+the second, more restrictive condition on the tail of Qπ, this per-run budget is unique and non-
+decreasing. However, this trend toward greater depth remains tempered by the need for breadth. Our
+next result shows that the optimal strategy never collapses into a single exhaustive run as the total
+budget increases.
+Theorem 5.2 (Interior optimum). Suppose ZB(π, ·) is bounded above uniformly for any B > 0.
+Then there exists ¯B > 0 such that:
+Ω∗
+π(B) ⊆(c0, B)
+∀B ≥¯B.
+Provided the budget B is sufficiently large, the optimal strategy strictly balances per-run computational
+effort with the quantity of independent runs. In this regime, restarts are key to ensure the budget isn’t
+exhausted on a single trajectory that may have plateaued. While the total budget B dictates the scale
+of the search, the inherent efficiency of the policy itself also influences how aggressively the per-run
+budget should be tuned.
+Theorem 5.3 (Monotonicity in µ′). Let π1, π2 be two policy families sharing the same order-statistic
+term Qπ. If µ′
+π2(ω) ≥µ′
+π1(ω) for all ω ∈[c0, B], then:
+1. ZB(π2, ω) ≥ZB(π1, ω),
+∀ω ∈[c0, B],
+7
+
+
+--- Page 8 ---
+2. ωπ2(B) ≥ωπ1(B), and ωπ2(B) ≥ωπ1(B).
+A policy that yields greater marginal performance gains per unit of run budget performs better at
+all effort levels ω, and the set of optimal per-run budgets of the higher marginal performance policy
+dominates that of the lower marginal performance policy in the product order. This suggests that
+efficient policies should prioritize depth over breadth.
+6
+Numerical Results
+We evaluate our framework on three combinatorial optimization problems: the Traveling Salesman
+Problem (TSP), the Location Routing Problem (LRP) [21], and a variant of the Bus Routing Problem
+(BRP) [22] without predefined stop locations. We compare our graph-based search and its context-
+guided variant against a baseline that generates full algorithms with natural-language descriptions and
+refines them iteratively as in EoH [3]. All LLM queries use DeepSeek-V3.2 [23]. Implementation
+details, problem specifications, and prompts are provided in Appendices B, C, and D, respectively.
+We run each method 50 times with 20 iterations per run. All methods start from the same 50 initial,
+randomly seeded algorithms to reduce variance across runs. Figure 2 displays the fitness trajectories
+relative to cumulative token usage across all runs for TSP and LRP, highlighting the 75th, 90th, and
+95th quantiles. BRP is omitted from Figure 2 for brevity; the full results are available in Appendix B.
+The graph-based methods exhibit more consistent improvements across all three quantiles: whereas
+the baseline quickly stalls after a few iterations, the graph-based methods keep improving over a
+longer horizon. While the context-guided search is highly beneficial for LRP, it surprisingly degrades
+performance for TSP. We explain this phenomenon by the difference in prior knowledge of LLMs:
+TSP has been extensively studied and is heavily represented in pretraining data, providing the LLM
+with a strong prior [24, 25]. In contrast, LRP is comparatively underrepresented. The vanilla graph-
+based method already exploits this prior effectively on TSP, and providing a search summary dilutes
+the knowledge while incurring additional inference cost. However, on LRP, where the prior is weaker,
+the search substantially benefits from the summary.
+Figure 2: Fitness against cumulative tokens on TSP and LRP. The solid, dashed, and dotted lines
+show the 95th, 90th, and 75th quantiles, respectively.
+The baseline method’s tendency to stall is further evidenced by the decaying improvement rates
+shown in Figure 3, whereas graph-based methods demonstrate consistent gains over a longer horizon.
+We attribute this to the rapid growth in algorithm length and complexity over iterations. Refining
+a full, long algorithm in a single LLM query is a complex task, making the model more likely to
+introduce a faulty edit that degrades performance or a syntax error that renders the code unusable.
+8
+
+
+--- Page 9 ---
+Graph-based search handles long algorithms more reliably: syntax errors are less likely due to shorter
+outputs, and detrimental corrections can be toggled off while beneficial ones are retained.
+Figure 3: Proportion of iterations that strictly improve
+the incumbent’s best fitness, averaged across all prob-
+lems. Per-problem curves are shown in Appendix B.
+To estimate the performance of a method
+capped at n iterations under a budget B, we
+simulate 1000 bootstrap trajectories of se-
+quential rollouts. Reaching the n-iteration
+cap triggers a random restart. We track the
+incumbent’s best fitness along the trajec-
+tory and report the final fitness averaged
+across the 1000 trajectories.
+We report in Table 1 the expected best
+fitness achieved by each search method,
+capped at n iterations per run, with random
+restarts performed until the total budget B
+is exhausted. When n = 0, all methods co-
+incide with repeatedly sampling zero-shot
+algorithms until budget exhaustion. Three
+key observations emerge from these results.
+First, a small budget favors multiple random restarts. Notably, at the tightest budget B = 105, no
+iterative refinement strategy beats zero-shot sampling for TSP. Since the intrinsic stochasticity of
+LLMs yields a wide diversity of zero-shot algorithms, it is more advantageous to sample multiple in-
+dependent zero-shot algorithms rather than allocating a fraction of the budget on iterative refinements
+that yield only marginal improvements.
+Second, across all problems and methods, the optimal number of iterations per run increases with
+the total budget B. This observation aligns with our theoretical findings that the per-run cost should
+be non-decreasing with respect to B (Theorem 5.1). Similarly, the most expensive context-guided
+search only outperforms other methods for larger budgets and on problems for which the LLM lacks
+extensive knowledge.
+Finally, at each method’s best iterative configuration, the vanilla graph-based search outperforms
+the baseline across all problems and budget levels. On TSP, this corresponds to a 7.5%, 19.7%, and
+22.3% smaller optimality gap at B = 105, B = 106, and B = 107, respectively, confirming the
+practical efficacy of our approach to fully exploit the capabilities of the LLM.
+Table 1: Mean performance across varying budgets. For each budget, the best fitness per method is
+underlined, and the best fitness across all methods is bolded.
+Baseline
+Graph
+Graph + context-guided
+B
+n = 0
+n = 5
+n = 10
+n = 20
+n = 5
+n = 10
+n = 20
+n = 5
+n = 10
+n = 20
+TSP
+(x100)
+105
+-5.476
+-7.140
+-8.217
+-9.664
+-6.603
+-6.884
+-7.779
+-7.779
+-8.202
+-9.335
+106
+-5.310
+-5.325
+-5.484
+-5.558
+-4.573
+-4.742
+-4.275
+-5.146
+-5.065
+-5.043
+107
+-5.310
+-5.259
+-5.261
+-4.430
+-3.958
+-3.829
+-3.443
+-4.606
+-3.704
+-3.651
+LRP
+105
+-15.16
+-16.90
+-19.73
+-24.38
+-16.50
+-19.26
+-22.31
+-16.73
+-20.19
+-20.70
+106
+-15.08
+-15.15
+-15.16
+-15.50
+-14.90
+-15.00
+-15.07
+-14.70
+-14.81
+-14.83
+107
+-15.08
+-15.08
+-14.93
+-14.95
+-14.63
+-14.57
+-14.53
+-14.49
+-14.50
+-14.42
+BRP
+105
+-2067
+-1991
+-2033
+-2070
+-1969
+-2053
+-2146
+-2073
+-2109
+-2141
+106
+-1989
+-1732
+-1642
+-1679
+-1580
+-1600
+-1668
+-1583
+-1599
+-1720
+107
+-1989
+-1705
+-1505
+-1518
+-1528
+-1528
+-1471
+-1467
+-1366
+-1393
+7
+Conclusion
+We introduced a graph-based search framework for budget-efficient AAD that alleviates the ineffi-
+ciencies of existing LLM-driven pipelines. By representing algorithms as paths in a directed acyclic
+graph and querying the LLM for localized, reusable corrections rather than full rewrites, our method
+significantly increases algorithm yield and enables correction-level credit assignment. We demon-
+9
+
+
+--- Page 10 ---
+strated that this approach consistently outperforms full-algorithm search baselines on combinatorial
+optimization tasks, while also providing theoretical and empirical insights into depth-versus-breadth
+trade-offs under budget constraints. Specifically engineered to navigate the bottleneck of costly LLM
+inference, a limitation of our framework is its reliance on a cheap evaluation oracle. In domains where
+the oracle is highly expensive, the greater number of evaluations would likely undermine the cost
+savings on inference. Future work includes adaptive tuning of the per-run budget and information
+sharing across parallel runs.
+References
+[1] Bernardino Romera-Paredes, Mohammadamin Barekatain, Alexander Novikov, Matej Balog, M Pawan
+Kumar, Emilien Dupont, Francisco JR Ruiz, Jordan S Ellenberg, Pengming Wang, Omar Fawzi, et al.
+Mathematical discoveries from program search with large language models. Nature, 2024.
+[2] Alexander Novikov, Ngân V˜u, Marvin Eisenberger, Emilien Dupont, Po-Sen Huang, Adam Zsolt Wagner,
+Sergey Shirobokov, Borislav Kozlovskii, Francisco JR Ruiz, Abbas Mehrabian, et al. Alphaevolve: A
+coding agent for scientific and algorithmic discovery. arXiv preprint arXiv:2506.13131, 2025.
+[3] Fei Liu, Xialiang Tong, Mingxuan Yuan, Xi Lin, Fu Luo, Zhenkun Wang, Zhichao Lu, and Qingfu Zhang.
+Evolution of heuristics: Towards efficient automatic algorithm design using large language model. arXiv
+preprint arXiv:2401.02051, 2024.
+[4] Haoran Ye, Jiarui Wang, Zhiguang Cao, Federico Berto, Chuanbo Hua, Haeyeon Kim, Jinkyoo Park, and
+Guojie Song. Reevo: Large language models as hyper-heuristics with reflective evolution. Advances in
+neural information processing systems, 37:43571–43608, 2024.
+[5] Zhi Zheng, Zhuoliang Xie, Zhenkun Wang, and Bryan Hooi. Monte carlo tree search for comprehensive
+exploration in llm-based automatic heuristic design. arXiv preprint arXiv:2501.08603, 2025.
+[6] Milad Yazdani, Mahdi Mostajabdaveh, Samin Aref, and Zirui Zhou. Evocut: Strengthening integer
+programs via evolution-guided language models. arXiv preprint arXiv:2508.11850, 2025.
+[7] Anja Surina, Amin Mansouri, Lars Quaedvlieg, Amal Seddas, Maryna Viazovska, Emmanuel Abbe, and
+Caglar Gulcehre. Algorithm discovery with llms: Evolutionary search meets reinforcement learning. arXiv
+preprint arXiv:2504.05108, 2025.
+[8] Zhijie Wang, Zijie Zhou, Da Song, Yuheng Huang, Shengmai Chen, Lei Ma, and Tianyi Zhang. Where do
+large language models fail when generating code. arXiv preprint arXiv:2406.08731, 2024.
+[9] Shihan Dou, Haoxiang Jia, Shenxi Wu, Huiyuan Zheng, Muling Wu, Yunbo Tao, Ming Zhang, Mingxu
+Chai, Jessica Fan, Zhiheng Xi, et al. What is wrong with your code generated by large language models?
+an extensive study. Science China Information Sciences, 69(1):112107, 2026.
+[10] Wei Cheng, Yongchang Cao, Chen Shen, Binhua Li, Jue Chen, Yongbin Li, and Wei Hu. To diff or not
+to diff? structure-aware and adaptive output formats for efficient llm-based code editing. arXiv preprint
+arXiv:2604.27296, 2026.
+[11] Shunyu Yao, Fei Liu, Xi Lin, Zhichao Lu, Zhenkun Wang, and Qingfu Zhang. Multi-objective evolution of
+heuristic using large language model. In Proceedings of the AAAI Conference on Artificial Intelligence,
+volume 39, pages 27144–27152, 2025.
+[12] Chentong Chen, Mengyuan Zhong, Ye Fan, Jialong Shi, and Jianyong Sun. Tide: Tuning-integrated
+dynamic evolution for llm-based automated heuristic design. arXiv preprint arXiv:2601.21239, 2026.
+[13] Asankhaya Sharma. Openevolve: an open-source evolutionary coding agent, 2025.
+[14] Hui Wang, Xufeng Zhang, and Chaoxu Mu. Planning of heuristics: Strategic planning on large lan-
+guage models with monte carlo tree search for automating heuristic optimization.
+arXiv preprint
+arXiv:2502.11422, 2025.
+[15] Jierui Li, Hung Le, Yingbo Zhou, Caiming Xiong, Silvio Savarese, and Doyen Sahoo. Codetree: Agent-
+guided tree search for code generation with large language models. 2025.
+[16] Nicolás Astorga, Tennison Liu, Yuanzhang Xiao, and Mihaela van der Schaar. Autoformulation of
+mathematical optimization models using llms. arXiv preprint arXiv:2411.01679, 2024.
+[17] Chenyu Huang, Zhengyang Tang, Shixi Hu, Ruoqing Jiang, Xin Zheng, Dongdong Ge, Benyou Wang,
+and Zizhuo Wang. Orlm: A customizable framework in training large models for automated optimization
+modeling. Operations Research, 2025.
+[18] Zeyi Chen, Xinzhi Zhang, Humishka Zope, Hugo Barbalho, Konstantina Mellou, Marco Molinaro,
+Janardhan Kulkarni, Ishai Menache, and Sirui Li. Optimind: Teaching llms to think like optimization
+experts. arXiv preprint arXiv:2509.22979, 2025.
+10
+
+
+--- Page 11 ---
+[19] Sirui Li, Janardhan Kulkarni, Ishai Menache, Cathy Wu, and Beibin Li. Towards foundation models for
+mixed integer linear programming. arXiv preprint arXiv:2410.08288, 2024.
+[20] Vinicius Lima, Dzung T Phan, Jayant Kalagnanam, Dhaval Patel, and Nianjun Zhou. Toward a trustworthy
+optimization modeling agent via verifiable synthetic data generation. arXiv preprint arXiv:2508.03117,
+2025.
+[21] Anantaram Balakrishnan, James E Ward, and Richard T Wong. Integrated facility location and vehicle
+routing models: Recent work and future prospects. American Journal of Mathematical and Management
+Sciences, 7(1-2):35–61, 1987.
+[22] Dimitris Bertsimas, Arthur Delarue, and Sebastien Martin. Optimizing schools’ start time and bus routes.
+Proceedings of the National Academy of Sciences, 116(13):5943–5948, 2019.
+[23] Aixin Liu, Aoxue Mei, Bangcai Lin, Bing Xue, Bingxuan Wang, Bingzheng Xu, Bochao Wu, Bowei
+Zhang, Chaofan Lin, Chen Dong, et al. Deepseek-v3. 2: Pushing the frontier of open large language
+models. arXiv preprint arXiv:2512.02556, 2025.
+[24] Mahmoud Masoud, Ahmed Abdelhay, and Mohammed Elhenawy. Exploring combinatorial problem
+solving with large language models: A case study on the travelling salesman problem using gpt-3.5 turbo.
+arXiv preprint arXiv:2405.01997, 2024.
+[25] Mohammed Elhenawy, Ahmed Abdelhay, Taqwa I Alhadidi, Huthaifa I Ashqar, Shadi Jaradat, Ahmed
+Jaber, Sebastien Glaser, and Andry Rakotonirainy. Eyeballing combinatorial problems: A case study of
+using multimodal large language models to solve traveling salesman problems. In International Conference
+on Intelligent Systems, Blockchain, and Communication Technologies, pages 341–355. Springer, 2024.
+[26] Scott M Lundberg, Gabriel G Erion, and Su-In Lee. Consistent individualized feature attribution for tree
+ensembles. arXiv preprint arXiv:1802.03888, 2018.
+[27] Jilei Yang. Fast treeshap: Accelerating shap value computation for trees. arXiv preprint arXiv:2109.09847,
+2021.
+[28] Gerhard Reinelt. Tsplib - a traveling salesman problem library. ORSA journal on computing, 3(4):376–384,
+1991.
+11
+
+
+--- Page 12 ---
+A
+Proofs
+Let N = B/ω. Differentiating ZB once with respect to ω:
+∂ZB
+∂ω (π, ω) = µ′
+π(ω) −B
+ω2 Q′
+π
+B
+ω
+
+(3)
+= µ′
+π(ω) −N
+ω Q′
+π (N)
+and twice, with N = B/ω,
+∂2ZB
+∂ω2 (π, ω) = µ′′
+π(ω) + 2B
+ω3 Q′
+π
+B
+ω
+
++ B2
+ω4 Q′′
+π
+B
+ω
+
+(4)
+= µ′′
+π(ω) + 2N
+ω2 Q′
+π (N) + N 2
+ω2 Q′′
+π (N)
+= µ′′
+π(ω) + 1
+ω2
+d
+dN
+
+N 2Q′
+π(N)
+
+Lemma A.1. If h : [a, ∞) →R is differentiable, increasing, concave, and bounded above, then
+limx→∞xh′(x) = 0.
+Proof. Since h is increasing and bounded above, there exists l
+=
+limx→∞h(x).
+Thus
+limx→∞h(2x) −h(x) = l −l = 0. The concavity of h implies that h′ is non-increasing so
+for t ∈[x, 2x], h′(t) ≥h′(2x). Therefore h(2x) −h(x) =
+R 2x
+x
+h′(t)dt ≥
+R 2x
+x
+h′(2x)dt = xh′(2x).
+It follows that limx→∞xh′(2x) = 0.
+A.1
+Proof of Theorem 5.1
+Proof. We show that ZB(π, ω) exhibits increasing differences in (ω, B). From (3), we have:
+∂ZB
+∂ω (π, ω) = µ′
+π(ω) −B
+ω2 Q′
+π
+B
+ω
+
+Letting N = B/ω, differentiating with respect to B gives:
+∂2ZB
+∂ω∂B (π, ω) = −1
+ω2 Q′
+π
+B
+ω
+
+−B
+ω3 Q′′
+π
+B
+ω
+
+= −1
+ω2 (Q′
+π(N) + NQ′′
+π(N))
+= −1
+ω2
+∂
+∂N (NQ′
+π(N)) ,
+where the last equality uses
+d
+dN [NQ′
+π(N)] = Q′
+π(N) + NQ′′
+π(N).
+Since N 7→NQ′
+π(N) is non-increasing on [1, ∞), its derivative is non-positive so ∂2ZB
+∂ω∂B (π, ω) ≥0
+on {(ω, B) : c0 ≤ω ≤B}. Therefore, for any B1 ≤B2 and any c0 ≤ωL ≤ωH ≤B1,
+ZB2(π, ωH) −ZB2(π, ωL) ≥ZB1(π, ωH) −ZB1(π, ωL).
+By Topkis’s monotone comparative statics theorem, Ω⋆
+π(B) = arg maxω∈[c0,B] ZB(π, ω) is non-
+decreasing in B in the strong set order, so both ωπ(B) and ωπ(B) are non-decreasing in B.
+Further assume that N 7→N 2Q′
+π(N) is strictly decreasing on [1, ∞). Let G(N) ≜N 2Q′
+π(N), so
+G′(N) ≤0. Using (4), we have:
+∂2ZB
+∂ω2 (π, ω) = µ′′
+π(ω) + 1
+ω2
+d
+dN
+
+N 2Q′
+π(N)
+
+= µ′′
+π(ω) + 1
+ω2 G′
+B
+ω
+
+Since µπ is concave and G is strictly decreasing, it follows that ∂2ZB
+∂ω2 (π, ω) < 0 on [c0, B]. Thus
+ZB(π, ·) is strictly concave on [c0, B]. It follows that ZB(π, ·) has a unique maximizer on the
+compact interval [c0, B]. Letting ω⋆(B) be that maximizer, it holds Ω∗
+π(B) = {ω⋆(B)}.
+Since Ω∗
+π(B) is a singleton, the non-decreasing property of ωπ(B) and ωπ(B) implies that ω⋆(B) is
+non-decreasing in B.
+12
+
+
+--- Page 13 ---
+A.2
+Proof of Theorem 5.2
+Proof. The uniform boundedness of ZB for all B implies that µπ and Qπ are both bounded above.
+Lemma A.1 gives:
+lim
+ω→∞ωµ′(ω) = 0
+lim
+N→∞NQ′(N) = 0
+First fix ω = c0. From (3), with N0 = B/c0:
+∂ZB
+∂ω (π, c0) = µ′
+π(c0) −N0
+c0
+Q′
+π(N0).
+Since µ′
+π(c0) > 0 is fixed and N0Q′
+π(N0) →0 as B →∞, there exists ¯B1 such that ∂ZB
+∂ω (π, c0) > 0
+for all B ≥¯B1. By continuity of ∂ZB
+∂ω with respect to ω, ZB is strictly increasing on an interval
+[c0, c0 + ϵ] for some ϵ > 0. Thus c0 is not a local maximizer and c0 /∈Ω∗
+π(B).
+Now fix ω = B. Again from (3), with NB = 1,
+∂ZB
+∂ω (π, B) = µ′
+π(B) −NB
+B Q′
+π(NB)
+= 1
+B [Bµ′
+π(B) −Q′
+π(NB)]
+Since Bµ′
+π(B) →0 as B →∞and Q′
+π(1) > 0 from the strict monotonicity of Qπ, we have that
+there exists ¯B2 such that ∂ZB
+∂ω (π, B) < 0 for all B ≥¯B2. By continuity, ZB is strictly decreasing on
+an interval [B −ϵ, B] for some ϵ > 0. Thus, for any B ≥¯B2, ω = B is not a local maximizer and
+B /∈Ω∗
+π(B).
+Setting ¯B = max( ¯B1, ¯B2) gives Ω∗
+π(B) ⊆(c0, B) for all B ≥¯B.
+A.3
+Proof of Theorem 5.3
+Proof. The per-run mean fitness for policy πi at budget ω can be written as:
+µπi(ω) = µπi(c0) +
+Z ω
+c0
+µ′
+πi(x)dx.
+By hypothesis, µ′
+π2(x) ≥µ′
+π1(x) for all x ∈[c0, B]. Integrating from c0 to ω yields:
+Z ω
+c0
+µ′
+π2(x)dx ≥
+Z ω
+c0
+µ′
+π1(x)dx.
+Adding µπ2(c0) = µπ1(c0) to both sides gives:
+µπ2(ω) ≥µπ1(ω)
+∀ω ∈[c0, B].
+Since both policies share the order-statistic term Qπ(B/ω), adding it to both sides preserves the
+inequality:
+ZB(π2, ω) = µπ2(ω) + Qπ
+B
+ω
+
+≥µπ1(ω) + Qπ
+B
+ω
+
+= ZB(π1, ω),
+which proves the first result.
+Using (3), and since both policies share Qπ, the difference of marginal returns reduces to:
+∂ZB
+∂ω (π2, ω) −∂ZB
+∂ω (π1, ω) = µ′
+π2(ω) −µ′
+π1(ω) ≥0,
+so ZB(π2, ω) −ZB(π1, ω) is non-decreasing in ω. Equivalently, for any ωL ≤ωH in [c0, B],
+ZB(π2, ωH) −ZB(π2, ωL) ≥ZB(π1, ωH) −ZB(π1, ωL).
+(5)
+Assume by contradiction that ωπ2(B) < ωπ1(B). Apply (5) with ωL = ωπ2(B) and ωH = ωπ1(B):
+ZB(π2, ωπ1(B)) −ZB(π2, ωπ2(B)) ≥ZB(π1, ωπ1(B)) −ZB(π1, ωπ2(B)).
+13
+
+
+--- Page 14 ---
+Since ωπ1(B) is a maximizer of ZB(π1, ·), the right-hand side is non-negative, and it follows that:
+ZB(π2, ωπ1(B)) ≥ZB(π2, ωπ2(B)).
+Then either the equality holds, in which case ωπ1(B) is also a maximizer of ZB(π2, ·) contradicting
+that ωπ2(B) is the larger maximizer of ZB(π2, ·), or the inequality is strict, in which case ωπ2(B)
+is not a maximizer of ZB(π2, ·), contradicting its definition. Both cases yield a contradiction, so
+ωπ2(B) ≥ωπ1(B).
+With a dual argument, assume by contradiction that ωπ2(B) < ωπ1(B). Apply (5) with ωL = ωπ2(B)
+and ωH = ωπ1(B):
+ZB(π2, ωπ1(B)) −ZB(π2, ωπ2(B)) ≥ZB(π1, ωπ1(B)) −ZB(π1, ωπ2(B)).
+Since ωπ2(B) is a maximizer of ZB(π2, ·), the left-hand side is non-positive, hence:
+ZB(π1, ωπ1(B)) ≤ZB(π1, ωπ2(B)).
+Either the equality holds, in which case ωπ2(B) is also a maximizer of ZB(π1, ·) contradicting that
+ωπ1(B) is the smallest maximizer of ZB(π1, ·), or the inequality is strict, in which case ωπ1(B)
+is not a maximizer of ZB(π1, ·), contradicting its definition. Both cases yield a contradiction, so
+ωπ2(B) ≥ωπ1(B).
+B
+Implementation Details & Additional Numerical Results
+B.1
+Implementation Details
+We use DeepSeek-V3.2 [23] for every query: initial algorithm generation, full-algorithm update,
+correction generation, and summary update. The cost of a run is its total number of input and
+output tokens. The temperature is fixed at the default value of 1.0. The number of evaluations per
+correction is capped at neval = 16 for both graph-based variants. For all problems, the runtime limit
+of algorithms is set to 60 seconds per instance. We use a Random Forest Regression model as the
+surrogate. Runs are parallelized on an AMD EPYC 9734 processor.
+DAG Representation of the Algorithmic Space.
+We represent every algorithm as a source-to-
+sink path in a directed acyclic graph (DAG) whose nodes are individual lines of code, so that each
+source-to-sink path maps to exactly one algorithm. Figure 4 depicts such DAG, in which linear
+segments of the graph are collapsed into blocks for readability. Each correction augments the DAG
+by adding sub-paths that do not introduce cycles. The DAG thus acts as a compact representation of
+a combinatorial family of algorithms: k independent corrections yield up to 2k distinct paths, each
+corresponding to a syntactically valid algorithm. The DAG is initialized by connecting the source to
+the sink with a single edge. This edge encapsulates the complete source code of the initial algorithm,
+a0. In Figure 4, the two corrections, green and purple, already induce four algorithms, namely the
+paths (1-2-3-4), (1-5-2-3), (1-6-4) and (1-5-6). This structure is what makes the search tractable: we
+store a single DAG rather than an explicit list of variants. Furthermore, we can efficiently enumerate
+all algorithms that include a given correction by joining its endpoints to the source and the sink.
+Correction handling.
+Recall that a correction captures a semantic modification of the reference
+algorithm, whereas an edit captures the underlying syntactic code modifications required to realize it.
+A single correction is therefore represented as a set of edits, each acting on a localized region of the
+code.
+Corrections are produced by calling an LLM with a reference algorithm annotated with line numbers,
+and potentially additional context. The LLM returns a list of corrections. Each correction is composed
+of multiple edits characterized by (i) the type of edit (insert_before, insert_after, replace,
+delete), (ii) a couple (nstart, nend), the line numbers of the first and last anchor lines, and (iii) a
+sequence of characters new_lines, the code to insert or replace (ignored for the delete operation).
+Each edit is parsed as follows. First, the anchors are translated to existing nodes in the DAG based on
+the reference algorithm and anchor lines returned. Second, the new_lines are converted into a chain
+of nodes, which we then connect to the DAG via the first and last nodes of the anchors. A correction
+is then stored as a list of edits and a short natural-language description.
+14
+
+
+--- Page 15 ---
+Figure 4: Augmentation of a DAG with two corrections. The green correction, “Move the refinement
+procedure before the main optimization loop", consists of two edits: insert and delete. The purple
+correction, “Replace the main optimization loop with Gurobi model" consists of a single replace edit.
+Surrogate-guided evaluation and interpretation.
+Enumerating paths through the DAG is cheap,
+but evaluating a candidate algorithm end-to-end on the target task is not. We therefore couple the
+DAG with a surrogate model, a random forest that predicts the score of algorithms, trained on the
+candidates that have already been evaluated. The surrogate serves two distinct purposes.
+1. Frontier selection. Among the exponentially many unevaluated paths, the surrogate provides
+a cheap ranking that lets us avoid spending compute on low-potential candidates and only
+consider the top-scoring ones for evaluation.
+2. Fast and robust identification of corrections’ influence. Shapley values distribute credit fairly
+among interacting corrections, but computing them exactly is exponential in the number of
+corrections. Leveraging the specific structure of trees, the methods of [26] and [27] make
+this identification tractable.
+B.2
+Additional Numerical Results
+In Figure 5, we present the average performance of the baseline and both graph-based variants across
+TSP, LRP, and BRP. Each contour plot illustrates the performance of each method relative to varying
+token budgets and iterations per run. The results for BRP align with those observed for LRP: the
+vanilla graph-based approach consistently outperforms the baseline across all token budgets and
+iteration counts, and the context-guided graph-based variant achieves superior performance over the
+other two methods only under larger budgets.
+Figure 6 reports the improvement rate (the proportion of iterations that strictly improve the incum-
+bent’s best fitness) for each problem.
+15
+
+
+--- Page 16 ---
+Figure 5: Contour plots of the Traveling Salesman Problem (top), Location Routing Problem (middle),
+and Bus Routing Problem (bottom).
+16
+
+
+--- Page 17 ---
+(a) TSP
+(b) LRP
+(c) BRP
+Figure 6: Proportion of iterations that strictly improve the incumbent’s best fitness for each problem.
+17
+
+
+--- Page 18 ---
+C
+Problem Specifications
+For TSP, the fitness is the negative optimality gap averaged over 5 instances of TSPLIB [28]: d198,
+d2103, fl3795, nrw1379, pcb1173. For LRP and BRP, the fitness is the negative objective value
+averaged over 5 random instances of similar size.
+C.1
+Traveling Salesman Problem
+Description
+Task:
+* Given a set of nodes with their coordinates, find the shortest route that
+visits each node once and returns to the starting node.
+* For any two vertices u, v in C, the cost c\_uv is defined as their Euclidean
+distance.
+* The route must be closed i.e. route[0] = route[-1].
+Input template
+instance = {
+’customers’: [ # list[dict]
+{
+’id’: None, # str: unique customer identifier (different from depot
+ids)
+’position’: (None, None) # tuple(float, float): 2D coordinates (x,
+y) of the customer
+},
+# ... more customers
+],
+’time_limit’: None # float: time limit in seconds
+}
+Output template
+{
+"route": None, # list[str] e.g. ["c5", "c1", "c2", "d5"]
+"objective_value": None # float: total cost
+}
+C.2
+Location Routing Problem
+Description
+Given:
+* A set of customers C with 2-dimensional coordinates, and demand d_i.
+* A set of potential depot sites D with 2-dimensional coordinates and a fixed
+opening cost p_j > 0.
+* A homogeneous fleet of vehicles, each with capacity Q (unlimited number of
+vehicles available at each open depot).
+* For any two vertices u, v, the cost of traveling edge uv is c_uv is defined
+as their Euclidean distance.
+Task:
+* Choose a subset of depots D_open \subseteq D to open.
+* Design a set of vehicle routes, each route starts at an open depot, visits a
+non-empty sequence of customers, and returns at the same depot.
+* Each customer must be reached once by exactly one vehicle.
+18
+
+
+--- Page 19 ---
+* The total demand on any single route cannot exceed Q.
+* Minimize the total cost = sum of fixed opening costs of depots in D_open +
+sum of travel costs over all routes.
+Notes:
+* A feasible solution is guaranteed to exist.
+Input template
+instance = {
+’depots’: [ # list[dict] - set D of potential depot sites
+{
+’id’: None, # str - unique depot identifier
+’opening_cost’: None, # float >= 0 - fixed cost p_j to open this
+depot
+’position’: (None, None) # tuple(float, float) - 2D coordinates (x,
+y) of the depot
+},
+# ... more depots
+],
+’customers’: [ # list[dict] - set C of customers
+{
+’id’: None, # str - unique customer identifier (different from depot
+ids)
+’demand’: None, # float > 0 - customer demand
+’position’: (None, None) # tuple(float, float) - 2D coordinates (x,
+y) of the customer
+},
+# ... more customers
+],
+’vehicle_capacity’: None, # float > 0 - capacity Q of each (homogeneous)
+vehicle,
+’time_limit’: None # float: time limit in seconds
+}
+Output template
+{
+"open_depots": [ # list[str] - ids of depots j in D that are opened
+# e.g. "d0", "d1", "d5"
+],
+"routes": [
+["d2", "c1", "c2", "d2"], # example route: depot d2 -> customers c1, c2 ->
+depot d2
+# ... more routes
+],
+"objective_value": None # float - total cost = total_opening_cost +
+total_travel_cost
+}
+C.3
+Bus Routing Problem
+Description
+Task:
+* Given a set of students and a single, unique school, the decision maker must
+simultaneously determine the continuous coordinate locations for bus stops,
+assign students to those stops, and design bus routes, where each route may
+19
+
+
+--- Page 20 ---
+visit an ordered sequence of multiple stops before terminating at the
+school.
+* There are no predefined candidate locations for the stops; they can be placed
+anywhere in the 2D coordinate space.
+* The objective is to minimize the total travel time for all students:
+\sum_{student} (d_walk(student) / v_walk + d_bus(student) / v_bus).
+* d_walk is defined as the Euclidean distance from the student’s location to
+their assigned bus stop.
+* d_bus is defined as the total Euclidean distance the bus travels from the
+moment a student boards at their assigned stop, through any subsequent
+stops on that same route, until it finally arrives at the school.
+* The total number of bus routes generated must not exceed ‘bus_limit‘.
+Input template
+instance = {
+’school’: {
+’id’: None, # str: unique school identifier
+’position’: (None, None) # tuple(float, float): 2D coordinates (x, y)
+},
+’students’: [ # list[dict]
+{
+’id’: None, # str: unique student identifier
+’position’: (None, None)# tuple(float, float): 2D coordinates (x, y)
+},
+# ... more students
+],
+’v_walk’: None, # float: student walking speed
+’v_bus’: None, # float: bus traveling speed
+’bus_limit’: None, # int: maximum number of buses available to use
+’time_limit’: None # float: time limit in seconds
+}
+Output template
+{
+"stops": None, # list[dict]: generated stops, e.g., [{"id": "stop_0",
+"position": (x, y)}, ...]
+"student_assignments": None, # dict[str, str]: mapping of student ID to a
+generated stop ID
+"routes": None, # list[list[str]]: list of routes, where each route is a
+sequence of generated stop IDs ending at the school ID
+"objective_value": None # float: total travel time (walking + bus)
+}
+D
+Prompts
+Initial algorithm generation
+You are an expert algorithms engineer. Write a function solve(input) -> output
+that solves the following problem:
+{problem_description}
+--------------------
+Input format:
+{input_template}
+--------------------
+20
+
+
+--- Page 21 ---
+Output format:
+{output_template}
+--------------------
+In the ‘thoughts‘ field, explain your approach in a few steps using your own
+terms before coding.
+In the ‘code‘ field, write the complete, executable and well indented code of
+the ’solve’ function, including necessary imports.
+The code should be modular and readable, include minimal comments.
+Ensure that the solve returns the *best possible solution making full use of
+the time budget*.
+In the ‘description‘ field, describe the algorithmic approach (abstracted from
+the problem) as a sequence of 10-word max phrases, separated by semicolons.
+The description should not exceed 50 words.
+Full algorithm upgrade
+You are an expert algorithms engineer. Consider the following problem:
+{problem_description}
+--------------------
+Input format:
+{input_template}
+--------------------
+Output format:
+{output_template}
+--------------------
+You are given the following code:
+---BEGIN_CODE---
+{code}
+---END_CODE---
+The description of the algorithm is the following:
+{description}
+--------------------
+Your task is to implement a new algorithm that improves the performance so that
+it returns the *best possible solution making full use of the time budget*.
+Explain your approach in a few steps using your own terms before coding.
+Write the complete, executable and well indented code of the ’solve’ function,
+including necessary imports.
+The code should be modular and readable, include minimal comments.
+Give the full description of the algorithmic approach (abstracted from the
+problem) as a sequence of 10-word max phrases, separated by semicolons. The
+description should not exceed 50 words.
+Correction generation
+You are an expert algorithms engineer. Consider the following problem:
+{problem_description}
+--------------------
+Input format:
+21
+
+
+--- Page 22 ---
+{input_template}
+--------------------
+Output format:
+{output_template}
+--------------------
+You are given the following algorithm:
+---BEGIN_ALGORITHM---
+{lined_code}
+---END_ALGORITHM---
+--------------------
+{summary} # context-guided only
+--------------------
+Your task is to propose multiple performance corrections to improve the fitness
+score of the algorithm.
+Corrections are independent and self-consistent (i.e. does not rely on other
+corrections to execute).
+Each correction consists of a short description and one or more edits (each
+edit is a single operation applied to one contiguous block of code).
+If a correction introduces a new mechanism (e.g., variable/function/data
+structure), it must also include the edit(s) that integrate it; do not
+split prerequisites into separate corrections.
+For example, an edit may introduce a new variable, and a later edit may replace
+a contiguous block to make the algorithm use it.
+For each edit, provide an anchor by giving the numbers of the first (inclusive)
+and last line (exclusive) of the affected contiguous block and ’new_lines’
+(code to introduce).
+Assume all edits are applied simultaneously. Base every anchor strictly on the
+unmodified input code.
+Available edit operations:
+- insert_after: Adds new_lines after the anchor
+- insert_before: Adds new_lines before the anchor
+- replace: Replaces the anchor with new_lines
+- delete: Removes the anchor (new_lines should be ignored or empty)
+For insert_after and insert_before, the anchor must be a single line (first ==
+last).
+For replace and delete, the anchor must be a contiguous range (first <= last).
+The indentation of every line in new_lines must match the surrounding code so
+that, when inserted at the anchor location, the file remains syntactically
+valid and compiles without indentation errors.
+Each line must end with a linebreak.
+new_lines must not include docstrings or line numbers (#<num> lines are not
+part of the code and must never appear in new_lines).
+Summary update
+Consider the following problem:
+{problem_description}
+--------------------
+Input format:
+{input_template}
+--------------------
+22
+
+
+--- Page 23 ---
+Output format:
+{output_template}
+--------------------
+You are given the new corrections since the previous summary (\Delta scores if
+correction is valid, failure reasons if not).
+* \Delta>0 means the correction improved the algorithm.
+* \Delta<0 means the correction degraded the algorithm.
+* \Delta=0 means the correction had no effect on the final score. Do not treat
+\Delta=0 as a success or a failure.
+{corrections_and_delta}
+--------------------
+Here is the summary of the corrections of previous iterations.
+{summary}
+--------------------
+Task 1 (‘meta_analysis‘ field): write a meta-analysis explaining why specific
+traits succeeded or failed in this environment, and what are the key
+drivers of performance.
+Task 2 (‘summary‘ field): write the full, updated summary that will guide the
+correction-generating LLM toward effective edits.
+Keep the previous summary as the baseline and apply the smallest set of edits
+needed to reflect the new corrections.
+Only remove prior information if new evidence refutes it, or if the word cap
+leaves no room, in which case drop the entry with the weakest evidence
+first.
+Critical rules for high-signal summary:
+1. Strict grounding: only extract insights explicitly present in the provided
+correction history. Do not include general ML theory or textbook advice.
+2. Conciseness: the summary should only include the most informative and
+actionable points.
+3. No ambiguity: avoid vague terms.
+4. Advisory tone: give strong guidelines rather than absolute rules, allowing
+the generator to revisit concepts if it can fix the underlying bug.
+Keep the whole summary under 500 words.
+Strict formatting of the summary (if the provided history contains no
+supporting data for a category, output ’* None’ under that header):
+### Strongly Discouraged
+* [Concept] - [concrete reason it failed]
+### Highly Encouraged
+* [Concept] - [concrete reason it succeeded]
+### Needs Careful Implementation
+* [Concept] - [presumed bug or flaw]
+23

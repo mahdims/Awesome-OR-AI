@@ -1,0 +1,2530 @@
+--- Page 1 ---
+DiLaServe: High SLO Attainment Serving for Diffusion
+Language Models
+Tzu-Tao Chang
+tchang85@wisc.edu
+University of Wisconsin-Madison
+USA
+Benjamin Yuanyang Hong
+byhong@wisc.edu
+University of Wisconsin-Madison
+USA
+Kiet Pham
+kvpham@wisc.edu
+University of Wisconsin-Madison
+USA
+Shivaram Venkataraman
+shivaram@cs.wisc.edu
+University of Wisconsin-Madison
+USA
+Abstract
+Diffusion language models (DLMs) have recently emerged
+as a promising alternative to conventional autoregressive
+language models. By generating multiple tokens in paral-
+lel during each denoising step, they offer higher inference
+throughput while maintaining competitive quality. How-
+ever, realizing these throughput gains while meeting latency
+SLOs in a serving system requires addressing challenges
+introduced by DLMs’ unique characteristics. These include
+navigating the speed-quality tradeoff created by confidence-
+based denoising, choosing appropriate parallelization levels
+across model instances under fluctuating load, and coordi-
+nating approximate KV caching mechanisms that introduce
+non-uniform per-step costs. To address these challenges,
+we present DiLaServe, a cluster-level serving system for
+DLMs. DiLaServe enables deadline-aware scheduling and
+adaptive load control through confidence-threshold adjust-
+ment, and dynamically reconfigures the cluster by solving a
+quality-aware optimization problem, while explicitly model-
+ing the step-level heterogeneity introduced by approximate
+KV caching. Across multiple benchmarks and real-world
+traces, DiLaServe improves SLO attainment by up to 56.6
+percentage points and reduces end-to-end request latency
+by up to 46% while incurring less than 1% accuracy drop.
+1
+Introduction
+Large language models (LLMs) exhibit strong general-purpose
+capabilities and are increasingly integrated into services
+across domains, such as conversational agents [38], code
+generation [5], retrieval-augmented generation [16], and
+agentic task execution [58]. As adoption scales, efficiently
+serving LLM workloads becomes increasingly important and
+challenging. Service providers must sustain high throughput
+to handle massive request volumes (billions of queries per
+day [42]) while simultaneously meeting strict latency SLOs
+to maintain interactive responsiveness.
+While many system-level optimizations have been pro-
+posed to improve the efficiency of LLM serving [25, 46, 48, 59,
+62], the throughput of current deployments is fundamentally
+150
+200
+250
+300
+Throughput (token/s)
+77
+78
+79
+80
+Accuracy (%)
+LLaDA 8B (0.9)
+LLaDA 8B (0.8)
+LLaDA 8B (0.7)
+LLaMA3 8B
+Figure 1. Accuracy and throughput comparison of
+LLaMA [50] (autoregressive) and LLaDA [36] (diffusion) on
+GSM8K [10], run on a single H100 GPU. Numbers in paren-
+theses denote the denoising confidence thresholds.
+constrained by the autoregressive nature of these models:
+tokens must be generated sequentially, one at a time. This
+inherent serialization limits parallelism and makes it diffi-
+cult to scale throughput to meet growing request loads. In
+response to these limitations, researchers and industry have
+explored diffusion language models (DLMs) as a powerful
+and promising alternative [17, 26, 36, 45, 55]. These mod-
+els generate text through an iterative refinement process:
+starting from a fully corrupted sequence containing only
+[MASK] tokens, the model repeatedly performs denoising
+steps, unmasking all tokens with confidence exceeding a
+certain threshold at each step. Because multiple tokens can
+be generated in parallel during each iteration, DLMs achieve
+higher throughput than classic autoregressive language mod-
+els while maintaining comparable generation quality. Prior
+industry reports [26] have shown that DLMs can achieve 10×
+greater throughput and our own measurements (Figure 1)
+show that open-weight DLMs achieve up to 1.75× higher
+throughput at equal or better accuracy compared to similarly
+sized autoregressive models.
+However, realizing DLM throughput gains while meeting
+latency SLOs requires addressing several challenges. First,
+the use of token confidence in the denoising process (Fig-
+ure 2) introduces an explicit speed-quality knob: lowering
+the confidence threshold can reduce the number of denois-
+ing steps required, at the cost of a modest quality drop. This
+1
+arXiv:2606.29094v1  [cs.LG]  27 Jun 2026
+
+
+--- Page 2 ---
+means that DLM serving systems should choose the appro-
+priate threshold for each request to meet SLOs while ensur-
+ing response quality. Second, each denoising step in DLMs
+is compute-heavy [53, 54] making end-to-end latency and
+throughput sensitive to the degree of parallelization used;
+with a fixed number of GPUs, using a higher paralleliza-
+tion degree lowers per-request latency but leads to lower
+aggregate throughput (Figure 4). This means that DLM serv-
+ing systems need to jointly select the confidence threshold
+and parallelization degree, taking into account fluctuating
+workload conditions.
+To address these challenges, we present DiLaServe (Diffusion
+Language Model Serving), a cluster-level serving system for
+DLMs that achieves high throughput while meeting strict la-
+tency SLOs. DiLaServe manages a cluster of model instances
+and makes scheduling decisions at the granularity of denois-
+ing steps, enabling fine-grained load balancing and deadline-
+aware adaptation. For each request, DiLaServe dynamically
+adjusts the confidence threshold to balance throughput, la-
+tency, and generation quality. It uses SLO-aware threshold se-
+lection to identify the highest confidence threshold predicted
+to meet the request’s remaining latency budget, thereby max-
+imizing quality subject to the deadline. In addition, it applies
+adaptive load control to bound the maximum threshold each
+request may use so that the aggregate workload remains
+within the cluster’s processing capacity. Given the resulting
+threshold, DiLaServe schedules the next denoising step on
+the instance with the lowest step completion time, account-
+ing for per-instance load and tensor parallelism (TP) degree
+to minimize execution latency.
+To adapt the cluster configuration to changing workloads,
+DiLaServe periodically solves a two-stage integer linear pro-
+gram (ILP). In the first stage, it determines the number of
+model instances at each TP degree to ensure sufficient steady-
+state capacity while maximizing average confidence thresh-
+old and minimizing latency. If the resulting configuration
+differs from the current one, the second stage computes a
+reconfiguration plan that minimizes migration overhead,
+thereby minimizing disruption to service availability. In ad-
+dition, prior work has proposed approximate key-value (KV)
+caching for DLMs, which reuses KV states across denoising
+steps to reduce redundant computation but requires regular
+refreshes to avoid staleness. To account for the non-uniform
+computational cost introduced by approximate KV caching,
+DiLaServe incorporates this step-level heterogeneity directly
+into its scheduling and reconfiguration decisions.
+We implement DiLaServe on top of vLLM [25] and Ray [35],
+extending them to support DLMs, multi-instance serving,
+and approximate KV caching. Evaluation on a real-world
+LLM serving trace shows that DiLaServe improves SLO at-
+tainment by 30.2 percentage points and reduces latency by
+46% with only a 0.09 drop in quality score. Across multiple
+accuracy benchmarks, it improves SLO attainment by up to
+Mask Predictor
+.49
+.95
+.3
+.61
+.92
+What
+is
+25
+[M]
++
+33
+?
+[M]
+[M]
+[M]
+[M]
+Here
+answer
+a
+48
+.
+answer
+.
+[M]
+[M]
+[M]
+answer
+.
+The
+is
+58
+> 0.9
+ 
+ 
+× N
+Confidence 
+threshold 
+Figure 2. Diffusion language models.
+56.6 percentage points with only a 0.9% accuracy drop under
+high load.
+2
+Background and Challenges
+2.1
+Diffusion Language Models
+Diffusion has emerged as a promising alternative paradigm
+to autoregressive language modeling [6, 32, 43]. Rather than
+generating tokens one-by-one in a left-to-right order, DLMs
+initialize generation from a corrupted sequence and progres-
+sively refine it through a sequence of denoising steps [6, 21,
+43], analogous to diffusion image models. More specifically,
+at each denoising step, the prompt, concatenated with a user-
+specified number of [MASK] tokens, is fed into the model’s
+mask predictor. The mask predictor produces predictions for
+all masked tokens in parallel in a single forward pass, after
+which the model selectively keeps a subset of tokens and
+remasks the rest. The partially unmasked sequence is then
+used as input to the next denoising step, and this iterative
+refinement continues until no [MASK] tokens remain.
+Existing DLMs predominantly use Transformer-based mask
+predictors with full bidirectional attention [26, 36, 55]. This
+design allows the predictor to condition on both left and right
+context when inferring each masked token, and has been
+shown to provide stronger capabilities on tasks involving
+reversal reasoning [7].
+A common and effective strategy for deciding which to-
+kens to unmask is based on token confidence [9, 36, 54]. For
+each predicted token, the model uses its softmax probability
+as a confidence score, and at each denoising step unmasks
+only those tokens whose confidence exceeds a predefined
+threshold. If no predicted tokens have confidence exceeding
+the threshold, the token with the highest confidence is un-
+masked to ensure progress. Figure 2 illustrates this process.
+This confidence-based refinement progressively resolves
+uncertain regions and often produces more coherent text [28].
+Moreover, because multiple tokens may exceed the confi-
+dence threshold at each step, diffusion models can unmask
+several tokens in parallel, achieving higher throughput than
+autoregressive models while maintaining comparable qual-
+ity. Figure 1 shows that DLMs achieve 1.75× higher through-
+put at equal or better accuracy compared to similarly sized
+2
+
+
+--- Page 3 ---
+30
+40
+50
+60
+70
+80
+Number of denoising steps
+65
+70
+75
+80
+Accuracy (%)
+Confidence threshold
+0.5
+0.6
+0.7
+0.8
+0.9
+(a) Fixed confidence threshold:
+each dot corresponds to using
+a single threshold throughout
+the entire denoising process.
+40
+50
+60
+70
+80
+Number of denoising steps
+70
+72
+74
+76
+78
+80
+Accuracy (%)
+0
+0.2
+0.4
+0.6
+0.8
+1
+Fraction of steps using
+confidence threshold = 0.6
+(b) Dynamic confidence thresh-
+old: the default threshold is 0.9;
+each point uses a randomly
+chosen fraction of steps that
+switch to 0.6.
+Figure 3. Accuracy-speed tradeoff of LLaDA [36] on GSM8K [10]
+autoregressive models. These advantages make DLMs a com-
+pelling alternative to traditional autoregressive approaches
+and have driven significant recent progress, including both
+large open-source models [36, 55, 60, 61] and production-
+scale systems [17, 26, 45].
+2.2
+Challenges and Opportunities for Efficient
+Diffusion Language Model Serving
+While DLMs offer promising capabilities, their unique char-
+acteristics also introduce new challenges and opportunities
+for efficient serving. To fully leverage these models in prac-
+tice, we outline three key challenges and opportunities that
+a DLM serving system must address.
+2.2.1
+Speed-Quality Trade-off. The iterative denoising
+process in DLMs introduces an inherent speed-quality trade-
+off. At each denoising step, only tokens whose confidence
+exceeds a predefined confidence threshold are unmasked.
+With a high threshold, the model only unmasks tokens it is
+very confident in, which improves correctness but reduces
+the number of tokens unmasked per step, increasing the to-
+tal number of denoising steps. With a low threshold, more
+tokens can be unmasked per step, reducing the number of
+steps needed but increasing the risk of unmasking incorrect
+tokens and hurting quality. This is illustrated in Figure 2: if
+the threshold is set to 0.6, the token “48” would be unmasked
+for the question “What is 25 + 33?”, which is incorrect. Fig-
+ure 3a shows this trade-off for LLaDA [36] on the GSM8K [10]
+benchmark. Using a lower threshold reduces both accuracy
+and the number of steps.
+In addition, the confidence threshold does not need to
+remain fixed throughout the denoising process; the speed-
+quality trade-off can be controlled at the granularity of in-
+dividual denoising steps. Figure 3b illustrates this effect by
+showing accuracy and total denoising steps when mixing a
+high confidence threshold (0.9) with a lower threshold (0.6).
+As the fraction of steps using the lower threshold increases,
+No Cache Cache (32) Cache (8)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Normalized latency
+TP1
+TP2
+TP4
+(a) Latency under different TP
+degrees. Numbers in paren-
+theses indicate the denoising
+block size.
+0.25 0.50 0.75 1.00 1.25 1.50
+Requests per second
+0
+2
+4
+6
+8
+10
+12
+Latency (sec)
+TP4×2
+TP1×8
+(b) Latency under 2 TP-4 in-
+stances vs. 8 TP-1 instances
+across RPS.
+Figure 4. Tensor parallelism for DLMs.
+both the achieved accuracy and the number of denoising
+steps decrease accordingly.
+This trade-off creates opportunities for improved serving
+performance, both for meeting individual request SLOs and
+for system-wide load control. At the request level, this knob
+enables deadline-aware adaptation: if a request is predicted to
+miss its SLO under the current threshold, the server can tem-
+porarily lower the threshold to reduce the remaining number
+of denoising steps, then return to a higher threshold when
+slack permits. At the system level, a load-aware controller
+can lower thresholds during overload to reduce per-request
+work and keep the aggregate load within what the cluster
+can sustainably handle. This stabilizes queue growth and pre-
+vents the tail-latency cascades that otherwise lead to broad
+SLO misses. As shown in Figure 3a, reducing the threshold
+from 0.9 to 0.7 decreases the number of steps by 38%, sug-
+gesting that the system can process 1.61× more requests
+with only a 1.5% accuracy drop. In both cases, the quality im-
+pact remains bounded as long as the thresholds stay within
+an acceptable range, allowing us to trade small, controlled
+reductions in quality for meaningful latency improvements.
+2.2.2
+Cluster-Level Serving. With full bidirectional at-
+tention, each denoising step in a DLM is computationally
+intensive. As a result, these models benefit substantially from
+tensor parallelism. Figure 4a shows that employing tensor
+parallelism reduces per-step latency by 25% with 2 GPUs
+and by 55% with 4 GPUs. In a cluster-serving setting, this
+suggests that high-TP-degree workers can significantly re-
+duce end-to-end latency; migrating requests to these workers
+can therefore improve the likelihood of meeting SLOs when
+requests are close to violating their deadlines.
+However, with a fixed cluster size, choosing the TP degree
+for workers introduces a fundamental latency-throughput
+trade-off. Figure 4b illustrates two cluster configurations:
+one with fewer high-TP-degree workers and one with more
+low-TP-degree workers. Under low load, the high-TP config-
+uration reduces request latency by up to 43% by leveraging
+model parallelism. Under high load, however, its limited num-
+ber of workers constrains overall throughput, causing the
+3
+
+
+--- Page 4 ---
+request queue to grow rapidly. The resulting queueing delay
+dominates end-to-end latency, leading to substantial slow-
+down. In contrast, the low-TP configuration remains stable
+due to its higher throughput capacity. Real-world serving
+traces show that request arrival rates and compositions fluc-
+tuate significantly over time [23, 51], implying that a single,
+static cluster configuration is insufficient.
+The ability to adjust confidence thresholds adds another
+dimension to this problem. When load increases, the sys-
+tem has two levers: it can lower confidence thresholds to
+reduce per-request computation at the cost of potential qual-
+ity degradation, or it can reconfigure the cluster toward
+lower TP degrees to increase throughput at the cost of higher
+per-step latency. These interacting trade-offs between la-
+tency, throughput, and quality make static policies insuffi-
+cient. Serving DLMs effectively therefore requires dynamic
+reconfiguration strategies that jointly account for threshold
+control, TP-degree allocation, and workload conditions.
+2.2.3
+Support for Approximate Caching. One widely
+used optimization in Transformer-based autoregressive mod-
+els is KV caching. With autoregressive models, each newly
+generated token attends only to previously generated tokens;
+as a result, the key and value tensors for the prefix remain
+invariant throughout decoding. These tensors can therefore
+be cached and reused exactly across decoding steps, elimi-
+nating redundant computation and reducing inference cost.
+In contrast, DLMs cannot leverage exact KV caching. Be-
+cause they employ bidirectional attention, the key and value
+tensors depend on the entire (partially masked) sequence
+at each denoising step and thus change as the sequence is
+progressively refined. This makes the standard KV-cache
+optimization used in autoregressive models inapplicable.
+To address this limitation, recent work [31, 54] introduces
+approximate KV-caching mechanisms tailored for DLMs.
+These approaches partition the output sequence into blocks,
+whose size is configured beforehand, and process them se-
+quentially. Within each block, the model runs multiple de-
+noising steps to gradually unmask tokens. A key empirical
+observation is that, during the denoising of a given block, the
+key and value activations for the prompt, previously com-
+pleted blocks (prefix blocks), and future blocks that remain
+fully masked (suffix blocks) change only minimally across
+consecutive steps. Leveraging this stability, these methods
+cache and reuse the KV tensors for the prefix and suffix
+blocks throughout the denoising steps of the current block.
+To avoid excessive staleness, the KV tensors for all blocks
+are recomputed after the current block is fully unmasked,
+before the model processes the next block.
+By avoiding redundant computation, approximate KV
+caching can reduce latency by up to 2.1× without significant
+degradation in generation quality [54]. A practical serving
+system for DLMs must therefore support approximate KV
+Confidence 
+Threshold Controller
+SLO-aware Adjustment
+Adaptive Load Control
+Step Predictor
+Scheduler
+Workload Monitor
+Reconfigurator
+TP1 Instance
+Remaining 
+steps left
+Confidence 
+threshold
+Cluster
+TP1 Instance
+TP2 Instance
+TP4 Instance
+Denoising 
+steps
+Workload 
+statistics
+New 
+config
+Figure 5. DiLaServe architecture.
+caching while also coordinating it with dynamic confidence-
+threshold control and cluster reconfiguration.
+3
+DiLaServe
+DiLaServe is a cluster-level serving system for DLMs that
+achieves high SLO attainment by dynamically adjusting the
+denoising-step confidence threshold and using an ILP-based
+reconfiguration framework tailored to the characteristics
+of DLMs. In this section, we first provide an overview of
+DiLaServe’s design and architecture in §3.1. We then describe
+the scheduling and confidence-adjustment algorithm in §3.2.
+§3.3 describes how DiLaServe dynamically reconfigures the
+cluster in response to workload changes. §3.4 explains how
+these ideas generalize to support approximate KV caching.
+We conclude by discussing extensions for more complex
+SLOs and priority policies in §3.5.
+3.1
+Design Overview
+Figure 5 shows the architecture of DiLaServe. The system
+administrator specifies the request latency SLO (we assume
+a homogeneous SLO for simplicity but discuss extensions
+in §3.5), the set of supported TP degrees, and the initial
+cluster configuration (i.e., the number of model instances
+and their TP degrees). The administrator also specifies a set
+of candidate confidence thresholds for token unmasking (e.g.,
+[0.5, 0.6, 0.7, 0.8, 0.9]); this set should be chosen per model
+and application to provide sufficient control flexibility while
+ensuring acceptable quality even at the lowest threshold. The
+system performs a one-time latency profiling step to measure
+the per-denoising-step latency for each batch size under
+every supported TP degree, similar to existing systems [46,
+48]. These measurements guide DiLaServe’s scheduling and
+reconfiguration decisions.
+For each request, the Confidence Threshold Controller
+determines the confidence threshold used for future denois-
+ing steps to maximize generation quality while ensuring
+the request meets its latency SLO. To achieve this, it se-
+lects the highest threshold from the candidate set that keeps
+the request within its remaining SLO budget. The threshold
+is adjusted dynamically throughout the denoising process.
+However, making these decisions independently for each re-
+quest is insufficient: if all requests select the highest feasible
+threshold without accounting for one another, the resulting
+4
+
+
+--- Page 5 ---
+aggregate load can exceed cluster capacity, causing queue
+growth and system-wide SLO violations. The Confidence
+Threshold Controller therefore also applies adaptive load
+control that limits the maximum threshold each request may
+use so that the aggregate load remains within cluster ca-
+pacity while preserving as much flexibility for high-quality
+generation as possible.
+The Confidence Threshold Controller relies on estimates
+of the remaining denoising steps for each request. These
+estimates are produced by the Step Predictor, a lightweight
+model trained offline to predict the remaining denoising steps
+based on the request’s current state, including its unmasking
+progress and token-confidence statistics.
+Once the confidence threshold is determined for a request,
+the Scheduler assigns each denoising step to the model in-
+stance that yields the lowest step latency (e.g., higher TP
+degree or lower load), and migrates requests when doing
+so reduces latency. Each model instance performs denois-
+ing asynchronously for its assigned batch of requests using
+the confidence threshold selected by the Confidence Thresh-
+old Controller. After each step, the newly unmasked tokens
+and confidence statistics are returned to and tracked by the
+Scheduler, which then makes scheduling decisions for the
+next denoising step.
+The Workload Monitor tracks request arrivals and their in-
+put and output length statistics. The Reconfigurator uses this
+information to periodically compute a cluster configuration
+suited to the current workload. This is formulated as a two-
+stage ILP. In the first stage, the objective is to maximize the
+per-token confidence threshold (thereby maximizing genera-
+tion quality) while ensuring steady-state capacity sufficiency;
+the output of this stage is the desired number of model in-
+stances at each TP degree. If the current cluster configuration
+does not match this plan, the second stage determines how to
+transition to the new configuration with minimal overhead
+by identifying which existing model instances to terminate
+and on which nodes to launch new ones.
+3.2
+Dynamic Confidence Threshold Adjustment and
+Scheduling
+This section describes the core confidence-threshold adjust-
+ment and scheduling mechanisms in DiLaServe. We first de-
+scribe how the Confidence Threshold Controller selects the
+confidence threshold that satisfies each request’s remaining
+SLO budget (§3.2.1). We then present the adaptive load con-
+trol mechanism that limits the maximum confidence thresh-
+old used for each request to keep the aggregate load within
+cluster capacity (§3.2.2). Next, we describe the Step Predictor
+used to estimate the remaining denoising steps for each re-
+quest (§3.2.3). Finally, we present the scheduling algorithm
+that assigns denoising steps to model instances based on TP
+degree and current load (§3.2.4).
+Algorithm 1 SLO-aware Confidence Threshold Adjustment
+1: function PredictedTimeLeft(req, 𝛾)
+2:
+steps ←req.predStepsLeft[𝛾]
+3:
+tp ←req.instance.tpDegree
+4:
+batch ←req.instance.numTokens
+5:
+perStepLatency ←latencyProfile[tp][batch]
+6:
+return steps × perStepLatency
+7: function UpdateConfThreshold(req)
+8:
+for 𝛾in desc req.allowedConfThresh do
+9:
+req.confThreshold ←𝛾
+10:
+if PredictedTimeLeft(req, 𝛾) ≤req.sloLeft then
+11:
+break
+3.2.1
+SLO-aware Confidence Threshold Adjustment.
+Given a candidate set of confidence thresholds, our goal is
+to maximize generation quality while ensuring a request
+does not violate its latency SLO. As shown in Figure 3b,
+generation quality improves when more denoising steps use
+a high confidence threshold. This motivates selecting the
+highest allowable threshold whenever doing so does not
+violate the request’s SLO.
+To determine whether an SLO would be violated, we es-
+timate the remaining latency of a request based on (1) the
+predicted number of denoising steps left under a given con-
+fidence threshold, obtained from the Step Predictor, and (2)
+the per-step iteration time of the assigned model instance,
+obtained from the latency profile for its TP degree and batch
+size. Using this estimation, the system selects the highest
+confidence threshold within the allowed range whose es-
+timated remaining latency does not exceed the request’s
+remaining SLO budget. This procedure is outlined in Algo-
+rithm 1. As shown in Section 5.4, this SLO-aware confidence
+threshold adjustment improves SLO attainment by up to 70.8
+percentage points under high load compared to using a fixed
+confidence threshold.
+3.2.2
+Adaptive Load Control. While SLO-aware thresh-
+old adjustment improves each request individually, it lacks
+awareness of overall system conditions. If every request in-
+dependently chooses the highest threshold that satisfies its
+own SLO, the resulting aggregate load can exceed the clus-
+ter’s processing capacity, causing long queueing delays and
+widespread SLO violations. As shown in Section 5.4, this
+could lead to a reduction in SLO attainment by up to 42.4
+percentage points. Adaptive load control prevents this by
+restricting the maximum confidence threshold each request
+may use so that the aggregate load remains within the total
+processing capacity of the cluster over the SLO window.
+More specifically, the work needed for a request is the
+product of its total number of tokens (input plus output)
+and its predicted number of remaining denoising steps, and
+the aggregate load is the sum of this work across all active
+requests. A model instance’s capacity over the SLO window
+is the number of tokens it can process per second multiplied
+5
+
+
+--- Page 6 ---
+Algorithm 2 Adaptive Load Control
+1: function ReqLoad(req, 𝛾)
+2:
+return req.predStepsLeft[𝛾] × req.numTokens
+3: function ClusterCapacity( )
+4:
+totalCapacity ←0
+5:
+for each instance do
+6:
+tp ←instance.tpDegree
+7:
+capacity ←maxbatch
+
+batch
+latencyProfile[tp][batch]
+
+× SLO
+8:
+totalCapacity ←totalCapacity + capacity
+9:
+return totalCapacity
+10: function UpdateAllowedConfThresholds( )
+11:
+𝑅←all requests, 𝑛←|𝑅|
+12:
+Γ ←default allowed confidence thresholds
+13:
+𝛾min ←lowest value in Γ
+14:
+minRemainLoad ←array of length 𝑛initialized to 0
+15:
+for 𝑖= 𝑛−2 downto 0 do
+16:
+minRemainLoad[𝑖] ←minRemainLoad[𝑖+1] + Re-
+qLoad(𝑅[𝑖+1], 𝛾min)
+17:
+usedLoad ←0, totalCapacity ←ClusterCapacity( )
+18:
+for 𝑖= 0 to 𝑛−1 do
+19:
+req ←𝑅[𝑖]
+20:
+req.allowedConfThresh ←Γ
+21:
+for 𝛾in desc Γ do
+22:
+reqLoad ←ReqLoad(req, 𝛾)
+23:
+remainLoad ←minRemainLoad[𝑖]
+24:
+if usedLoad + reqLoad + remainLoad ≤totalCa-
+pacity or 𝛾= 𝛾min then
+25:
+usedLoad ←usedLoad + reqLoad
+26:
+break
+27:
+else
+28:
+remove 𝛾from req.allowedConfThresh
+by the SLO duration, and the total cluster capacity is the sum
+of the capacities of all model instances.
+Given a fixed cluster configuration, the total capacity is
+constant, whereas the aggregate load depends on the confi-
+dence thresholds used. Our goal is thus to give each request
+the widest feasible confidence-threshold range by assigning
+it the highest allowable maximum threshold, so that the per-
+request controller can still choose high thresholds for better
+generation quality, while ensuring that the worst-case aggre-
+gate load – where every request uses its maximum permitted
+threshold – remains within the cluster’s capacity.
+Algorithm 2 outlines this adaptive load control mecha-
+nism. The algorithm iterates through all active requests in
+order of arrival time. For each request, it iterates through
+the candidate confidence thresholds in descending order. For
+each threshold, it computes the worst-case aggregate load as
+the sum of (1) the load already committed to previously pro-
+cessed requests, (2) the load of the current request if it were
+to use this threshold, and (3) a conservative estimate of the
+load from remaining requests, computed under the assump-
+tion that all remaining requests use the lowest confidence
+1.5x
+2x
+2.5x
+3x
+SLO Multiple
+60
+70
+80
+90
+100
+SLO Attain. (%)
+0
+25
+50
+75
+Pred. Error (%)
+Output Len
++ Progress
++ Confidence
+Oracle
+75.0
+35.1
+19.3
+0.0
+Oracle
+One-shot
+Online (Progress Features)
+Online (Progress + Confidence Features)
+Figure 6. Serving performance of LLaDA on GSM8K (left)
+and step prediction error (right) under different step predic-
+tion strategies.
+threshold. If this worst-case load exceeds cluster capacity, the
+algorithm removes this threshold from the request’s allowed
+set and continues to the next lower threshold; otherwise,
+it keeps this threshold and moves on to the next request.
+By doing so, the algorithm finds the widest range of confi-
+dence thresholds for each request that keeps the aggregate
+load within cluster capacity, thereby maximizing quality for
+individual requests while ensuring overall system stability.
+3.2.3
+Step Prediction. Both SLO-aware confidence thresh-
+old adjustment (§3.2.1) and adaptive load control (§3.2.2) rely
+on estimates of how many denoising steps remain for a
+request under a candidate confidence threshold. A naive ap-
+proach is to make a one-shot estimate when a request arrives
+using the request’s output length and the historical average
+number of steps required under each confidence threshold.
+As shown in Figure 6, this one-shot baseline can be inac-
+curate, with prediction error of up to 75%. During serving,
+such errors may cause the controller to select suboptimal
+confidence thresholds, reducing SLO attainment by up to 15
+percentage points compared with an oracle that has exact
+knowledge of the remaining steps.
+To improve estimation accuracy, we instead update the
+estimates online as the request progresses through the de-
+noising process. Online updates allow the estimator to use
+runtime signals that are unavailable at request arrival, includ-
+ing the request’s denoising progress and token-confidence
+features. Progress features (i.e. the fraction of tokens un-
+masked so far) capture how far a request has advanced in
+the denoising process: requests with a larger fraction of un-
+masked tokens are typically closer to completion. As shown
+in Figure 6, adding these features reduces prediction error by
+34.9%. Confidence-based features (i.e. the confidence values
+of the output tokens) further captures the uncertainty of
+the DLM. Intuitively, when the DLM is more certain about
+the predicted tokens, fewer denoising steps are typically
+needed to finalize the output. These features further reduce
+prediction error by 15.8%. As shown in Figure 6, the resulting
+improvement in prediction accuracy translates into better
+serving performance, improving SLO attainment by up to
+11 percentage points and generation accuracy by up to 1.1%
+compared to one-shot estimation.
+6
+
+
+--- Page 7 ---
+5
+10
+15
+20
+Overhead (%)
+20
+22
+24
+26
+28
+Pred. Error (%)
+Granularity
+(tokens unmasked)
+1
+16
+2
+32
+4
+64
+8
+Figure 7. Step prediction error and execution overhead at
+different prediction granularities. Here, execution overhead
+is measured as the time spent generating predictions using
+the predictor relative to the execution time of a denoising
+step. The red dashed line marks a 5% relative error upper
+bound over the 1-token-granularity.
+We use these features to train a Step Predictor that esti-
+mates the remaining work of a request under each candidate
+confidence threshold. Formally, let 𝑆𝑟(𝑡,𝛾) denote the true
+number of remaining steps for request 𝑟at denoising step 𝑡
+under confidence threshold 𝛾, and let x𝑟(𝑡) denote the fea-
+ture vector used by the predictor. This vector consists of
+the output length, denoising progress, and token-confidence
+features observed during denoising (the full list of features is
+provided in Section A). We train a predictor𝑔that takes as in-
+put the request state (𝑡,𝛾, x𝑟(𝑡)) and estimates the number of
+remaining denoising steps: ˆ𝑆𝑟(𝑡,𝛾) = 𝑔(𝑡,𝛾, x𝑟(𝑡)). We train
+𝑔offline as a gradient boosting machine [14] using a small
+training set of 100 requests, where each request is evaluated
+under every candidate confidence threshold configured by
+the system administrator. This profiling and training process
+only needs to be performed once per deployed model.
+During deployment, however, updating step estimates af-
+ter every denoising step (i.e., every time a token is unmasked)
+can be prohibitively expensive. As shown in Figure 7, per-
+token updates introduce an execution overhead of 20%. Since
+this overhead lies on the execution hot path, it can signifi-
+cantly affect serving performance. To reduce this overhead,
+we observe that the predicted number of remaining steps
+does not change substantially after every token unmask-
+ing. As shown in Figure 7, updating the prediction only
+after several newly unmasked tokens substantially reduces
+scheduling overhead while incurring only a small increase in
+prediction error. In our setting, we select the largest update
+granularity (i.e., the number of newly unmasked tokens be-
+tween updates) whose prediction error remains within 5% of
+the per-token baseline. To further reduce overhead, we per-
+form predictions in a separate asynchronous worker thread
+and batch them across multiple requests and all candidate
+confidence thresholds to amortize the cost.
+3.2.4
+Request Scheduling. Once the confidence thresh-
+olds have been determined, the Scheduler decides which
+model instance executes each request’s next denoising step.
+Algorithm 3 Request Scheduling
+1: function FindBestInstance(nTok)
+2:
+𝐼←{inst | inst.batchSize + nTok ≤inst.maxBatchSize}
+3:
+if 𝐼= ∅then
+4:
+return None
+5:
+return
+the
+inst
+∈
+𝐼
+minimizing
+latencyProfile[inst.tpDegree][inst.batchSize+nTok]
+6: function Schedule( )
+7:
+𝑅←unscheduledRequests
+8:
+𝑅←𝑅∪finishedStepRequests
+9:
+for all req in 𝑅do
+10:
+inst ←FindBestInstance(req.nTok)
+11:
+if inst ≠None then
+12:
+req.instance ←inst
+13:
+for all req in 𝑅such that req.instance ≠None do
+14:
+if req was migrated then
+15:
+UpdateConfThreshold(req)
+Because the system maintains multiple model instances run-
+ning asynchronously, scheduling decisions are triggered
+whenever a new request arrives or when any model instance
+completes a denoising step. Several such events may occur
+in close succession, so the scheduler may handle multiple
+requests during a single decision cycle.
+The scheduling algorithm is outlined in Algorithm 3. At
+each scheduling event, the Scheduler processes unscheduled
+requests – either newly arrived requests or requests that
+were previously deferred because no model instance could
+accommodate them – and requests that have just completed
+a denoising step. For each request, the Scheduler assigns it
+to the model instance with the lowest denoising-step latency,
+favoring instances with higher TP degrees or lighter load
+and balancing load across the cluster.
+A request may be migrated between model instances be-
+tween denoising steps. Because individual denoising steps
+are essentially stateless without KV caching, migration is
+extremely lightweight: the system only needs to send the
+prompt and the current masked/unmasked tokens to the
+new executor, a transfer size on the order of tens of kilobytes
+even for long sequences. This enables denoising-step-level
+migration and fine-grained load balancing, which we show
+in Section E can reduce tail latency by up to 19%.
+Whenever a request is assigned or migrated to a new
+model instance, its confidence threshold is updated to reflect
+the change in predicted remaining latency, which is affected
+by the new instance’s TP degree and load.
+3.3
+Reconfiguration
+To adjust the cluster configuration in response to chang-
+ing workload, the Workload Monitor groups requests by
+their input-output sizes and tracks the arrival rate of each
+class. This information is then used by the Reconfigurator,
+which periodically (e.g., every 5 minutes, at a much coarser
+7
+
+
+--- Page 8 ---
+Symbol
+Definition
+C
+Set of possible confidence thresholds
+D
+Set of possible TP degrees
+B
+Set of possible batch sizes
+N
+Set of compute nodes
+K
+Set of input classes
+𝑆𝐿𝑂
+Latency SLO
+𝑃𝑘
+Prompt length of class 𝑘∈K
+𝑂𝑘
+Output length of class 𝑘∈K
+𝑅𝑃𝑆𝑘
+Arrival rate of class 𝑘∈K
+𝑇𝑐
+Average number of tokens unmasked per step
+under confidence threshold 𝑐∈C
+𝐿𝑑,𝑏
+Latency per step for TP-𝑑and batch size 𝑏
+|G𝑛|
+Number of GPUs on node 𝑛∈N
+𝑠𝑘,𝑐∈R≥0 Steps of class 𝑘using confidence threshold 𝑐
+𝑠𝑘,𝑑∈R≥0 Steps of class 𝑘using TP degree 𝑑
+𝑡𝑘∈R
+Latency of class 𝑘
+𝑧𝑑,𝑏∈B Whether TP-𝑑machines use batch size 𝑏
+𝑥𝑛,𝑑∈N Number of TP-𝑑instances on node 𝑛
+Table 1. Notation used in Stage 1 formulation.
+granularity than the Scheduler) computes an updated cluster
+configuration suited to the current workload. Determining
+this configuration is formulated as a two-stage ILP.
+Stage 1: Quality-Aware Capacity Planning In the first
+stage, the goal is to determine the number of model instances
+at each TP degree such that all request SLOs are met and
+the cluster has sufficient capacity to sustain the workload in
+steady state (i.e., without unbounded queue growth). If the
+optimization problem is infeasible under these constraints,
+we fall back to using only TP-1 instances, which maximizes
+throughput, as discussed in §2.2.2.
+A trivial feasible solution is to force all requests to use
+the lowest confidence threshold, which minimizes load, but
+this severely reduces overall generation quality. Instead, the
+optimization seeks a configuration that maximizes the use
+of high confidence thresholds while still satisfying SLO and
+throughput constraints. Among all configurations achieving
+the same average confidence threshold, we further prefer
+those that minimize request latency.
+Table 1 summarizes the parameters and variables used in
+the formulation. Formally, the optimization problem has a
+hierarchical two-level objective. The primary objective is to
+maximize the average confidence threshold used per output
+token: max Í
+𝑘∈K 𝑅𝑃𝑆𝑘·
+Í
+𝑐∈C 𝑐𝑇𝑐𝑠𝑘,𝑐
+𝑂𝑘
+. The secondary objective,
+applied only among solutions that tie on the first criterion,
+is to maximize SLO slack: max Í
+𝑘∈K 𝑅𝑃𝑆𝑘· (𝑆𝐿𝑂−𝑡𝑘). The
+optimization problem is subject to the following constraints:
+• Token-Unmasking Completeness: For each request, the
+total number of tokens unmasked across all confidence
+thresholds must equal the output length: Í
+𝑐∈C 𝑇𝑐𝑠𝑘,𝑐=
+𝑂𝑘, ∀𝑘∈K.
+• Step Allocation Consistency: For each request, the to-
+tal number of denoising steps allocated across confidence
+thresholds must match the total allocated across TP de-
+grees: Í
+𝑐∈C 𝑠𝑘,𝑐= Í
+𝑑∈D 𝑠𝑘,𝑑, ∀𝑘∈K.
+• SLO Satisfaction: For each request, the end-to-end latency
+of executing all denoising steps, under the selected TP
+degree and batch size, must not exceed its latency SLO:
+𝑡𝑘= Í
+𝑑∈D
+Í
+𝑏∈B 𝑧𝑑,𝑏𝐿𝑑,𝑏𝑠𝑘,𝑑≤𝑆𝐿𝑂𝑘, ∀𝑘∈K.
+• Batch Size Selection: All model instances of a given TP
+degree share a single batch size configuration. This is not
+a fundamental requirement of the system but a modeling
+simplification that keeps the optimization problem man-
+ageable: Í
+𝑏∈B 𝑧𝑑,𝑏= 1, ∀𝑑∈D.
+• Node GPU Capacity: For each node, the total GPU de-
+mand of all model instances placed on it must not exceed
+its GPU capacity: Í
+𝑑∈D 𝑥𝑛,𝑑𝑑≤|G𝑛|, ∀𝑛∈N.
+• System Stability: For each TP degree, the load assigned
+to it does not exceed its processing capacity. This ensures
+that the system remains stable with bounded queue growth,
+according to queueing theory [24]: Í
+𝑘∈K 𝑅𝑃𝑆𝑘𝑠𝑘,𝑑(𝑃𝑘+
+𝑂𝑘) ≤Í
+𝑏∈B 𝑧𝑑,𝑏𝑏
+
+1
+𝐿𝑑,𝑏
+Í
+𝑛∈N 𝑥𝑛,𝑑
+
+, ∀𝑑∈D.
+Stage 2: Minimal-Overhead Reconfiguration Planning
+The Stage-1 solution specifies a cluster configuration through
+the variables 𝑥𝑛,𝑑. Because all nodes are symmetric and there-
+fore interchangeable in a homogeneous cluster, only the
+total number of TP-𝑑model instances matters. Let 𝑅𝑑:=
+Í
+𝑛∈N 𝑥𝑛,𝑑denote the required number of TP-𝑑instances. If
+the current configuration already matches 𝑅𝑑for all 𝑑∈D,
+no reconfiguration is needed. Otherwise, we must terminate
+and launch model instances to reach the target configura-
+tion, and we solve a second ILP to determine the minimal-
+overhead reconfiguration plan.
+The objective of Stage 2 is to maximize the number of
+model instances that can be preserved (i.e., instances that
+continue using the same GPUs on the same node) while
+satisfying 𝑅𝑑. Preserving more instances directly reduces
+the number of terminations and launches required during
+the transition, which in turn limits the temporary reduction
+in available processing capacity during reconfiguration and
+minimizes the impact on service availability. The full ILP
+formulation for Stage 2 is presented in Section B.
+Practical Consideration To avoid frequent or unnecessary
+reconfiguration, the system triggers reconfiguration only
+when the Stage 1 proposal improves sufficiently over the
+current configuration (e.g., at least 10% improvement in the
+primary or secondary objective). Furthermore, to ensure
+robustness against short-term load fluctuations, the request-
+class RPS values used in the optimization include a safety
+buffer, making them slightly higher than the observed RPS.
+If a reconfiguration is deemed necessary, the system exe-
+cutes the plan generated by Stage 2 sequentially to prevent
+large temporary reductions in cluster processing capacity.
+New model instances are launched one at a time, and before
+8
+
+
+--- Page 9 ---
+each launch, only the minimum necessary set of old instances
+whose GPUs are required for that launch are terminated.
+3.4
+Supporting Approximate KV Caching
+With approximate KV caching, denoising steps split into two
+types: cache steps, which reuse previously computed keys
+and values, and recompute steps, which recompute the cache.
+Although DiLaServe’s core design remains effective, these
+two step types have substantially different computational
+costs and therefore require several adjustments to support
+approximate KV caching.
+Request Load, Cluster Capacity, and Predicted Time
+Left. Approximate KV caching makes denoising steps het-
+erogeneous: cache steps compute only the tokens inside the
+current cache block, while recompute steps process all to-
+kens in the sequence. Cache steps therefore incur a much
+lighter computational load and latency than recompute steps.
+To account for this heterogeneity, DiLaServe treats cache
+and recompute steps separately when estimating request
+load, cluster capacity, and remaining latency. For load con-
+trol (§3.2.2, Algorithm 2), the load of a request is computed
+as the combined load of its remaining cache and recompute
+steps, and cluster capacity is estimated using the correspond-
+ing block-level execution pattern. Similarly, when selecting
+the highest confidence threshold that still satisfies the SLO
+(§3.2.1, Algorithm 1), DiLaServe estimates the remaining la-
+tency as the sum of the latency of the remaining cache and
+recompute steps. The detailed load, capacity, and remaining-
+time estimation algorithms are provided in Section C.
+Migration Granularity. During request scheduling (§3.2.4,
+Algorithm 3), migrating a request during a cache step would
+require rebuilding its KV cache on the destination instance,
+effectively adding an additional recompute step. To avoid
+this overhead while still allowing migration for load balanc-
+ing, we permit migration only at recompute steps. At these
+steps, the KV cache must be rebuilt regardless of migration,
+so moving the request incurs no additional cost. We show in
+Table 6 of Section E that this reduces latency by up to 38%.
+Reconfiguration. In deriving the optimal cluster configura-
+tion (§3.3), instead of a single step variable𝑠and batch-size se-
+lector𝑧, we use recompute steps𝑠and cache steps𝑠′, together
+with batch-size choices 𝑧and 𝑧′ for recompute and cache
+steps, respectively. Most constraints remain unchanged af-
+ter substituting these variables. The primary modification is
+the System Stability constraint, which now accounts for the
+different computational costs of recompute and cache steps:
+Í
+𝑘𝑅𝑃𝑆𝑘
+h
+𝑠𝑘,𝑑(𝑃𝑘+ 𝑂𝑘) 𝛼𝑑+ 𝑠′
+𝑘,𝑑𝐵𝛽𝑑
+i
+≤Í
+𝑛𝑥𝑛,𝑑, ∀𝑑∈D.
+Here, 𝛼𝑑= Í
+𝑏𝑧𝑑,𝑏𝐿𝑑,𝑏/𝑏is the per-step cost of recompute
+steps and 𝛽𝑑= Í
+𝑏𝑧′
+𝑑,𝑏𝐿𝑑,𝑏/𝑏is the per-step cost of cache
+steps, and 𝐵denotes the cache block size.
+3.5
+Extensions
+In this section, we discuss several extensions that DiLaServe
+can support with minimal modification.
+Non-homogeneous SLOs Service providers may assign dif-
+ferent latency SLOs to different requests – for example, based
+on prompt/output length or service tier – rather than using a
+single global SLO. Supporting heterogeneous SLOs requires
+only minor changes to DiLaServe. For capacity estimation
+(Algorithm 2), one can use an average SLO across request
+classes, or a minimum SLO if prioritizing tighter-latency
+classes when estimating cluster capacity. In Stage 1 recon-
+figuration, each request class simply carries its own SLO.
+Importantly, the confidence-threshold selection and sched-
+uling logic already operates on a per-request basis and uses
+each request’s remaining SLO budget. Thus, these compo-
+nents naturally extend to the non-homogeneous SLO setting
+without modification.
+Request Priority Some deployments may prioritize certain
+requests, such as premium-tier users or quality-critical tasks,
+by ensuring they receive consistently higher generation qual-
+ity. When determining the allowed confidence thresholds for
+each request (Algorithm 2), priority can be incorporated by
+ordering requests so that high-priority ones are processed
+first, giving them the widest feasible range of confidence
+thresholds. In the extreme, the system may guarantee that
+high-priority requests always retain access to the full range
+of confidence thresholds, while lower-priority requests adapt
+to keep the overall load within system capacity.
+4
+Implementation
+DiLaServe is built on top of vLLM, with approximately 9,500
+lines of additional Python code. Model instances are launched
+as Ray [35] actors, and the Scheduler issues execution com-
+mands to them as Ray tasks. Each command contains the
+metadata required for a denoising step, including the request
+prompt and output length (if not already present), the set
+of tokens unmasked in the previous denoising step, and the
+selected confidence threshold.
+With multiple model instances running concurrently, the
+Scheduler executes an asynchronous event loop, making
+scheduling decisions whenever new requests arrive or when-
+ever any model instance completes a denoising step and
+returns control. The Workload Monitor continuously tracks
+workload statistics over a user-specified time window, and
+the Reconfigurator uses Gurobi [20] as the underlying solver
+to compute an updated cluster configuration periodically.
+To support approximate KV caching, FlashAttention [13]
+is configured to use full bidirectional attention without causal
+masking. KV caches are stored in GPU memory and rebuilt
+during recompute steps as needed.
+9
+
+
+--- Page 10 ---
+Avg
+P50
+P90
+P99
+Prompt Length
+140
+28
+344
+1698
+Output Length
+264
+224
+544
+928
+Table 2. ShareGPT statistics. Samples are filtered to exclude
+cases where prompt + output exceeds the models’ 4096-token
+limit. Output lengths are rounded up to the nearest multiple
+of 32 to match the denoising block size used for KV caching.
+Benchmark
+Domain Samples Prompt Len.
+GSM8K (5) [10]
+Math
+1,319
+1,020
+MMLU-Pro (0) [52] General
+12,032
+261
+MBPP (3) [37]
+Coding
+474
+737
+Table 3. Benchmarks used for evaluation. The number in
+parentheses denotes the number of few-shot examples.
+5
+Evaluation
+We evaluate DiLaServe on 16-GPU clusters using a real-world
+LLM serving trace and diverse accuracy benchmarks. The
+evaluation shows that DiLaServe improves SLO attainment
+by up to 56.6 percentage points and reduces the end-to-end
+latency by 46%, with less than 1% quality degradation com-
+pared to state-of-the-art serving systems that use a fixed
+confidence threshold.
+5.1
+Experimental Setup
+Compute Platforms Experiments were conducted on two
+clusters. Experiments in §5.2 and §5.4 were run on Cluster 1,
+while experiments in §5.3 were run on Cluster 2. Cluster 1
+consists of NVIDIA GH200 nodes. Each node contains four
+GH200 superchips, each equipped with one H100 GPU (96
+GB HBM3) and one Grace CPU (72 cores), for a total of 4
+GPUs, 288 CPU cores, 480 GB LPDDR5 system memory per
+node. Nodes are connected via a 200 Gbps interconnect. Clus-
+ter 2 consists of NVIDIA H100 nodes. Each node contains
+four H100 GPUs (96 GB HBM3), 96 vCPU cores, 1 TB DDR5
+memory. Nodes are connected via a 100 Gbps interconnect.
+Models We evaluate our system on LLaDA [36] and Dream [55],
+two of the largest open-source DLMs with 8 billion and 7
+billion parameters, respectively. Unless otherwise noted, we
+enable approximate KV caching with a denoising block size
+of 32 tokens and use a default confidence threshold of 0.9,
+following the configurations described in prior work [54].
+Benchmark and Workloads To evaluate DiLaServe in a
+realistic deployment setting, we use real-world LLM serving
+workloads derived from ShareGPT [49] and BurstGPT [51].
+The ShareGPT dataset provides real conversational prompts
+and outputs but lacks arrival timestamps. In contrast, Burst-
+GPT is a production LLM serving trace that contains request
+arrival timestamps but does not include prompts or outputs.
+We therefore combine the two: we use arrival timestamps
+from BurstGPT and sample prompt text and output lengths
+from ShareGPT (Table 2). BurstGPT contains two months of
+request arrivals. From this trace, we construct an “average-
+day profile” by averaging the requests-per-second (RPS) for
+each hour across the two months, which preserves the di-
+urnal pattern of the workload. Following prior work [41],
+we retain this shape but compress it into a 2-hour trace,
+where each 5-minute interval corresponds to one hour in the
+average-day profile. Within each 5-minute interval, arrivals
+are generated using a Poisson process with mean equal to
+the RPS of the corresponding hour. Finally, we scale the RPS
+(which peaks at 20) to match the capacity of our cluster. The
+final trace consists of 63,736 requests.
+For conversational workloads, there is no ground-truth an-
+swer for computing accuracy metrics. We therefore adopt an
+LLM-as-a-judge approach [30, 57]. We use a strong LLM,
+Llama-3.3-70B-Instruct, as the judge model. For each
+prompt-response pair, it produces a quality score from 0
+to 10. We report the average score across all requests as the
+generation-quality metric for a given serving system. The
+evaluation prompt for the judge is provided in Section D.
+We also evaluate DiLaServe using three standard accuracy
+benchmarks spanning different domains, as shown in Table 3.
+For each benchmark, we use the same few shot settings as in
+prior work [36, 54, 55] and set the output length to 256. For
+each sample in the benchmarks, we send a corresponding
+request to the serving system. Although MBPP is a relatively
+large coding benchmark, its size is still insufficient for gen-
+erating meaningful load at our cluster scale. To address this,
+we replicate each sample twice (three copies total) to create
+a request set large enough for load testing. Request arrivals
+follow a Poisson process [48, 59] with varying request rates.
+For each benchmark, by default we set the SLOs to 5× the
+average latency of a single request running in isolation on a
+TP-1 model instance, similar to prior work [22, 29, 46]. We
+also vary this SLO multiple to evaluate the system’s ability
+to operate under stricter latency budgets.
+Baselines To the best of our knowledge, DiLaServe is the
+first cluster-level serving system designed specifically for
+DLMs. We adapt two state-of-the-art model and LLM serving
+systems to support DLMs and use them as baselines. Both
+baseline systems use a fixed confidence threshold.
+• INFaaS [41]: INFaaS is a general, multi-instance ML model
+serving system. Upon request arrival, INFaaS dispatches
+the request to the least-loaded worker for load balancing.
+We adapt it for DLM serving by using the number of tokens
+– rather than the number of requests – as the measure of
+load, which better reflects the computational demand of
+language model workloads.
+• Llumnix [48]: Llumnix is a multi-instance serving system
+for autoregressive language models. It uses efficient migra-
+tion techniques to perform iteration-level load balancing
+while avoiding the eviction and preemption overheads
+10
+
+
+--- Page 11 ---
+0
+10
+20
+RPS
+0
+5
+10
+15
+# Instances
+TP-1
+TP-4
+0.6
+0.7
+0.8
+0.9
+Conf.
+Max Confidence Threshold
+Confidence Threshold Used
+0
+20
+40
+60
+80
+100
+120
+Time (min)
+0
+25
+50
+75
+100
+SLO (%)
+INFaaS
+Llumnix
+DiLaServe
+Figure 8. RPS of the trace, DiLaServe’s cluster configuration
+and confidence threshold, and SLO attainment over time for
+all three systems on the real-world trace.
+System
+SLO
+Score
+Avg. Latency (s)
+Attain.
+Overall Low-load High-load
+DiLaServe 91.13%
+6.80
+5.75
+2.26
+6.33
+Llumnix
+60.98%
+6.89
+10.64
+3.23
+11.30
+INFaaS
+70.03%
+6.89
+8.80
+2.71
+9.34
+Table 4. Experimental results on the real-world trace. “Score”
+denotes the average evaluation score generated by the LLM
+judge. The low-load period corresponds to minutes 0 – 45,
+and the high-load period corresponds to minutes 45 – 120.
+caused by growing KV-cache memory. For DLMs, the out-
+put length (and thus the KV-cache size) is user-specified
+and known in advance, so this issue does not arise; however,
+Llumnix’s fine-grained load-balancing approach remains
+relevant. We adapt Llumnix for DLMs by restricting migra-
+tion to only happen at recompute steps, which avoids the
+high overhead of recomputing KV-cache.
+5.2
+Real-World Workload
+To validate DiLaServe’s effectiveness in a realistic deploy-
+ment setting, we evaluate it by serving LLaDA using a trace
+constructed from the real-world ShareGPT and BurstGPT
+datasets on a 16-GPU cluster. As shown in the top figure of
+Figure 8, the request load fluctuates over time, reflecting the
+diurnal pattern and the bursty nature of service usage. This
+allows us to evaluate the effectiveness of DiLaServe’s recon-
+figuration mechanism in responding to changing workload
+patterns. Since INFaaS and Llumnix do not support reconfig-
+uration, we run both baselines with a fixed configuration of
+16 TP-1 workers, which maximizes throughput and is best
+suited for handling peak loads. The generated response for
+each request is evaluated by the LLM judge on a scale of 0
+to 10, with higher scores indicating better response quality.
+The evaluation results are shown in Table 4. DiLaServe
+achieves 21.1 percentage points and 30.2 percentage points
+higher SLO attainment and 34.7% and 46.0% lower latency,
+with only a 0.09-point drop in quality score compared to
+INFaaS and Llumnix, respectively. Figure 8 shows that Di-
+LaServe adapts both the cluster configuration and the maxi-
+mum confidence threshold in response to fluctuating work-
+load. At lower loads, requests can be served comfortably at
+the highest confidence threshold, and DiLaServe selects con-
+figurations with higher TP-degree model instances to reduce
+latency, yielding 16.6% and 30.0% lower latency compared
+to INFaaS and Llumnix, respectively. As the load increases,
+DiLaServe reconfigures to use more low TP-degree model
+instances for higher throughput, while lowering the maxi-
+mum confidence threshold to keep effective load manageable.
+Under high load, more requests risk violating their latency
+SLOs, so they are assigned lower confidence thresholds to re-
+duce the number of required denoising steps. Together, these
+adaptations lower the average confidence threshold during
+high-load periods and allow DiLaServe to maintain low la-
+tency and thus high SLO attainment, while the baselines
+suffer from significant queueing delays and increased load
+per model instance, leading to higher latency and significant
+drop in SLO attainment. In the high-load period, DiLaServe
+achieves 32.2% and 44.0% lower latency compared to INFaaS
+and Llumnix, respectively.
+5.3
+Accuracy Benchmarks
+To further evaluate DiLaServe’s ability to maintain high SLO
+attainment while preserving accuracy, we evaluate it by serv-
+ing LLaDA and Dream on three accuracy benchmarks span-
+ning different application domains – GSM8K [10] for math,
+MMLU-Pro [52] for general understanding, and MBPP [37]
+for coding. To ensure a fair comparison with the baselines,
+all three systems are run with a fixed cluster configuration
+of 16 TP-1 workers and no reconfiguration, allowing us to
+assess their scheduling effectiveness under high request load.
+Figure 9 shows the experimental results. As the request
+rate increases, request latency grows due to longer queue-
+ing delays and increased load per model instance, causing
+more requests to violate their SLOs. By dynamically adjust-
+ing the confidence threshold, DiLaServe effectively balances
+the trade-off between speed and quality, leading to consis-
+tently better serving performance across request rate and
+benchmarks. Under high request rates, DiLaServe achieves
+up to 55 percentage points higher SLO attainment with only
+a 0.7% accuracy drop compared to INFaaS, and 56.6 percent-
+age points higher SLO attainment with only a 0.9% accuracy
+drop compared to Llumnix.
+We also vary the SLO to evaluate each system’s ability
+to maintain performance under a fixed RPS but tighter la-
+tency requirements. DiLaServe consistently achieves higher
+11
+
+
+--- Page 12 ---
+0
+25
+50
+75
+100
+SLO (%)
+0
+25
+50
+75
+100
+0
+25
+50
+75
+100
+1.6
+1.8
+75
+76
+77
+78
+Acc. (%)
+5x
+4x
+3x
+2x
+1.0
+1.2
+1.4
+33
+34
+35
+36
+5x
+4x
+3x
+2.3
+2.5
+2.7
+30
+31
+32
+33
+5x
+4x
+3x
+2x
+0
+25
+50
+75
+100
+SLO (%)
+0
+25
+50
+75
+100
+0
+25
+50
+75
+100
+1.7
+1.8
+1.9
+RPS per GPU
+69
+70
+71
+72
+Acc. (%)
+5x
+4x
+3x
+2x
+SLO Multiple
+1.7
+1.9
+RPS per GPU
+33
+34
+35
+36
+5x
+4x
+3x
+2x
+SLO Multiple
+1.9
+2.1
+2.3
+RPS per GPU
+35
+36
+37
+38
+5x
+4x
+3x
+SLO Multiple
+GSM8K
+MMLU-Pro
+MBPP
+LLaDA
+Dream
+DiLaServe
+Llumnix
+INFaaS
+Figure 9. Experimental results for serving LLaDA (top) and Dream (bottom) on the three accuracy benchmarks.
+1.88
+2
+2.12 2.25
+RPS per GPU
+0
+25
+50
+75
+100
+SLO Attain. (%)
+1.88
+2
+2.12 2.25
+RPS per GPU
+70
+72
+74
+76
+78
+Accuracy (%)
+Fixed thresh.
+Dynamic thresh.
+Dynamic thresh.
++ Load control
+Figure 10. Confidence threshold control ablation serving
+LLaDA with GSM8K.
+SLO attainment as the SLO becomes stricter. In the mod-
+erately tight SLO regime (≥3×), DiLaServe achieves up to
+33.9 percentage points higher SLO attainment with only a
+0.1% accuracy drop compared to INFaaS, and 42.3 percent-
+age points higher SLO attainment with only a 0.1% accuracy
+drop compared to Llumnix. Under extremely tight SLOs, Di-
+LaServe can further trade off quality for latency, allowing it
+to maintain higher SLO attainment.
+5.4
+Ablation Studies
+Confidence Threshold Control. Figure 10 shows an ab-
+lation of DiLaServe’s confidence-threshold control serving
+GSM8K requests with LLaDA. Compared to the fixed-threshold
+baseline, enabling SLO-aware dynamic threshold adjustment
+(§3.2.1) substantially improves SLO attainment across in all
+settings, by up to 70.8 percentage points, while incurring at
+most a 1.9% drop in accuracy. Incorporating aggregate-load-
+aware system-wide control (§3.2.2) further improves SLO
+attainment by up to 42.4 percentage points over dynamic
+threshold adjustment alone, while changing accuracy by at
+most 1.7%. These results show that dynamically adjusting
+thresholds based on per-request SLOs significantly improves
+0
+8
+16
+Peak RPS 2
+Peak RPS 6
+0
+30
+60
+90
+120
+0
+8
+16
+Peak RPS 4
+0
+30
+60
+90
+120
+Peak RPS 8
+0
+30
+60
+90
+120
+RPS
+Num Instances
+Time (min)
+TP-1
+TP-2
+TP-4
+Figure 11. Derived cluster configuration over time under
+different peak RPS of the real-world workload.
+SLO attainment, and that adding system-wide load control
+provides additional gains by preventing the aggregate work-
+load from exceeding cluster capacity under higher load.
+Reconfiguration. Figure 11 evaluates DiLaServe’s reconfig-
+uration scheme under different load levels. In §5.2, we scale
+the real-world trace so that its peak RPS matches the capac-
+ity of our 16-GPU cluster. Here, we vary that peak RPS and
+simulate feeding the resulting trace into the Workload Mon-
+itor, while the Reconfigurator periodically uses the collected
+workload statistics to compute a new cluster configuration.
+The results show that the derived configurations adapt to
+both the overall load level and the temporal fluctuation in
+RPS. At low load, the reconfigurator favors fewer high-TP
+instances, which provide lower per-request latency. As the
+peak RPS increases, it shifts toward more low-TP instances
+to increase throughput and maintain SLO satisfaction under
+heavier demand. Across all settings, the chosen configura-
+tion also changes over time to track the changing request
+12
+
+
+--- Page 13 ---
+0
+25
+50
+75
+100
+SLO (%)
+2-shot
+8-shot
+Output 64
+Output 1024
+2.0
+2.5
+3.0
+60
+65
+70
+75
+80
+Acc (%)
+0.5
+1.0
+1.5 5.5
+6.0
+6.5
+0.40
+0.45
+RPS per GPU
+DiLaServe
+INFaaS
+Figure 12. Input and output length ablation. For the input
+length ablation (left two columns), output length is fixed
+to 256. For the output length ablation (right two columns),
+number of few-shot examples is fixed to 5.
+rate in the underlying trace.
+Input and Output Length. Figure 12 shows DiLaServe
+serving GSM8K requests with LLaDA under varying input
+lengths (number of few-shot examples) and output lengths.
+Across all settings, DiLaServe consistently outperforms the
+fixed-threshold baseline (INFaaS) in SLO attainment regard-
+less of input or output length. For varying input length, it
+improves SLO attainment by up to 81.0 percentage points
+with at most a 1.0% accuracy drop. For varying output length,
+DiLaServe improves SLO attainment by up to 82.3 percent-
+age points while incurring at most a 0.8% accuracy drop.
+These results show that DiLaServe remains effective across
+a wide range of request sizes.
+6
+Related Work
+Model Serving There has been a long line of work for
+ML model serving, from general DNN serving [3, 11, 18,
+19, 29, 41, 44, 56], to more specialized systems tailored for
+LLM [22, 25, 40, 46–48, 59, 62] and diffusion image mod-
+els [2, 4, 27]. DiLaServe draws inspiration from these works
+on exploiting execution predictability [18, 56], request sched-
+uling [41, 48], dynamic cluster reconfiguration [8, 33] to
+design a high throughput language model serving system
+tailored for the unique characteristics of DLMs.
+Speed-Quality Tradeoff The speed-quality trade-off is
+widely exploited across systems, including index search [34],
+video streaming [15], and online advertising [1]. In model
+serving, systems such as Apparate [12] and 𝐸3 [39] focus on
+this trade-off with early-exit DNN models, while Clipper [11],
+Proteus [3], and Sommelier [19] select among models to bal-
+ance accuracy and efficiency. DiLaServe adopts a similar
+principle but departs from these prior work by controlling
+the speed-quality trade-off within a single model’s execution,
+enabling high throughput and improved SLO attainment.
+7
+Conclusion
+We presented DiLaServe, a cluster-level serving system for
+diffusion language models that achieves high throughput
+while meeting strict latency SLOs. DiLaServe dynamically
+adjusts the confidence threshold used during denoising for
+both aggregate load control and deadline-aware adaptation.
+It further adapts the cluster configuration to changing work-
+loads and supports approximate KV caching. Our evaluation
+shows that DiLaServe improves SLO attainment by up to
+56.6 percentage points with only 0.9% quality degradation
+across diverse benchmarks and real-world workload.
+References
+[1] Deepak Agarwal, Bo Long, Jonathan Traupman, Doris Xin, and
+Liang Zhang. 2014. LASER: a scalable response prediction platform
+for online advertising. In Proceedings of the 7th ACM International
+Conference on Web Search and Data Mining (New York, New York,
+USA) (WSDM ’14). Association for Computing Machinery, New York,
+NY, USA, 173–182. doi:10.1145/2556195.2556252
+[2] Shubham Agarwal, Subrata Mitra, Sarthak Chakraborty, Srikrishna
+Karanam, Koyel Mukherjee, and Shiv Kumar Saini. 2024. Approxi-
+mate caching for efficiently serving text-to-image diffusion models. In
+Proceedings of the 21st USENIX Symposium on Networked Systems
+Design and Implementation (Santa Clara, CA, USA) (NSDI’24).
+USENIX Association, USA, Article 65, 17 pages.
+[3] Sohaib Ahmad, Hui Guan, Brian D. Friedman, Thomas Williams,
+Ramesh K. Sitaraman, and Thomas Woo. 2024.
+Proteus: A
+High-Throughput Inference-Serving System with Accuracy Scal-
+ing. In Proceedings of the 29th ACM International Conference on
+Architectural Support for Programming Languages and Operating
+Systems, Volume 1 (La Jolla, CA, USA) (ASPLOS ’24). Association for
+Computing Machinery, New York, NY, USA, 318–334. doi:10.1145/
+3617232.3624849
+[4] Sohaib Ahmad, Qizheng Yang, Haoliang Wang, Ramesh K. Sitaraman,
+and Hui Guan. 2025. DiffServe: Efficiently Serving Text-to-Image Diffu-
+sion Models with Query-Aware Model Scaling. In Eighth Conference
+on Machine Learning and Systems. https://openreview.net/forum?
+id=1N3ShLfcTf
+[5] Anthropic. 2025. Claude Code. https://claude.com/product/claude-
+code. Accessed: 2025-12-10.
+[6] Jacob Austin, Daniel D. Johnson, Jonathan Ho, Daniel Tarlow, and
+Rianne van den Berg. 2021.
+Structured denoising diffusion mod-
+els in discrete state-spaces. In Proceedings of the 35th International
+Conference on Neural Information Processing Systems (NIPS ’21).
+Curran Associates Inc., Red Hook, NY, USA, Article 1376, 13 pages.
+[7] Lukas Berglund, Meg Tong, Maximilian Kaufmann, Mikita Balesni,
+Asa Cooper Stickland, Tomasz Korbak, and Owain Evans. 2024. The
+Reversal Curse: LLMs trained on “A is B” fail to learn “B is A”. In
+The Twelfth International Conference on Learning Representations.
+https://openreview.net/forum?id=GPKTIktA0k
+[8] Tzu-Tao Chang and Shivaram Venkataraman. 2025. Eva: Cost-Efficient
+Cloud-Based Cluster Scheduling. In Proceedings of the Twentieth
+European Conference on Computer Systems (Rotterdam, Nether-
+lands) (EuroSys ’25). Association for Computing Machinery, New York,
+NY, USA, 1399–1416. doi:10.1145/3689031.3717483
+[9] Shuang Cheng, Yihan Bian, Dawei Liu, Linfeng Zhang, Qian Yao,
+Zhongbo Tian, Wenhai Wang, Qipeng Guo, Kai Chen, Biqing Qi, and
+Bowen Zhou. 2025. SDAR: A Synergistic Diffusion-AutoRegression
+Paradigm for Scalable Sequence Generation. arXiv:2510.06303 [cs.LG]
+https://arxiv.org/abs/2510.06303
+13
+
+
+--- Page 14 ---
+[10] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Hee-
+woo Jun, Lukasz Kaiser, Matthias Plappert, Jerry Tworek, Jacob Hilton,
+Reiichiro Nakano, Christopher Hesse, and John Schulman. 2021. Train-
+ing Verifiers to Solve Math Word Problems. arXiv:2110.14168 [cs.LG]
+https://arxiv.org/abs/2110.14168
+[11] Daniel Crankshaw, Xin Wang, Guilio Zhou, Michael J. Franklin,
+Joseph E. Gonzalez, and Ion Stoica. 2017. Clipper: A Low-Latency
+Online Prediction Serving System. In 14th USENIX Symposium
+on Networked Systems Design and Implementation (NSDI 17).
+USENIX Association, Boston, MA, 613–627. https://www.usenix.org/
+conference/nsdi17/technical-sessions/presentation/crankshaw
+[12] Yinwei Dai, Rui Pan, Anand Iyer, Kai Li, and Ravi Netravali. 2024. Ap-
+parate: Rethinking Early Exits to Tame Latency-Throughput Tensions
+in ML Serving. In Proceedings of the ACM SIGOPS 30th Symposium
+on Operating Systems Principles (Austin, TX, USA) (SOSP ’24). As-
+sociation for Computing Machinery, New York, NY, USA, 607–623.
+doi:10.1145/3694715.3695963
+[13] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher
+Ré. 2022. FLASHATTENTION: fast and memory-efficient exact at-
+tention with IO-awareness. In Proceedings of the 36th International
+Conference on Neural Information Processing Systems (New Orleans,
+LA, USA) (NIPS ’22). Curran Associates Inc., Red Hook, NY, USA, Ar-
+ticle 1189, 16 pages.
+[14] Jerome H Friedman. 2001. Greedy function approximation: a gradient
+boosting machine. Annals of statistics (2001), 1189–1232.
+[15] Aditya Ganjam, Faisal Siddiqui, Jibin Zhan, Xi Liu, Ion Stoica, Junchen
+Jiang, Vyas Sekar, and Hui Zhang. 2015. C3: Internet-Scale Control
+Plane for Video Quality Optimization. In 12th USENIX Symposium
+on Networked Systems Design and Implementation (NSDI 15).
+USENIX Association, Oakland, CA, 131–144.
+https://www.usenix.
+org/conference/nsdi15/technical-sessions/presentation/ganjam
+[16] Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia, Jinliu Pan, Yuxi
+Bi, Yixin Dai, Jiawei Sun, Haofen Wang, and Haofen Wang. 2023.
+Retrieval-augmented generation for large language models: A survey.
+arXiv preprint arXiv:2312.10997 2, 1 (2023).
+[17] Google DeepMind. 2025. Gemini Diffusion. https://deepmind.google/
+models/gemini-diffusion/. [text diffusion model].
+[18] Arpan Gujarati, Reza Karimi, Safya Alzayat, Wei Hao, Antoine
+Kaufmann, Ymir Vigfusson, and Jonathan Mace. 2020.
+Serving
+DNNs like Clockwork: Performance Predictability from the Bottom
+Up. In 14th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 20). USENIX Association, 443–462.
+https:
+//www.usenix.org/conference/osdi20/presentation/gujarati
+[19] Peizhen Guo, Bo Hu, and Wenjun Hu. 2022.
+Sommelier: Cu-
+rating DNN Models for the Masses. In Proceedings of the 2022
+International Conference on Management of Data (Philadelphia, PA,
+USA) (SIGMOD ’22). Association for Computing Machinery, New
+York, NY, USA, 1876–1890. doi:10.1145/3514221.3526173
+[20] Gurobi Optimization, LLC. 2025. Gurobi Optimizer Reference Manual.
+https://www.gurobi.com
+[21] Zhengfu He, Tianxiang Sun, Qiong Tang, Kuanning Wang, Xuanjing
+Huang, and Xipeng Qiu. 2023. DiffusionBERT: Improving Genera-
+tive Masked Language Models with Diffusion Models. In Proceedings
+of the 61st Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), Anna Rogers, Jordan Boyd-
+Graber, and Naoaki Okazaki (Eds.). Association for Computational
+Linguistics, Toronto, Canada, 4521–4534. doi:10.18653/v1/2023.acl-
+long.248
+[22] Ke Hong, Xiuhong Li, Lufang Chen, Qiuli Mao, Guohao Dai, Xuefei
+Ning, Shengen Yan, Yun Liang, and Yu Wang. 2025. SOLA: Optimizing
+SLO Attainment for Large Language Model Serving with State-Aware
+Scheduling. In Eighth Conference on Machine Learning and Systems.
+https://openreview.net/forum?id=ubIvpetAd6
+[23] Junhao Hu, Jiang Xu, Zhixia Liu, Yulong He, Yuetao Chen, Hao
+Xu, Jiang Liu, Jie Meng, Baoquan Zhang, Shining Wan, Gengyuan
+Dan, Zhiyu Dong, Zhihao Ren, Changhong Liu, Tao Xie, Dayun Lin,
+Qin Zhang, Yue Yu, Hao Feng, Xusheng Chen, and Yizhou Shan.
+2025. DEEPSERVE: serverless large language model serving at scale.
+In Proceedings of the 2025 USENIX Conference on Usenix Annual
+Technical Conference (Boston, MA, USA) (USENIX ATC ’25). USENIX
+Association, USA, Article 4, 16 pages.
+[24] Leonard Kleinrock. 1975.
+Theory, Volume 1, Queueing Systems.
+Wiley-Interscience, USA.
+[25] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica.
+2023.
+Efficient Memory Management for Large Language Model
+Serving with PagedAttention. In Proceedings of the 29th Symposium
+on Operating Systems Principles (Koblenz, Germany) (SOSP ’23). As-
+sociation for Computing Machinery, New York, NY, USA, 611–626.
+doi:10.1145/3600006.3613165
+[26] Inception Labs, Samar Khanna, Siddhant Kharbanda, Shufan Li,
+Harshit Varma, Eric Wang, Sawyer Birnbaum, Ziyang Luo, Yanis Mi-
+raoui, Akash Palrecha, Stefano Ermon, Aditya Grover, and Volodymyr
+Kuleshov. 2025. Mercury: Ultra-Fast Language Models Based on Dif-
+fusion. arXiv:2506.17298 [cs.CL] https://arxiv.org/abs/2506.17298
+[27] Suyi Li, Lingyun Yang, Xiaoxiao Jiang, Hanfeng Lu, Dakai An, Zhipeng
+Di, Weiyi Lu, Jiawei Chen, Kan Liu, Yinghao Yu, Tao Lan, Guodong
+Yang, Lin Qu, Liping Zhang, and Wei Wang. 2025.
+KATZ: effi-
+cient workflow serving for diffusion models with many adapters.
+In Proceedings of the 2025 USENIX Conference on Usenix Annual
+Technical Conference (Boston, MA, USA) (USENIX ATC ’25). USENIX
+Association, USA, Article 61, 16 pages.
+[28] Tianyi Li, Mingda Chen, Bowei Guo, and Zhiqiang Shen. 2025. A
+Survey on Diffusion Language Models. arXiv:2508.10875 [cs.CL] https:
+//arxiv.org/abs/2508.10875
+[29] Zhuohan Li, Lianmin Zheng, Yinmin Zhong, Vincent Liu, Ying Sheng,
+Xin Jin, Yanping Huang, Zhifeng Chen, Hao Zhang, Joseph E. Gon-
+zalez, and Ion Stoica. 2023.
+AlpaServe: Statistical Multiplexing
+with Model Parallelism for Deep Learning Serving. In 17th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI
+23). USENIX Association, Boston, MA, 663–679. https://www.usenix.
+org/conference/osdi23/presentation/li-zhouhan
+[30] Yen-Ting Lin and Yun-Nung Chen. 2023. LLM-Eval: Unified Multi-
+Dimensional Automatic Evaluation for Open-Domain Conversations
+with Large Language Models. In Proceedings of the 5th Workshop on
+NLP for Conversational AI (NLP4ConvAI 2023), Yun-Nung Chen and
+Abhinav Rastogi (Eds.). Association for Computational Linguistics,
+Toronto, Canada, 47–58. doi:10.18653/v1/2023.nlp4convai-1.5
+[31] Zhiyuan Liu, Yicun Yang, Yaojie Zhang, Junjie Chen, Chang Zou,
+Qingyuan Wei, Shaobo Wang, and Linfeng Zhang. 2025. dLLM-Cache:
+Accelerating Diffusion Large Language Models with Adaptive Caching.
+arXiv:2506.06295 [cs.LG] https://arxiv.org/abs/2506.06295
+[32] Aaron Lou, Chenlin Meng, and Stefano Ermon. 2024.
+Discrete
+diffusion modeling by estimating the ratios of the data distri-
+bution. In Proceedings of the 41st International Conference on
+Machine Learning (Vienna, Austria) (ICML’24). JMLR.org, Article
+1333, 30 pages.
+[33] Jayashree Mohan, Amar Phanishayee, Janardhan Kulkarni, and Vijay
+Chidambaram. 2022. Looking Beyond GPUs for DNN Scheduling
+on Multi-Tenant Clusters. In 16th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI 22). USENIX Association,
+Carlsbad, CA, 579–596. https://www.usenix.org/conference/osdi22/
+presentation/mohan
+[34] Jason Mohoney, Devesh Sarda, Mengze Tang, Shihabur Rahman
+Chowdhury, Anil Pacaci, Ihab F. Ilyas, Theodoros Rekatsinas, and
+Shivaram Venkataraman. 2025. Quake: adaptive indexing for vector
+search. In Proceedings of the 19th USENIX Conference on Operating
+14
+
+
+--- Page 15 ---
+Systems Design and Implementation (Boston, MA, USA) (OSDI ’25).
+USENIX Association, USA, Article 9, 17 pages.
+[35] Philipp Moritz, Robert Nishihara, Stephanie Wang, Alexey Tu-
+manov, Richard Liaw, Eric Liang, Melih Elibol, Zongheng Yang,
+William Paul, Michael I. Jordan, and Ion Stoica. 2018. Ray: A Dis-
+tributed Framework for Emerging AI Applications. In 13th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI
+18). USENIX Association, Carlsbad, CA, 561–577. https://www.usenix.
+org/conference/osdi18/presentation/moritz
+[36] Shen Nie, Fengqi Zhu, Zebin You, Xiaolu Zhang, Jingyang Ou, Jun Hu,
+Jun Zhou, Yankai Lin, Ji-Rong Wen, and Chongxuan Li. 2025. Large
+Language Diffusion Models. arXiv preprint arXiv:2502.09992 (2025).
+[37] Augustus Odena, Charles Sutton, David Martin Dohan, Ellen Jiang,
+Henryk Michalewski, Jacob Austin, Maarten Paul Bosma, Maxwell
+Nye, Michael Terry, and Quoc V. Le. 2021. Program Synthesis with
+Large Language Models. In n/a. n/a, n/a. n/a.
+[38] OpenAI. 2024. GPT-4 Technical Report. arXiv (2024). https://arxiv.
+org/abs/2303.08774
+[39] Anand Padmanabha Iyer, Mingyu Guan, Yinwei Dai, Rui Pan, Swapnil
+Gandhi, and Ravi Netravali. 2024. Improving DNN Inference Through-
+put Using Practical, Per-Input Compute Adaptation. In Proceedings of
+the ACM SIGOPS 30th Symposium on Operating Systems Principles
+(Austin, TX, USA) (SOSP ’24). Association for Computing Machinery,
+New York, NY, USA, 624–639. doi:10.1145/3694715.3695978
+[40] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo
+Goiri, Saeed Maleki, and Ricardo Bianchini. 2024. Splitwise: Efficient
+Generative LLM Inference Using Phase Splitting. In 2024 ACM/IEEE
+51st Annual International Symposium on Computer Architecture
+(ISCA). 118–132. doi:10.1109/ISCA59077.2024.00019
+[41] Francisco Romero, Qian Li, Neeraja J. Yadwadkar, and Christos
+Kozyrakis. 2021. INFaaS: Automated Model-less Inference Serving.
+In 2021 USENIX Annual Technical Conference (USENIX ATC 21).
+USENIX Association, 397–411. https://www.usenix.org/conference/
+atc21/presentation/romero
+[42] Emma Roth. 2025. OpenAI says ChatGPT users send over 2.5 billion
+prompts every day. The Verge (2025). https://www.theverge.com/
+news/710867/openai-chatgpt-daily-prompts-2-billion Accessed: 2025-
+12-10.
+[43] Subham Sekhar Sahoo, Marianne Arriola, Aaron Gokaslan, Edgar Mar-
+iano Marroquin, Alexander M Rush, Yair Schiff, Justin T Chiu, and
+Volodymyr Kuleshov. 2024. Simple and Effective Masked Diffusion
+Language Models. In The Thirty-eighth Annual Conference on Neural
+Information Processing Systems. https://openreview.net/forum?id=
+L4uaAR4ArM
+[44] Haichen Shen, Lequn Chen, Yuchen Jin, Liangyu Zhao, Bingyu Kong,
+Matthai Philipose, Arvind Krishnamurthy, and Ravi Sundaram. 2019.
+Nexus: a GPU cluster engine for accelerating DNN-based video
+analysis. In Proceedings of the 27th ACM Symposium on Operating
+Systems Principles (Huntsville, Ontario, Canada) (SOSP ’19). Asso-
+ciation for Computing Machinery, New York, NY, USA, 322–337.
+doi:10.1145/3341301.3359658
+[45] Yuxuan Song, Zheng Zhang, Cheng Luo, Pengyang Gao, Fan Xia,
+Hao Luo, Zheng Li, Yuehang Yang, Hongli Yu, Xingwei Qu, Yuwei
+Fu, Jing Su, Ge Zhang, Wenhao Huang, Mingxuan Wang, Lin Yan,
+Xiaoying Jia, Jingjing Liu, Wei-Ying Ma, Ya-Qin Zhang, Yonghui Wu,
+and Hao Zhou. 2025. Seed Diffusion: A Large-Scale Diffusion Language
+Model with High-Speed Inference. arXiv:2508.02193 [cs.CL] https:
+//arxiv.org/abs/2508.02193
+[46] Jovan Stojkovic, Chaojie Zhang, Íñigo Goiri, Josep Torrellas, and Esha
+Choukse. 2025. DynamoLLM: Designing LLM Inference Clusters
+for Performance and Energy Efficiency. In 2025 IEEE International
+Symposium on High Performance Computer Architecture (HPCA).
+1348–1362. doi:10.1109/HPCA61900.2025.00102
+[47] Foteini Strati, Sara Mcallister, Amar Phanishayee, Jakub Tar-
+nawski, and Ana Klimovic. 2024. DéjàVu: KV-cache Streaming for
+Fast, Fault-tolerant Generative LLM Serving. In Proceedings
+of
+the
+41st
+International
+Conference
+on
+Machine
+Learning
+(Proceedings of Machine Learning Research,
+Vol.
+235),
+Ruslan
+Salakhutdinov, Zico Kolter, Katherine Heller, Adrian Weller, Nuria
+Oliver, Jonathan Scarlett, and Felix Berkenkamp (Eds.). PMLR,
+46745–46771. https://proceedings.mlr.press/v235/strati24a.html
+[48] Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao, Xinyi Zhang,
+Yong Li, and Wei Lin. 2024. Llumnix: dynamic scheduling for large lan-
+guage model serving. In Proceedings of the 18th USENIX Conference
+on Operating Systems Design and Implementation (Santa Clara, CA,
+USA) (OSDI’24). USENIX Association, USA, Article 10, 19 pages.
+[49] ShareGPT Team. [n. d.]. ShareGPT. https://sharegpt.com/.
+[50] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-
+Anne Lachaux, Timothée Lacroix, Baptiste Rozière, Naman Goyal, Eric
+Hambro, Faisal Azhar, Aurelien Rodriguez, Armand Joulin, Edouard
+Grave, and Guillaume Lample. 2023. LLaMA: Open and Efficient
+Foundation Language Models. arXiv:2302.13971 [cs.CL] https://arxiv.
+org/abs/2302.13971
+[51] Yuxin Wang, Yuhan Chen, Zeyu Li, Xueze Kang, Yuchu Fang, Yeju
+Zhou, Yang Zheng, Zhenheng Tang, Xin He, Rui Guo, Xin Wang,
+Qiang Wang, Amelie Chi Zhou, and Xiaowen Chu. 2025. BurstGPT:
+A Real-World Workload Dataset to Optimize LLM Serving Systems
+(KDD ’25). Association for Computing Machinery, New York, NY, USA,
+5831–5841. doi:10.1145/3711896.3737413
+[52] Yubo Wang, Xueguang Ma, Ge Zhang, Yuansheng Ni, Abhranil Chan-
+dra, Shiguang Guo, Weiming Ren, Aaran Arulraj, Xuan He, Ziyan
+Jiang, Tianle Li, Max Ku, Kai Wang, Alex Zhuang, Rongqi Fan, Xiang
+Yue, and Wenhu Chen. 2024. MMLU-Pro: a more robust and challeng-
+ing multi-task language understanding benchmark. In Proceedings of
+the 38th International Conference on Neural Information Processing
+Systems (Vancouver, BC, Canada) (NIPS ’24). Curran Associates Inc.,
+Red Hook, NY, USA, Article 3018, 25 pages.
+[53] Chengyue Wu, Hao Zhang, Shuchen Xue, Shizhe Diao, Yonggan Fu,
+Zhijian Liu, Pavlo Molchanov, Ping Luo, Song Han, and Enze Xie. 2025.
+Fast-dLLM v2: Efficient Block-Diffusion LLM. arXiv:2509.26328 [cs.CL]
+https://arxiv.org/abs/2509.26328
+[54] Chengyue Wu, Hao Zhang, Shuchen Xue, Zhijian Liu, Shizhe Diao,
+Ligeng Zhu, Ping Luo, Song Han, and Enze Xie. 2025. Fast-dLLM:
+Training-free Acceleration of Diffusion LLM by Enabling KV Cache
+and Parallel Decoding. arXiv:2505.22618 [cs.CL] https://arxiv.org/abs/
+2505.22618
+[55] Jiacheng Ye, Zhihui Xie, Lin Zheng, Jiahui Gao, Zirui Wu, Xin Jiang,
+Zhenguo Li, and Lingpeng Kong. 2025. Dream 7B: Diffusion Large
+Language Models. arXiv preprint arXiv:2508.15487 (2025).
+[56] Hong Zhang, Yupeng Tang, Anurag Khandelwal, and Ion Stoica.
+2023.
+SHEPHERD: Serving DNNs in the Wild. In 20th USENIX
+Symposium on Networked Systems Design and Implementation
+(NSDI 23). USENIX Association, Boston, MA, 787–808. https://www.
+usenix.org/conference/nsdi23/presentation/zhang-hong
+[57] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhang-
+hao Wu, Yonghao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric P.
+Xing, Hao Zhang, Joseph E. Gonzalez, and Ion Stoica. 2023. Judging
+LLM-as-a-judge with MT-bench and Chatbot Arena. In Proceedings of
+the 37th International Conference on Neural Information Processing
+Systems (New Orleans, LA, USA) (NIPS ’23). Curran Associates Inc.,
+Red Hook, NY, USA, Article 2020, 29 pages.
+[58] Yuxiang Zheng, Dayuan Fu, Xiangkun Hu, Xiaojie Cai, Lyuman-
+shan Ye, Pengrui Lu, and Pengfei Liu. 2025. DeepResearcher: Scal-
+ing Deep Research via Reinforcement Learning in Real-world En-
+vironments. In Proceedings of the 2025 Conference on Empirical
+15
+
+
+--- Page 16 ---
+Methods in Natural Language Processing, Christos Christodoulopou-
+los, Tanmoy Chakraborty, Carolyn Rose, and Violet Peng (Eds.). As-
+sociation for Computational Linguistics, Suzhou, China, 414–431.
+doi:10.18653/v1/2025.emnlp-main.22
+[59] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu,
+Xuanzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: disaggre-
+gating prefill and decoding for goodput-optimized large language
+model serving. In Proceedings of the 18th USENIX Conference on
+Operating Systems Design and Implementation (Santa Clara, CA,
+USA) (OSDI’24). USENIX Association, USA, Article 11, 18 pages.
+[60] Fengqi Zhu, Rongzhen Wang, Shen Nie, Xiaolu Zhang, Chunwei Wu,
+Jun Hu, Jun Zhou, Jianfei Chen, Yankai Lin, Ji-Rong Wen, and Chongx-
+uan Li. 2025. LLaDA 1.5: Variance-Reduced Preference Optimiza-
+tion for Large Language Diffusion Models. arXiv:2505.19223 [cs.LG]
+https://arxiv.org/abs/2505.19223
+[61] Fengqi Zhu, Zebin You, Yipeng Xing, Zenan Huang, Lin Liu, Yihong
+Zhuang, Guoshan Lu, Kangyu Wang, Xudong Wang, Lanning Wei,
+Hongrui Guo, Jiaqi Hu, Wentao Ye, Tieyuan Chen, Chenchen Li,
+Chengfu Tang, Haibo Feng, Jun Hu, Jun Zhou, Xiaolu Zhang, Zhen-
+zhong Lan, Junbo Zhao, Da Zheng, Chongxuan Li, Jianguo Li, and
+Ji-Rong Wen. 2025. LLaDA-MoE: A Sparse MoE Diffusion Language
+Model. arXiv:2509.24389 [cs.CL] https://arxiv.org/abs/2509.24389
+[62] Kan Zhu, Yufei Gao, Yilong Zhao, Liangyu Zhao, Gefei Zuo, Yile Gu,
+Dedong Xie, Tian Tang, Qinyu Xu, Zihao Ye, Keisuke Kamahori, Chien-
+Yu Lin, Ziren Wang, Stephanie Wang, Arvind Krishnamurthy, and
+Baris Kasikci. 2025. NanoFlow: towards optimal large language model
+serving throughput. In Proceedings of the 19th USENIX Conference
+on Operating Systems Design and Implementation (Boston, MA, USA)
+(OSDI ’25). USENIX Association, USA, Article 41, 17 pages.
+16
+
+
+--- Page 17 ---
+Symbol
+Definition
+N
+Set of compute nodes
+I
+Set of old model instances
+D
+Set of TP degrees
+G𝑛
+Set of GPUs on node 𝑛∈N
+L𝑛,𝑑
+Set of slots for TP-𝑑on node 𝑛(L𝑛,𝑑
+=
+{1, 2, ..., ⌊|G𝑛|/𝑑⌋})
+G𝑖
+Set of GPUs originally used by old instance 𝑖
+(𝑛𝑖,𝑑𝑖)
+Node and TP degree of model instance 𝑖
+𝑅𝑑
+Required number of TP-𝑑instances (𝑅𝑑
+=
+Í
+𝑛∈N 𝑥𝑛,𝑑)
+𝑢𝑛,𝑑,ℓ∈B
+Whether slot ℓfor TP-𝑑on node 𝑛is activated
+𝑎𝑛,𝑑,ℓ,𝑔∈B Whether GPU 𝑔∈G𝑛is assigned to slot
+(𝑛,𝑑, ℓ)
+𝑚𝑖,ℓ∈B
+Whether executor 𝑖is preserved by mapping
+to slot (𝑛𝑖,𝑑𝑖, ℓ)
+Table 5. Notation used in Stage 2 formulation.
+A
+Step Predictor Features
+The Step Predictor uses 11 scalar features:
+• confidence_threshold: the confidence threshold for the
+next denoising step.
+• output_length: the request’s output length.
+• Progress features:
+– full_progress: the completed denoising steps divided by
+the output length.
+– full_unmask_progress: the number of unmasked tokens
+divided by the output length.
+– block_progress: the current block index divided by the
+total number of blocks.
+– block_unmask_progress: the number of unmasked to-
+kens in the current block divided by the block length.
+• Confidence features:
+– output_min_confidence: minimum confidence among all
+output tokens.
+– output_q25_confidence: lower-quartile token confidence.
+– output_median_confidence: median confidence among
+all output tokens.
+– output_avg_confidence: average confidence among all
+output tokens.
+– output_q75_confidence: upper-quartile token confidence.
+B
+Details for Stage 2 Reconfiguration
+With 𝑅𝑑produced by Stage 1, the goal of Stage 2 is to maxi-
+mize the number of model instances that can be preserved
+(i.e., instances that continue using the same GPUs on the
+same node). Preserving more instances directly reduces the
+number of terminations and launches required during the
+transition, which in turn limits the temporary reduction in
+available processing capacity while reconfiguration is taking
+place.
+To express this problem cleanly, we introduce the notion
+of slots. For each node𝑛and TP degree𝑑, we define a set L𝑛,𝑑
+of potential TP-𝑑slots, where each slot represents a feasible
+placement location for a TP-𝑑model instance. A node with
+|G𝑛| GPUs can host at most ⌊|G𝑛|/𝑑⌋such slots. These slots
+serve as fixed candidate containers to which GPUs may be
+assigned and old instances may be matched.
+Table 5 summarizes the parameters and variables used in
+this formulation. The objective is to maximize the number
+of preserved model instances:
+max
+∑︁
+𝑖∈I
+∑︁
+ℓ∈L𝑛𝑖,𝑑𝑖
+𝑚𝑖,ℓ.
+Subject to the following constraints:
+• Stage 1 Compliance: For each TP degree 𝑑, the number of
+slots activated for TP-𝑑is equal to 𝑅𝑑, the plan generated
+by Stage 1.
+∑︁
+𝑛∈N
+∑︁
+ℓ∈L𝑛,𝑑
+𝑢𝑛,𝑑,ℓ= 𝑅𝑑,
+∀𝑑∈D.
+• Slot GPU Assignment: If a slot of TP-𝑑is activated on a
+node, it must be assigned exactly 𝑑GPUs from that node.
+∑︁
+𝑔∈G𝑛
+𝑎𝑛,𝑑,ℓ,𝑔= 𝑑· 𝑢𝑛,𝑑,ℓ,
+∀𝑛∈N, ∀𝑑∈D, ∀ℓ∈L𝑛,𝑑.
+• GPU Exclusivity: Each GPU on a node can only be as-
+signed to one slot.
+∑︁
+𝑑∈D
+∑︁
+ℓ∈L𝑛,𝑑
+𝑎𝑛,𝑑,ℓ,𝑔= 1,
+∀𝑛∈N, ∀𝑔∈G𝑛.
+• Preservation Uniqueness: If a model instance is pre-
+served, it can only be assigned to one slot.
+∑︁
+ℓ∈L𝑛𝑖,𝑑𝑖
+𝑚𝑖,ℓ≤1,
+∀𝑖∈I.
+• Preservation Implies Slot Activation: If a model in-
+stance is preserved, the corresponding slots need to be
+activated.
+𝑚𝑖,ℓ≤𝑢𝑛𝑖,𝑑𝑖,ℓ,
+∀𝑖∈I, ∀ℓ∈L𝑛𝑖,𝑑𝑖.
+• Preservation Implies Same GPU Set: If a model instance
+is preserved, all the GPUs it previously occupied must be
+exactly the GPUs assigned to its new slot.
+𝑚𝑖,ℓ≤𝑎𝑛𝑖,𝑑𝑖,ℓ,𝑔,
+∀𝑖∈I, ∀ℓ∈L𝑛𝑖,𝑑𝑖, ∀𝑔∈G𝑖.
+From the variables 𝑢𝑛,𝑑,ℓand 𝑎𝑛,𝑑,ℓ,𝑔, we reconstruct the final
+cluster configuration by identifying which TP-𝑑slots are ac-
+tivated on each node and which GPUs are assigned to them.
+This determines how many TP-𝑑model instances will run on
+each node after reconfiguration. For any activated slot where
+𝑚𝑖,ℓ= 1, the corresponding old model instance 𝑖is preserved
+and continues to use its original GPUs. For all remaining
+activated slots, a new model instance must be launched; con-
+sequently, any old instance currently occupying the GPUs
+assigned to that slot must be terminated.
+17
+
+
+--- Page 18 ---
+Algorithm 4 Load and Capacity Calculation with KV Caching
+Note: LP is short for LatencyProfile. cacheBlockSize and
+maxNumSeqPerBatch are fixed system parameters.
+1: function ReqLoad(req, 𝛾)
+2:
+totalSteps ←req.predStepsLeft[𝛾]
+3:
+cacheSteps ←totalSteps - req.recompStepsLeft
+4:
+return
+cacheSteps
+×
+cacheBlockSize
++
+req.recompStepsLeft × req.numTokens
+5: function ClusterCapacity(numTokenPerReq)
+6:
+totalCapacity ←0
+7:
+for each instance do
+8:
+tp ←instance.tpDegree
+9:
+cacheStepLoad ←cacheBlockSize × maxNumSe-
+qPerBatch
+10:
+cacheStepLat ←LP[tp][cacheStepLoad]
+11:
+recompStepLat ←LP[tp][numTokenPerReq]
+12:
+tput ←cacheStepLoad×(cacheBlockSize-1)+numTokenPerReq
+cacheStepLat×(cacheBlockSize-1)+recompStepLat
+13:
+capacity ←tput × SLO
+14:
+totalCapacity ←totalCapacity + capacity
+15:
+return totalCapacity
+C
+Algorithm for Supporting Approximate
+KV Caching
+This section provides the detailed procedures to support ap-
+proximate KV caching.
+Request Load and Cluster Capacity Calculation. In
+the no-cache setting, throughput is approximated by
+maxbatch
+
+batch
+latencyProfile[tp][batch]
+
+. With KV caching, however,
+this substantially overestimates throughput, because most
+steps are lightweight cache steps rather than compute-heavy
+recomputations. To address this, we estimate throughput
+at the block level, assuming that each block consists of
+(cacheBlockSize −1) cache steps and one recompute step.
+The load of a cache step accounts for batching effects via the
+maximum number of sequences per batch, while the load of
+a recompute step corresponds to the average request length,
+obtained empirically. This block-based throughput estimate
+more accurately reflects the actual execution pattern under
+KV caching and provides a more reliable basis for capacity
+planning. The changes to load and capacity calculation are
+formalized in Algorithm 4.
+Predicted Time Left. Selecting the highest confidence
+threshold that still satisfies the SLO also depends on dis-
+tinguishing cache and recompute steps. With KV caching,
+the remaining latency is the sum of the latency of all re-
+maining cache steps and recompute steps. We estimate this
+conservatively by assuming that cache steps across requests
+are batched together and recompute steps are batched to-
+gether, yielding worst-case latencies. This is formalized in
+Algorithm 5.
+Algorithm 5 Remaining Time Estimation with KV Caching
+1: function PredictedTimeLeft(req, 𝛾)
+2:
+inst ←req.instance
+3:
+tp ←inst.tpDegree
+4:
+steps ←req.predStepsLeft[𝛾]
+5:
+cacheStepsLeft ←steps - req.recompStepsLeft
+6:
+cacheBatchSize ←cacheBlockSize × inst.numReqs
+7:
+recompBatchSize ←inst.numTokens
+8:
+cacheStepLat ←LP[tp][cacheBatchSize]
+9:
+recompStepLat ←LP[tp][recompBatchSize]
+10:
+return
+cacheStepsLeft
+×
+cacheStepLat
++
+req.recompStepsLeft × recompStepLat
+D
+LLM Judge Prompt
+We use the following prompt for the LLM-based judge that
+scores assistant responses:
+You are grading an assistant response to a user request.
+### USER REQUEST:
+{prompt}
+### ASSISTANT ANSWER:
+{response}
+---
+Assign one integer score from 0 to 10 using this rubric:
+- 10: Fully correct, directly answers the request, complete,
+clear, and safe.
+- 7-9: Mostly correct and useful, with minor omissions or
+small inaccuracies.
+- 4-6: Partially correct or helpful, but missing important
+content or containing notable mistakes.
+- 1-3: Mostly incorrect, off-topic, or seriously incomplete.
+- 0: Dangerous, nonsensical, or fails to answer the request.
+Evaluate only these criteria:
+1. Correctness
+2. Relevance
+3. Completeness
+4. Clarity
+5. Safety
+Rules:
+- Judge only the assistant answer.
+- Prefer factual accuracy over style.
+- Penalize unsafe or harmful advice heavily.
+- If the request does not provide enough information to
+fully verify facts, score based on likely usefulness
+and internal consistency.
+- Return only valid JSON matching the required schema.
+- The score must be an integer from 0 to 10.
+- The explanation must be one short sentence.
+Return JSON only.
+{{"score": <0-10>, "explanation": "<one short sentence>"}}.
+18
+
+
+--- Page 19 ---
+1.5
+2.0
+2.5
+Mean latency (s)
+Output Len = 256
+3
+4
+5
+6
+Output Len = 512
+10
+20
+30
+Output Len = 1024
+0.75
+1.00
+1.25
+1.50
+RPS
+1.5
+2.0
+2.5
+P99 latency (s)
+0.6
+0.8
+RPS
+3
+4
+5
+6
+0.10
+0.15
+0.20
+0.25
+RPS
+10
+20
+30
+Without Migration
+With Migration
+Figure 13. Migration effectiveness. Enabling denoising-step-
+level migration reduces P99 latency. Input length is set to
+256 for all cases.
+# Model Instances
+4
+8
+12
+16
+Normalized latency
+(vs. recompute-only)
+1.17
+1.28
+1.33
+1.38
+Table 6. Migration granularity. Shown is the request latency
+when migration is allowed at any step, normalized to Di-
+LaServe’s design where it is permitted only at recompute
+steps.
+E
+Experimental Results: Migration
+Granularity
+DiLaServe performs migration at the denoising-step level
+to enable fine-grained load balancing beyond the initial dis-
+patch. Figure 13 shows that enabling migration reduces tail
+latency by up to 19% across different RPS values and output
+lengths, as requests can opportunistically move to model
+instances that become idle or lightly loaded as other re-
+quests complete. However, naively performing migration
+introduces non-negligible overhead when approximate KV
+caching is enabled, since migrating at non-recompute steps
+requires the KV cache to be rebuilt. As shown in Table 6,
+allowing migration at arbitrary steps increases request la-
+tency by up to 17% with 4 model instances. This overhead
+grows with cluster size as more instances create more mi-
+gration opportunities, reaching 38% with 16 instances. As a
+result, DiLaServe only migrates a request at recompute steps,
+avoiding migration overhead while preserving the benefits
+of fine-grained load balancing.
+F
+Experimental Results: Serving without
+Caching
+Although DiLaServe includes support for approximate KV
+caching, its core design remains applicable regardless of
+whether caching is enabled. Figure 14 shows the results of
+serving LLaDA without KV caching. In this setting, each de-
+noising step becomes more computationally expensive; as a
+0.00
+0.25
+0.50
+0.75
+1.00
+SLO Attainment
+0.25
+0.30
+0.35
+RPS per GPU
+0.77
+0.78
+0.79
+0.80
+Accuracy
+5×
+4×
+3×
+2×
+SLO Multiple
+DiLaServe
+Llumnix
+INFaaS
+Figure 14. GSM8K without KV Caching.
+result, without adjusting confidence thresholds for load con-
+trol, the queue grows quickly once the request rate exceeds
+cluster capacity, causing Llumnix and INFaaS to experience
+significant drops in SLO attainment. In contrast, DiLaServe
+maintains high SLO attainment without sacrificing accuracy.
+Under tight SLOs, it continues to perform robustly, achieving
+25.5% higher SLO attainment than Llumnix and INFaaS with
+no accuracy drop.
+19

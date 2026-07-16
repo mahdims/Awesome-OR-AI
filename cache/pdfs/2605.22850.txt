@@ -1,0 +1,3779 @@
+--- Page 1 ---
+ObjectCache: Layerwise Object-Storage Retrieval for
+KV Cache Reuse
+Yu Zhu
+ETH Zurich
+Switzerland
+yu.zhu@inf.ethz.ch
+Aditya Dhakal
+HPE Labs
+United States of America
+aditya.dhakal@hpe.com
+Yunming Xiao
+The Chinese University of Hong
+Kong, Shenzhen
+China
+yunmingxiao@cuhk.edu.cn
+Dejan Milojicic
+HPE Labs
+United States of America
+dejan.milojicic@hpe.com
+Gustavo Alonso
+ETH Zurich
+Switzerland
+alonso@inf.ethz.ch
+Abstract
+Prefix KV caching has become a key mechanism in LLM
+serving: it reduces time to first token (TTFT) by avoiding re-
+dundant computation across requests that share a prefix (i.e.,
+the system prompt). However, the accumulated KV cache
+is often larger than what GPU memory and local DRAM
+can hold. To preserve latency, current systems keep the KV
+cache in remote DRAM pools, increasing serving-cluster size
+and cost. In this paper, we explore a different approach: stor-
+ing the KV cache in S3-compatible object storage so that ca-
+pacity is no longer the constraint, while minimizing the im-
+pact on TTFT. We propose ObjectCache, which co-designs
+the storage protocol and transfer schedule so that the stor-
+age server delivers KV cache data in the order the GPU con-
+sumes it, overlapping data transfer with compute across con-
+current requests. We prototype ObjectCache on a 100 Gbps
+RoCE cluster with NIXL (an inference library that abstracts
+storage and memory), Ceph RGW (an Object Gateway for
+clusters), and DAOS (an open source storage system). For
+64K contexts, common in today’s systems, ObjectCache adds
+only 5.6% latency over local DRAM; for 4K contexts, where
+less compute is available to mask transfer, ObjectCache adds
+56–75 ms over the optimal local layerwise baseline. Under
+shared bandwidth caps, our scheduler reduces added TTFT
+by 1.2–1.8x compared with equal bandwidth sharing.
+1
+Introduction
+Modern LLM serving increasingly relies on long and reusable
+input contexts, including system prompts, retrieval-augmented
+generation, code repositories, long conversations, and agent
+histories [1, 18, 69, 70] (Figure 1). These workloads make the
+prefill phase expensive because the model must materialize
+key–value (KV) tensors for every token and every layer be-
+fore decoding can begin. Prefix KV-cache reuse avoids re-
+computing the shared prefix across requests and is there-
+fore a primary mechanism for reducing TTFT. As context
+Single-turn
+Q&A
+RAG & 
+Reasoning
+Agentic 
+Tasks
+Large-context
+Workflows
+Q: How can we retain more reusable KV cache with its growing size? 
+Early LLMs 2023
+Today
+Prefix reuse opportunity
+KV cache footprint
+Figure 1. Long-context LLM tasks increasingly reuse long-
+lived prefixes, growing the aggregate KV cache footprint
+that a serving cluster must retain.
+lengths and reuse opportunities grow, however, the aggre-
+gate KV-cache footprint that a serving cluster must retain
+also grows rapidly (Appendix Figure A1).
+The challenge is that reusable KV cache is much larger
+than the memory capacity naturally available near GPUs.
+GPU memory is scarce and needed for model weights and
+active requests, while local DRAM only scales with the serv-
+ing nodes that happen to produce or consume the cache. Re-
+cent systems therefore use remote DRAM pools or memory-
+centric KV-cache tiers to preserve low latency [27, 55]. Al-
+though effective, this approach makes cache capacity a pro-
+visioned part of the serving cluster: memory must be sized
+for the retained KV working set and remains coupled to the
+compute deployment, thus increasing cost and limiting how
+much long-lived reusable context the system can retain.
+This motivates a different question: can S3-compatible
+object storage serve as a runtime backend for reusable KV
+cache? Object storage is attractive because prefix KV blocks
+are immutable after prefill, naturally addressable by content-
+derived prefix hashes, and reusable across users, sessions,
+and compute nodes. Unlike a remote-DRAM tier, an object
+store scales capacity independently of the GPU serving clus-
+ter and persists cache state beyond the lifetime of any partic-
+ular worker. If object storage could be used on the serving
+path, prefill and decode workers would become largely state-
+less with respect to reusable prefixes: once KV blocks are
+committed, later requests could fetch them from the shared
+1
+arXiv:2605.22850v1  [cs.DC]  16 May 2026
+
+
+--- Page 2 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+object tier rather than returning to the node that produced
+them [52, 79].
+The obstacle is not only transport bandwidth. Even with
+an RDMA data path like Nvidia cuObject [48, 49], the stan-
+dard S3 abstraction remains mismatched to runtime KV-cache
+reuse. S3 exposes object-level operations: a request names
+one object, or one byte range of one object. In contrast, a
+prefix hit returns a set of many hash-addressed KV chunks,
+and the inference engine consumes the matched cache in
+layer order. Fetching each chunk or each layer range with
+independent S3 requests exposes fixed request overhead on
+the TTFT critical path, while fetching coarse objects sacri-
+fices fine-grained prefix reuse. Thus, the gap between S3 and
+runtime KV-cache reuse is semantic: object storage moves
+objects, whereas inference needs prefix-selected KV blocks
+delivered in the order the GPU consumes them.
+We present ObjectCache, a protocol-scheduling co-design
+that makes S3-compatible object storage suitable for run-
+time KV-cache reuse. On the protocol side, ObjectCache keeps
+KV cache stored as fine-grained, hash-addressed chunks, but
+extends the S3-compatible request with a compact descrip-
+tor that names the matched chunks, model layout, delivery
+order, and RDMA target. The storage server uses this de-
+scriptor to gather many chunk ranges, assemble one layer-
+major payload at a time, and deliver each layer directly to
+the serving node over RDMA. On the scheduling side, Ob-
+jectCache exploits the fact that layerwise transfer can over-
+lap with per-layer GPU computation. Rather than sharing
+bandwidth equally or in proportion to bytes, ObjectCache
+allocates bandwidth according to each request’s per-layer
+stall target, avoiding bandwidth assignments that do not fur-
+ther reduce TTFT.
+We prototype ObjectCache on a 100 Gbps RoCE cluster
+using NIXL [50], Ceph RGW [5], and DAOS [12], and eval-
+uate it with Llama 3.1 8B [44]. For 64K-token contexts, Ob-
+jectCache adds only 5.6% TTFT over an optimized local lay-
+erwise baseline. For shorter 4K-token contexts, where less
+compute is available to hide transfer, ObjectCache adds 56–
+75 ms over the local layerwise baseline. Under shared band-
+width caps, the ObjectCache scheduler reduces added TTFT
+by 1.2–1.8× compared with equal bandwidth sharing.
+This paper makes the following contributions:
+• We propose ObjectCache, a protocol-scheduling co-
+design for serving reusable KV cache from S3-compatible
+object storage.
+• We design an S3-compatible protocol extension that
+supports prefix-selected multi-object aggregation and
+layerwise KV delivery while preserving fine-grained
+client-side prefix lookup.
+• We introduce a bandwidth scheduler that allocates
+storage bandwidth according to per-layer compute-
+transfer overlap, reducing TTFT under contention.
+2024
+2025
+2026
+LLM release date
+16
+32
+64
+128
+256
+Object size (KB)
+64 KB (GQA-8 × 128)
+Gemma
+Llama
+Mistral
+Qwen
+Phi
+DeepSeek
+Kimi
+GLM
+Figure 2. Per-layer KV payload for a 16-token chunk across
+recent open-weight LLM families. The 64 KB dashed line
+marks the grouped-query attention (GQA) baseline with 8
+KV heads of 128 dimensions; multi-head latent attention
+(MLA) and smaller head counts push recent models below
+this threshold.
+• We demonstrate on a 100 Gbps RoCE prototype that
+ObjectCache approaches local layerwise KV-cache per-
+formance for long-context workloads and improves
+TTFT under shared bandwidth limits.
+2
+Background and Motivation
+2.1
+KV cache and Prefix Reuse
+During the prefill phase, LLM inference processes the input
+prompts and materializes the per-layer key/value tensors to
+be used in transformer attention [11, 66]. During the decode
+phase, the model reuses these tensors instead of recomput-
+ing attention over the entire prefix each time by storing the
+context in a KV cache. To enable cross-query reuse and stor-
+age, serving systems partition the KV cache into fixed-size
+chunks corresponding to 𝐺consecutive tokens. For a model
+with 𝐿layers, 𝑛kv KV heads, head dimension 𝑑, and element
+width 𝑝, the KV bytes per token and the per-layer bytes of
+a 𝐺-token chunk are:
+KVtoken = 2𝐿𝑛kv𝑑𝑝,
+𝑆layer,chunk = 2𝐺𝑛kv𝑑𝑝.
+(1)
+The prefix KV cache reuse relies on a radix tree or similar
+prefix index to find the longest cached match for a new re-
+quest [21, 23, 32, 68, 73]. Each chunk can be identified by a
+rolling hash, 𝐻𝑖= Hash(𝐻𝑖−1 ∥tokens𝑖), that gives it a de-
+terministic object key. Using 𝐻𝑖as the object key gives KV
+chunks the properties object storage is good at: immutable
+writes, content-addressed deduplication, and independent
+reuse across requests.
+At fine chunk sizes, the per-layer KV payload becomes
+small enough that the fixed object-request overhead is vis-
+ible even when the communication overhead is small (Fig-
+ure 2 instantiates Equation 1 for current models). A 16-token
+chunk exposes only tens of KB per layer for many current
+models, and MLA-style layouts can reduce the layer slice
+to roughly 16 KB [35, 43]. This pressure remains even at
+coarser chunk sizes. For Llama 3.1 8B [44], a 256-token chunk
+is about 1 MB per layer; compact KV layouts, MLA-style
+representations, or shape-preserving compression can push
+2
+
+
+--- Page 3 ---
+ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse
+A-0
+A-1
+A-2
+A-3
+A-4
+A-5
+B-2
+B-3
+B-4
+B-5
+B-6
+C-5
+D-4
+D-5
+D-6
+E-3
+E-4
+E-5
+(a)
+Fine
+granularity
+pre-
+serves intermediate branch
+points.
+A-0
+A-1
+A-2
+A-3
+A-4
+A-5
+B-2
+B-3
+B-4
+B-5
+B-6
+B-4
+C-5
+D-4
+D-5
+D-6
+B-2
+E-3
+E-4
+E-5
+Duplication
+Partial
+chunks
+(discarded)
+Dup.
+(b) Coarse granularity merges
+branch points.
+Figure 3. Prefix reuse under fine and coarse storage
+granularities. Coarse chunks reduce index depth but lose
+branch points where requests can diverge, forcing other-
+wise reusable tokens to be recomputed.
+1K
+4K
+16K
+64K
+256K
+Context length (tokens)
+100
+103
+Time (ms)
+Tokenize
+Lookup, G=16
+Lookup, G=256
+Figure 4. Prefix-hash lookup cost is small relative to tok-
+enization, even at 16-token granularity. Fine-grained index-
+ing is therefore not the request critical-path bottleneck.
+that below the efficient object-transfer regime [6, 75]. In-
+creasing the chunk granularity enables larger physical data
+transfers, but also coarsens prefix reuse. ObjectCache instead
+keeps the logical reuse granularity independent of the effec-
+tive transfer granularity by aggregating chunks at the stor-
+age server.
+Figures 3 and 4 separate two concerns that are often con-
+flated. Figure 3 shows why fine chunks preserve more radix-
+tree branch points and avoid unnecessary recompute after a
+request diverges. Figure 4 shows that prefix-hash lookup re-
+mains small compared to tokenization, even at 𝐺=16 granu-
+larity. Fine-grained indexing does not add meaningful over-
+head to the request critical path. The system bottleneck is
+therefore not finding the prefix; it is delivering the matched
+KV chunks in the order the model can consume.
+2.2
+Serving-Path KV Access Pattern
+In disaggregated serving, a prefill worker materializes KV
+cache for the input prompt, while a decode worker later uses
+the resulting KV state to generate tokens. When a new re-
+quest shares a cached prefix, prefix lookup returns an or-
+dered list of matched KV chunks that the prefill worker can
+reuse before computing the remaining suffix. Although these
+chunks are stored independently, the model consumes them
+layer by layer: it needs the layer 0 slice from all matched
+chunks before computing layer 0, then the layer 1 slice be-
+fore computing layer 1, and so on. Thus, the storage-facing
+access pattern is an ordered multi-object, multi-range read
+rather than a single object read.
+3
+ObjectCache Design
+Figure 5 shows how ObjectCache fits into a disaggregated
+LLM serving cluster. A central orchestrator receives a re-
+quest, performs prefix matching, and assigns the remaining
+prefill work to a prefill node together with the matched pre-
+fix KV list. The prefill node fetches the reusable KV cache
+from the S3-compatible object tier, computes the remaining
+prompt suffix, and materializes the full KV state. The decode
+node can then load the full KV state and generate output to-
+kens, while newly produced KV blocks are offloaded back
+to object storage for future reuse. This organization decou-
+ples prefill and decode workers from the machines that orig-
+inally produced the cache, making reusable prefix state per-
+sistent and shared through the object-storage tier.
+The key challenge is that this serving path needs more
+than ordinary object reads. ObjectCache is built around one
+design rule: keep storage objects small enough for prefix reuse,
+but expose a serving interface that returns large, layer-ordered
+transfers. The design is therefore an interface extension, not
+a new transport. The underlying S3-over-RDMA data path
+moves bytes; ObjectCache changes what the serving system
+can ask the object tier to do.
+The resulting architecture has three roles (Figure 6). The
+GPU serving node issues S3-compatible requests and con-
+sumes KV cache data through the inference engine’s layer-
+wise interface. The gateway terminates the S3 control plane,
+parses the ObjectCache descriptor, forwards the multi-object
+request to the storage server, and upgrades the S3 control
+plane to express prefix-aware, layer-scheduled KV transfer.
+The storage server resolves chunk objects in the S3 names-
+pace, performs range reads, assembles layer-major payloads,
+RDMA-writes them directly to the client buffer, and exe-
+cutes the layer-scheduled semantic at the object/range level.
+All runtime policy—whether a given request is served chunk-
+wise or via layerwise aggregation, and how concurrent ten-
+ants share the network cap—runs on the storage server, so
+the gateway and NIXL client both remain stateless with re-
+spect to scheduling decisions (Sections 3.4 and 3.6).
+3.1
+Required Semantics
+ObjectCache requires four access semantics that no exist-
+ing S3 primitive provides in combined form; this is the gap
+3
+
+
+--- Page 4 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+DECODE NODE
+Load full KV cache + metadata
+1
+Token generation
+2
+Update KV cache
+3
+PREFILL NODE
+Fetch matched KV cache
+1
+Compute remaining prompt suffix 
+2
+Materialize full KV cache + metadata
+3
+OBJECT STORAGE (S3)
+Persistent KV objects
+Prefix / prompt context
+CENTRAL ORCHESTRATOR
+Prefix Match
+Request Queue
+Task Scheduler
+INPUT PROMPT
+...
+“System research such as 
+network and storage play 
+a foundational role for 
+KVCache management ....”
+OUTPUT
+TOKENS
+Assign Prefill Task
+with Matched Prefix KV List
+Assign Decode Task
+Fetch KV
+Cache
+Offload
+New KV
+S3 Access Planner
+Full KV
+state
+Figure 5. ObjectCache in a disaggregated cluster. Prefix KV caches are stored in an object-storage tier through an S3-
+compatible interface, decoupling prefill and decode workers from the machines that produced the cache. ObjectCache extends
+this interface so object storage can serve KV cache reuse with the granularity and layerwise delivery order expected by LLM
+serving systems.
+vLLM / SGLang (inference engine)
+LMCache (KV cache management)
+NIXL (RDMA transport client)
+GPU Serving Node
+Network
+Control plane: HTTP / TCP
+Data plane: RDMA  
+Storage Server
+S3 Gateway
+(Ceph RGW)
+Object Storage 
+Backend (DAOS)
+HTTP Req with
+RDMA Descriptor
+RDMA Data Transfer
+Co-design 1: Stateful
+RDMA session
+HTTP
+Open
+RDMA
+Burst
+RDMA
+Burst
+HTTP
+Close
+Analog to S3 Express One Zone
+Co-design 2: Server 
+Side Aggregation
+OBJ 1
+OBJ 2
+...
+OBJ N
+Aggregated Large Payload
+Leverage Network I/O efficiency
+Co-design 3: Server 
+Side Runtime Scheduling
+Non-aggregated
+Layerwise
+Aggregated 
+Chunkwise
+Maximize Network I/O efficiency
+RDMA
+Burst
+Figure 6. ObjectCache system design. HTTP preserves S3-
+compatible control, while the storage server aggregates
+matched chunk ranges into layerwise KV payloads and de-
+livers them to the serving node over RDMA.
+Table 1. ObjectCache request descriptor.
+Field
+Meaning
+chunk_keys
+Matched prefix chunks [𝐻0, . . . , 𝐻𝑁−1].
+num_layers
+𝐿: Number of model layers.
+chunk_tokens
+𝐺: Tokens per stored chunk.
+per_layer_chunk_bytes
+𝑆: Slice size inside each chunk.
+delivery
+Layer-major order.
+rdma_target
+Client buffer address, key, and length.
+between accelerating S3 through better transport protocols
+and making S3 suitable for prefix KV reuse.
+(1) Multi-object batching. A prefix hit returns a list of
+matched KV chunks, not one object. If each chunk requires
+an independent S3 request, fixed request overhead domi-
+nates in the fine-grained regime that prefix caching prefers.
+(2) Layerwise delivery. Inference consumes KV cache
+data layer by layer. Delivering complete chunks in chunk-
+major order forces the NIXL client to wait for the full matched
+prefix before starting layer 0. Delivery of layer 0 for all chunks
+first creates a compute window to transfer later layers.
+(3) Hash-derived immutable keys. KV chunks must re-
+main addressable by hashes so that requests reuse the same
+object when they share a prefix. This preserves the radix-
+tree storage semantics used by existing prefix caches.
+(4) Bulk-transfer compatibility. Once the layer-major
+payload has been assembled, data should be transferred us-
+ing RDMA because it provides the high-throughput trans-
+port that the higher-level aggregation semantics can use.
+Standard S3 GET satisfies hash-derived keys but not batch-
+ing or layerwise delivery. Range-GET can fetch one layer
+range, but only by issuing a request per chunk per layer. S3-
+over-RDMA satisfies the bulk-transfer requirement, but it
+inherits the same single-object request model. ObjectCache
+adds the missing server-side multi-object aggregation and
+layerwise delivery semantics while reusing the RDMA.
+3.2
+The ObjectCache Descriptor
+ObjectCache adds an S3-compatible descriptor to a normal
+request. The descriptor names the matched chunk keys, the
+model layout, the delivery order, and the RDMA target buffer.
+Table 1 lists the fields of the descriptor, which is intention-
+ally arithmetic rather than manifest-heavy. Because every
+chunk in the same model deployment has the same per-layer
+size 𝑆, the byte range for layer ℓin a chunk is [ℓ𝑆, (ℓ+ 1)𝑆).
+Thus, the storage server can derive all fixed-shape layer ranges
+from the descriptor without a per-object manifest. Variable-
+size or compressed layouts can add a manifest later, but the
+common serving fast path keeps the descriptor compact.
+3.3
+Server-Side Layer Aggregation
+The storage server executes the descriptor by assembling
+one payload per model layer. For each layer ℓ∈[0, 𝐿), it
+range-fetches [ℓ𝑆, (ℓ+ 1)𝑆) from every matched chunk in
+parallel, appends the returned slices in prefix order, RDMA-
+writes the assembled payload to the client buffer, and noti-
+fies the serving node that the layer is ready (pseudocode in
+4
+
+
+--- Page 5 ---
+ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse
+Appendix Table A3). This notification is on the critical path
+of inference: it lets the GPU start layer computation without
+waiting for the whole prefix to arrive [36, 55].
+The physical storage layout remains chunkwise even though
+the logical delivery layout is layerwise. In KV_L2TD for-
+mat (Key-Value tensors stored in Layer-major order, with
+the 2 matrices concatenated per layer, then Token position,
+then hidden Dimension), each immutable prefix-chunk ob-
+ject stores all layers sequentially, and each layer is arranged
+by token position and hidden dimension. Server-side aggre-
+gation changes only the readout order: one layerwise pay-
+load covers all matched chunks for a single model layer.
+Keeping storage fine-grained matters because coarsening
+sacrifices reuse. Larger KV blocks reduce object retrieval
+overhead but discard reuse when two requests diverge in-
+side a block; increasing the lookup granularity from 16 to
+512 tokens can force otherwise reusable tokens to be recom-
+puted across models and hit boundaries (Appendix Table A6
+quantifies this recompute cost). The right design point is
+therefore not “make objects as large as possible”; the system
+should keep lookup granularity small and transfer granular-
+ity large enough for efficient I/O.
+3.4
+Server-Side Mode Selection
+ObjectCache does not serve every cache hit using server-
+side layer aggregation. The KV cache is always stored in
+the chunkwise layout above, so the storage server chooses
+only the delivery mode. Each incoming descriptor names
+the matched chunks, from which the server derives the total
+matched payload 𝑊= 𝑁· 𝐿· 𝑆, where 𝑁is the number
+of matched chunks, 𝐿is the number of model layers, and
+𝑆is the per-layer chunk size. It then applies a single size-
+threshold rule:
+mode(𝑊) =
+(
+chunkwise
+𝑊< Θ,
+layerwise + aggregation
+𝑊≥Θ.
+(2)
+The threshold Θ is a deployment knob: payloads below Θ
+use chunkwise delivery, and larger payloads use server-side
+aggregation with layerwise delivery. Below Θ, the layerwise
+schedule of Equation 3 still minimizes TTFT in theory, but
+the absolute saving is negligible relative to the aggregation
+overhead. Above Θ, the aggregation pipeline recovers its
+CPU and I/O-depth cost as measurable TTFT reduction while
+also amortizing per-object descriptor overhead across many
+small range reads.
+As an illustration, on our 100 Gbps prototype with Llama
+3.1 8B we use Θ ≈512 MB, the payload size at which net-
+work transfer time at line rate becomes comparable to the
+prefill compute window. Under this rule, the 4K configura-
+tions in Section 5 fall on the chunkwise side and the 16K/64K
+configurations fall on the aggregated-layerwise side, match-
+ing where each mode wins in Figure 13. The appropriate
+value of Θ depends on the storage backend, SSD queue depth,
+Time
+All chunks
+C1
+C2
+C3
+C4
+C5
+C6
+TTFT = Txfer_all_chunks + Nlayers x Tcompute_per_layer
+Prefix KVCache
+Partial Prefill
+(a) Chunkwise loading waits for the full cached prefix before com-
+pute can start.
+Time
+T1
+C1
+T2
+C2
+T3
+T4
+T5
+T6
+C3
+C4
+C5
+C6
+Prefix KVCache
+Partial Prefill
+(b) Transfer-bound layerwise prefetch.
+Time
+T1
+C1
+T2
+C2
+T3
+T4
+T5
+T6
+C3
+C4
+C5
+C6
+Prefix KVCache
+Partial Prefill
+(c) Compute-bound layerwise prefetch.
+Figure 7. KV cache fetch scheduling. Chunkwise delivery
+serializes cache loading before prefill, while layerwise deliv-
+ery exposes per-layer readiness so transfer can overlap com-
+pute when bandwidth is sufficient and otherwise appears as
+per-layer stall.
+and link rate; the dispatch rule itself does not. A full sensi-
+tivity analysis of Θ is left to future work.
+Equation 2 is also what decides which requests enter multi-
+tenant scheduling: chunkwise requests run independently
+against the object storage and consume only their fair share
+of object-store concurrency, while every layerwise request
+joins the shared bandwidth pool described next. The sched-
+uling problem below is therefore scoped to layerwise re-
+quests under a shared bandwidth cap.
+3.5
+Layerwise Prefetch
+Figure 7 explains why the delivery order matters. A chunk-
+wise baseline waits for all matched chunks before compute
+can use any layer from the KV cache. Layerwise prefetch
+instead transfers layer 0 first; once layer 0 arrives, the GPU
+begins computing on it while the remaining layers transfer
+in parallel. Let 𝑋ℓbe the transfer time for layer ℓand 𝐶ℓ
+be the compute time exposed by the miss tokens at layer ℓ.
+With one-layer prefetch, the TTFT model is
+𝑇TTFT ≈𝑋0 +
+𝐿−2
+∑︁
+ℓ=0
+max(𝑋ℓ+1, 𝐶ℓ) + 𝐶𝐿−1,
+(3)
+where 𝑋0 is the latency before the GPU can start (layer 0
+must arrive in full), the summation captures 𝐿−1 stages in
+which transfer and compute overlap, and 𝐶𝐿−1 is the final
+layer’s compute after all transfers have finished. When 𝑋ℓ>
+𝐶ℓ, the transfer time that exceeds the compute window ap-
+pears as additional waiting time in the corresponding stage
+5
+
+
+--- Page 6 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+of Equation 3. Section 5.3 evaluates this model with mea-
+sured compute times and ObjectCache throughput.
+3.6
+Bandwidth-Aware Scheduling
+Under the layerwise delivery of Section 3.5, each request’s
+per-layer transfer can overlap with its per-layer compute
+window. This creates a bandwidth-scheduling problem spe-
+cific to KV cache reuse: under a shared bandwidth cap 𝐵,
+policies proportional to matched bytes or equal-share misal-
+locate. Matched-bytes allocation over-serves long-prefix re-
+quests whose per-layer transfer is already shorter than per-
+layer compute, so extra bandwidth yields no further benefit,
+while equal-share under-serves short-prefix requests whose
+compute window is small.
+The key observation is that each layer of a request trans-
+fers roughly the same KV bytes and performs similar com-
+pute, so we characterise request 𝑖by its per-layer transfer
+size 𝑠𝑖and per-layer compute window 𝑐𝑖.1 When the sched-
+uler assigns bandwidth 𝑟𝑖to request 𝑖, the per-layer transfer
+time is 𝑠𝑖/𝑟𝑖. Transfer that exceeds the compute window in-
+troduces additional stall:
+𝜏𝑖(𝑟𝑖) = max
+
+0, 𝑠𝑖
+𝑟𝑖
+−𝑐𝑖
+
+.
+(4)
+Each request’s additional latency vanishes once𝑟𝑖reaches
+its zero-stall rate 𝑟∗
+𝑖
+= 𝑠𝑖/𝑐𝑖; any bandwidth beyond this
+point yields no further latency benefit. In an unconstrained
+setting, every request would receive𝑟∗
+𝑖, but the total demand
+Í
+𝑖𝑟∗
+𝑖may exceed the shared budget 𝐵. The scheduler must
+then distribute a total cut of Í
+𝑖𝑟∗
+𝑖−𝐵across requests. Let R
+denote the set of active layerwise requests sharing the stor-
+age link, and let Δ𝑖≥0 denote the bandwidth cut applied
+to request 𝑖(so its allocated rate is 𝑟𝑖= 𝑟∗
+𝑖−Δ𝑖). Allocat-
+ing these cuts to minimize total stall leads to the Stall-opt
+problem:
+min
+{Δ𝑖}
+∑︁
+𝑖∈R
+
+𝑠𝑖
+𝑟∗
+𝑖−Δ𝑖
+−𝑐𝑖
+
+s.t.
+∑︁
+𝑖∈R
+Δ𝑖=
+∑︁
+𝑖∈R
+𝑟∗
+𝑖−𝐵, 0 ≤Δ𝑖≤𝑟∗
+𝑖.
+(5)
+Since 𝑐𝑖does not depend on Δ𝑖, substituting 𝑟𝑖= 𝑟∗
+𝑖−
+Δ𝑖reduces the objective to minimising total transfer time
+under the bandwidth budget:
+min
+{𝑟𝑖}
+∑︁
+𝑖∈R
+𝑠𝑖
+𝑟𝑖
+s.t.
+∑︁
+𝑖∈R
+𝑟𝑖= 𝐵, 0 < 𝑟𝑖≤𝑟∗
+𝑖.
+(6)
+Because 𝑠𝑖/𝑟𝑖is convex in 𝑟𝑖, Equation 6 is a convex pro-
+gram. When Í
+𝑖𝑟∗
+𝑖≤𝐵, every request receives its zero-stall
+rate and all additional TTFT vanishes; when the budget is
+tight, the optimal allocation admits a closed-form solution.
+In practice, the analytical 𝑟∗
+𝑖falls on the slope of the TTFT
+curve rather than at the start of the flat region (see Section
+1Both are approximately constant across layers because every layer has the
+same number of KV heads and the same attention/feed-forward network
+(FFN) structure.
+5.7). Calibrated Stall-opt shifts the target by a small positive
+offset 𝛿to ensure the operating point lies on the plateau:
+ˆ𝑟𝑖= 𝑟∗
+𝑖+ 𝛿,
+(7)
+Calibrated Stall-opt solves the bandwidth allocation of
+Equation 5 with corrected targets ˆ𝑟𝑖as upper bounds. When
+the total demand Í
+𝑖ˆ𝑟𝑖exceeds the budget 𝐵, the closed-form
+solution distributes the deficit to minimize total stall across
+concurrent requests (pseudocode in Appendix Table A4). Dur-
+ing each scheduling epoch, a batch of active layerwise re-
+quests is admitted under a fixed total bandwidth budget, and
+each request receives a stable target layer-delivery rate for
+the duration of its KV load. If one request finishes early, its
+released bandwidth returns to the pool for the next sched-
+uling epoch rather than being redistributed immediately to
+in-flight requests. This conservative rule makes per-request
+transfer times predictable, so the serving node does not need
+to react to unexpected bandwidth changes during an epoch.
+4
+Implementation
+Our prototype integrates ObjectCache into a three-node serv-
+ing/storage stack. The serving node runs the LLM and issues
+KV cache reads. The gateway terminates S3-compatible re-
+quests, parses ObjectCache descriptors, and forwards them
+to the storage server, which executes the multi-object aggre-
+gation. Concretely, the prototype uses NIXL as the asynchro-
+nous transfer library [50], Ceph RGW as the S3-compatible
+gateway [5], and DAOS as the storage server behind the
+gateway [12]. The implementation keeps the gateway thin:
+the serving node issues normal S3-compatible requests with
+additional headers, the gateway handles only S3 control, and
+the DAOS storage server performs the cross-object range
+reads and layer-major assembly.
+4.1
+S3-Compatible Paths
+The prototype includes five S3-compatible paths. The first
+three isolate transport choices for a single object; the last
+two exercise the ObjectCache interface:
+• S3TCP: standard S3 request; object sent via HTTP/TCP.
+• S3RDMA Buffer: S3 request naming one object; the
+gateway stages the payload before the RDMA trans-
+fer to the NIXL client.
+• S3RDMA Direct: S3 request naming one object; the
+data goes through the object-store RDMA path with-
+out gateway staging.
+• S3RDMA Batch: S3 request naming multiple objects;
+one S3 request carries one HTTP header followed by
+an RDMA burst, thereby amortizing per-object over-
+head.
+• S3RDMA Agg: S3 request naming multiple objects;
+the storage server assembles layer-major payloads and
+RDMA-writes them to the NIXL client.
+6
+
+
+--- Page 7 ---
+ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse
+Table 2. Interface-level positioning. Existing systems accelerate either the memory tier or the S3 byte path; ObjectCache adds
+KV-aware multi-object, layer-major aggregation inside an S3-compatible request.
+Interface
+Primary abstraction
+S3 Namespace
+Multi-object
+Layer-major
+Rate target
+Remote KV transfer [27, 55]
+Memory-resident KV blocks
+No
+Runtime-specific
+Yes
+Runtime-specific
+S3-over-RDMA [45, 47–49, 65]
+One S3 object or byte range
+Yes
+No
+No
+No
+RDMA scatter-gather
+Registered memory segments
+No
+No
+No
+No
+ObjectCache
+Hash-addressed KV chunk objects
+Yes
+Yes
+Yes
+Yes
+We use the following names in the end-to-end TTFT eval-
+uation:
+• Local-DRAM-CW and Local-DRAM-LW: local CPU-
+DRAM KV cache baselines with chunkwise and lay-
+erwise delivery, respectively.
+• S3Batch-CW: the S3-backed chunkwise batched path.
+• S3Agg-LW: ObjectCache’s server-side aggregated lay-
+erwise path.
+4.2
+GPU Serving Node
+The serving node uses the NIXL object backend to issue S3
+operations. For ordinary objects, the backend can use TCP,
+an RDMA-buffer mode, or the RDMA-direct path used in
+our microbenchmarks. For ObjectCache requests, LMCache
+[40] provides the matched prefix chunk keys and the model
+layout parameters (𝐿, 𝐺, and 𝑆). NIXL serializes these fields
+into the HTTP descriptor and attaches an RDMA target to-
+ken for the receive buffer. The LLM inference framework,
+such as vLLM [67], waits for layer-ready notifications and
+lets the model proceed as soon as the next layer’s KV has
+arrived. This is the same execution pattern used by DRAM-
+backed layerwise KV loading, but the source is now object
+storage.
+4.3
+Gateway and Storage Server Execution
+Ceph RGW is used as the gateway. It parses the ObjectCache
+descriptor after normal S3 request handling, then forwards
+the descriptor to the DAOS storage server via a server-side
+extension. The DAOS server maps each chunk key to the
+corresponding DAOS object, fetches the per-layer record ex-
+tent from each chunk in parallel, concatenates the slices in
+chunk order, and RDMA-writes the assembled layer payload
+directly into the client’s registered buffer.
+The gateway keeps the S3 abstraction in the control path:
+request headers, authentication, bucket/object naming, and
+access control are still handled at the S3 layer. The data path
+is split: HTTP carries control, while RDMA carries the as-
+sembled layer payload directly between the storage server
+and the GPU serving node. This mirrors the S3-over-RDMA
+control/data-plane separation [47–49], but ObjectCache adds
+multi-object range selection and layer-major assembly at
+the storage server before the RDMA transfer.
+4.4
+Tracing and Rate Control
+To understand request overhead, the prototype propagates
+request identifiers from the NIXL client through RGW into
+DAOS traces, allowing the evaluation to split latency into
+client, gateway, storage, and RDMA-bulk components. For
+the multi-tenant scheduling experiments, we add a layer-
+wise pacing control that limits the effective layer delivery
+rate. This lets us emulate shared bandwidth caps while keep-
+ing the same layerwise access pattern used by ObjectCache.
+4.5
+Testbed
+The evaluation uses a 100 Gbps RoCEv2 (RDMA over Con-
+verged Ethernet, v2) cluster with a GPU serving node for
+inference, an S3 gateway, and a DAOS storage node. The
+GPU is an A100 80 GB GPU (CUDA 12.8, PyTorch 2.10.0,
+vLLM v0.19.0, the modified LMCache v0.4.2, the modified
+NIXL v1.0.0); the gateway runs the modified Ceph RGW
+v18.2.7; the storage node runs DAOS v2.7.102 with its de-
+fault UCX [64] transport, equipped with 4 KIOXIA enter-
+prise NVMe SSDs. In this stack, vLLM is the inference run-
+time, LMCache manages KV cache reuse on the GPU serv-
+ing node, NIXL provides the unified storage/memory trans-
+fer interface used by both the serving node and the gateway,
+Ceph RGW terminates S3 requests, DAOS is the underlying
+object-storage backend, and UCX is the RDMA transport be-
+neath DAOS. DAOS stripes data across all 4 SSDs; however,
+because layerwise range reads access non-contiguous off-
+sets within each chunk object, the per-SSD access pattern
+is random rather than sequential. The measurement of the
+same micro-benchmark for H100 80GB is in Appendix.
+5
+Evaluation
+Our evaluation follows the same mechanisms introduced in
+the design. First, the storage and network substrate must
+transfer data fast enough. Second, the S3 control path must
+be measured separately from the RDMA data path. Third,
+ObjectCache’s server-side aggregation must achieve high
+throughput for fine-grained KV chunks. Fourth, layerwise
+delivery must overlap with GPU compute in configurations
+where measured compute and transfer rates make overlap
+feasible. Finally, under a shared bandwidth cap, bandwidth-
+aware scheduling should minimize TTFT.
+7
+
+
+--- Page 8 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+64KB
+256KB
+1MB
+4MB
+P50
+P99
+TCP
+RDMA
+LOCAL
+0
+5
+10
+15
+20
+Throughput (GB/s)
+102
+103
+104
+105
+Latency (µs)
+(a) READ, 𝐶=8
+TCP
+RDMA
+LOCAL
+0
+5
+10
+15
+20
+Throughput (GB/s)
+102
+103
+104
+105
+Latency (µs)
+(b) READ, 𝐶=32
+TCP
+RDMA
+LOCAL
+0
+5
+10
+15
+20
+Throughput (GB/s)
+102
+103
+104
+105
+Latency (µs)
+(c) WRITE, 𝐶=8
+TCP
+RDMA
+LOCAL
+0
+5
+10
+15
+20
+Throughput (GB/s)
+102
+103
+104
+105
+Latency (µs)
+(d) WRITE, 𝐶=32
+Figure 8. Raw object-storage interface baseline. The gray region marks throughput above the 100 Gbps link capacity; points
+in this region are limited by local storage and host execution rather than the network.
+64KB
+256KB
+1MB
+4MB
+P50
+P99
+S3TCP
+S3RDMA
+Buffer
+S3RDMA
+Direct
+0
+4
+8
+12
+Throughput (GB/s)
+102
+103
+104
+105
+Latency (µs)
+(a) S3 GET, 𝐶=8
+S3TCP
+S3RDMA
+Buffer
+S3RDMA
+Direct
+0
+4
+8
+12
+Throughput (GB/s)
+102
+103
+104
+105
+Latency (µs)
+(b) S3 GET, 𝐶=32
+S3TCP
+S3RDMA
+Buffer
+S3RDMA
+Direct
+0
+4
+8
+12
+Throughput (GB/s)
+102
+103
+104
+105
+Latency (µs)
+(c) S3 PUT, 𝐶=8
+S3TCP
+S3RDMA
+Buffer
+S3RDMA
+Direct
+0
+4
+8
+12
+Throughput (GB/s)
+102
+103
+104
+105
+Latency (µs)
+(d) S3 PUT, 𝐶=32
+Figure 9. S3-compatible interface baseline. S3RDMA Direct preserves high large-object throughput, while S3TCP and
+S3RDMA Buffer expose protocol and staging bottlenecks.
+5.1
+Raw Storage Baseline
+Setup. We measure DAOS throughput as seen by the NIXL
+object client without the Ceph RGW gateway, isolating the
+storage backend from S3 protocol overhead (Figure 8). The
+benchmark ranges block sizes from 64 KB to 4 MB and client
+concurrency 𝐶∈{8, 32}, where 𝐶=8 uses a single thread
+with 8 in-flight requests and𝐶=32 uses 4 threads each with 8
+in-flight requests. Writes populate deterministic per-thread
+key spaces; a large scrub workload flushes the DAOS cache
+before measuring the cold-read throughput.
+Local DAOS reads exceed the 100 Gbps NIC capacity at
+256 KB block size with 𝐶=32, and saturate the SSD through-
+put at 4 MB block size with 𝐶=32. DAOS over RDMA ap-
+proaches the 100 Gbps hardware limit on cold reads at 1
+MB block size with 𝐶=8, while TCP lags consistently (Fig-
+ure 8). We use the saturated RDMA configurations as the
+reference point for later S3 and ObjectCache experiments:
+any remaining gap is attributable to the S3 interface, gate-
+way processing, GPU landing, or aggregation policy rather
+than the DAOS backend alone.
+5.2
+S3 Transport Baseline
+Setup. We next measure S3 PUT and GET throughput
+across block sizes from 64 KB to 4 MB. The benchmark com-
+pares S3TCP, S3RDMA Buffer that uses a gateway staging
+buffer, and S3RDMA Direct where the S3 request carries con-
+trol information data going through the DAOS RDMA data
+path; Section 4 gives the corresponding path names. The
+two concurrency points,𝐶=8 and𝐶=32, match the canonical
+raw-storage configurations in Figure 8. Figure 9 shows that
+S3RDMA Direct approaches the NIC capacity at 4 MB block
+size with 𝐶=32. S3TCP and S3RDMA Buffer suffer from dif-
+ferent bottlenecks. S3TCP is limited by the gateway’s stream-
+ing HTTP path, while S3RDMA Buffer pays a server-side
+staging cost. Figure 9 also shows why transport alone is
+not sufficient: the single-object overhead remains visible for
+small KV chunks.
+5.3
+Layerwise Overlap Model with Hit Rate
+What matters for inference is not whether the full prefix
+arrives quickly, but whether each layer of cached KV ar-
+rives before the GPU needs it. For a context length 𝑃(in
+tokens) with prefix hit rate 𝑟(the fraction of the 𝑃context
+tokens that are covered by the cached prefix), the matched
+KV bytes per layer are 𝐷(ℓ) = 2𝑛kv 𝑑𝑝(𝑃𝑟). Given the mea-
+sured per-layer compute time 𝑡(ℓ), perfect overlap requires
+transfer throughput 𝐵req = 𝐷(ℓ)/𝑡(ℓ). These expressions con-
+nect the byte layout from Equation 1 to the TTFT model in
+Equation 3. If ObjectCache’s effective per-layer throughput
+exceeds 𝐵req, only the first-layer transfer latency is visible
+in the TTFT; otherwise, each layer whose transfer exceeds
+its compute window adds directly to the total TTFT.
+5.4
+Per-Request Overhead and Overlap Feasibility
+Figures 10 and 11 first isolate the two interface costs that
+ObjectCache must address: fixed per-request control cost
+8
+
+
+--- Page 9 ---
+ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse
+Storage
+Network
+Control Plane
+64KB 256KB 1MB
+4MB
+Block size
+0%
+25%
+50%
+75%
+100%
+7%
+7%
+14%
+13%
+7%
+8%
+11%
+26%
+85%
+85%
+75%
+61%
+(a) GET.
+64KB 256KB 1MB
+4MB
+Block size
+0%
+25%
+50%
+75%
+100%
+6%
+12%
+17%
+7%
+9%
+10%
+20%
+89%
+85%
+79%
+63%
+(b) PUT.
+Figure 10. Per-request latency breakdown of S3RDMA Di-
+rect. Storage is backend object I/O, Network is RDMA data-
+plane transfer, and Control Plane is S3 frontend request and
+metadata processing. For small objects, fixed control-plane
+work dominates the remaining latency after RDMA removes
+TCP data movement.
+S3RDMA Direct
+S3RDMA Batch
+S3RDMA Agg
+Agg Data Plane
+G=16
+64KB
+G=32
+128KB
+G=64
+256KB
+G=128
+512KB
+G=256
+1MB
+G=512
+2MB
+0
+3
+6
+9
+12
+Throughput (GB/s)
+Network Bound
+22×
+15×
+11×
+6×
+4×
+1.3×
+Figure 11. Server-side aggregation amortizes per-object
+overhead and achieves high speedups at small chunk gran-
+ularities.
+and low throughput for fine-grained objects. After RDMA
+reduces transfer overhead, HTTP and RGW metadata work
+dominate the remaining per-request cost at small objects
+(Figure 10). Figure 11 shows that batching and server-side
+aggregation turn many small object reads into larger lay-
+erwise transfers and recover high throughput for KV cache
+loads. Together, these measurements show why ObjectCache
+needs both pieces: batching amortizes fixed request over-
+head, while aggregation makes fine-grained KV chunks ef-
+ficient to transfer.
+Figure 12 connects aggregation throughput to serving. The
+first heatmap reports measured per-layer compute time for
+Llama 3.1 8B, while the remaining heatmaps report the trans-
+fer throughput required for Llama, Granite [30], and DeepSeek
+[13] models. Configurations requiring less bandwidth than
+the ObjectCache layer throughput are compute-bound; con-
+figurations above that boundary suffer from added latency.
+The counter-intuitive takeaway is that longer contexts can
+relax the transfer budget: although they carry more cached
+< 10
+< 100
+< 1000
+> 1000 ms
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(a) Llama 3.1 8B per-layer com-
+pute time.
+< 2.5
+< 5
+< 12.5
+> 12.5 GB/s
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(b) Llama 3.1 8B required trans-
+fer throughput to overlap.
+< 2.5
+< 5
+< 12.5
+> 12.5 GB/s
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(c) Granite 3.3 8B required
+transfer throughput to overlap.
+< 2.5
+< 5
+< 12.5
+> 12.5 GB/s
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(d) DeepSeek-R1-Distill-Qwen-
+7B required transfer throughput
+to overlap.
+Figure 12. A100 layerwise overlap requirements. Most eval-
+uated configurations require less than 2.5GB/s of layerwise
+transfer bandwidth, so ObjectCache can hide cached KV
+transfer under prefill compute in the dominant regimes.
+KV bytes, they also create a larger per-layer compute win-
+dow in which ObjectCache can hide layerwise transfer. Ob-
+jectCache also reduces many cross-object range reads per
+layer to a single RDMA payload per layer (Appendix Ta-
+ble A7).
+5.5
+End-to-End TTFT
+We evaluate end-to-end TTFT for Llama 3.1 8B across two
+context lengths, 4K and 64K, three prefix hit rates, 12.5%,
+50%, and 87.5%, and three chunk granularities,𝐺∈{16, 64, 256}.
+For each workload configuration, the baseline is opt-local-
+LW: a pre-aggregated KV cache in layer-major order in pinned
+host-memory, so inference requires only host-to-device trans-
+fers and incurs no runtime aggregation cost. For all other
+TTFT measurements, we store KV cache data chunkwise
+with the specified 𝐺in local DRAM or on the remote DAOS
+server. Figure 13 reports the TTFT overhead of each config-
+uration relative to this baseline.
+The results show that layerwise delivery is important re-
+gardless of where the KV cache is stored. Local-DRAM-LW
+consistently outperforms Local-DRAM-CW, indicating that
+delivering KV blocks in layer order enables better overlap
+between transfer and GPU computation. In contrast, S3Batch-
+CW incurs the highest overhead in most configurations be-
+cause it combines chunkwise delivery with S3 control-plane
+and network transfer costs. S3Agg-LW substantially reduces
+this overhead and performs close to Local-DRAM-LW in
+9
+
+
+--- Page 10 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+0
+20
+ΔTTFT (%)
+opt-local-LW=312 ms
+4K, hit=12.5%, KV=64 MB
+0
+20
+40
+60
+opt-local-LW=187 ms
+4K, hit=50%, KV=256 MB
+0
+100
+116
+200
+opt-local-LW=64 ms
+4K, hit=87.5%, KV=448 MB
+Local-DRAM-CW
+Local-DRAM-LW
+S3Batch-CW
+S3Agg-LW
+0.0
+2.5
+5.0
+ΔTTFT (%)
+opt-local-LW=11868 ms
+64K, hit=12.5%, KV=1 GB
+Local-DRAM-CW
+Local-DRAM-LW
+S3Batch-CW
+S3Agg-LW
+0
+5
+10
+15
+opt-local-LW=8374 ms
+64K, hit=50%, KV=4 GB
+Local-DRAM-CW
+Local-DRAM-LW
+S3Batch-CW
+S3Agg-LW
+0
+5.6
+20
+40
+60
+opt-local-LW=2451 ms
+64K, hit=87.5%, KV=7 GB
+Local-DRAM-CW
+Local-DRAM-LW
+S3Batch-CW
+S3Agg-LW
+G=16
+G=64
+G=256
+LW Transfer Bound
+Figure 13. TTFT overhead for Llama 3.1 8B relative to the measured optimal local layerwise baseline for each workload
+configuration. CW denotes chunkwise delivery and LW denotes layerwise delivery; S3Agg-LW stays close to the local baseline
+except in the transfer-bound corner where layer delivery cannot be hidden by compute.
+0
+10
+20
+30
+ΔTTFT (%)
+4K, hit=12.5%
+46
+49
+46
+0
+50
+100
+150
+4K, hit=50%
+196
+184
+183
+23
+6
+1
+0
+100
+200
+300 4K, hit=87.5%
+326
+323
+326
+273
+256
+252
+S3Batch-CW
+S3Agg-LW
+0
+5
+10
+15
+ΔTTFT (%)
+64K, hit=12.5%
+546
+470
+673
+S3Batch-CW
+S3Agg-LW
+0
+20
+40
+64K, hit=50%
+2853
+2979
+3306
+S3Batch-CW
+S3Agg-LW
+0
+50
+100
+150
+20064K, hit=87.5%
+5054
+5313
+5222
+3649
+3695
+3694
+G=16
+G=64
+G=256
+LW Transfer Bound
+Figure 14. Sensitivity of S3-backed KV loading to band-
+width changes for Llama 3.1 8B. Each bar reports the rela-
+tive TTFT increase when the same path and granularity are
+capped at 10 Gbps, using its 100 Gbps result as the baseline.
+most cases. In several configurations, S3Agg-LW even achieves
+lower TTFT than Local-DRAM-LW. We interpret this as an
+observed resource-isolation effect: server-side aggregation
+uses dedicated CPU cores and parallel SSD reads, whereas
+Local-DRAM-LW consumes client-side CPU and memory
+bandwidth that may also be needed by the inference engine.
+The benefit of S3Agg-LW is most evident for long-context
+workloads. At 64K context length, the per-layer compute
+window is sufficiently large to hide most transfer latency,
+and S3Agg-LW remains within 0.1–5.6% of opt-local-LW for
+𝐺= 64 across all 64K configurations. Even at the highest hit
+rate, where the KV payload reaches 7 GB, the predicted over-
+lap throughput is 3.1 GB/s (Appendix Table A8), which is be-
+low ObjectCache’s sustained aggregation bandwidth. How-
+ever, 𝐺= 16 shows noticeably higher overhead than 𝐺= 64
+and 𝐺= 256, suggesting that small chunk granularity pre-
+vents the pipeline from fully exploiting the available server-
+side aggregation throughput of approximately 5 GB/s.
+The short-context 4K workloads are more challenging be-
+cause the compute window is much smaller. In these cases,
+the main 𝐺= 64 S3Agg-LW configuration adds 56–75 ms
+over opt-local-LW, and its TTFT can become comparable
+to S3Batch-CW. The limiting case is the 4K, 87.5% hit-rate
+workload, where the baseline compute time is only 64 ms
+and the required overlap throughput rises to 7.4 GB/s (Ap-
+pendix Table A8). Although the KV payload is only 448 MB,
+fixed costs such as RDMA session setup, first-layer transfer,
+and control-plane exchange consume a significant fraction
+of the available compute window. As a result, all three gran-
+ularities converge to similar TTFT overhead in this config-
+uration, indicating that the bottleneck is the short compute
+window rather than steady-state transfer throughput. We
+therefore classify all three granularities in this configura-
+tion as transfer-bound: layer delivery, not steady-state band-
+width efficiency, determines the tail. Chunk granularity has
+a modest effect on chunkwise methods. For Local-DRAM-
+CW, larger 𝐺improves efficiency by reducing chunk man-
+agement overhead. For S3Batch-CW, the effect is weaker be-
+cause even𝐺= 16 produces objects large enough to achieve
+reasonably high network transfer efficiency. These 4K re-
+sults are consistent with the thresholded mode selection in
+Section 3.4: small-payload regimes can be dominated by fixed
+10
+
+
+--- Page 11 ---
+ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse
+0.0
+0.5
+1.0
+16K, 50% hit, ΔTTFTmax=833ms
+0.0
+0.5
+1.0
+16K, 87.5% hit, ΔTTFTmax=2.75s
+0.0
+0.5
+1.0
+64K, 50% hit, ΔTTFTmax=350ms
+0
+10
+20
+40
+60
+80Gbps
+0.0
+0.5
+1.0
+64K, 87.5% hit, ΔTTFTmax=9.79s
+Normalized ΔTTFT
+Perfect overlap T
+Calibrated T *
+Figure 15. Sensitivity of layerwise TTFT to throttled trans-
+fer throughput with S3Agg-LW. Each panel normalizes
+TTFT increase relative to its best measured point. Dashed
+lines show the perfect-overlap bandwidth estimate; dash-
+dot lines show the calibrated scheduler target.
+and startup costs, so ObjectCache should not assume that
+aggregation is always the better delivery mode.
+5.6
+Sensitivity to Bandwidth Changes
+We evaluate bandwidth sensitivity by capping the S3-backed
+paths at 10 Gbps and reporting the TTFT increase relative
+to the corresponding 100 Gbps run. Figure 14 shows that
+S3Agg-LW is less sensitive to this bandwidth reduction than
+S3Batch-CW except in transfer-bound configurations.
+This behavior follows from layerwise overlap. In S3Batch-
+CW, computation cannot start until the chunkwise KV load
+completes, so a bandwidth reduction largely appears as addi-
+tional TTFT. In S3Agg-LW, only the non-overlapped portion
+of each layer transfer contributes to TTFT. Therefore, band-
+width changes affect TTFT mainly when the required over-
+lap throughput exceeds the available bandwidth. Appendix
+Table A8 explains where this happens. At 64K and 50% hit
+rate, the required throughput is only 0.50 GB/s, well below
+10 Gbps, so S3Agg-LW shows almost no sensitivity. At 4K
+and 50% hit rate, the predicted requirement is 1.45 GB/s, slightly
+above 10 Gbps, but the 100 Gbps run is already dominated by
+fixed costs and pipeline startup overheads; hence the band-
+width cap does not visibly dominate end-to-end TTFT.
+The large increases appear at 87.5% hit rate, where the re-
+quired throughput exceeds the capped bandwidth: 7.41 GB/s
+for 4K and 3.10 GB/s for 64K. These configurations become
+transfer-bound, as indicated by the markers in Figure 14,
+and therefore show the largest TTFT increase for S3Agg-
+LW. Overall, the results validate that layerwise loading is
+intrinsically less sensitive to bandwidth changes, but only
+while per-layer transfer can be hidden behind compute.
+16K, 50%
+16K, 87.5%
+32K, 50%
+32K, 87.5%
+64K, 50%
+64K, 87.5%
+0
+25
+50
+75
+100
+BW Share (%)
+(a) Workload-A allocation.
+0
+1
+2
+3
+ΔTTFT (s)
+1.29
+1.81
+3.15
+1.52
+0.73
+(b) Workload-A ΔTTFT.
+0
+25
+50
+75
+100
+BW Share (%)
+(c) Workload-B allocation.
+0
+5
+10
+ΔTTFT (s)
+3.83 4.13
+11.58
+2.43 2.17
+(d) Workload-B ΔTTFT.
+Equal
+KV-prop
+BW-prop
+Stall-opt
+Calibrated
+Stall-opt
+0
+25
+50
+75
+100
+BW Share (%)
+(e) Workload-C allocation.
+Equal
+KV-prop
+BW-prop
+Stall-opt
+Calibrated
+Stall-opt
+0
+10
+20
+30
+ΔTTFT (s)
+9.75 10.16
+29.08
+7.45 7.89
+(f) Workload-C ΔTTFT.
+Figure 16. Bandwidth scheduling under shared transfer
+caps. For each workload, the left panel shows the band-
+width allocated by each policy and the right panel shows
+the resulting added TTFT. Workload-A uses an 80 Gbps cap;
+Workload-B and Workload-C use 50 Gbps caps.
+5.7
+Bandwidth Allocation for Multi Tenants
+We next evaluate how the bandwidth allocator behaves when
+multiple S3Agg-LW retrievals share a fixed transfer budget.
+Section 3.6 defines Stall-opt and Calibrated Stall-opt; here
+we compare them against three heuristic bandwidth-allocation
+baselines that do not model the layerwise overlap condi-
+tion. Equal assigns the same bandwidth to every active re-
+quest, which is attractive for fairness but ignores both KV
+cache size and compute slack. KV-prop allocates bandwidth
+in proportion to the retrieved KV cache size, favoring larger
+or higher-hit-rate requests. BW-prop allocates bandwidth in
+proportion to the zero-stall bandwidth estimate from 𝐵req,
+so requests that require higher bandwidth to hide layerwise
+transfer receive a larger share. For Calibrated Stall-opt, we
+use a 5 Gbps margin, chosen from the S3Agg-LW rate sweep
+in Figure 15: the dash-dot calibrated targets shift the ana-
+lytic perfect-overlap estimates to the measured knees of the
+TTFT curves.
+Figure 16 compares the scheduling policies on three mixed
+workloads, and Appendix Table A9 reports the exact per-
+request bandwidth allocations. We construct the workloads
+11
+
+
+--- Page 12 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+from the per-request bandwidth requirements in Appendix
+Table A8. Workloads A and B contain the same four requests:
+16K and 64K contexts at 50% and 87.5% hit rates. Together,
+these requests require 91 Gbps in aggregate, or 111 Gbps
+after adding the 5 Gbps calibration margin to each request.
+The two workloads differ only in their shared bandwidth
+cap. Workload A uses an 80 Gbps cap to model moderate
+contention, where several requests can still remain near their
+calibrated overlap points. Workload B uses a 50 Gbps cap to
+stress the allocator under a tighter budget. Workload C ex-
+tends this setting by adding 32K-context requests, resulting
+in six tenants with small, medium, and large KV cache foot-
+prints under the same 50 Gbps cap. Its aggregate require-
+ment is 137 Gbps, or 167 Gbps after calibration. This work-
+load tests whether the scheduler remains effective when the
+available bandwidth must be distributed across a denser set
+of transfer sensitivities. The measured per-configuration TTFTs
+are listed in Appendix Tables A10 and A11.
+Across the three workloads, Calibrated Stall-opt outper-
+forms the heuristic baselines by allocating bandwidth ac-
+cording to measured overlap requirements rather than per-
+request parity, KV size, or analytic demand alone. Measured
+as additional TTFT over the effectively unthrottled baseline,
+it reduces Equal’s penalty by 1.2–1.8× (Figure 16); Appen-
+dix Table A12 gives the full breakdown. This improvement
+comes from assigning bandwidth near each request’s useful
+overlap region. Equal ignores heterogeneous transfer sen-
+sitivity, KV-prop can starve small but latency-sensitive re-
+quests, and BW-prop can over-allocate beyond the point where
+extra bandwidth reduces TTFT. Calibrated Stall-opt avoids
+these extremes and reduces added TTFT under both moder-
+ate and tight caps. The only exception is Workload C, where
+Stall-opt is slightly better because the calibration margin
+can mildly over-provision some requests under a dense, het-
+erogeneous 50 Gbps cap. Even there, Calibrated Stall-opt re-
+mains better than Equal, KV-prop, and BW-prop, preserv-
+ing most of Stall-opt’s benefit while improving robustness
+to measurement-level deviations from the analytic model.
+6
+Discussion
+6.1
+Position in the KV cache Hierarchy
+ObjectCache is not a replacement for hot KV-cache tier, where
+GPU memory or DRAM-backed KV cache pools serve those
+hottest prefixes. ObjectCache instead provides a persistent,
+shared, S3-compatible capacity tier for large prefix pools,
+where placement flexibility and low storage cost matter. The
+key question is whether it can be made fast enough for serving-
+path prefix reuse. This role complements disaggregated in-
+ference systems that separate prefill, decode, and KV cache
+storage [27, 52, 55, 79]. By storing long-lived prefixes in
+object storage, ObjectCache lets requests run on any avail-
+able GPU serving node rather than only where the prefix is
+cached.
+6.2
+When Layerwise Object Storage Helps
+Layerwise ObjectCache is most useful when recomputation
+is costly, partial prefill computation provides enough per-
+layer overlap window, and the storage tier can deliver near
+the required overlap bandwidth. When the compute win-
+dow is too small, bandwidth is below the overlap require-
+ment, or the prefix hit is too small to amortize S3 overheads,
+the system should instead fall back to chunkwise transfer, a
+DRAM hot cache, or recomputation.
+6.3
+Limitations and Future Work
+In this paper we optimize the serving-path data movement
+mechanism for S3-compatible object storage. Our prototype
+evaluates the critical data path and scheduling policy on
+a small cluster, which is sufficient to isolate the effects of
+aggregation, RDMA transfer, layerwise delivery, and band-
+width scheduling, but does not capture all production ef-
+fects. Future work should validate ObjectCache with con-
+current clients, long-running prefix churn, failures, and inte-
+gration with batching [78], chunked prefill [2], routing [16],
+and eviction policies [19, 68].
+ObjectCache also assumes that cached KV can be addressed
+by prefix chunk and layer range. Irregular layouts, packed
+objects, or compressed KV representations [6, 37] are com-
+patible only if the storage server has sufficient metadata
+to translate layerwise requests. Finally, production deploy-
+ments need scalable connection management, per-tenant ad-
+mission control, and stronger isolation around RDMA cre-
+dentials [41, 56, 59, 63, 77].
+7
+Related Work
+KV cache management and prefix reuse. Paged KV al-
+location, radix-tree prefix matching, and KV offloading sys-
+tems provide the software substrate that ObjectCache builds
+on [7, 32, 33, 53, 58, 72–74, 81]. These systems typically store
+KV in fixed-size chunks. ObjectCache preserves this chunk-
+wise, hash-addressed layout, but changes how remote stor-
+age delivers matched chunks to the serving node. CacheFlow [46]
+accelerates KV cache restoration by scheduling recomputa-
+tion and I/O across token, layer, and GPU dimensions in-
+side the serving system. ObjectCache addresses a different
+bottleneck: how an S3-compatible object tier should fetch,
+aggregate, and deliver many matched KV chunks in layer
+order to the inference engine.
+Disaggregated LLM serving. Prior work on prefill/decode
+separation and remote KV pools shows that LLM serving
+can benefit from decoupling compute roles and moving KV
+cache data over the network [8, 9, 20, 27–29, 31, 42, 52, 54,
+55, 60, 79]. ObjectCache follows this architectural direction,
+but targets a persistent S3-compatible object storage which
+targets for a cloud native solution.
+S3-over-RDMA and object storage. Recent S3-over-RDMA
+systems split the HTTP control path from an RDMA data
+12
+
+
+--- Page 13 ---
+ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse
+path, improving large-object transfer over TCP-based S3 [10,
+15, 25, 45, 47–49, 62, 65]. Low-latency object stores such
+as S3 Express reduce access latency but still expose single-
+object request semantics [80]. ObjectCache builds on this
+trend by adding KV-aware multi-object aggregation and lay-
+erwise delivery to S3-compatible storage.
+KV compression and small-state attention. KV quan-
+tization, compression, MLA-style architectures, recent-window
+methods, and state-retention techniques reduce the bytes re-
+tained per token [3, 17, 19, 22, 26, 34, 35, 38, 39, 57, 61, 71, 75,
+76]. These techniques are complementary to ObjectCache.
+They can reduce transfer volume, but they also shrink each
+useful object payload, making S3 overhead more dominant.
+8
+Conclusion
+S3-compatible object storage is a natural storage tier for
+large prefix KV cache pools, but standard S3 exposes the
+mismatched serving-path semantics. ObjectCache adds the
+missing serving-path semantics via protocol-scheduling co-
+design. Our prototype shows that these pieces must work to-
+gether. RDMA improves raw S3 transport, aggregation amor-
+tizes network overhead, layerwise delivery overlaps trans-
+fer with GPU compute, and bandwidth-aware scheduling re-
+duces added TTFT under shared bandwidth. On a 100 Gbps
+RoCE prototype with Llama 3.1 8B, ObjectCache reaches
+within 5.6% of the optimal local DRAM solution at 64K con-
+text length. Our results suggest that object storage can serve
+as a runtime KV cache backend rather than only a cold archive,
+while retaining the persistence, capacity, placement flexibil-
+ity, and low storage cost that make object storage attractive.
+References
+[1] Mohamad Abou Ali, Fadi Dornaika, and Jinan Charafeddine. 2025.
+Agentic AI: a comprehensive survey of architectures, applications,
+and future directions. Artificial Intelligence Review 59, 1 (2025), 11.
+[2] Arney Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan,
+Nipun Kwatra, Bhargav S Gulavani, Alexey Tumanov, and Ramachan-
+dran Ramjee. 2025. Efficient llm inference via chunked prefills. ACM
+SIGOPS Operating Systems Review 59, 1 (2025), 9–16.
+[3] Joshua Ainslie, James Lee-Thorp, Michiel De Jong, Yury Zemlyanskiy,
+Federico Lebrón, and Sumit Sanghai. 2023. Gqa: Training general-
+ized multi-query transformer models from multi-head checkpoints.
+In Proceedings of the 2023 Conference on Empirical Methods in Natural
+Language Processing. 4895–4901.
+[4] Anthropic. 2026.
+Models & Pricing.
+https://platform.claude.com/
+docs/en/about-claude/pricing.
+[5] Ceph. 2026. Ceph - a scalable distributed storage system. https://
+github.com/ceph/ceph.
+[6] Chi-Chih Chang, Wei-Cheng Lin, Chien-Yu Lin, Chong-Yan Chen, Yu-
+Fang Hu, Pei-Shuo Wang, Ning-Chi Huang, Luis Ceze, Mohamed Ab-
+delfattah, and Kai-Chiang Wu. 2025.
+Palu: KV-cache compression
+with low-rank projection. In International Conference on Learning Rep-
+resentations, Vol. 2025. 50222–50249.
+[7] Weijian Chen, Shuibing He, Haoyang Qu, Ruidong Zhang, Siling
+Yang, Ping Chen, Yi Zheng, Baoxing Huai, and Gang Chen. 2025.
+{IMPRESS}: An {Importance-Informed}{Multi-Tier} prefix {KV}
+storage system for large language model inference. In 23rd USENIX
+Conference on File and Storage Technologies (FAST 25). 187–201.
+[8] Yukang Chen, Weihao Cui, Han Zhao, Ziyi Xu, Xiaoze Fan, Xusheng
+Chen, Yangjie Zhou, Shixuan Sun, Bingsheng He, and Quan Chen.
+2026. Towards High-Goodput LLM Serving with Prefill-decode Mul-
+tiplexing. In Proceedings of the 31st ACM International Conference on
+Architectural Support for Programming Languages and Operating Sys-
+tems, Volume 2. 2030–2047.
+[9] Rongxin Cheng, Yuxin Lai, Xingda Wei, Rong Chen, and Haibo Chen.
+2026. KUNSERVE: Parameter-centric Memory Management for Effi-
+cient Memory Overloading Handling in LLM Serving. In Proceedings
+of the 21st European Conference on Computer Systems (EuroSys ’26). As-
+sociation for Computing Machinery, 1244–1260. doi:10.1145/3767295.
+3769348
+[10] Cloudian.
+2025.
+Supercharging
+Vector
+Database
+Indexing:
+8x
+Faster
+with
+Cloudian
+S3
+RDMA,
+Milvus
+and
+NVIDIA.
+https://cloudian.com/blog/supercharging-vector-database-indexing-
+8x-faster-with-cloudian-s3-rdma-and-nvidia/.
+[11] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré.
+2022. Flashattention: Fast and memory-efficient exact attention with
+io-awareness. Advances in neural information processing systems 35
+(2022), 16344–16359.
+[12] DAOS. 2026. DAOS. https://docs.daos.io/v2.6/.
+[13] DeepSeek. 2026. DeepSeek R1 Distill Qwen 7B. https://huggingface.
+co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B.
+[14] DeepSeek. 2026. Models & Pricing. https://api-docs.deepseek.com/
+quick_start/pricing.
+[15] Dell Technologies. 2026.
+Accelerating AI Workloads with RDMA
+for S3-compatible storage: A Game-Changer with Dell ObjectScale.
+https://infohub.delltechnologies.com/en-uk/p/accelerating-ai-
+workloads-with-rdma-for-s3-compatible-storage-a-game-changer-
+with-dell-objectscale/.
+[16] Dujian Ding, Ankur Mallick, Chi Wang, Robert Sim, Subhabrata
+Mukherjee, Victor Rühle, Laks Lakshmanan, and Ahmed H Awadal-
+lah. 2024. Hybrid llm: Cost-efficient and quality-aware query rout-
+ing. In International Conference on Learning Representations, Vol. 2024.
+41348–41366.
+[17] Dayou Du, Shijie Cao, Jianyi Cheng, Luo Mai, Ting Cao, and Mao
+Yang. 2026. Bitdecoding: Unlocking tensor cores for long-context llms
+with low-bit kv cache. In 2026 IEEE International Symposium on High
+Performance Computer Architecture (HPCA). IEEE, 1–13.
+[18] Wenqi Fan, Yujuan Ding, Liangbo Ning, Shijie Wang, Hengyun Li,
+Dawei Yin, Tat-Seng Chua, and Qing Li. 2024. A survey on rag meet-
+ing llms: Towards retrieval-augmented large language models. In Pro-
+ceedings of the 30th ACM SIGKDD conference on knowledge discovery
+and data mining. 6491–6501.
+[19] Yuan Feng, Junlin Lv, Yukun Cao, Xike Xie, and S Kevin Zhou. 2026.
+Ada-kv: Optimizing kv cache eviction by adaptive budget allocation
+for efficient llm inference. Advances in Neural Information Processing
+Systems 38 (2026), 113152–113188.
+[20] Yao Fu, Leyang Xue, Yeqi Huang, Andrei-Octavian Brabete, Dmitrii
+Ustiugov, Yuvraj Patel, and Luo Mai. 2024. {ServerlessLLM}:{Low-
+Latency} serverless inference for large language models. In 18th
+USENIX Symposium on Operating Systems Design and Implementation
+(OSDI 24). 135–153.
+[21] Bin Gao, Zhuomin He, Puru Sharma, Qingxuan Kang, Djordje Jevdjic,
+Junbo Deng, Xingkun Yang, Zhou Yu, and Pengfei Zuo. 2024. {Cost-
+Efficient} large language model serving for multi-turn conversations
+with {CachedAttention}. In 2024 USENIX annual technical conference
+(USENIX ATC 24). 111–126.
+[22] Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, and
+Jianfeng Gao. 2024. Model tells you what to discard: Adaptive kv
+cache compression for llms. In International Conference on Learning
+Representations, Vol. 2024. 22975–22988.
+[23] In Gim, Guojun Chen, Seung-seob Lee, Nikhil Sarda, Anurag Khandel-
+wal, and Lin Zhong. 2024. Prompt cache: Modular attention reuse for
+13
+
+
+--- Page 14 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+low-latency inference. Proceedings of Machine Learning and Systems
+6 (2024), 325–338.
+[24] Google. 2026. Models & Pricing. https://cloud.google.com/gemini-
+enterprise-agent-platform/generative-ai/pricing.
+[25] Yingyi Hao, Ting Yao, Xingda Wei, Dingyan Zhang, Tianle Sun, Yi-
+wen Zhang, Zhiyong Fu, Huatao Wu, and Rong Chen. 2026.
+Fast
+Cloud Storage for {AI} Jobs via Grouped {I/O}{API} with Trans-
+parent {Read/Write} Optimizations. In 24th USENIX Conference on
+File and Storage Technologies (FAST 26). 255–270.
+[26] Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W
+Mahoney, Yakun S Shao, Kurt Keutzer, and Amir Gholami. 2024.
+Kvquant: Towards 10 million context length llm inference with kv
+cache quantization. Advances in Neural Information Processing Sys-
+tems 37 (2024), 1270–1303.
+[27] Cunchen Hu, Heyang Huang, Junhao Hu, Jiang Xu, Xusheng Chen,
+Tao Xie, Chenxi Wang, Sa Wang, Yungang Bao, Ninghui Sun, et al.
+2024. Memserve: Context caching for disaggregated llm serving with
+elastic memory pool. arXiv preprint arXiv:2406.17565 (2024).
+[28] Cunchen Hu, Heyang Huang, Liangliang Xu, Xusheng Chen, Chenxi
+Wang, Jiang Xu, Shuang Chen, Hao Feng, Sa Wang, Yungang Bao,
+et al. 2025. ShuffleInfer: Disaggregate LLM inference for mixed down-
+stream workloads. ACM Transactions on Architecture and Code Opti-
+mization 22, 2 (2025), 1–24.
+[29] Junhao Hu, Jiang Xu, Zhixia Liu, Yulong He, Yuetao Chen, Hao
+Xu, Jiang Liu, Jie Meng, Baoquan Zhang, Shining Wan, et al. 2025.
+{DEEPSERVE}: Serverless Large Language Model Serving at Scale.
+In 2025 USENIX Annual Technical Conference (USENIX ATC 25). 57–
+72.
+[30] IBM. 2026.
+Granite 3.3 8B.
+https://huggingface.co/ibm-granite/
+granite-3.3-8b-instruct.
+[31] Aditya K Kamath, Ramya Prabhu, Jayashree Mohan, Simon Peter, Ra-
+machandran Ramjee, and Ashish Panwar. 2025. Pod-attention: Un-
+locking full prefill-decode overlap for faster llm inference. In Proceed-
+ings of the 30th ACM International Conference on Architectural Support
+for Programming Languages and Operating Systems, Volume 2. 897–
+912.
+[32] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica.
+2023. Efficient memory management for large language model serv-
+ing with pagedattention. In Proceedings of the 29th symposium on op-
+erating systems principles. 611–626.
+[33] Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. 2024.
+{InfiniGen}: Efficient generative inference of large language models
+with dynamic {KV} cache management. In 18th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI 24). 155–172.
+[34] Yuhong Li, Yingbing Huang, Bowen Yang, Bharat Venkitesh, Acyr
+Locatelli, Hanchen Ye, Tianle Cai, Patrick Lewis, and Deming Chen.
+2024. Snapkv: Llm knows what you are looking for before generation.
+Advances in Neural Information Processing Systems 37 (2024), 22947–
+22970.
+[35] Aixin Liu, Bei Feng, Bin Wang, Bingxuan Wang, Bo Liu, Chenggang
+Zhao, Chengqi Dengr, Chong Ruan, Damai Dai, Daya Guo, et al. 2024.
+Deepseek-v2: A strong, economical, and efficient mixture-of-experts
+language model. arXiv preprint arXiv:2405.04434 (2024).
+[36] Yuhan Liu, Yihua Cheng, Jiayi Yao, Yuwei An, Xiaokun Chen, Shaot-
+ing Feng, Yuyang Huang, Samuel Shen, Rui Zhang, Kuntai Du, et al.
+2025. Lmcache: An efficient KV cache layer for enterprise-scale LLM
+inference. arXiv preprint arXiv:2510.09665 (2025).
+[37] Yuhan Liu, Hanchen Li, Yihua Cheng, Siddhant Ray, Yuyang Huang,
+Qizheng Zhang, Kuntai Du, Jiayi Yao, Shan Lu, Ganesh Anantha-
+narayanan, et al. 2024. Cachegen: Kv cache compression and stream-
+ing for fast large language model serving. In Proceedings of the ACM
+SIGCOMM 2024 Conference. 38–56.
+[38] Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor
+Xie, Zhaozhuo Xu, Anastasios Kyrillidis, and Anshumali Shrivastava.
+2023. Scissorhands: Exploiting the persistence of importance hypoth-
+esis for llm kv cache compression at test time. Advances in Neural
+Information Processing Systems 36 (2023), 52342–52364.
+[39] Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu,
+Vladimir Braverman, Beidi Chen, and Xia Hu. 2024. KIVI: a tuning-
+free asymmetric 2bit quantization for KV cache. In Proceedings of the
+41st International Conference on Machine Learning. 32332–32344.
+[40] LMCache. 2026. LMCache. https://github.com/lmcache/lmcache.
+[41] Jiaqi Lou, Xinhao Kong, Jinghan Huang, Wei Bai, Nam Sung Kim, and
+Danyang Zhuo. 2024. Harmonic: Hardware-assisted {RDMA} per-
+formance isolation for public clouds. In 21st USENIX Symposium on
+Networked Systems Design and Implementation (NSDI 24). 1479–1496.
+[42] Yixuan Mei, Yonghao Zhuang, Xupeng Miao, Juncheng Yang, Zhihao
+Jia, and Rashmi Vinayak. 2025. Helix: Serving large language models
+over heterogeneous gpus and network via max-flow. In Proceedings
+of the 30th ACM International Conference on Architectural Support for
+Programming Languages and Operating Systems, Volume 1. 586–602.
+[43] Fanxu Meng, Pingzhi Tang, Zengwei Yao, Xing Sun, and Muhan
+Zhang. 2026. TransMLA: Migrating GQA models to MLA with full
+deepseek compatibility and speedup. Advances in Neural Information
+Processing Systems 38 (2026), 81977–82019.
+[44] Meta. 2026. Llama 3.1 8B. https://huggingface.co/meta-llama/Llama-
+3.1-8B.
+[45] MinIO. 2025.
+MinIO S3 over RDMA.
+https://blog.min.io/s3-over-
+rdma/.
+[46] Sean Nian, Jiahao Fang, Qilong Feng, Zhiyu Wu, and Fan Lai.
+2026. CacheFlow: Efficient LLM Serving with 3D-Parallel KV Cache
+Restoration. arXiv preprint arXiv:2604.25080 (2026).
+[47] NVIDIA. 2025. How to Unlock Accelerated AI Storage Performance
+With RDMA for S3-Compatible Storage.
+https://blogs.nvidia.com/
+blog/s3-compatible-ai-storage/.
+[48] NVIDIA. 2026.
+NVIDIA cuObject: GPUDirect Storage for Objects.
+https://docs.nvidia.com/gpudirect-storage/cuobject/index.html.
+[49] NVIDIA. 2026.
+NVIDIA cuObject server v1.0.0 Release Notes.
+https://docs.nvidia.com/gpudirect-storage/cuobject/cuobject-
+server-release-notes/index.html.
+[50] Nvidia. 2026. NVIDIA Inference Xfer Library (NIXL). https://github.
+com/ai-dynamo/nixl.
+[51] OpenAI. 2026. Models & Pricing. https://developers.openai.com/api/
+docs/pricing.
+[52] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo
+Goiri, Saeed Maleki, and Ricardo Bianchini. 2024. Splitwise: Efficient
+generative llm inference using phase splitting. In 2024 ACM/IEEE
+51st Annual International Symposium on Computer Architecture (ISCA).
+IEEE, 118–132.
+[53] Ramya Prabhu, Ajay Nayak, Jayashree Mohan, Ramachandran Ram-
+jee, and Ashish Panwar. 2025. vattention: Dynamic memory manage-
+ment for serving llms without pagedattention. In Proceedings of the
+30th ACM International Conference on Architectural Support for Pro-
+gramming Languages and Operating Systems, Volume 1. 1133–1150.
+[54] Ruoyu Qin, Weiran He, Yaoyu Wang, Zheming Li, Xinran Xu, Yong-
+wei Wu, Weimin Zheng, and Mingxing Zhang. 2026.
+Prefill-as-
+a-Service: KVCache of Next-Generation Models Could Go Cross-
+Datacenter. arXiv preprint arXiv:2604.15039 (2026).
+[55] Ruoyu Qin, Zheming Li, Weiran He, Jialei Cui, Heyi Tang, Feng Ren,
+Teng Ma, Shangming Cai, Yineng Zhang, Mingxing Zhang, et al. 2024.
+Mooncake: A kvcache-centric disaggregated architecture for llm serv-
+ing. ACM Transactions on Storage (2024).
+[56] Benjamin Rothenberger, Konstantin Taranov, Adrian Perrig, and
+Torsten Hoefler. 2021.
+{ReDMArk}: Bypassing {RDMA} security
+mechanisms. In 30th USENIX Security Symposium (USENIX Security
+21). 4277–4292.
+14
+
+
+--- Page 15 ---
+ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse
+[57] Noam Shazeer. 2019. Fast transformer decoding: One write-head is
+all you need. arXiv preprint arXiv:1911.02150 (2019).
+[58] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max
+Ryabinin, Beidi Chen, Percy Liang, Christopher Ré, Ion Stoica, and
+Ce Zhang. 2023. Flexgen: High-throughput generative inference of
+large language models with a single gpu. In International Conference
+on Machine Learning. PMLR, 31094–31116.
+[59] Anna Kornfeld Simpson, Adriana Szekeres, Jacob Nelson, and Irene
+Zhang. 2020. Securing {RDMA} for {High-Performance} datacen-
+ter storage systems. In 12th USENIX Workshop on Hot Topics in Cloud
+Computing (HotCloud 20).
+[60] Zhaoyuan Su, Zeyu Zhang, Tingfeng Lan, Zirui Wang, Juncheng
+Yang, and Yue Cheng. 2026. MorphServe: Efficient and Workload-
+Aware LLM Serving via Runtime Quantized Layer Swapping and KV
+Cache Resizing. In Proceedings of Machine Learning and Systems.
+[61] Hanshi Sun, Li-Wen Chang, Wenlei Bao, Size Zheng, Ningxin Zheng,
+Xin Liu, Harry Dong, Yuejie Chi, and Beidi Chen. [n. d.]. ShadowKV:
+KV Cache in Shadows for High-Throughput Long-Context LLM Infer-
+ence. In Forty-second International Conference on Machine Learning.
+[62] Shuwen Sun, Isaac Khor, Ji-Yong Shin, and Peter Desnoyers. 2025. A
+Fast, Efficient, and Strongly-Consistent Object Store. In Proceedings
+of the 2025 ACM Symposium on Cloud Computing. 708–721.
+[63] Shin-Yeh Tsai, Mathias Payer, and Yiying Zhang. 2019. Pythia: remote
+oracles for the masses. In 28th USENIX Security Symposium (USENIX
+Security 19). 693–710.
+[64] UCX. 2026. Unified Communication X. https://github.com/openucx/
+ucx.
+[65] VAST Data. 2025.
+S3 over RDMA: Scaling the KV Cache Data
+Plane.
+https://www.vastdata.com/blog/s3-over-rdma-scaling-the-
+kv-cache-data-plane.
+[66] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion
+Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. At-
+tention is all you need. Advances in neural information processing
+systems 30 (2017).
+[67] vLLM. 2026. vLLM. https://github.com/vllm-project/vllm.
+[68] Jiahao Wang, Jinbo Han, Xingda Wei, Sijie Shen, Dingyan Zhang,
+Chenguang Fang, Rong Chen, Wenyuan Yu, and Haibo Chen. 2025.
+{KVCache} Cache in the Wild: Characterizing and Optimizing
+{KVCache} Cache at a Large Cloud Provider. In 2025 USENIX Annual
+Technical Conference (USENIX ATC 25). 465–482.
+[69] Yuxin Wang, Yuhan Chen, Zeyu Li, Xueze Kang, Yuchu Fang, Yeju
+Zhou, Yang Zheng, Zhenheng Tang, Xin He, Rui Guo, et al. 2025.
+Burstgpt: A real-world workload dataset to optimize llm serving sys-
+tems. In Proceedings of the 31st ACM SIGKDD Conference on Knowl-
+edge Discovery and Data Mining V. 2. 5831–5841.
+[70] Yuxing Xiang, Xue Li, Kun Qian, Yan Zhang, Wenyuan Yu, Ennan
+Zhai, Xin Jin, and Jingren Zhou. 2026. {ServeGen}: Workload Char-
+acterization and Generation of Large Language Model Serving in Pro-
+duction. In 23rd USENIX Symposium on Networked Systems Design and
+Implementation (NSDI 26). 1845–1859.
+[71] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike
+Lewis. 2024.
+Efficient streaming language models with atten-
+tion sinks. In International Conference on Learning Representations,
+Vol. 2024. 21875–21895.
+[72] Jiayi Yao, Hanchen Li, Yuhan Liu, Siddhant Ray, Yihua Cheng,
+Qizheng Zhang, Kuntai Du, Shan Lu, and Junchen Jiang. 2025.
+Cacheblend: Fast large language model serving for rag with cached
+knowledge fusion. In Proceedings of the twentieth European conference
+on computer systems. 94–109.
+[73] Lu Ye, Ze Tao, Yong Huang, and Yang Li. 2024. Chunkattention: Effi-
+cient self-attention with prefix-aware kv cache and two-phase parti-
+tion. In Proceedings of the 62nd Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers). 11608–11620.
+[74] Weiping Yu, Ye Jiarui, He Mengke, Junfeng Liu, and Siqiang Luo.
+2025. On 10x Better Scalability: KV Stores Scale Up KV Cache. arXiv
+preprint arXiv:2511.16138 (2025).
+[75] Amir Zandieh, Majid Daliri, Majid Hadian, and Vahab Mirrokni. 2026.
+TurboQuant: Online Vector Quantization with Near-optimal Distor-
+tion Rate. In Proceedings of the International Conference on Learning
+Representations.
+[76] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin
+Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Ré, Clark
+Barrett, et al. 2023. H2o: Heavy-hitter oracle for efficient generative
+inference of large language models. Advances in Neural Information
+Processing Systems 36 (2023), 34661–34710.
+[77] Chenxingyu Zhao, Jaehong Min, Ming Liu, and Arvind Krishna-
+murthy. 2025.
+{White-Boxing}{RDMA} with {Packet-Granular}
+Software Control. In 22nd USENIX Symposium on Networked Systems
+Design and Implementation (NSDI 25). 427–449.
+[78] Zhen Zheng, Xin Ji, Taosong Fang, Fanghao Zhou, Chuanjie Liu, and
+Gang Peng. 2026.
+BatchLLM: Optimizing Large Batched LLM In-
+ference with Global Prefix Sharing and Throughput-oriented Token
+Batching. In Proceedings of Machine Learning and Systems (MLSys).
+[79] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-
+anzhe Liu, Xin Jin, and Hao Zhang. 2024. {DistServe}: Disaggregat-
+ing prefill and decoding for goodput-optimized large language model
+serving. In 18th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 24). 193–210.
+[80] Jiatang Zhou, Kaisong Huang, and Tianzheng Wang. 2026. Millis-
+cale: Fast Commit on Low-Latency Object Storage. arXiv preprint
+arXiv:2603.02108 (2026).
+[81] Jing Zou, Shangyu Wu, Hancong Duan, Qiao Li, and Chun Jason
+Xue. 2026. ContiguousKV: Accelerating LLM Prefill with Granularity-
+Aligned KV Cache Management.
+arXiv preprint arXiv:2601.13631
+(2026).
+15
+
+
+--- Page 16 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+Table A1. Steady-state boundary-granularity recompute
+cost for Llama 3.1 8B.
+GPU Ctx. Hit (%)
+𝐺= 16
+𝐺= 512
+Δ
+A100 4K
+12.5
+322.6 ± 8.6
+344.2 ± 5.9
+21.6
+25.0
+270.5 ± 0.4
+310.3 ± 1.8
+39.7
+37.5
+236.3 ± 1.4
+264.5 ± 0.6
+28.2
+50.0
+192.6 ± 0.4
+222.7 ± 0.2
+30.2
+62.5
+149.3 ± 2.0
+182.1 ± 0.0
+32.9
+75.0
+109.0 ± 0.1
+141.8 ± 1.5
+32.7
+87.5
+70.2 ± 0.9
+101.9 ± 0.3
+31.7
+64K
+12.5
+11643.8 ± 9.3 11686.9 ± 12.7
+43.1
+25.0 10768.3 ± 13.2
+10810.8 ± 1.1
+42.5
+37.5
+9616.7 ± 2.3
+9671.8 ± 6.2
+55.2
+50.0
+8236.6 ± 6.8
+8283.8 ± 6.5
+47.2
+62.5
+6577.9 ± 9.0
+6645.4 ± 9.5
+67.6
+75.0
+4676.2 ± 1.0
+4763.2 ± 0.1
+87.0
+87.5
+2538.5 ± 3.1
+2642.0 ± 0.5 103.6
+H100 4K
+12.5
+143.5 ± 0.2
+162.3 ± 0.5
+18.8
+25.0
+122.8 ± 0.0
+140.7 ± 0.3
+17.9
+37.5
+107.1 ± 1.5
+125.9 ± 0.5
+18.8
+50.0
+87.5 ± 0.7
+106.2 ± 1.5
+18.6
+62.5
+69.0 ± 0.1
+87.9 ± 0.9
+18.9
+75.0
+50.0 ± 0.1
+70.8 ± 1.0
+20.8
+87.5
+33.7 ± 0.1
+51.7 ± 0.8
+17.9
+64K
+12.5
+4948.6 ± 14.4
+5009.5 ± 2.9
+60.9
+25.0
+4547.8 ± 0.4
+4605.5 ± 5.5
+57.7
+37.5
+4015.1 ± 1.9
+4067.1 ± 2.9
+52.0
+50.0
+3410.1 ± 3.6
+3482.9 ± 1.2
+72.7
+62.5
+2699.0 ± 0.6
+2757.0 ± 0.7
+58.0
+75.0
+1911.2 ± 3.4
+1985.0 ± 3.1
+73.7
+87.5
+1022.1 ± 1.1
+1090.5 ± 1.8
+68.5
+A
+Additional Motivation Data
+Tables A1 and A2 report the full steady-state measurements
+behind the cache-boundary granularity study. For each se-
+mantic hit boundary, the prompt reuses 𝑀−𝐺tokens, where
+𝑀= 𝐶· 𝑟is the base hit boundary and 𝐺∈{16, 512}.
+Thus 𝐺= 512 recomputes 496 more tokens than 𝐺= 16
+in every row. Entries are TTFT in milliseconds over steady-
+state trials 1–2, reported as mean ± one standard deviation.
+Δ = 𝑇𝐺=512 −𝑇𝐺=16 uses the same steady-state trials and ex-
+cludes trial 0 to avoid shape-warmup effects.
+Table A2. Steady-state boundary-granularity recompute
+cost for DeepSeek-R1-Distill-Qwen-7B.
+GPU Ctx. Hit (%)
+𝐺= 16
+𝐺= 512
+Δ
+A100 4K
+12.5
+283.1 ± 1.2
+317.0 ± 2.8 34.0
+25.0
+251.2 ± 2.9
+278.5 ± 0.3 27.3
+37.5
+212.0 ± 2.9
+243.7 ± 2.9 31.7
+50.0
+177.7 ± 1.6
+206.3 ± 0.4 28.6
+62.5
+140.6 ± 0.7
+168.5 ± 0.9 27.8
+75.0
+102.6 ± 0.1
+132.2 ± 0.3 29.6
+87.5
+60.2 ± 0.0
+93.5 ± 0.3 33.3
+64K
+12.5 9633.1 ± 19.9 9708.1 ± 17.7 75.0
+25.0 8893.6 ± 26.1
+8966.9 ± 0.1 73.3
+37.5 7932.3 ± 16.4
+7994.1 ± 8.8 61.8
+50.0 6769.8 ± 16.1
+6836.8 ± 8.2 66.9
+62.5
+5414.7 ± 2.2
+5479.2 ± 1.3 64.5
+75.0
+3847.8 ± 3.2 3914.7 ± 19.3 66.9
+87.5
+2098.0 ± 3.2
+2179.5 ± 9.9 81.5
+H100 4K
+12.5
+133.7 ± 0.8
+149.8 ± 0.5 16.1
+25.0
+117.1 ± 0.2
+134.3 ± 1.0 17.3
+37.5
+98.4 ± 0.3
+115.8 ± 0.6 17.4
+50.0
+83.9 ± 2.0
+99.5 ± 0.9 15.6
+62.5
+68.1 ± 1.8
+81.1 ± 0.1 12.9
+75.0
+45.6 ± 0.5
+64.2 ± 0.7 18.6
+87.5
+31.7 ± 0.3
+46.2 ± 0.2 14.5
+64K
+12.5
+4259.2 ± 8.6
+4311.1 ± 0.8 51.9
+25.0
+3898.4 ± 1.2
+3934.0 ± 3.1 35.6
+37.5
+3425.6 ± 0.4
+3454.9 ± 2.3 29.3
+50.0
+2895.8 ± 0.0
+2922.4 ± 2.2 26.6
+62.5
+2280.2 ± 2.8
+2329.3 ± 4.9 49.1
+75.0
+1616.2 ± 0.5
+1647.2 ± 3.0 31.0
+87.5
+847.2 ± 1.1
+904.5 ± 0.2 57.2
+10 GB
+100 GB
+1 TB
+10 TB
+KV cache size (log scale)
+Llama-models
+FlashAttention
+NIXL
+LMCache
+DAOS
+Ceph
+15.7 GB
+141.4 GB
+82.0 GB
+738.2 GB
+93.4 GB
+840.3 GB
+101.0 GB
+908.9 GB
+533.5 GB
+4.69 TB
+1.95 TB
+17.52 TB
+Qwen 2.5 7B (56 KB/tok)
+Llama 3.1 405B (504 KB/tok)
+Figure A1. Repository-scale prefixes can translate into
+large KV cache footprints. Ranges are computed from repos-
+itory token counts and two representative KV cache sizes
+per token.
+16
+
+
+--- Page 17 ---
+ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse
+0
+2
+4
+6
+8
+10
+Cached / fresh input price (%)
+DeepSeek V4 Pro
+Claude Opus 4.7
+Gemini 3.1 Pro
+GPT-5.5
+0.83%
+10%
+10%
+10%
+Figure A2. Major APIs price cached input far below fresh
+input, reflecting the economic value of prefix reuse in de-
+ployed LLM services [4, 14, 24, 51].
+B
+Measured Cache-Boundary Recompute
+C
+Pinned CPU-GPU H2D
+Microbenchmarks
+D
+Per-model, per-GPU recompute and
+bandwidth heatmaps
+Figures A4–A7 extend the main-paper recompute and required-
+throughput surfaces across the four representative 7–8B mod-
+els and both GPU platforms. Total cached KV size is GPU-
+agnostic (Figure A4); per-layer compute time (Figure A5),
+MFU (Figure A6), and required bandwidth (Figure A7) each
+stack A100 (top row) and H100 (bottom row) to expose the
+GPU-platform effect at constant model and context.
+E
+Optimal Aggregation Size Benchmark
+Here we test what is the optimal aggregation size for differ-
+ent chunk granularities.
+17
+
+
+--- Page 18 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+64KB
+1MB
+64MB
+0
+5
+10
+Throughput (GB/s)
+PCIe Gen4 x8 practical
+(a) A100, PCIe Gen4 x8
+64KB
+1MB
+64MB
+0
+20
+40
+60
+Throughput (GB/s)
+PCIe Gen5 x16 practical
+(b) H100, PCIe Gen5 x16
+10−1
+100
+Latency (ms)
+10−2
+10−1
+100
+Latency (ms)
+Throughput
+P50 latency
+P99 latency
+Figure A3. Pinned CPU→GPU H2D throughput and latency vs. block size for A100 (PCIe Gen4 x8) and H100 (PCIe Gen5 x16).
+Bars report mean throughput (±1𝜎over 200 per-size samples); right-axis lines report P50/P99 latency across 64 KB–64 MB
+blocks. The source buffer is placed on NUMA 0 in both setups. A100 saturates near 12 GB/s; H100 saturates near 55 GB/s for
+blocks ≥8 MB.
+< 0.5
+< 2
+< 10
+> 10 GB
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(a) Llama 3.1 8B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(b) Mistral 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(c) DeepSeek-Distill 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(d) Granite 3.3 8B
+Figure A4. Total cached KV size per (context length, hit rate) configuration for each model. KV size is independent of GPU
+platform, so each value is reported once.
+< 10
+< 100
+< 1000
+> 1000 ms
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(a) A100, Llama 3.1 8B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(b) A100, Mistral 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(c) A100, DeepSeek-Distill 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(d) A100, Granite 3.3 8B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(e) H100, Llama 3.1 8B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(f) H100, Mistral 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(g) H100, DeepSeek-Distill 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(h) H100, Granite 3.3 8B
+Figure A5. Per-layer compute time across four representative models on A100 (top row) and H100 (bottom row). Blank
+configurations indicate unsupported or unmeasured context lengths, such as Mistral 7B beyond its 32K window.
+18
+
+
+--- Page 19 ---
+ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse
+< 10
+< 25
+< 40
+> 40%
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(a) A100, Llama 3.1 8B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(b) A100, Mistral 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(c) A100, DeepSeek-Distill 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(d) A100, Granite 3.3 8B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(e) H100, Llama 3.1 8B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(f) H100, Mistral 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(g) H100, DeepSeek-Distill 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(h) H100, Granite 3.3 8B
+Figure A6. Model FLOP utilization (MFU) across four representative models on A100 (top row) and H100 (bottom row). Low-
+MFU cells indicate configurations that do not saturate GPU compute; high-MFU cells identify compute-dense configurations.
+< 2.5
+< 5
+< 12.5
+> 12.5 GB/s
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(a) A100, Llama 3.1 8B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(b) A100, Mistral 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(c) A100, DeepSeek-Distill 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(d) A100, Granite 3.3 8B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(e) H100, Llama 3.1 8B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(f) H100, Mistral 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(g) H100, DeepSeek-Distill 7B
+1K
+4K
+16K
+64K
+Context length
+20%
+40%
+60%
+80%
+Hit rate
+(h) H100, Granite 3.3 8B
+Figure A7. Required per-layer transfer throughput to fully overlap cached KV loading with compute across four models on
+A100 (top row) and H100 (bottom row). Faster compute on H100 raises the bandwidth needed for perfect overlap.
+19
+
+
+--- Page 20 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+16
+32
+64
+128
+256
+512
+Token granularity per chunk (G)
+0
+2
+4
+6
+8
+10
+12
+Throughput (GB/s)
+peak
+9.98 GB/s
+agg=512 KB
+agg=1 MB  (small-G best)
+agg=2 MB  (peak)
+agg=4 MB
+agg=8 MB
+Figure A8. S3RDMA Agg throughput across aggrega-
+tion sizes and chunk granularities. The sweep cov-
+ers agg_size ∈{512KB,1MB,2MB,4MB,8MB} and 𝐺
+∈
+{16, 32, 64, 128, 256, 512}. Throughput peaks at 𝐺=256 with
+agg_size=2 MB (9.98 GB/s); for 𝐺=16, agg_size=1 MB is
+best.
+20
+
+
+--- Page 21 ---
+ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse
+F
+Reference Algorithms and Cost Table
+This appendix collects the full pseudocode for the Object-
+Cache layerwise GET and the Calibrated Stall-opt scheduler,
+together with the storage-tier cost breakdown referenced in
+the main discussion.
+Table A3. ObjectCache layerwise GET (full pseudocode).
+1 for ℓ= 0, . . . , 𝐿−1 do
+2
+𝐵ℓ←∅
+3
+for each key 𝐻𝑗in chunk_keys do
+4
+𝑜←ℓ· 𝑆
+5
+append RangeGet(𝐻𝑗,𝑜,𝑆) to 𝐵ℓ
+6
+RDMAWrite(client_buffer[ℓ], 𝐵ℓ)
+7
+NotifyLayerReady(ℓ)
+Table A4. Calibrated Stall-opt layerwise bandwidth alloca-
+tion (full pseudocode).
+1 Input: epoch requests R, bandwidth cap 𝐵, sched-
+uler margin Δ; per-request bytes-per-layer 𝑏𝑖and
+per-layer compute time 𝑡𝑖.
+2 for each request 𝑖∈R do
+3
+𝑛𝑖←𝑏𝑖/𝑡𝑖+ Δ
+4 Allocate up to 𝑛𝑖while capacity remains.
+5 Redistribute unassigned budget to requests with
+remaining per-layer stall.
+6 Hold per-request rates stable for this epoch.
+7 Dispatch layer payloads with weighted deficit
+round robin.
+Table A5. Approximate cost comparison across storage
+tiers (2025 cloud pricing).
+Tier
+Capacity
+$/GB/month
+Latency
+GPU VRAM (H100 80GB)
+80 GB
+$25+
+<1 𝜇s
+CPU DRAM
+512 GB
+$3–5
+100 ns
+Remote DRAM (RDMA)
+TB-scale
+$1–2
+10–100 𝜇s
+NVMe SSD (local)
+TB-scale
+$0.10
+100 𝜇s
+S3/Object Storage
+PB-scale
+$0.02
+10–50 ms
+Table A6. Extra GPU prefill latency per cache-hit boundary
+when chunk granularity increases from G=16 (vLLM [32]
+default) to G=512 (Mooncake [55]), measured on A100/H100.
+Each boundary recomputes up to 496 redundant tokens. At
+1K QPS, the Llama 8B-64K penalty wastes ∼1,500 GPU hours
+per day for both A100 and H100.
+Llama 3.1 8B
+DeepSeek R1 7B
+Metric
+4K
+64K
+4K
+64K
+Δ FLOPs
+8.0 T
+24.0 T
+7.3 T
+19.5 T
+A100 Δ𝑡
+31.0±5.5 ms
+63.7±23.7 ms
+30.3±2.7 ms
+70.0±6.9 ms
+H100 Δ𝑡
+18.8±1.0 ms
+63.4±8.3 ms
+16.1±1.9 ms
+40.1±12.4 ms
+Δ FLOPs:
+extra
+recompute
+work
+per
+request
+from
+the
+coarser
+chunk
+tail
+(496
+additional
+tokens),
+constant
+across
+hit
+rates
+𝑟
+∈
+{12.5%, 25%, . . . , 87.5%}.
+Latency
+rows:
+mean
+±
+std
+of
+Δ𝑡= 𝑇𝐺=512 −𝑇𝐺=16 measured at each 𝑟with one chunk miss. Steady-state
+after warm-up; full per-hit breakdowns in Appendix Tables 1–2.
+Table A7. Client-visible element count for S3RDMA Agg
+bounded layerwise aggregation.
+Context = 4K
+Context = 64K
+chunk (tokens)
+16
+64
+256
+16
+64
+256
+number (hit=87.5%)
+224
+56
+14
+3,584
+896
+224
+original elements
+7,168 1,792
+448 114,688 28,672 7,168
+agg payload size
+1 MB 2 MB 2 MB
+1 MB
+2 MB 2 MB
+elements per agg
+16
+8
+2
+16
+8
+2
+elements after agg
+448
+224
+224
+7,168
+3,584 3,584
+reduction factor
+16×
+8×
+2×
+16×
+8×
+2×
+21
+
+
+--- Page 22 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+G
+Compute time and required throughput
+at the canonical configurations
+Table A8 reports total prefill compute time, per-layer com-
+pute time, and the per-layer transfer throughput needed for
+full overlap, for the (𝐶,𝑟) configurations used throughout
+the streaming-overlap analysis and scheduler workloads.
+Table A8. Per-layer compute time and required transfer
+throughput to fully overlap one layer of cached KV load-
+ing with compute, for Llama 3.1 8B on A100 80GB. Total
+cached KV bytes = 𝑟· 𝐶· 𝐿· b with 𝐿=32 layers and b=4096
+bytes per token per layer.𝑇(ℓ)
+compute = 𝑇total/𝐿. Required trans-
+fer throughput = KV/𝑇total (equivalently per-layer-KV / per-
+layer-compute).
+Context
+Hit Cached
+𝑇total
+𝑇(ℓ)
+compute
+Req. BW
+Length 𝐶
+Rate 𝑟
+Tokens
+(ms) (ms / layer)
+(GB/s)
+4K
+0.500
+2,048
+185.31
+5.79
+1.45
+4K
+0.875
+3,584
+63.47
+1.98
+7.41
+16K
+0.500
+8,192
+955.89
+29.87
+1.12
+16K
+0.875
+14,336
+281.76
+8.80
+6.67
+32K
+0.500
+16,384 2,589.25
+80.91
+0.83
+32K
+0.875
+28,672
+763.19
+23.85
+4.92
+64K
+0.500
+32,768 8,672.79
+271.02
+0.50
+64K
+0.875
+57,344 2,423.90
+75.75
+3.10
+22
+
+
+--- Page 23 ---
+ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse
+H
+Per-request allocations behind Figure 16
+Table A9 reports the per-request transfer throughput each
+scheduling policy assigns under shared 80 Gbps and 50 Gbps
+caps to show moderate and stronger contention for the sched-
+uler workloads.
+Table A9. Per-request allocated transfer throughput (Gbps)
+for the parallel scheduler workloads, using an 80 Gbps cap
+for Workload A and a 50 Gbps cap for Workloads B and C.
+Request
+Equal KV-prop BW-prop Stall-opt Cal. Stall-opt
+Workload A: 16K/64K, 50%/87.5%, 80 Gbps cap
+16K, 50%
+20.00
+5.82
+7.89
+8.99
+13.99
+16K, 87.5%
+20.00
+10.18
+46.85
+42.25
+27.25
+64K, 50%
+20.00
+23.27
+3.48
+3.96
+8.96
+64K, 87.5%
+20.00
+40.73
+21.78
+24.81
+29.81
+Workload B: 16K/64K, 50%/87.5%, 50 Gbps cap
+16K, 50%
+12.50
+3.64
+4.93
+8.99
+8.26
+16K, 87.5%
+12.50
+6.36
+29.28
+12.35
+10.93
+64K, 50%
+12.50
+14.55
+2.17
+3.96
+8.96
+64K, 87.5%
+12.50
+25.45
+13.61
+24.70
+21.85
+Workload C: 16K/32K/64K, 50%/87.5%, 50 Gbps cap
+16K, 50%
+8.33
+2.60
+3.28
+5.76
+4.97
+16K, 87.5%
+8.33
+4.55
+19.45
+7.62
+6.58
+32K, 50%
+8.33
+5.19
+2.42
+6.64
+7.03
+32K, 87.5%
+8.33
+9.09
+14.36
+10.78
+9.30
+64K, 50%
+8.33
+10.39
+1.44
+3.96
+8.96
+64K, 87.5%
+8.33
+18.18
+9.04
+15.24
+13.15
+Table A10 reports the measured S3Agg-LW-cap TTFT for
+the exact allocation configurations in Table A9. Table A12
+sums those per-request measurements into the total TTFT
+used by the three scheduling workloads.
+23
+
+
+--- Page 24 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+Table A10. Measured S3Agg-LW-cap TTFT for the exact allocation configurations in Table A9.
+Workload Policy
+Request
+Rate Avg. TTFT Stdev
+(Gbps)
+(ms)
+(ms)
+Workload A: 16K + 64K at 50% and 87.5%, 80 Gbps cap
+A
+Equal
+16K, 50%
+20.00
+1,002.9
+3.9
+A
+Equal
+16K, 87.5%
+20.00
+851.0
+4.3
+A
+Equal
+64K, 50%
+20.00
+8,188.5
+29.2
+A
+Equal
+64K, 87.5%
+20.00
+3,330.7
+16.3
+A
+KV-prop
+16K, 50%
+5.82
+1,592.2
+1.1
+A
+KV-prop
+16K, 87.5%
+10.18
+1,577.9
+6.4
+A
+KV-prop
+64K, 50%
+23.27
+8,104.5
+25.7
+A
+KV-prop
+64K, 87.5%
+40.73
+2,616.0
+34.1
+A
+BW-prop
+16K, 50%
+7.89
+1,213.8
+12.9
+A
+BW-prop
+16K, 87.5%
+46.85
+416.7
+0.9
+A
+BW-prop
+64K, 50%
+3.48
+10,513.9
+17.2
+A
+BW-prop
+64K, 87.5%
+21.78
+3,086.3
+3.8
+A
+Stall-opt
+16K, 50%
+8.99
+1,080.4
+2.1
+A
+Stall-opt
+16K, 87.5%
+42.25
+453.5
+2.0
+A
+Stall-opt
+64K, 50%
+3.96
+9,312.4
+4.3
+A
+Stall-opt
+64K, 87.5%
+24.81
+2,754.5
+14.3
+A
+Cal. Stall-opt
+16K, 50%
+13.99
+1,001.8
+4.4
+A
+Cal. Stall-opt 16K, 87.5%
+27.25
+644.7
+0.3
+A
+Cal. Stall-opt
+64K, 50%
+8.96
+8,531.7
+3.5
+A
+Cal. Stall-opt 64K, 87.5%
+29.81
+2,636.3
+5.2
+Workload B: 16K + 64K at 50% and 87.5%
+B
+Equal
+16K, 50%
+12.50
+1,021.7
+5.1
+B
+Equal
+16K, 87.5%
+12.50
+1,308.8
+5.8
+B
+Equal
+64K, 50%
+12.50
+8,448.4
+8.1
+B
+Equal
+64K, 87.5%
+12.50
+5,139.7
+14.3
+B
+KV-prop
+16K, 50%
+3.64
+2,489.4
+5.2
+B
+KV-prop
+16K, 87.5%
+6.36
+2,467.9
+1.5
+B
+KV-prop
+64K, 50%
+14.55
+8,541.0
+189.2
+B
+KV-prop
+64K, 87.5%
+25.45
+2,714.4
+19.4
+B
+BW-prop
+16K, 50%
+4.93
+1,861.4
+1.9
+B
+BW-prop
+16K, 87.5%
+29.28
+608.8
+3.0
+B
+BW-prop
+64K, 50%
+2.17
+16,443.2
+7.9
+B
+BW-prop
+64K, 87.5%
+13.61
+4,751.4
+12.2
+B
+Stall-opt
+16K, 50%
+8.99
+1,082.5
+2.7
+B
+Stall-opt
+16K, 87.5%
+12.35
+1,327.8
+24.1
+B
+Stall-opt
+64K, 50%
+3.96
+9,319.5
+30.2
+B
+Stall-opt
+64K, 87.5%
+24.70
+2,788.1
+31.5
+B
+Cal. Stall-opt
+16K, 50%
+8.26
+1,166.8
+5.9
+B
+Cal. Stall-opt 16K, 87.5%
+10.93
+1,473.3
+3.2
+B
+Cal. Stall-opt
+64K, 50%
+8.96
+8,524.8
+10.8
+B
+Cal. Stall-opt 64K, 87.5%
+21.85
+3,090.4
+24.8
+24
+
+
+--- Page 25 ---
+ObjectCache: Layerwise Object-Storage Retrieval for KV Cache Reuse
+Table A11. Measured S3Agg-LW-cap TTFT for the exact allocation configurations in Table A9.
+Workload Policy
+Request
+Rate Avg. TTFT Stdev
+(Gbps)
+(ms)
+(ms)
+Workload C: 16K + 32K + 64K at 50% and 87.5%, 50 Gbps cap
+C
+Equal
+16K, 50%
+8.33
+1,167.9
+17.2
+C
+Equal
+16K, 87.5%
+8.33
+1,914.6
+12.3
+C
+Equal
+32K, 50%
+8.33
+2,626.0
+24.4
+C
+Equal
+32K, 87.5%
+8.33
+3,785.7
+23.6
+C
+Equal
+64K, 50%
+8.33
+8,302.2
+34.6
+C
+Equal
+64K, 87.5%
+8.33
+7,565.0
+51.8
+C
+KV-prop
+16K, 50%
+2.60
+3,434.8
+2.5
+C
+KV-prop
+16K, 87.5%
+4.55
+3,406.4
+0.1
+C
+KV-prop
+32K, 50%
+5.19
+3,563.8
+6.5
+C
+KV-prop
+32K, 87.5%
+9.09
+3,475.9
+10.2
+C
+KV-prop
+64K, 50%
+10.39
+8,216.7
+455.0
+C
+KV-prop
+64K, 87.5%
+18.18
+3,678.9
+53.5
+C
+BW-prop
+16K, 50%
+3.28
+2,757.7
+11.8
+C
+BW-prop
+16K, 87.5%
+19.45
+878.9
+0.9
+C
+BW-prop
+32K, 50%
+2.42
+7,357.9
+5.1
+C
+BW-prop
+32K, 87.5%
+14.36
+2,274.2
+20.8
+C
+BW-prop
+64K, 50%
+1.44
+24,447.9
+54.1
+C
+BW-prop
+64K, 87.5%
+9.04
+6,981.1
+25.6
+C
+Stall-opt
+16K, 50%
+5.76
+1,609.5
+3.5
+C
+Stall-opt
+16K, 87.5%
+7.62
+2,067.5
+4.1
+C
+Stall-opt
+32K, 50%
+6.64
+2,841.8
+12.6
+C
+Stall-opt
+32K, 87.5%
+10.78
+2,949.3
+9.7
+C
+Stall-opt
+64K, 50%
+3.96
+9,301.6
+28.3
+C
+Stall-opt
+64K, 87.5%
+15.24
+4,299.3
+52.1
+C
+Cal. Stall-opt
+16K, 50%
+4.97
+1,850.0
+4.9
+C
+Cal. Stall-opt 16K, 87.5%
+6.58
+2,381.4
+2.0
+C
+Cal. Stall-opt
+32K, 50%
+7.03
+2,746.2
+1.2
+C
+Cal. Stall-opt 32K, 87.5%
+9.30
+3,403.5
+25.8
+C
+Cal. Stall-opt
+64K, 50%
+8.96
+8,231.0
+468.1
+C
+Cal. Stall-opt 64K, 87.5%
+13.15
+4,892.7
+1.5
+25
+
+
+--- Page 26 ---
+Yu Zhu, Aditya Dhakal, Yunming Xiao, Dejan Milojicic, and Gustavo Alonso
+Table A12. Total TTFT for the scheduling workloads using the measured S3Agg-LW-cap configurations in Tables A10 and
+A11. The baseline is the sum of the same request configurations without an effective rate limit.
+Workload
+Policy
+Total TTFT
+No-limit base
+ΔTTFT
+(ms)
+(ms)
+(ms)
+A
+Equal
+13,373.0
+12,084.2
++1,288.8
+A
+KV-prop
+13,890.5
+12,084.2
++1,806.3
+A
+BW-prop
+15,230.7
+12,084.2
++3,146.5
+A
+Stall-opt
+13,600.9
+12,084.2
++1,516.7
+A
+Cal. Stall-opt
+12,814.5
+12,084.2
++730.3
+B
+Equal
+15,918.6
+12,084.2
++3,834.4
+B
+KV-prop
+16,212.6
+12,084.2
++4,128.5
+B
+BW-prop
+23,664.8
+12,084.2
++11,580.6
+B
+Stall-opt
+14,517.9
+12,084.2
++2,433.7
+B
+Cal. Stall-opt
+14,255.3
+12,084.2
++2,171.1
+C
+Equal
+25,361.3
+15,616.1
++9,745.3
+C
+KV-prop
+25,776.4
+15,616.1
++10,160.3
+C
+BW-prop
+44,697.7
+15,616.1
++29,081.6
+C
+Stall-opt
+23,069.1
+15,616.1
++7,453.0
+C
+Cal. Stall-opt
+23,505.0
+15,616.1
++7,888.9
+26
