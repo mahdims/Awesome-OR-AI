@@ -55,7 +55,7 @@ DEFAULT_AGENT_MODELS = AgentModels(
     ),
     positioning=ModelConfig(
         provider="gemini",
-        model_name="gemini-3-pro-preview",
+        model_name="gemini-3.1-pro-preview",
         temperature=0.0,
         max_tokens=0
     ),
