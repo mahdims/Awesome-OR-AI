@@ -246,7 +246,7 @@ def print_config():
     print(f"  Email Generator:  {AGENT_MODELS.email_generator.provider} / {AGENT_MODELS.email_generator.model_name}")
 
     print("\nPaths:")
-    print(f"  Database:         (DATABASE_URL via .env)")
+    print(f"  Database:         {PROJECT_ROOT / 'src' / 'db' / 'research_intelligence.db'}")
     print(f"  PDF Cache:        {PDF_CACHE_DIR}")
     print(f"  Living Reviews:   {LIVING_REVIEWS_DIR}")
     print("="*70)

@@ -1,51 +1,18 @@
-"""Postgres database wrapper.
+"""SQLite database wrapper for the repository's checked-in data store.
 
-Replaces the prior SQLite wrapper. The public method surface is preserved
-so Layer 1 / Layer 2 / Layer 3 / scripts do not need invasive rewrites,
-with two deliberate behavior changes that callers must adopt:
-
-1.  JSONB round-trips as ``dict`` / ``list`` — not as JSON ``str``.
-    Callers that used ``json.loads(row["artifacts"])`` must drop the
-    ``json.loads`` call. See the SQL dialect sweep (M1a, step 2).
-2.  ``is_relevant`` round-trips as ``bool``, not as ``int`` 0/1.
-    Callers doing ``== 1`` must switch to truthiness checks.
-
-Schema is owned by Alembic migrations in ``src/db/migrations/``. This class
-does NOT create tables; run ``alembic upgrade head`` once against a fresh
-Postgres before using.
-
-Connection string: ``DATABASE_URL`` env var. Expected form
-``postgresql+psycopg://user:pass@host:port/db`` (SQLAlchemy-style). We strip
-the ``+psycopg`` suffix when handing it to psycopg3 directly.
+The public method surface intentionally matches the former Postgres wrapper so
+the analysis pipeline can keep using its existing query style. JSON columns are
+decoded on reads, preserving the dict/list behavior expected by newer callers.
 """
 
 from __future__ import annotations
 
 import json
-import os
+import sqlite3
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-import psycopg
-from pgvector.psycopg import register_vector
-from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-
-def _get_dsn() -> str:
-    url = os.getenv("DATABASE_URL")
-    if not url:
-        raise RuntimeError(
-            "DATABASE_URL not set. Copy .env.example to .env and fill it in."
-        )
-    # Accept both SQLAlchemy-style (postgresql+psycopg://...) and native
-    # (postgresql://...) URLs; psycopg3 wants the native form.
-    return url.replace("postgresql+psycopg://", "postgresql://", 1)
+DB_PATH = Path(__file__).parent / "research_intelligence.db"
 
 
 # JSONB columns that the class serializes automatically on insert/update.
@@ -61,21 +28,31 @@ _JSON_FIELDS_BRIDGE = {"connected_fronts"}
 
 
 def _wrap_json(value: Any) -> Any:
-    """Wrap ``value`` for a JSONB column. Accepts dict/list or an already-JSON string."""
+    """Serialize structured values for SQLite TEXT columns."""
     if isinstance(value, (dict, list)):
-        return Jsonb(value)
-    if isinstance(value, str):
-        # Legacy callers may still pass JSON strings. Parse and re-wrap so the
-        # column receives JSONB rather than a TEXT literal.
-        try:
-            return Jsonb(json.loads(value))
-        except (json.JSONDecodeError, TypeError):
-            return Jsonb(value)
+        return json.dumps(value)
     return value
 
 
+_JSON_FIELDS = _JSON_FIELDS_ANALYSIS | _JSON_FIELDS_FRONT | _JSON_FIELDS_BRIDGE
+
+
+def _dict_row(cursor: sqlite3.Cursor, row: tuple) -> Dict[str, Any]:
+    result = {description[0]: row[index] for index, description in enumerate(cursor.description)}
+    for field in _JSON_FIELDS.intersection(result):
+        value = result[field]
+        if isinstance(value, str):
+            try:
+                result[field] = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    if "is_relevant" in result and result["is_relevant"] is not None:
+        result["is_relevant"] = bool(result["is_relevant"])
+    return result
+
+
 class Database:
-    """Thin Postgres wrapper, sync psycopg3.
+    """Thin SQLite wrapper around ``src/db/research_intelligence.db``.
 
     Usage::
 
@@ -83,16 +60,17 @@ class Database:
             rows = db.fetchall("SELECT * FROM papers WHERE category = %s", (cat,))
     """
 
-    def __init__(self, dsn: Optional[str] = None):
-        self.dsn = dsn or _get_dsn()
-        self.conn: Optional[psycopg.Connection] = None
+    def __init__(self, db_path: Optional[Path] = None):
+        self.db_path = Path(db_path) if db_path else DB_PATH
+        self.dsn = str(self.db_path)
+        self.conn: Optional[sqlite3.Connection] = None
 
     # --- connection lifecycle ---
 
     def connect(self) -> "Database":
-        self.conn = psycopg.connect(self.dsn, row_factory=dict_row)
-        # Required for pgvector list<->vector adaptation on embedding column.
-        register_vector(self.conn)
+        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn.row_factory = _dict_row
+        self.conn.execute("PRAGMA foreign_keys = ON")
         return self
 
     def close(self) -> None:
@@ -117,10 +95,18 @@ class Database:
 
     # --- low-level query helpers (paramstyle: pyformat "%s") ---
 
-    def execute(self, query: str, params: Sequence[Any] = ()) -> psycopg.Cursor:
+    @staticmethod
+    def _sqlite_query(query: str) -> str:
+        return query.replace("%s", "?").replace("now()", "CURRENT_TIMESTAMP")
+
+    @staticmethod
+    def _sqlite_params(params: Sequence[Any]) -> tuple:
+        return tuple(_wrap_json(value) if isinstance(value, (dict, list)) else value for value in params)
+
+    def execute(self, query: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
         assert self.conn is not None, "connect() first"
         cur = self.conn.cursor()
-        cur.execute(query, params)
+        cur.execute(self._sqlite_query(query), self._sqlite_params(params))
         return cur
 
     def fetchone(self, query: str, params: Sequence[Any] = ()) -> Optional[Dict[str, Any]]:
@@ -150,28 +136,19 @@ class Database:
             "SELECT * FROM paper_analyses WHERE arxiv_id = %s", (arxiv_id,)
         )
 
-    def get_embedding(self, arxiv_id: str) -> Optional[List[float]]:
-        """Return embedding as a list of floats, or None if not yet generated.
-
-        Behavior change from SQLite: the column is now ``vector(768)`` (pgvector),
-        not ``BLOB``. Callers that previously did ``np.frombuffer(blob)`` should
-        switch to using the list directly (or ``np.asarray(row)``).
-        """
+    def get_embedding(self, arxiv_id: str) -> Optional[bytes]:
+        """Return the serialized float32 embedding BLOB, if available."""
         row = self.fetchone(
             "SELECT embedding FROM paper_analyses WHERE arxiv_id = %s", (arxiv_id,)
         )
         return row["embedding"] if row else None
 
     def store_embedding(self, arxiv_id: str, embedding: Iterable[float]) -> None:
-        """Persist an embedding into the paper_analyses row.
-
-        Accepts any iterable of floats (list, numpy array, etc.). The
-        pgvector pg adapter is registered lazily by the pgvector package;
-        we pass a plain list which the adapter coerces.
-        """
+        """Persist a serialized float32 embedding BLOB."""
+        value = embedding if isinstance(embedding, (bytes, bytearray, memoryview)) else bytes(embedding)
         self.execute(
             "UPDATE paper_analyses SET embedding = %s WHERE arxiv_id = %s",
-            (list(embedding), arxiv_id),
+            (value, arxiv_id),
         )
         self.commit()
 
@@ -274,9 +251,10 @@ class Database:
     ) -> List[str]:
         if not all_paper_ids:
             return []
+        placeholders = ", ".join(["%s"] * len(all_paper_ids))
         analyzed = self.fetchall(
-            "SELECT arxiv_id FROM paper_analyses WHERE arxiv_id = ANY(%s)",
-            (list(all_paper_ids),),
+            f"SELECT arxiv_id FROM paper_analyses WHERE arxiv_id IN ({placeholders})",
+            tuple(all_paper_ids),
         )
         analyzed_ids = {r["arxiv_id"] for r in analyzed}
         return [pid for pid in all_paper_ids if pid not in analyzed_ids]
@@ -288,8 +266,10 @@ class Database:
         cur = self.conn.cursor()
         try:
             cur.executemany(
-                "INSERT INTO citations (source_paper_id, target_paper_id, category) "
-                "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                self._sqlite_query(
+                    "INSERT INTO citations (source_paper_id, target_paper_id, category) "
+                    "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING"
+                ),
                 [(src, tgt, category) for src, tgt in citations],
             )
         finally:
@@ -305,10 +285,11 @@ class Database:
     ) -> List[str]:
         if not paper_ids:
             return []
+        placeholders = ", ".join(["%s"] * len(paper_ids))
         rows = self.fetchall(
             "SELECT arxiv_id, fetch_mode FROM citation_fetch_log "
-            "WHERE category = %s AND arxiv_id = ANY(%s)",
-            (category, list(paper_ids)),
+            f"WHERE category = %s AND arxiv_id IN ({placeholders})",
+            (category, *paper_ids),
         )
         already_fetched = {
             r["arxiv_id"]
@@ -440,7 +421,7 @@ class Database:
                 "SELECT artifacts FROM paper_analyses WHERE arxiv_id = %s",
                 (arxiv_id,),
             )
-            # artifacts is JSONB; psycopg3 returns a dict directly.
+            # JSON fields are decoded by the SQLite row factory.
             if row and row["artifacts"]:
                 artifacts = row["artifacts"]
                 if isinstance(artifacts, str):
@@ -452,7 +433,7 @@ class Database:
                     artifacts["code_url"] = code_url
                     self.execute(
                         "UPDATE paper_analyses SET artifacts = %s WHERE arxiv_id = %s",
-                        (Jsonb(artifacts), arxiv_id),
+                        (artifacts, arxiv_id),
                     )
         self.commit()
 
