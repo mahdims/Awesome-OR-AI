@@ -1,10 +1,37 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-06-02
+**Last Updated:** 2026-07-17
 
 ---
 
 ## Recent Papers
+
+#### 2026-07-17 (3 papers)
+
+### [How to Guide LLM Generation: Dual-Surrogate Guided Search for Automated Heuristic Design](https://arxiv.org/abs/2607.13911)
+
+**2026-07-15** | The Hong Kong Polytechnic University, Nankai University, South China Agricultural University | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Dual-Surrogate Guided Search (DGS) for operator-parent action selection, using a transition surrogate to predict child latent distribution and an instance-conditioned utility surrogate to estimate expected performance, combined with an uncertainty-aware acquisition rule. | *LLM role:* program_generator
+
+> Wang et al. introduce Dual-Surrogate Guided Search (DGS) to improve sample efficiency in LLM-based automated heuristic design by learning which parent heuristics and mutation operators to select before querying the LLM. The results are backed by solid empirical evidence, showing superior performance over strong baselines like FunSearch and EoH across five combinatorial optimization tasks (including TSP and CVRP) within a strict 200-query budget. The key insight is the use of a transition surrogate that predicts the latent distribution of an ungenerated child heuristic based on the parent and operator, coupled with a utility surrogate to estimate its performance. This is highly relevant to our focus on LLM evolutionary search, as it provides a concrete, implementable mechanism to drastically reduce expensive LLM calls by shifting from post-generation filtering to pre-generation action selection.
+
+### [Reward-Free Evolving Agents via Pairwise Validator](https://arxiv.org/abs/2607.14408)
+
+**2026-07-15** | Accenture | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Replacing per-step scalar task reward with a training-free pairwise LLM validator | *LLM role:* evaluator
+
+> Liu et al. replace the expensive scalar task reward in self-evolving agentic loops with a training-free pairwise LLM validator that compares parent and child candidates. The results are backed by rigorous empirical evaluations across prompt and code evolution engines, including ShinkaEvolve, demonstrating that this reward-free approach matches or exceeds full-reward baselines. The key insight is the 'Soft Elo' mechanism, which uses pairwise LLM verdicts to update candidate ratings for parent selection, entirely eliminating the need for scalar validation rewards. This is a must-read for our work in LLM evolutionary search, as it provides a highly actionable, drop-in replacement for costly reward engineering while maintaining search quality.
+
+### [GAE: Graph-Augmented Evolution for Scientific Discovery via Reinforcement Optimization](https://arxiv.org/abs/2607.10127)
+
+**2026-07-11** | Georgia Institute of Technology, Shanghai Academy of AI for Science | M=9 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Graph-Augmented Evolutionary Search with GNN-based RL Meta-Controller and Online LLM Fine-tuning | *LLM role:* mutation_operator_with_adaptive_policy
+
+> Chen et al. introduce Graph-Augmented Evolution (GAE), which enhances LLM-guided evolutionary search by integrating a GNN-based RL meta-controller for mutation selection and online GRPO fine-tuning for the LLM operator. The results are rigorously backed by empirical data, showing that GAE significantly outperforms static baselines like OpenEvolve and PACEvolve on symbolic regression benchmarks. The key insight is that replacing structurally blind, prompt-driven mutations with a learned policy (Discrete SAC) and continuously updating the LLM weights via group-relative rewards drastically improves sample efficiency and search trajectory. This is a critical read for our work in LLM evolutionary search, as the three-pillar architecture provides a concrete blueprint for implementing RL-infused evolution and overcoming the limitations of static LLM operators in heuristic discovery.
+
 
 #### 2026-05-28 (1 papers)
 

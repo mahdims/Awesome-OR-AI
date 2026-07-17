@@ -1,10 +1,21 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-06-02
+**Last Updated:** 2026-07-17
 
 ---
 
 ## Recent Papers
+
+#### 2026-07-17 (1 papers)
+
+### [General Non-Clairvoyant KV-Cache Scheduling via Regime-Aware Routing](https://arxiv.org/abs/2607.09248)
+
+**2026-07-10** | Hong Kong University of Science and Technology, Shanghai Jiao Tong University | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Regime decomposition with budget-doubling greedy for rectangle strips and geometric slicing SPS for response-heavy jobs, combined by a routing meta-scheduler | *LLM role:* none
+
+> Feng et al. introduce a non-clairvoyant scheduling algorithm for batched LLM inference that minimizes total completion time under hard KV-cache constraints. The authors mathematically prove the first O(1)-competitive theoretical guarantee against an optimal clairvoyant scheduler for arbitrary prompt and response lengths. The key insight is that a single global priority rule cannot simultaneously maintain high memory utilization and area-consistent completion order; instead, requests must be dynamically routed into three geometric regimes (large, prompt-heavy, and response-heavy). This is highly relevant for our work on LLM serving scheduling, as this regime-aware routing framework provides a rigorous foundation that can be directly adapted into practical multi-replica dispatching policies.
+
 
 #### 2026-05-28 (1 papers)
 
