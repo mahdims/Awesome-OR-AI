@@ -1,10 +1,53 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-07-17
+**Last Updated:** 2026-07-21
 
 ---
 
 ## Recent Papers
+
+#### 2026-07-21 (5 papers)
+
+### [Robust KV Cache Management for LLM Serving under Output Token Length Uncertainty](https://arxiv.org/abs/2607.16892)
+
+**2026-07-18** | Arizona State University | M=8 P=9 I=8 **MUST-READ** *discuss*
+
+*Method:* Wasserstein distributionally robust optimization (DRO) with block coordinate descent (BCD) algorithm | *LLM role:* none
+
+> Cheng et al. formulate KV cache reservation in LLM serving as a Wasserstein distributionally robust optimization (DRO) problem to jointly optimize GPU parallelism, routing, and prefix caching under output length uncertainty. The results are rigorously backed by trace-driven simulations on production workloads (BurstGPT, Azure), demonstrating up to 56% lower costs compared to fixed-quantile baselines while maintaining competitive P99 latency. The key insight is the derivation of a critical fractile structure that automatically adapts the reservation quantile based on the ratio of preemption to memory-waste costs, eliminating the need for manual tuning. This is highly relevant for our work in OR formulations for LLM serving scheduling, as the DRO approach and block coordinate descent algorithm provide a concrete, scalable mathematical framework for handling stochastic token generation in GPU clusters.
+
+### [ExpertPlex: A High-Goodput Disaggregated Serving System for MoE LLMs with Adaptive Persistent Kernels](https://arxiv.org/abs/2607.18002)
+
+**2026-07-20** | Peking University, Independent Researcher | M=5 P=8 I=7 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Hybrid disaggregation-colocation architecture with adaptive persistent kernels (APKs) and attention-initiated one-sided MoE communication, optimized by a cross-stack placement optimizer | *LLM role:* none
+
+> ExpertPlex introduces a hybrid LLM serving architecture for Mixture-of-Experts (MoE) models that shares massive MoE weights across prefill and decode phases while disaggregating attention, supported by tile-level GPU scheduling and a cross-stack placement optimizer. The system demonstrates strong empirical results, achieving up to 2.01x higher goodput over standard prefill-decode disaggregation on real-world MoE models like MiniMax-M2.7 and GLM-5.1-FP8. The key insight is the tile-aware latency model for MoE computation: because sparse routing changes latency based on per-expert packing rather than just token volume, resource allocation models must account for active expert counts rather than raw token counts. This is highly relevant for our research in LLM serving scheduling and GPU resource allocation, as we must integrate these hybrid architectural constraints and non-linear latency dynamics into our mathematical formulations to remain competitive with state-of-the-art MoE deployments.
+
+### [WAR: Workload-Aware Rollouts for Synchronous Agentic Reinforcement Learning](https://arxiv.org/abs/2607.17299)
+
+**2026-07-19** |  | M=7 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Workload-aware system combining model-free SuffixDecoding and cache-aware scheduling | *LLM role:* target_model_inference_acceleration
+
+> WAR optimizes synchronous agentic RL rollouts by dynamically applying model-free speculative decoding (SuffixDecoding) under low load and cache-aware request scheduling under high load. The results are backed by strong empirical evidence, demonstrating 1.4x to 1.6x throughput improvements on 16 H100 GPUs using Qwen3-32B for software engineering agent tasks. The key insight is that the effectiveness of rollout optimizations is highly workload-dependent; speculative decoding wastes compute under high load where standard batched decoding already saturates GPUs, making cache-aware scheduling (prioritizing KV-cache locality and shorter trajectories) the better lever. This is highly relevant for our work in LLM serving scheduling and scaling multi-agent optimization, as implementing a similar workload-aware routing layer could significantly reduce GPU costs and idle time in our large-scale evolutionary search pipelines.
+
+### [LMEdge: QoS-Aware LLM Inference Orchestration on Edge Clusters](https://arxiv.org/abs/2607.17175)
+
+**2026-07-19** | Vienna University of Technology, University of Klagenfurt, University of Messina | M=5 P=7 I=6 
+
+*Method:* Lightweight heuristic approximating Binary Integer Linear Programming (BILP) optimization, leveraging five XGBoost/Random Forest ML models for query-specific performance prediction | *LLM role:* none
+
+> LMEdge orchestrates LLM inference across heterogeneous edge devices by using ML predictors and a lightweight heuristic to jointly optimize model selection, quantization, and placement under QoS constraints. The results are backed by empirical measurements from a 57-device Kubernetes testbed, demonstrating improved latency and resource utilization over standard load-aware baselines. The key insight is the practical integration of query-specific XGBoost predictors for accuracy and latency directly into the scheduling constraints, alongside a released dataset of 59,000 inference measurements that could be highly valuable for offline scheduling simulations. This work is directly relevant to operations research formulations for LLM serving scheduling, though its methods are relatively standard and primarily target edge environments rather than large-scale cloud GPU clusters.
+
+### [JoyNexus: Service-Oriented Multi-Tenant Post-Training for VLA Models](https://arxiv.org/abs/2607.16074)
+
+**2026-07-17** | Tsinghua University, Peking University, Beihang University, Beijing Institute of Technology, JDT AI Infra | M=5 P=6 I=7 *discuss*
+
+*Method:* Service-oriented architecture with decoupled Training Model Service, Inference Model Service, and Environment Service, employing multi-tenant group batching for shared VLM backbone forward passes. | *LLM role:* none
+
+> JoyNexus proposes a multi-tenant service architecture for Vision-Language-Action model post-training that decouples training, inference, and environment interaction into separate, independently scheduled services. The results are backed by empirical simulations, demonstrating a 28.3% reduction in aggregate GPU time and up to 3.24x shared-forward throughput speedup. The key insight is the use of group batching for heterogeneous requests, which canonicalizes different tenant data schemas to share a single forward pass through a frozen base model before splitting features for tenant-specific updates. This systems engineering pattern is highly relevant for scaling LLM evolutionary search infrastructure, as decoupling generation, evaluation, and update phases allows for asynchronous scaling and better GPU utilization during bursty search workloads.
+
 
 #### 2026-07-17 (1 papers)
 

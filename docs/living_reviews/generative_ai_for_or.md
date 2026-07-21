@@ -1,10 +1,29 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-06-02
+**Last Updated:** 2026-07-21
 
 ---
 
 ## Recent Papers
+
+#### 2026-07-21 (2 papers)
+
+### [Falsification-Based Verification of LLM-Generated Optimization Models: Sound Test Batteries and Their Detection Limits](https://arxiv.org/abs/2607.16646)
+
+**2026-07-18** | Central University of Finance and Economics | M=7 P=8 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Falsification-based verification using optimization theory (duality, comparative statics, polyhedral limits, symmetry) | *LLM role:* assertion_extractor
+
+> This paper introduces a falsification-based, oracle-free verification framework for LLM-generated optimization models using metamorphic tests derived from optimization theory. The results are rigorously backed by empirical evidence, achieving a 0.0% false-positive rate on faithful models compared to 54.9% for threshold-based baselines, while successfully detecting execution-blind errors across multiple benchmarks. The key insight is that classical optimization theory, such as value function convexity and shadow-price consistency, provides provably valid metamorphic relations that can verify generated models without requiring ground-truth labels. This is highly relevant for our work in OR benchmarking and LLM evolutionary search, as these sound tests can be directly repurposed as a process reward model to provide reliable, per-step fitness signals when evolving mathematical programs.
+
+### [Constrained Path Reasoning: Measuring When Committed Stages Earn Their Cost](https://arxiv.org/abs/2607.17240)
+
+**2026-07-19** | ShanghaiTech University | M=6 P=7 I=7 *discuss*
+
+*Method:* Constrained Path Reasoning (CPR) framework with stage-level accounting and source-aware path hypothesis | *LLM role:* heuristic_generator, code_writer, decomposition_guide
+
+> This paper introduces Constrained Path Reasoning (CPR), a framework to quantify the utility versus computational cost of intermediate LLM reasoning stages (e.g., formalization, convexification) when solving non-convex optimization problems. Backed by rigorous experiments on over 1,100 QCQPs, the authors demonstrate that while formal transcription with a deterministic solver achieves 90% yield, adding an LLM-proposed convex surrogate drops yield to 20% due to relaxation leakage and over-contraction. The key insight is the use of classical error bounds to map constraint residuals into a continuous feedback signal for triage and local repair, which successfully recovers 63% of feasible yield using only 17% of the computational attempts. This is highly relevant for our work on LLM reasoning evaluation and process reward models, as the residual-gated feedback mechanism offers a concrete, mathematically grounded way to provide step-level rewards and repair signals in optimization tasks.
+
 
 #### 2026-05-10 (2 papers)
 

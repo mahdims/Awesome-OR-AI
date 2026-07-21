@@ -1,10 +1,45 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-07-17
+**Last Updated:** 2026-07-21
 
 ---
 
 ## Recent Papers
+
+#### 2026-07-21 (4 papers)
+
+### [Automated Discovery Has No Universally Superior Harness](https://arxiv.org/abs/2607.18235)
+
+**2026-07-20** | UC Berkeley, MIT, MIT-IBM Watson AI Lab, Weizmann Institute of Science | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Systematic decomposition and statistical evaluation of LLM-guided discovery harnesses (evolutionary search and tree-based search) with adaptive online allocation | *LLM role:* heuristic_generator
+
+> Gupta et al. systematically decompose and evaluate LLM-guided discovery harnesses across 3.1 million rollouts to show that no single fixed harness universally generalizes across models and problems. The results are highly rigorous, utilizing budget-matched statistical bootstrap tests to prove that complex evolutionary machinery often underperforms simpler tree-search or epsilon-greedy baselines. The key insight is that early search progress strongly predicts final performance, enabling an online adaptive allocation strategy that prunes weak partial runs and reallocates compute to surviving trajectories. This is a must-read for our work in LLM evolutionary search, as it dictates a shift away from engineering complex, fixed search harnesses toward implementing dynamic, early-stopping compute allocation to maximize sample efficiency.
+
+### [How to Guide LLM Generation: Dual-Surrogate Guided Search for Automated Heuristic Design](https://arxiv.org/abs/2607.13911)
+
+**2026-07-15** | The Hong Kong Polytechnic University, Nankai University, South China Agricultural University | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Dual-Surrogate Guided Search (DGS) for operator-parent action selection, using a transition surrogate to predict child latent distribution and an instance-conditioned utility surrogate to estimate expected performance, combined with an uncertainty-aware acquisition rule. | *LLM role:* program_generator
+
+> Wang et al. introduce Dual-Surrogate Guided Search (DGS) to improve sample efficiency in LLM-based automated heuristic design by learning which parent heuristics and mutation operators to select before querying the LLM. The results are backed by solid empirical evidence, showing superior performance over strong baselines like FunSearch and EoH across five combinatorial optimization tasks (including TSP and CVRP) within a strict 200-query budget. The key insight is the use of a transition surrogate that predicts the latent distribution of an ungenerated child heuristic based on the parent and operator, coupled with a utility surrogate to estimate its performance. This is highly relevant to our focus on LLM evolutionary search, as it provides a concrete, implementable mechanism to drastically reduce expensive LLM calls by shifting from post-generation filtering to pre-generation action selection.
+
+### [Reward-Free Evolving Agents via Pairwise Validator](https://arxiv.org/abs/2607.14408)
+
+**2026-07-15** | Accenture | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Replacing per-step scalar task reward with a training-free pairwise LLM validator | *LLM role:* evaluator
+
+> Liu et al. replace the expensive scalar task reward in self-evolving agentic loops with a training-free pairwise LLM validator that compares parent and child candidates. The results are backed by rigorous empirical evaluations across prompt and code evolution engines, including ShinkaEvolve, demonstrating that this reward-free approach matches or exceeds full-reward baselines. The key insight is the 'Soft Elo' mechanism, which uses pairwise LLM verdicts to update candidate ratings for parent selection, entirely eliminating the need for scalar validation rewards. This is a must-read for our work in LLM evolutionary search, as it provides a highly actionable, drop-in replacement for costly reward engineering while maintaining search quality.
+
+### [Autonomous Discovery of Wireless Communications Algorithms](https://arxiv.org/abs/2607.17762)
+
+**2026-07-20** | NVIDIA | M=8 P=7 I=8 **MUST-READ** *discuss*
+
+*Method:* LLM-driven evolutionary search with agentic code generation and multi-objective Pareto optimization | *LLM role:* evolutionary_search
+
+> Aït Aoudia et al. introduce AITE, an LLM-driven evolutionary search framework that uses a two-tier orchestrator-worker architecture with agentic tool-use to autonomously discover wireless communication algorithms. The framework produces real, empirically validated results, discovering an OTFS equalizer that is 3.6x faster than the state-of-the-art with better error rates, and the first explainable pilotless OFDM receiver matching neural network performance. The most transferable methodological insights are the post-processing adherence check (where an LLM verifies if the generated code actually implemented the assigned idea before updating the orchestrator's leaderboard) and the prompt refinement stage (which critiques worker execution journals to improve instructions for the next generation). This is highly relevant to our work in LLM evolutionary search; while the telecom application is outside our scope, the architectural enhancements for agentic code generation, adherence filtering, and prompt refinement directly address sample efficiency and search observability.
+
 
 #### 2026-07-17 (3 papers)
 
