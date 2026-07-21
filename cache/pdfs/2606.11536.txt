@@ -1,0 +1,2602 @@
+--- Page 1 ---
+VIPIR: A Versatile GPU Framework for Integrating Private
+Information Retrieval Protocols
+Jongmin Kim∗†
+Seoul National University
+Seoul, South Korea
+jongmin.kim@snu.ac.kr
+Hyesung Ji∗
+Seoul National University
+Seoul, South Korea
+kevin5188@snu.ac.kr
+Jean-Luc Watson
+NVIDIA
+Santa Clara, CA, USA
+jwatson@nvidia.com
+Charles Gouert
+NVIDIA
+Santa Clara, CA, USA
+cgouert@nvidia.com
+G. Edward Suh
+NVIDIA / Cornell University
+Westford, MA, USA
+esuh@nvidia.com
+Jung Ho Ahn
+Seoul National University
+Seoul, South Korea
+gajh@snu.ac.kr
+Abstract
+While private information retrieval (PIR) enables private database
+services by fully concealing access patterns, it simultaneously re-
+quires high computational throughput, large memory capacity, and
+substantial memory bandwidth. We introduce VIPIR, a versatile
+GPU framework that co-designs PIR protocols with GPU acceler-
+ation. We develop a unified analytic model showing that state-of-
+the-art PIR protocols fall into two categories with complementary
+limitations, and propose two protocols that flexibly combine tech-
+niques across these categories, overcoming the limitations of both
+classes. These protocols incorporate a GPU-friendly data compres-
+sion method called expansion-based ring packing (ExpPack), which
+offers a high degree of parallelism and minimal communication cost.
+VIPIR applies further optimizations to core operations, including
+number-theoretic transforms (NTTs) and various matrix-matrix
+multiplications (GEMMs). Notably, we develop a tensor-core-based
+execution method for database multiplication by interpreting it
+as a mixed-integer-type GEMM. We also design memory-efficient
+scheduling methods that minimize intermediate buffers and enable
+multi-GPU scaling under memory capacity constraints. Overall,
+VIPIR achieves orders-of-magnitude higher throughput than prior
+PIR systems while reducing communication and memory overheads,
+making large-scale PIR practical.
+1
+Introduction
+As data privacy emerges as a key challenge for digital services,
+private information retrieval (PIR) [21, 36] has become a critical
+cryptographic primitive. PIR enables a client to retrieve a record
+from a database (DB) hosted on a remote server without revealing
+which record is being accessed. This capability is increasingly rele-
+vant in practice: for example, the Ethereum Foundation is exploring
+PIR to fully anonymize blockchain access [10], while Apple employs
+PIR for privacy-preserving contact discovery and safe browsing [5].
+Despite its theoretical appeal, deploying PIR at scale remains
+challenging due to a fundamental requirement: to preserve pri-
+vacy, the server must perform a linear scan over the entire DB per
+query. Single-server PIR [36] protocols execute homomorphic en-
+cryption (HE) [1] operations over DB during this scan; HE allows
+∗Both authors contributed equally to this research.
+†Part of this work was conducted during an internship at NVIDIA.
+Hybrid
+Spiral
+OnionPIRv2
+HintlessPIR
+YPIR (S)
+YPIR (D)
+InsPIRe
+ExpPack (S)
+ExpPack (D)
+Double-packing
+OnionPIRv2
+1
+10
+100
+1000
+10000
+100000
+Server computation time 
+(ms)
+Server-client communication (KB)
+10000
+1000
+100
+DB: 64GiB
+Latency bound 
+(DB access time) 
+Hybrid
+Spiral
+OnionPIRv2
+HintlessPIR
+YPIR (S)
+YPIR (D)
+InsPIRe
+ExpPack (S)
+ExpPack (D)
+Double-packing
+OnionPIRv2
+1
+10
+100
+1000
+10000
+100000
+Server computation time 
+(ms)
+Server-client communication (KB)
+10000
+1000
+100
+DB: 16GiB
+Latency bound 
+(DB access time) 
+Optimal corner
+VIPIR
+Prior work
+Out-of-memory 
+failures
+SimplePIR
+DoublePIR
+(S)
+(D)
+Figure 1: Server-side online computation time and client-
+server communication of prior CPU-based PIR studies and
+VIPIR for 16GiB/64GiB DB (single batch). VIPIR supports mul-
+tiple protocols (hybrid, double-packing, OnionPIRv2, Exp-
+Pack (S/D)). InsPIRe and our hybrid protocol span multiple
+DB dimensionalities. Refer to Table 1 for more details.
+direct computations on encrypted data, enabling private record re-
+trieval without revealing the accessed index. This HE-based linear
+scan imposes stringent system demands, requiring high computa-
+tional throughput, large memory capacity, and substantial memory
+bandwidth simultaneously.
+GPUs offer the massive parallelism needed to accelerate such
+scans. Compared to server-class CPU systems, which have been
+the primary platform for most prior cryptographic PIR studies,
+modern GPUs provide significantly higher memory bandwidth via
+High Bandwidth Memory (HBM) DRAM and orders-of-magnitude
+greater computational throughput at lower per-operation energy
+cost.
+Yet, only a few GPU-focused studies on PIR exist [22, 35, 56],
+and they focus on a single protocol with little regard for adapting
+protocol design to efficient GPU execution. Although GPUs have
+relatively limited DRAM capacity compared to CPU systems, which
+can provision TBs of memory, PIRonGPU [22] and the GPU imple-
+mentation of IVE [35] adopt protocols that expands the DB size by
+∼4×. This DB bloating becomes a critical bottleneck for scalability.
+1
+arXiv:2606.11536v1  [cs.CR]  10 Jun 2026
+
+
+--- Page 2 ---
+Jongmin Kim, Hyesung Ji, Jean-Luc Watson, Charles Gouert, G. Edward Suh, and Jung Ho Ahn
+For a principled approach, we analyze existing PIR protocols and
+develop a unified analytical model that enables reasoning about
+them from a common perspective. Despite diverse proposals, we
+observe that most PIR protocols fall into two categories under this
+model: one (which we term scalar-HE approach) with high client-
+server communication overhead and the other (poly-HE approach)
+with DB bloating.
+In this paper, we present VIPIR, a versatile GPU framework
+enabling GPU-aware PIR protocol design and optimized execution
+on NVIDIA GPUs. Beyond accelerating existing PIR protocols on
+GPUs, we derive new protocols from our unified model that are
+inherently more amenable to efficient GPU execution. These pro-
+tocols center on an HE primitive called ring packing (or simply
+packing) [6, 12, 17, 41] that compresses encrypted data to substan-
+tially smaller sizes (0.16% in our settings), trading communication
+for added computations. While packing has been used in prior PIR
+work [30, 39, 44, 47], we discover its different usage in our proto-
+cols and also develop a novel expansion-based packing (ExpPack)
+method.
+In particular, we introduce (i) a double-packing design applying
+ring packing twice to significantly improve compression, and (ii)
+a hybrid design repurposing ring packing to transition between
+scalar-HE and poly-HE approaches. This avoids the DB bloating
+problem of poly-HE, while alleviating the communication overhead
+of scalar-HE.
+ExpPack augments these protocols by replacing the transfer of
+𝑛= 1,280 “special” ciphertexts (120MiB) with a single ciphertext
+(96KiB) that is expanded on the server side, leveraging GPUs’ high
+computational capability to trade communication for additional
+computation. While prior studies also propose communication-
+efficient packing methods, they rely on sequential procedures or
+memory-intensive precomputation that limit GPU efficiency [39,
+44]. In contrast, ExpPack is designed to expose massive data paral-
+lelism through thousands of independent sub-operations—namely
+number-theoretic transforms (NTTs) and modular matrix-matrix
+multiplications (GEMMs)—enabling effective utilization of hun-
+dreds of streaming multiprocessors.
+VIPIR incorporates various architecture-aware GPU optimiza-
+tions to achieve practical performance. Notably, we leverage NVIDIA
+tensor cores [20] to accelerate core INT8-INT32 GEMMs by emu-
+lating them on the INT8 GEMM datapath, enabled by co-designing
+parameters and protocols with the GPU implementation. We also
+adjust data layouts for contiguous memory access, apply numerical
+techniques such as lazy reduction [19, 33] to reduce instruction
+count, and minimize temporary data by carefully scheduling jobs
+under constrained GPU memory. VIPIR also supports multi-GPU ex-
+ecution by combining DB sharding with batch-wise job distribution,
+enabling low-latency scaling to larger databases.
+VIPIR delivers substantial performance gains while supporting
+DB sizes up to 64GiB on a single GPU (H100 NVL 94GB), while
+avoiding the out-of-memory failures common in prior work due
+to excessive memory usage. As shown in Figure 1, VIPIR achieves
+orders-of-magnitude lower latency than prior work, with our co-
+designed double-packing and hybrid protocols simultaneously re-
+ducing communication costs. For a 64GiB DB, these protocols attain
+execution times of 33.0–33.5ms, only 1.67–1.69× above the 19.7ms
+hard latency bound for streaming DB once from DRAM, indicating
+that our implementation closely approaches the theoretical perfor-
+mance limit. VIPIR also achieves high throughput of 163.1–232.8
+queries per second (QPS), outperforming prior GPU-based work,
+ShiftPIR [56], by 652.6–931.3×.
+We summarize the main contributions of VIPIR as follows:
+• We develop a unified analytical model that captures diverse PIR
+protocols, exposes their limitations, and enables new double-
+packing and hybrid designs.
+• We introduce ExpPack, a GPU-friendly expansion-based ring
+packing method that exposes massive parallelism while minimiz-
+ing client-server communication.
+• We build optimized GPU implementations of PIR with tensor-
+core acceleration, memory-aware layout and scheduling, numer-
+ical optimizations, and multi-GPU scaling.
+2
+Motivation & Background
+Vectors (e.g., v) and matrices (e.g., A) are denoted in boldface; all
+vectors are column vectors. An 𝑀× 𝐾by 𝐾× 𝑁matrix-matrix
+multiplication is denoted as 𝑀× 𝑁× 𝐾GEMM. Major notations
+and symbols are summarized in Appendix A.
+2.1
+Challenges of private information retrieval
+(PIR)
+Dozens of PIR protocols [4, 11, 14, 24, 25, 30, 39, 42, 44–47, 49]
+exhibit intricate trade-offs across client/server-side computation,
+memory access, storage overhead, and client-server communication.
+Nevertheless, most constructions build upon prior work, reusing
+core components and design principles from earlier protocols.
+Without extensive client-side preprocessing [57], PIR protocols
+require the server to linearly scan the entire database (DB) per query
+to hide the accessed record. The resulting uniform access require-
+ments to GBs of data challenge computing systems to deliver high
+bandwidth and large capacity simultaneously, while the memory
+hierarchy offers limited assistance in alleviating this bottleneck.
+In this paper, we distill common factors of PIR to build a princi-
+pled PIR framework, rethinking how modern accelerators such as
+GPUs reshape the design space. To focus our analysis, we exclude
+PIR protocols relying on restrictive assumptions, such as multi-
+server non-collusion [21], single-client batch querying [4, 50], or
+extensive client-side DB preprocessing [57], which hinder practical
+adoption.
+2.2
+Homomorphic encryption (HE)
+HE allows direct computation on encrypted data, which is vital
+for implementing PIR. For HE ciphertexts ct1 and ct2 respectively
+encrypting plaintexts pt1 and pt2, HE schemes have the following
+linear property, allowing inter-ciphertext additions and plaintext-
+ciphertext multiplications:
+pt0 · ct1 + ct2
+decrypt
+−−−−−→pt0 · pt1 + pt2
+(1)
+We classify various HE schemes into two categories:
+• Scalar-HE encrypts an integer (plaintext) into a length-(𝑛+ 1)
+integer vector (ciphertext).
+2
+
+
+--- Page 3 ---
+VIPIR: A Versatile GPU Framework for Integrating Private Information Retrieval Protocols
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+Database DB
+(INT8)
+×
+𝐷0
+𝐷1
+𝐷0
+𝑛= 1280
+B (batch)
+Scalar-HE ciphertexts
+(INT32) as SimplePIR input 
+Fixed for 
+every client
+𝐷1
+𝑛
+B
+=
+Scalar-HE ciphertexts
+(INT32) as SimplePIR output  
+Precomputed
+Hint
+×
+⋱
+⋱
+0
+0
+0
+0
+⋮
+0
+0
+0
+0
+0
+0
+0
+0
+0
+⋮
+⋮
+0
+0
+⋱
++
+NTT
+(precompute)
+Special poly-HE
+ciphertexts (INT32) 
+for ring packing
+NTT & 
+zero-pad
+⋱
+2𝐵
+𝐷1
+𝑁
+Poly-HE ciphertexts
+(INT32) after packing
+(#𝑅𝑁𝑆× 𝑁)-parallel 𝐷1
+𝑁× 2𝐵× 𝑛GEMMs
+(a) Scalar-HE dimension folding (SimplePIR)
+(b) Tiptoe-style ring packing
+Figure 2: (a) Server-side 𝐵-batch execution of SimplePIR [31] and (b) ring packing based on Tiptoe [30]. Each cell represents an
+INT8/INT32 element. Red-bordered cells mark client-exchanged data, where dotted cells are not exchanged under packing.
+• Poly-HE encrypts an 𝑁-coefficient integer polynomial (plain-
+text) into two or more polynomials in the ring R𝑞= Z𝑞[𝑋]/(𝑋𝑁+
+1) (ciphertext).
+Specifically, scalar-HE refers to the basic Regev encryption based
+on the learning-with-errors (LWE) problem [55]. We use parameter
+settings, where we can encrypt an 8-bit integer (INT8) into a 32-
+bit integer (INT32) vector. Poly-HE includes various HE schemes
+based on ring LWE (RLWE) [43], ring GSW (RGSW) [28], or mod-
+ule LWE [38]. For RLWE, which is most commonly used, each
+ciphertext comprises two polynomials in R𝑞; i.e., ct ∈R2
+𝑞. We use
+𝑛= 1,280, 𝑁= 212, 𝑞≃287 throughout this work (detailed in §5).
+2.3
+Scalar-HE arithmetic vs. poly-HE arithmetic
+Computations with scalar-HE are relatively simple without the need
+for modular arithmetic [31]. For our typical parameters, plaintext-
+ciphertext multiplications and inter-ciphertext additions respec-
+tively translate to regular INT8-INT32 scalar-vector multiplications
+and INT32 vector additions.
+Handling polynomials for poly-HE is computationally more de-
+manding. A polynomial in R𝑞has 𝑁coefficients in Z𝑞, where
+residue number system (RNS) is used as an optimization to de-
+compose the modulus 𝑞into #RNS number of small primes. For
+example, we set𝑞= 𝑞0·𝑞1·𝑞2 (#RNS = 3) with𝑞𝑖< 232, converting a
+polynomial into a 3×𝑁INT32 matrix, where each row corresponds
+to a different 𝑞𝑖:
+𝑎0 + 𝑎1𝑋+ · · · + 𝑎𝑁−1𝑋𝑁−1 →©­
+«
+𝑎0 % 𝑞0
+· · ·
+𝑎𝑁−1 % 𝑞0
+𝑎0 % 𝑞1
+· · ·
+𝑎𝑁−1 % 𝑞1
+𝑎0 % 𝑞2
+· · ·
+𝑎𝑁−1 % 𝑞2
+ª®
+¬
+While poly-HE inter-ciphertext additions become simple point-wise
+modulo-𝑞𝑖matrix additions, plaintext-ciphertext multiplications
+involve polynomial multiplications.
+The number-theoretic transform (NTT) is a standard technique
+for accelerating polynomial multiplications. For the 3 × 𝑁matrix,
+NTT applies a variant of the Fourier transform (computational com-
+plexity is O(𝑁log 𝑁)) to each row. Once transformed, a polynomial
+multiplication (O(𝑁2)) reduces to an element-wise multiplication
+modulo 𝑞𝑖(O(𝑁)).
+2.4
+Ciphertext bloating & plaintext bloating
+Each HE category faces a distinct data-size blowup: ciphertext bloat-
+ing for scalar-HE and plaintext bloating for poly-HE. Scalar-HE
+encryption incurs huge data expansion of (𝑛+ 1) · INT32
+INT8 = 5,124×,
+which we refer to as ciphertext bloating. In contrast, poly-HE can
+exploit the 𝑁coefficients in a plaintext polynomial (∈R𝑝, 𝑝= 218
+in this work) to encrypt 𝑁log2 𝑝bits of data per ciphertext. In par-
+ticular, RLWE ciphertexts (∈R2
+𝑞) incurs only 2 · log2 𝑞
+log2 𝑝× expansion,
+which is under 10×.
+Instead, in poly-HE, plaintexts grow in size as we apply NTT
+to enable efficient plaintext-ciphertext multiplications. During this
+process, plaintexts in R𝑝are lifted to R𝑞, resulting in a size expan-
+sion of log2 𝑞
+log2 𝑝×, typically around 4×. This plaintext bloating issue
+does not arise in scalar-HE, where plaintexts (scalars) are kept in
+their original form.
+2.5
+Exemplar PIR protocol: SimplePIR
+As a concrete example, we look at SimplePIR [31], which organizes
+DB as a 𝐷1 × 𝐷0 matrix. To query index 𝑖∗along the 𝐷0 dimension,
+the client sends 𝐷0 scalar-HE ciphertexts, where only the 𝑖∗-th
+ciphertext encrypts one and the others encrypt zero, forming an
+encrypted one-hot representation of 𝑖∗. The ciphertexts together
+form a 𝐷0 × (𝑛+ 1) matrix, with which the server multiplies DB,
+producing a 𝐷1 × (𝑛+ 1) matrix that is interpreted as 𝐷1 scalar-HE
+ciphertexts encrypting the 𝑖∗-th column of DB.
+SimplePIR exploits the fact that 𝐷0 ×𝑛input elements are query-
+independent and can be reused across clients. Consequently, most
+of the DB GEMM can be precomputed, yielding a 𝐷1 × 𝑛hint. If
+the client system receives and stores the hint within an offline
+communication phase, the client can only send 𝐷0 elements per
+query and receive 𝐷1 elements in response during the online phase.
+Figure 2(a) illustrates the server-side computations for SimplePIR
+with multi-client batching [35]. With hint precomputation, the
+server’s online computation only includes a 𝐷1 × 𝐵× 𝐷0 INT8-
+INT32 GEMM for a batch of 𝐵queries.
+2.6
+Ring packing for hintless SimplePIR
+Numerous studies [30, 39, 44, 47] have explored hintless variants of
+SimplePIR by applying ring packing (or simply packing), which con-
+verts 𝑁scalar-HE ciphertexts with 𝑁×(𝑛+1) elements into a single
+poly-HE (RLWE) ciphertext with 2× (#RNS · 𝑁) elements. This rep-
+resents a compression factor (lower is better) of 2·#RNS
+𝑛+1 ×, mitigating
+ciphertext bloating in scalar-HE. #RNS can be further reduced to
+one after packing (referred to as modulus reduction [9]), achieving
+3
+
+
+--- Page 4 ---
+Jongmin Kim, Hyesung Ji, Jean-Luc Watson, Charles Gouert, G. Edward Suh, and Jung Ho Ahn
+2
+𝑛+1× (<0.16% for our parameters) compression. This eliminates the
+need for hint reuse, instead enabling online communication via
+compact poly-HE ciphertexts.
+Figure 2(b) illustrates an exemplar packing based on Tiptoe [30],
+which involves NTTs and parallel GEMMs with additional “special”
+poly-HE ciphertexts. Ring packing will be analyzed in detail in §3.5.
+2.7
+GPU execution model
+Modern NVIDIA GPUs are massively parallel systems composed
+of multiple streaming multiprocessors (SMs), each integrating exe-
+cution units such as INT32 cores for integer arithmetic and tensor
+cores for high-throughput low-bit (e.g., INT8) GEMMs. GPU ker-
+nels follow the single-instruction, multiple-thread (SIMT) model,
+where threads are grouped into warps (groups of 32 threads) and
+scheduled to SMs. Performance is governed by occupancy, which is
+the number of active warps per SM relative to the hardware limit,
+and efficient utilization of the memory hierarchy, spanning per-SM
+memory resources (registers, shared memory, and L1 cache) and
+global memory resources (L2 cache and DRAM).
+Recent GPUs employ High Bandwidth Memory (HBM) to deliver
+massive DRAM bandwidth (e.g., 3.94TB/s in H100 NVL 94GB) and
+provide high-bandwidth interconnects such as NVLink for multi-
+GPU configurations, enabling efficient parallelization with modest
+communication overhead.
+3
+A Unified Approach to PIR Protocols
+3.1
+PIR as a compression process
+We present a distinct perspective on PIR by interpreting it as a
+compression process. A trivial PIR protocol has a server return
+an entire DB as a response to each query, whereas practical proto-
+cols compress the response via HE operations to retain only the
+requested records. For example, SimplePIR (§2.5) achieves a com-
+pression factor of 4(𝑛+1)
+𝐷0
+×, compressing DB (𝐷1 × 𝐷0 INT8 values)
+into a compact response (𝐷1 × (𝑛+ 1) INT32 values including the
+hint).
+More generally, PIR protocols apply a sequence of dimension
+folding [42, 46] (or simply folding) steps to progressively compress
+DB. For a DB with 𝐷𝑘× 𝐷𝑘−1 × · · · × 𝐷0 records, each folding step
+removes a 𝐷𝑖factor from the response.
+3.2
+A unified analytic model for PIR
+We observe a dichotomy in PIR protocols, where most PIR protocols
+rely on a single HE category for dimension folding. More details
+on individual protocols are provided in §7.
+• Scalar-HE folding. Building upon SimplePIR, these protocols
+have one or two folding steps using one-hot representations (§2.5);
+the two-folding variant is referred to as DoublePIR [31]. The second
+folding requires reinterpretation beforehand, which treats existing
+data as a stream of scalars (plaintexts), because scalar-HE does not
+support inter-ciphertext multiplications. Hintless variants add a
+ring packing step at the end (§2.6). This PIR category includes Sim-
+plePIR/DoublePIR [31], Tiptoe [30], HintlessPIR [39], and YPIR [47].
+⑤NTT
+Scalar
+plaintexts
+Polynomial
+plaintexts
+(ℛ𝑞)
+Scalar-HE 
+ciphertexts
+(integer 
+vectors)
+Poly-HE 
+ciphertexts 
+( ℛ𝑞vectors)
+⑥Poly-HE dimension folding 
+①Scalar-HE dimension folding 
+③Ring packing
+4 𝑛+1
+𝐷𝑖
+×
+2
+𝑛+1 ×
+②Reinterpretation
+1 ×
+3–4 ×
+⑦Poly-HE 
+dimension 
+folding 
+2
+Di ×
+1
+𝐷𝑖×
+Poly-HE
+Scalar-HE
+Figure 3: Our unified PIR model. Each arrow, annotated with
+its typical compression factor (lower is better), denotes an
+operation that directly transforms the response state; the
+exact compression factor may vary depending on parameters
+and implementation. Here, 𝐷𝑖denote the DB dimensions and
+𝑛= 1,280 is the LWE degree.
+• Poly-HE folding. An optimized protocol of this category, Onion-
+PIRv2 [14], organizes DB as a 2 × 2 × · · · × 2 × 𝐷0 structure, utiliz-
+ing RLWE plaintext-ciphertext multiplications for the initial 𝐷0-
+dimension folding and RLWE-RGSW external products for the
+rest [49]. Although alternative methods, such as RLWE inter-ciphertext
+multiplications [4], rotation-based encrypted matrix-vector multi-
+plications [42], or MLWE operations [46], are also used, they offer
+similar computation-communication trade-offs. This category in-
+cludes XPIR [45], MulPIR [3], WhisPIR [25], OnionPIR [49], Onion-
+PIRv2 [14], Spiral [46], Respire [11], and KsPIR [42].
+We develop a unified analytic model that overcomes the di-
+chotomy and provides a comprehensive viewpoint for PIR protocols
+(see Figure 3). In this model, the two PIR categories follow these
+paths (optional paths enclosed in parentheses):
+• Scalar-HE folding: 1○→( 2○→1○) →( 3○).
+• Poly-HE folding: 5○→6○→7○→7○→· · · →7○.
+There are some exceptions; for instance, SealPIR [4] follows 5○
+→6○→4○→5○→6○, although such designs are generally less
+efficient compared to other poly-HE folding approaches [49]. Also,
+InsPIRe [44] develops protocols that follow similar paths to our
+new protocols in §3.4, but InsPIRe exhibits significant limitations
+when targeting GPUs (§3.5.3).
+3.3
+Limitations of the two PIR categories
+Under this model, we identify the limitations of each approach.
+Scalar-HE folding suffers from large response sizes. For 1○→2○
+→1○→3○, the overall compression factor is:
+4(𝑛+ 1)
+𝐷0
+× 1 × 4(𝑛+ 1)
+𝐷1
+×
+2
+𝑛+ 1 = 32(𝑛+ 1)
+𝐷0𝐷1
+.
+Although constant terms vary with the parameter choice, the (𝑛+1)
+(≥210) term, which stems from ciphertext bloating in scalar-HE,
+leads to substantial response expansion relative to the original
+record size.
+4
+
+
+--- Page 5 ---
+VIPIR: A Versatile GPU Framework for Integrating Private Information Retrieval Protocols
+Encrypt 𝑠0
+Encrypt 𝑠𝑛−1
+Encrypt 𝑖0
+Encrypt 𝑖𝑘
+⋯
+⋯
+Encrypt 𝑠0 + 𝑠1𝑋+ ⋯+ 𝑠𝑛−1𝑋𝑛−1 + 𝑖0𝑋𝑛+ 𝑖1𝑋𝑛+1 + ⋯+ 𝑖𝑘𝑋𝑛+𝑘
+Expansion
+Used for multiple
+Tiptoe-style ring packing
+Used for
+poly-HE dimension folding
+Expansion
+keys
+Figure 4: A black-box view of expansion-based ring packing
+(ExpPack) used for multiple paths in the unified model; red-
+bordered boxes denote client-sent data.
+In contrast, poly-HE folding achieves a more favorable compres-
+sion factor (≃
+8
+Î
+𝑖𝐷𝑖) but suffers from DB bloating, i.e., plaintext
+expansion due to the initial NTT ( 5○). The resulting ∼4× increase
+in DB size severely limits the applicability and scalability of PIR
+protocols for large databases.
+The DB bloating problem is particularly critical for GPUs, whose
+memory capacity (up to hundreds of GBs per device) is more limited
+than that of server-class CPUs (up to TBs). As PIR requires a linear
+scan over the entire DB, keeping DB in GPU DRAM is essential
+to maximize bandwidth. However, for real-world GB- to TB-scale
+databases, the additional ∼4× storage overhead becomes a major
+bottleneck, either incurring costly host-GPU communication or
+requiring additional GPUs merely for memory capacity.
+3.4
+GPU-friendly protocol constructions
+From our unified model, we derive two PIR protocols that achieve
+improved compression for low client-server communication while
+avoiding DB bloating, which is critical for GPUs, by starting with
+scalar-HE folding ( 1○):
+• Double-packing: 1○→3○→4○→1○→3○. Applying packing
+twice reduces the overall compression factor to
+64
+𝐷0𝐷1 , eliminating
+the (𝑛+1) factor. This essentially trades off reduced communication
+with additional computations for performing packing twice. We
+mitigate the computational overhead with a novel ring packing
+method (ExpPack, §3.5) that is especially effective for multiple
+packing computations.
+• Hybrid: 1○→3○→7○→7○→· · · →7○. While prior scalar-
+HE folding approaches used packing primarily for compression,
+we repurpose it as a bridge to enable hybrid PIR protocols that
+transition from scalar-HE folding in the initial dimension to poly-
+HE folding in subsequent dimensions. For poly-HE folding ( 7○), we
+adopt RGSW-RLWE external products [18], as used in OnionPIR [14,
+49].
+The overall computational cost of both protocols is dominated
+by the first two steps ( 1○→3○); beyond this point, the data is
+sufficiently compressed ( 8
+𝐷𝑖×) such that subsequent computations
+contribute minimally.
+3.5
+Expansion-based ring packing (ExpPack)
+Our protocols are particularly GPU-friendly in part because of a
+novel expansion-based packing (ExpPack) method ( 3○) that drasti-
+cally reduces client-server communication while exposing massive
+GPU parallelism. Across existing packing methods [6, 12, 17, 41], the
+core idea is the same: 𝑁scalar-HE ciphertexts are converted into a
+single poly-HE (RLWE) ciphertext using additional client-provided
+“special” ciphertexts (see Figure 2(b)) and/or keys [12, 39, 44].
+ExpPack differs primarily in how the special ciphertexts are
+constructed, enabling the server to expand them on-the-fly. Expan-
+sion is an HE algorithm that enables extracting RLWE ciphertexts
+each encrypting 𝑎𝑖(0 ≤𝑖< 𝑁) from an RLWE encryption of
+𝑎0 + 𝑎1𝑋+ · · · + 𝑎𝑁−1𝑋𝑁−1 [4, 49], which we use in a black-box
+manner in this work.
+We propose coupling this expansion with the packing method
+from Tiptoe [30], which is otherwise impractical due to exces-
+sive communication overhead for the special ciphertexts. For a
+client’s length-𝑛secret s = (𝑠0,𝑠1, · · · ,𝑠𝑛−1), Tiptoe requires 𝑛spe-
+cial RLWE ciphertexts for ring packing:
+Encrypt(𝑠0), Encrypt(𝑠1), · · · , Encrypt(𝑠𝑛−1).
+Their total size reaches 120MiB for our parameters, orders of mag-
+nitude larger than the actual index and response ciphertexts (on
+the order of KBs), making Tiptoe highly impractical.
+Instead, we make the client send a single RLWE ciphertext
+(96KiB) that encrypts all the secret values as:
+ctExpPack ←Encrypt(𝑠0 + 𝑠1𝑋+ · · · + 𝑠𝑛−1𝑋𝑛−1),
+𝑛< 𝑁.
+Then, the special ciphertexts can be recovered from ctExpPack through
+expansion. More cryptographic details of ExpPack are provided in
+Appendix C.
+ExpPack thus drastically reduces the communication overhead
+for the special ciphertexts, at the cost of additional expansion keys
+(up to 5.16 MiB under our parameters). These keys, however, can
+be stored at the server and reused across multiple queries from the
+same client over time.
+3.5.1
+Multi-purpose expansion. ExpPack is particularly well-suited
+for the protocols in §3.4 as it can be used for multiple paths in
+our unified model (see Figure 4). For the double-packing protocol,
+the expansion is performed only once, after which the recovered
+special ciphertexts can be reused for multiple packing steps. For the
+hybrid protocol, we exploit the fact that 𝑛< 𝑁to embed additional
+information in ctExpPack: we embed both the 𝑠𝑖values for packing
+and the index information for subsequent poly-HE folding steps.
+This allows a single expansion process to serve both packing ( 3○)
+and poly-HE folding ( 7○) paths.
+3.5.2
+Massive parallelism. ExpPack unlocks the massive paral-
+lelism inherent in Tiptoe-style packing, which was previously pro-
+hibitive due to its high communication overhead. After the expan-
+sion, whose acceleration via parallelization has been extensively
+studied in IVE [35], thousands of independent NTTs and INT32
+GEMMs follow (see Figure 2(b)), exposing massive parallelism well-
+suited for GPUs.
+Revisiting the 𝐵-batch SimplePIR in Figure 2, the 𝐷1 × 𝑛and
+𝐷1 × 𝐵SimplePIR outputs are first transformed into polynomials
+by treating each length-𝑁vector along the 𝐷1 dimension as a
+polynomial in R𝑞, with integer elements interpreted as coefficients.
+This yields ⌈𝐷1/𝑁⌉× 𝑛and ⌈𝐷1/𝑁⌉× 𝐵polynomials, to which
+NTTs are applied independently.
+5
+
+
+--- Page 6 ---
+Jongmin Kim, Hyesung Ji, Jean-Luc Watson, Charles Gouert, G. Edward Suh, and Jung Ho Ahn
+Let H and G denote these two polynomial matrices after the
+NTTs. The computation of H · C + (0 | G) follows, where C is
+an 𝑛× 2𝐵polynomial matrix corresponding to expanded special
+ciphertexts from 𝐵clients. As RNS and NTT transform a polyno-
+mial multiplication into point-wise multiplications over (#RNS · 𝑁)
+coefficients, this reduces to (#RNS · 𝑁)-parallel ⌈𝐷1/𝑁⌉× 2𝐵× 𝑛
+INT32 GEMMs with additional modular reduction computations.
+3.5.3
+Alternative ring packing methods. Unlike prior ring packing
+methods, ExpPack avoids both sequential loops that limit paral-
+lelism and heavy precomputation that incurs additional memory
+overhead. While our unified model does not preclude alternative
+packing methods used in studies such as HintlessPIR [39], YPIR [47],
+and InsPIRe [44], many exhibit inherent limitations on GPUs. In
+particular, HintlessPIR and InsPIRe rely on long O(𝑛) sequential
+loops arising from data-dependent, stateful transformations (e.g.,
+iterative rotations and accumulations), where each step depends
+on the previous, restricting parallelism. They also rely on extensive
+precomputation, whose results occupy a large memory footprint; in
+our 64GiB DB evaluation, InsPIRe’s CPU implementation exhausted
+memory even with 256GiB of DRAM. YPIR avoids such sequential
+structures and exhibits computation patterns closer to ExpPack, but
+does not provide the same protocol-level advantages as in §3.5.1.
+3.6
+Putting it all together for our hybrid
+protocol
+We walk through the hybrid protocol with our optimizations for
+a 64GiB DB organized as a 𝑁× 2 × · · · × 2 × 𝐷0 = 𝑁× 𝐷𝑟× 𝐷0 =
+212 ×28 ×216 structure of 1B records. In the offline phase, the server
+precomputes the hint by multiplying DB with a 𝐷0×𝑛random matrix,
+producing a (𝑁× 𝐷𝑟) × 𝑛result. It then performs NTTs along the
+𝑁-dimension to obtain H, a 𝐷𝑟× 𝑛matrix of polynomials. Each
+polynomial contains 3 × 𝑁INT32 elements (#RNS = 3), occupying
+48KiB. Thus, H occupies 15GiB of memory space, becoming the
+second largest data object in the protocol after DB. The client also
+sends reusable keys (6.09MiB) during the offline phase.
+During the online phase, the client sends a length-𝐷0 INT32
+vector (256KiB) for scalar-HE folding ( 1○) and one RLWE ciphertext
+(96KiB) to be expanded. Then the online server-side computation
+is performed as follows:
+1○(DB GEMM) INT8-INT32 GEMM between the query vector and
+DB (64GiB) produces an 𝑁× 𝐷𝑟INT32 matrix.
+3○(ExpPack) First, expansion produces a “special” C (𝑛× 2 poly-
+nomials, 120MiB) for ExpPack as well as RGSW ciphertexts
+for the remaining poly-HE folding steps. NTT is applied to
+the 1○output, producing 𝐷𝑟polynomials (G, 12MiB). Then,
+INT32 GEMMs are performed to compute H · C + (0 | G) for
+Tiptoe-style packing, yielding 𝐷𝑟output RLWE ciphertexts
+(24MiB).
+7○(The rest) RGSW-RLWE external products for poly-HE folding
+are performed log2 𝐷𝑟= 8 times to extract a single RLWE
+ciphertext (96KiB). After 3○, the data size is small enough
+that these steps contribute little to the overall cost. The final
+modulus reduction [9] yields a 32KiB response (one RLWE
+ciphertext with two polynomials and #RNS = 1).
+4
+VIPIR: A GPU-Optimized PIR Framework
+We develop VIPIR, a versatile GPU-optimized PIR framework based
+on our unified model. While it supports a range of PIR protocols,
+our goal is not to cover all existing variants, but to optimize those
+well-suited for GPU execution. By co-designing the protocol with
+GPU kernels and execution strategies, we bring PIR performance
+to practical levels even for large databases.
+The two primary computations in PIR are GEMM and NTT. Two
+types of GEMMs appear in the major execution paths of our unified
+model:
+• INT8-INT32 plain GEMM. This is used for scalar-HE folding
+( 1○). As we perform modulo-232 operations as in SimplePIR,
+modular reduction effectively becomes free.
+• INT32 modular GEMM. This is used for poly-HE folding ( 6○)
+and ring packing ( 3○). In this case, we operate on polynomials,
+resulting in (#RNS · 𝑁)-parallel GEMMs enabled by RNS decom-
+position and NTT. We need to perform modulo-𝑞𝑖operations.
+4.1
+Scalar-HE folding with tensor-core GEMMs
+Since scalar plaintexts fit within INT8, we leverage NVIDIA GPU
+tensor cores [20] to exploit their high computational throughput.
+For example, for H100 NVL GPUs, which are used in our evalua-
+tion, GEMMs with regular INT32 operations are limited to a peak
+throughput of 30TOPS, whereas tensor cores enable up to 1670TOPS
+for INT8 operations.
+As tensor cores support INT8 GEMMs with INT32 accumulation,
+we decompose the INT32 matrix into four INT8 matrices. For an
+INT8 matrix A and an INT32 matrix B, we decompose B into INT8
+matrices B0, B1, B2, B3 to compute A · B as follows:
+A · B0 + 28 · (A · B1) + 216 · (A · B2) + 224 · (A · B3) mod 232,
+where each A · B𝑖is computed using tensor cores, multiplications
+by {28, 216, 224} are implemented via bit shifts, and modulo-232
+reduction is free.
+We exploit NVIDIA’s prmt instruction [53], originally introduced
+for video processing, to efficiently perform the matrix decomposi-
+tion. This instruction selects four arbitrary bytes from two 32-bit
+registers and assembles them into a single 32-bit destination reg-
+ister. Given four contiguous INT32 elements from B, we use two
+prmt instructions to extract one byte from each element and pack
+them into a single 32-bit register for subsequent tensor-core oper-
+ations. This enables the decomposition to be implemented using
+only 2 × (# of elements from B) prmt instructions.
+All these operations, including prmt-based decomposition, INT8-
+INT8 tensor-core computation, and final shift-based accumulation,
+are fused into a single GPU kernel to minimize memory overhead.
+We further leverage advanced GPU features provided in recent
+NVIDIA GPUs, such as asynchronous global-to-shared memory
+copies, vectorized load/store instructions, matrix-specific shared-
+memory loads (ldmatrix), and swizzling [34].
+Our parameter and protocol choices are tailored to enable effi-
+cient tensor-core execution. While we have taken INT8 plaintexts
+and INT32 ciphertexts for granted thus far, this requires setting the
+plaintext modulus to 28 (unlike SimplePIR’s 247–991 range) and
+the ciphertext modulus to 232 for scalar-HE. In contrast, packing
+methods in YPIR [47] and InsPIRe [44] do not support power-of-two
+6
+
+
+--- Page 7 ---
+VIPIR: A Versatile GPU Framework for Integrating Private Information Retrieval Protocols
+ciphertext moduli, requiring modulo-𝑞𝑖(𝑞𝑖< 232) arithmetic as in
+poly-HE, which introduces significant overheads in accumulation
+and modular reduction under tensor-core execution [27].
+4.2
+Optimizing parallel modular GEMMs
+We optimize parallel INT32 modular GEMMs used in ring packing
+and poly-HE folding by (1) reconciling the layout mismatch between
+NTT and GEMM, and (2) reducing modular reduction overhead.
+In ExpPack, NTTs [35] dominate the computation of expansion
+and favor an 𝑁-innermost layout to enable contiguous accesses
+within each polynomial. However, this layout is suboptimal for
+(#RNS · 𝑁)-parallel GEMMs, where threads operate on matrix tiles
+and require contiguous accesses within the tiles for memory coa-
+lescing and shared-memory reuse [34]. To bridge this mismatch,
+we insert layout transpositions before and after the GEMMs to
+convert between polynomial-major (NTT-friendly) and tile-major
+(GEMM-friendly) layouts. This enables coalesced global memory
+accesses, higher shared-memory reuse, and larger GEMM tile usage,
+improving arithmetic intensity and throughput.
+We further reduce modular reduction overhead via lazy reduc-
+tion [19, 33]. Using RNS primes smaller than 229 and 64-bit accu-
+mulators, we defer reduction for up to 32 multiply-accumulates
+without overflow, amortizing reduction costs and lowering instruc-
+tion overhead.
+4.3
+Number-theoretic transform (NTT)
+We optimize NTT execution by employing a single-kernel design
+with Montgomery reduction. For the NTT with 𝑁= 212, whose
+working set fits within on-chip resources, we can implement it
+with a single kernel, eliminating inter-kernel synchronization over-
+head [32, 54]. We also adopt Montgomery reduction [48] instead
+of Barrett reduction [7], as it is better suited for the 32-bit integer
+datapath of GPUs with fewer instructions [19].
+We also fuse kernels to reduce memory traffic between the NTT
+and its adjacent kernels. Specifically, we fuse the initial RNS de-
+composition with the NTT in ExpPack (§3.5), reducing the DRAM
+transfers for temporary results. We also fuse modulus reduction [9]
+with inverse NTT.
+4.4
+Memory-capacity-aware stream-wise
+buffering
+Although we avoid DB bloating, certain intermediate data objects
+occupy large memory space. In particular, the second folding in
+our double-packing protocol multiplies a compressed intermediate
+(8𝑁× 𝐷1 INT8 per client) with scalar-HE ciphertexts (𝐷1 × (𝑛+ 1)
+INT32), producing an 8𝑁×(𝑛+1) result (160MiB) per client, totaling
+10GiB for 64 batches; subsequent NTTs for ring packing further
+triple this footprint.
+To balance batching parallelism and memory efficiency, we in-
+troduce stream-wise buffering. For 𝐵-batch execution, we partition
+execution across CUDA streams, allocate a fixed per-stream buffer
+sized for a single batch, and assign each stream 𝐵/#stream batches.
+Each stream processes its batches sequentially, reusing the buffer,
+reducing intermediate memory usage from O(𝐵) to O(#stream)
+while preserving parallelism. We apply this selectively to memory-
+intensive stages.
+Sharded
+DB
+×
+𝐷0
+𝐷1
+2
+B (batch)
+SimplePIR
+input
+𝐵/2
+B
+SimplePIR
+output
+𝐷1
+2
+𝐷1
+2
+𝐷1
+2
+Batch-
+wise 
+distrib.
+until 
+the end
+GPU 0
+GPU 1
+GPU 
+0
+GPU 0
+GPU 1
+=
+𝐷1
+GPU 
+1
+𝐵/2
+Broadcast
+All-to-all 
+exchanged output
+Figure 5: Two-GPU online computation flow for SimplePIR.
+4.5
+Multi-GPU support
+To further scale throughput and support larger DB sizes, we ex-
+tend VIPIR with multi-GPU support. We devise two parallelization
+strategies for distributing data and computation, both employed
+within a single protocol.
+First, because DB dominates DRAM usage, we shard it across
+GPUs to support DB sizes exceeding a single GPU’s memory capac-
+ity. Figure 5 shows an example for SimplePIR, where each GPU
+stores a (𝐷1/#GPU) × 𝐷0 partition of DB and independently per-
+forms GEMMs with the input queries (a 𝐷0 × 𝐵matrix), which are
+broadcast to all GPUs.
+After the first folding, we perform inter-GPU communications
+to transition to a batch-wise distribution, eliminating the need for
+further communications in later stages. If the first folding produces
+a (𝐷1/#GPU) × 𝐵output, we perform an all-to-all exchange so
+that each GPU holds a 𝐷1 × (𝐵/#GPU) partition of the aggregated
+result, effectively reducing the per-GPU batch size to 𝐵/#GPU. As
+the SimplePIR hint is shared across all queries and clients, it must
+reside on every GPU for further PIR steps. Thus, we instead perform
+an all-gather during hint precomputation.
+5
+Implementation
+VIPIR is implemented in C++ and CUDA. We implement the INT8-
+INT32 GEMM using the CuTE layout abstractions from CUTLASS [51],
+and leverage NVIDIA Collective Communications Library (NCCL) [52]
+for efficient inter-GPU communications. We use separate CUDA-
+core-based kernels for the INT8-INT32 matrix-vector multiplica-
+tions in single-batch execution as they are memory-bound and can-
+not exploit tensor-core throughput. VIPIR focuses on accelerating
+server-side PIR operations, the primary performance bottleneck;
+client-side operations are implemented for evaluation purposes
+using SEAL [13], a CPU-based HE library.
+We follow standard practices [1, 14, 30, 31, 49] for selecting the
+parameters. For scalar-HE, we set the plaintext modulus to 28 and
+the ciphertext modulus to 232, which is reduced to 218 after each
+scalar-HE folding step. For poly-HE (RLWE and RGSW), we set the
+plaintext modulus to 218, and the ciphertext modulus to 𝑞≃287
+(#RNS = 3), which can be reduced to 𝑞≃229 (#RNS = 1) through
+modulus reduction [9], where slightly larger parameters are used
+for implementing OnionPIRv2 [14]. We verify that these parameters
+achieve 128-bit security when using degrees of 𝑛= 1,280 and
+𝑁= 212 based on Lattice Estimator [2]. Parameter configurations
+are more detailed in Appendix A and Appendix D.
+7
+
+
+--- Page 8 ---
+Jongmin Kim, Hyesung Ji, Jean-Luc Watson, Charles Gouert, G. Edward Suh, and Jung Ho Ahn
+Table 1: Performance comparison of hintless PIR implementations across various DB sizes. The first three use only poly-HE
+folding; the next six use scalar-HE folding based on SimplePIR (S) or DoublePIR (D) [31]; and the last two combine both
+poly-HE and scalar-HE folding. Green cells denote the best value in each group. We report single-batch (𝐵=1) server-side online
+execution times in milliseconds. Communication per query (Comm./query) includes non-reusable keys, but excludes reusable
+keys (Reuse-keys). We used one H100 NVL 94GB GPU for VIPIR. OoM refers to out-of-memory failures.
+DB
+size
+System
+CPU
+CPU
+VIPIR
+CPU
+CPU
+CPU
+VIPIR
+VIPIR
+VIPIR
+CPU
+VIPIR
+Protocol
+Spiral
+Onion
+Onion
+Hintless
+YPIR
+YPIR
+ExpPack
+ExpPack
+Double-
+InsPIRe
+Hybrid
+PIRv2
+PIRv2
+PIR
+(S)
+(D)
+(S)
+(D)
+packing
+Retrieved records
+16KiB
+16KiB
+16KiB
+1B
+32KiB
+1B
+32KiB
+1B
+4KiB
+4KiB
+4KiB
+1
+GiB
+DB storage
+8GiB
+4GiB
+4GiB
+1GiB
+1GiB
+1GiB
+1GiB
+1GiB
+1GiB
+1GiB
+1GiB
+Exec. time (𝐵=1)
+3,310
+1,160
+4.1
+647
+355
+134
+3.1
+10.7
+9.8
+4,658
+9.6
+Comm./query
+96KiB
+128KiB
+256KiB
+1.94MiB
+924KiB
+924KiB
+480KiB
+395KiB
+357KiB
+271KiB
+132KiB
+Reuse-keys/client
+16.0MiB
+4.00MiB
+8.00MiB
+384KiB
+0
+0
+5.16MiB
+5.16MiB
+5.16MiB
+0
+6.09MiB
+Retrieved records
+16KiB
+16KiB
+16KiB
+1B
+64KiB
+1B
+64KiB
+1B
+4KiB
+4KiB
+4KiB
+4
+GiB
+DB storage
+32GiB
+16GiB
+16GiB
+4GiB
+4GiB
+4GiB
+4GiB
+4GiB
+4GiB
+4GiB
+4GiB
+Exec. time (𝐵=1)
+10,150
+3,896
+10.5
+1,242
+883
+430
+4.4
+19.3
+10.8
+6,919
+10.6
+Comm./query
+96KiB
+128KiB
+256KiB
+3.69MiB
+1.28MiB
+1.28MiB
+864KiB
+651KiB
+369KiB
+292KiB
+144KiB
+Reuse-keys/client
+16.0MiB
+4.00MiB
+8.00MiB
+384KiB
+0
+0
+5.16MiB
+5.16MiB
+5.16MiB
+0
+6.09MiB
+Retrieved records
+16KiB
+16KiB
+16KiB
+1B
+128KiB
+1B
+128KiB
+1B
+4KiB
+4KiB
+4KiB
+16
+GiB
+DB storage
+128GiB
+64GiB
+64GiB
+16GiB
+16GiB
+16GiB
+16GiB
+16GiB
+16GiB
+16GiB
+16GiB
+Exec. time (𝐵=1)
+51,960
+15,144
+35.9
+3,183
+2,654
+1,680
+9.3
+38.6
+15.3
+12,738
+15.1
+Comm./query
+96KiB
+128KiB
+256KiB
+7.19MiB
+2.03MiB
+2.03MiB
+1.59MiB
+1.14MiB
+417KiB
+376KiB
+192KiB
+Reuse-keys/client
+16.0MiB
+4.00MiB
+8.00MiB
+384KiB
+0
+0
+5.16MiB
+5.16MiB
+5.16MiB
+0
+6.09MiB
+Retrieved records
+16KiB
+16KiB
+16KiB
+1B
+256KiB
+1B
+256KiB
+1B
+4KiB
+4KiB
+4KiB
+64
+GiB
+DB storage
+512GiB
+256GiB
+256GiB
+64GiB
+64GiB
+64GiB
+64GiB
+64GiB
+64GiB
+64GiB
+64GiB
+Exec. time (𝐵=1)
+OoM
+OoM
+OoM
+10,637
+9,883
+7,076
+28.3
+90.8
+33.0
+OoM
+33.5
+Comm./query
+96KiB
+128KiB
+256KiB
+14.2MiB
+3.53MiB
+3.53MiB
+3.09MiB
+2.14MiB
+609KiB
+712KiB
+384KiB
+Reuse-keys/client
+16.0MiB
+4.00MiB
+8.00MiB
+384KiB
+0
+0
+5.16MiB
+5.16MiB
+5.16MiB
+0
+6.09MiB
+6
+Evaluation
+6.1
+Experimental setup
+We tested VIPIR across multiple PIR protocols, including exist-
+ing ones—OnionPIRv2 [14] and SimplePIR/DoublePIR [31]; hint-
+less protocols differing from prior work [30, 39, 47] only in ring
+packing—ExpPack(S) (SimplePIR-based: 1○→3○) and ExpPack(D)
+(DoublePIR-based: 1○→2○→1○→3○); plus our double-packing
+and hybrid protocols.
+We primarily evaluated the performance of VIPIR on an H100
+NVL 94GB GPU with an effective HBM bandwidth of 3.48TB/s. To
+demonstrate multi-GPU scalability, we also conducted experiments
+using two H100 NVL 94GB GPUs connected via NVLink 3.0, of-
+fering a bandwidth of 530.16GB/s. All reported execution times
+reflect server-side online execution times only, with throughput
+measured in queries per second (QPS). When DB contains 𝐷1B
+records, we set 𝐷0 ≈
+√
+𝐷for SimplePIR and DoublePIR (both with
+and without ExpPack). For double-packing and hybrid protocols,
+we used 𝐷/𝐷0 = 220 to minimize communication, except for 64GiB
+DB, where we used 𝐷/𝐷0 = 219 by default to avoid out-of-memory
+failures under large-batch execution (Table 1 still uses 220 as it
+reports single-batch results).
+We compare VIPIR against state-of-the-art PIR studies, includ-
+ing Spiral [46], OnionPIRv2 [14], HintlessPIR [39], YPIR [47], In-
+sPIRe [44], and SimplePIR/DoublePIR [31]. Their open-source CPU
+versions were executed on a system with an Intel Xeon Gold 6348
+CPU and 256GiB of DRAM. Configurations for the baselines are
+described in Appendix B.
+6.2
+VIPIR vs. CPU baselines
+Our extensive comparison against prior CPU baselines (Table 1)
+shows that VIPIR achieves orders-of-magnitude higher performance
+in server-side PIR computations than all the baselines. Compared
+to DoublePIR-based YPIR [47], which shows the best performance
+among the baselines, even our slowest configuration, ExpPack(D)
+demonstrates 12.5–77.9× improvements. Notably, the performance
+gains increase with the DB size—12.5× for 1GiB and 77.9× for 64GiB—
+highlighting VIPIR’s strong scalability to large databases.
+Owing to our memory-capacity-aware design, which introduces
+minimal overhead for auxiliary data objects, VIPIR can efficiently
+accommodate large databases within limited memory budgets. In
+contrast, InsPIRe [44] and poly-HE folding approaches, such as
+Spiral [46] and OnionPIRv2 [14], encounter out-of-memory (OoM)
+failures even with 256GiB of host memory. VIPIR, however, suc-
+cessfully handles up to 64GiB of DB entirely on the GPU, despite
+having only 94GiB of available memory.
+Our new protocol constructions demonstrate promising reduc-
+tions in communication cost while maintaining competitive server-
+side computation performance, even with their additional computa-
+tion overhead. The double-packing and hybrid protocols achieve the
+lowest per-query communication cost within their respective proto-
+col groups. At the same time, their server-side performance matches
+8
+
+
+--- Page 9 ---
+VIPIR: A Versatile GPU Framework for Integrating Private Information Retrieval Protocols
+Table 2: Throughput (QPS) for plain SimplePIR/DoublePIR
+based on the CPU implementation of YPIR [47], which does
+not support batching, and 32-batched VIPIR.
+DB
+SimplePIR
+DoublePIR
+size
+CPU
+VIPIR
+Improv.
+CPU
+VIPIR
+Improv.
+1GiB
+11.36
+8,244
+756×
+9.80
+1,838
+188×
+4GiB
+2.54
+2,201
+867×
+2.27
+779
+343×
+16GiB
+0.64
+565
+883×
+0.60
+294
+490×
+64GiB
+0.14
+144
+1,029×
+0.14
+98
+700×
+Table 3: Throughput (QPS) across various DB sizes for VIPIR
+(H100 NVL 94GB) using a batch size of 32 and prior GPU-
+based PIR studies. OoM refers to out-of-memory failures.
+DB
+Prior work
+VIPIR
+size
+PIRon Shift Onion ExpPack ExpPack Double- Hybrid
+(GiB)
+GPU
+PIR† PIRv2
+(S)
+(D)
+packing
+1
+7.94
+12.50 516.6
+480.6
+461.5
+190.4
+244.9
+4
+2.37
+3.61 177.8
+465.4
+405.0
+186.4
+236.1
+16
+OoM
+0.98
+48.6
+397.2
+303.3
+172.3
+219.6
+64
+OoM
+0.25
+OoM
+232.8
+168.3
+163.1
+207.4
+† Reported values from the paper [56] using an RTX 4090.
+that of simple designs such as ExpPack(S) for large databases.
+For 64GiB DB, ExpPack(S) requires 28.3ms of server computation,
+whereas the double-packing and hybrid protocols require compara-
+ble 33.0ms and 33.5ms, respectively.
+64GiB PIR execution times of 33.0–33.5ms with our protocols
+are only 1.67–1.69× above the hard latency bound imposed by DB
+access time. Simply streaming 64GiB of data from DRAM requires
+19.7ms on our evaluated GPU system.
+VIPIR also excels in executing existing protocols. Compared
+to the CPU implementation of OnionPIRv2 [14], VIPIR achieves
+283–422× performance improvements with the identical protocol.
+Although VIPIR currently incurs twice the communication cost of
+the CPU baseline, this can be equalized by replacing half of the
+transmitted data with random seeds [3], as done in the baseline.
+Support for multi-client batching [35] can further widen the
+performance gap when evaluating throughput (QPS). While prior
+CPU-based studies provide only limited batching capabilities, VIPIR
+fully supports batching as long as memory space is sufficient. As
+shown in Table 2, under identical SimplePIR/DoublePIR protocols,
+32-batch execution with VIPIR achieves 188–1,029× higher QPS
+compared to the single-batch CPU implementation [47].
+6.3
+VIPIR vs. GPU baselines
+Several GPU-based PIR studies also exist. We compare VIPIR against
+PIRonGPU [22], which was executed on the same GPU system,
+as well as the reported performance of ShiftPIR [56]. PIRonGPU
+and ShiftPIR belong to poly-HE folding approaches, which incur
+significant DB bloating due to NTT, limiting scalability to large DB
+sizes. ShiftPIR [56] attempts to mitigate this by partitioning DB and
+overlapping host-to-device transfers with GPU computation, but
+becomes constrained by the low host-device bandwidth.
+As shown in Table 3, VIPIR consistently outperforms prior GPU-
+based PIR implementations across all DB sizes and all protocol con-
+figurations. Even when using OnionPIRv2, which also incurs DB
+bloating, VIPIR achieves 65.1–75.0× and 41.3–49.6× QPS improve-
+ments compared to PIRonGPU and ShiftPIR, respectively. Further-
+more, using our protocols without DB bloating (all protocols in
+Table 3 except OnionPIRv2) yields larger QPS gains, reaching 175.7–
+405.1× for 16GiB DB and 652.6–931.3× for 64GiB.
+6.4
+Sensitivity study: Execution parameters
+Figure 6 shows how throughput (QPS) varies with DB size, batch size,
+and protocol. For all protocols, QPS increases steadily as the batch
+size grows. Relative to single-batch execution, 32-batch execution
+improves GPU throughput by 3.69–6.62×, 11.33–15.06×, 2.64–4.95×,
+and 3.33–6.02× for ExpPack(S), ExpPack(D), double-packing, and
+hybrid protocols, respectively. The particularly strong scaling of
+ExpPack(D) stems from its minimal reliance on ring packing, which
+is applied only to O(𝑛2) data elements and is thus independent
+of the DB dimensions. This implies that our tensor-core GEMM
+implementation for dimension folding scales well with batching.
+The QPS gap among the protocols narrows as the DB size in-
+creases, which makes our double-packing and hybrid protocols
+more attractive for large databases. Using 32-batch execution as
+the reference point, for a 16GiB DB, ExpPack(S) achieves 2.31× and
+1.81× higher QPS than the double-packing and hybrid protocols,
+respectively. When the DB size increases to 64GiB, however, these
+gaps shrink to 1.43× and 1.18×. This is because the overall execution
+time becomes increasingly dominated by the DB GEMM performed
+in the first scalar-HE folding step, while steps such as expansion
+remain a constant overhead.
+Figure 6 also shows the peak device memory usage for each
+case. For OnionPIR, even a single-batch execution with a 16GiB DB
+already uses 66.9GiB of memory because of the 4× DB bloating. The
+other protocols based on scalar-HE folding do not suffer from this
+issue; even for a 64GiB DB and a batch size of up to 32, they use
+only 69.8–92.1GiB of memory.
+6.5
+Sensitivity study: GPU optimizations
+Figure 7 shows the 32-batch execution time breakdown as we incre-
+mentally apply our GPU optimizations targeting GEMMs. For the
+64GiB DB, without tensor cores (Base), the initial DB GEMM uses
+standard INT32 operations and accounts for 60.5–74.0% of total
+server-side online computation time. Our tensor-core DB GEMM
+implementation accelerates this by 3.89–4.05×, reducing its share
+to 29.8–42.2%. Applying transposed INT32 GEMMs further acceler-
+ates the GEMMs in the first ExpPack computation by 1.09–1.44×.
+Together, these two GEMM optimizations deliver 1.44–1.53× end-
+to-end speedups for the 16GiB DB, and much larger 2.04–2.29×
+speedups for the 64GiB DB.
+Additionally, thanks to our efficient multi-GPU partitioning
+strategies, VIPIR achieves near-perfect scaling with 1.94–2.01×
+speedups when using two GPUs, where speedups also come from
+reduced per-GPU working set. While VIPIR supports more GPUs,
+we leave their evaluation as future work.
+9
+
+
+--- Page 10 ---
+Jongmin Kim, Hyesung Ji, Jean-Luc Watson, Charles Gouert, G. Edward Suh, and Jung Ho Ahn
+0
+20
+40
+60
+80
+100
+0
+80
+160
+240
+320
+400
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+1
+2
+4
+8
+16
+32
+OnionPIR
+SimplePIR 
++ExpPack
+DoublePIR 
++ExpPack
+Double-
+packing
+Hybrid
+OnionPIR
+SimplePIR 
++ExpPack
+DoublePIR 
++ExpPack
+Double-
+packing
+Hybrid
+OnionPIR
+SimplePIR 
++ExpPack
+DoublePIR 
++ExpPack
+Double-
+packing
+Hybrid
+16GiB
+32GiB
+64GiB
+Peak DRAM usage (GB)
+QPS
+QPS
+Memory
+B
+OoM
+OoM
+OoM
+Figure 6: Queries per second (QPS) and peak DRAM memory usage for different DB sizes, PIR protocols, and batch sizes ranging
+from 1 to 32. We used one H100 NVL 94GB GPU with VIPIR. OoM refers to out-of-memory failures.
+0
+100
+200
+300
+400
+Base
++ Tensor
++ Transpose
++ 2-GPU
+Base
++ Tensor
++ Transpose
++ 2-GPU
+Base
++ Tensor
++ Transpose
++ 2-GPU
+Base
++ Tensor
++ Transpose
++ 2-GPU
+Base
++ Tensor
++ Transpose
++ 2-GPU
+Base
++ Tensor
++ Transpose
++ 2-GPU
+16GiB
+64GiB
+16GiB
+64GiB
+16GiB
+64GiB
+SimplePIR + ExpPack
+Double-packing
+Hybrid
+Latency (ms)
+DB GEMM
+1st ExpPack (Exp)
+1st ExpPack (GEMM)
+Etc.
+Batch=32
+Figure 7: Online server computation latency as our GPU
+optimizations—tensor-core INT8-INT32 GEMMs (+Tensor),
+transposed INT32 GEMMs (+Transpose), and two-GPU execu-
+tion (+2-GPU)—are incrementally applied. We utilized H100
+NVL 94GB GPUs with NVLink connections.
+6.6
+Deeper analysis of the hybrid protocol
+Determining the DB dimensionality is a critical design choice for
+protocol constructions, with particularly substantial impacts on the
+hybrid protocol. Suppose DB contains 𝐷records in total. Figure 8
+shows that varying 𝐷0 creates a trade-off between server compu-
+tation and client-server communication. Increasing 𝐷0 (decreas-
+ing 𝐷/𝐷0) yields more compressed outputs (compression factor:
+4(𝑛+1)
+𝐷0
+×) from the initial folding, reducing the data volume for ring
+packing. In contrast, 𝐷0 has negligible impact on DB GEMM time,
+as the (𝐷/𝐷0) × 𝐵× 𝐷0 GEMM involves the same 𝐷· 𝐵multiply-
+accumulates regardless of 𝐷0, for batch size 𝐵. Therefore, increasing
+𝐷0 reduces overall server execution time but increases communica-
+tion volume (O(𝐷0)) to send the encrypted one-hot representation
+of the index in the 𝐷0 dimension.
+We primarily used 𝐷/𝐷0 = 220 in our experiments to min-
+imize server-client communication, as computational costs are
+largely mitigated by our optimizations. If we instead opt for more
+communication-heavy settings with 𝐷/𝐷0 = 217, we can obtain
+1.59–1.76× speedups (vs. 220) for DB sizes smaller than 64GiB, and
+1.21× for 64GiB (vs. 219). We leverage this trade-off to show multiple
+data points in Figure 1.
+7
+Related Work
+Since the seminal work of Chor et al. [21], numerous PIR protocols
+have been proposed. XPIR [45] employs a single poly-HE folding
+0
+400
+800
+1200
+1600
+2000
+2400
+0
+30
+60
+90
+120
+150
+180
+256 128 64
+32 256 128 64
+32 256 128 64
+32 256 128 64
+32
+8GiB
+16GiB
+32GiB
+64GiB
+Online communication (KB)
+Latency (ms)
+DB GEMM
+1st ExpPack (Exp)
+1st ExpPack (GEMM)
+Etc.
+Comm./query
+𝑫/𝑫𝟎220 219 218 217 220 219 218 217 220 219 218 217 220 219 218 217
+OoM
+Batch=32, Hybrid
+Figure 8: Latency breakdown and online communication as
+𝐷/𝐷0 varies in the hybrid protocol on an H100 NVL 94GB
+GPU. OoM refers to out-of-memory failures.
+step. SealPIR [4] introduces query expansion and performs mul-
+tiple poly-HE folding steps with a reinterpretation step [8, 26].
+WhisPIR [25] later introduces an expansion method with reduced
+expansion key overhead. Building on SealPIR, MulPIR [3] employs
+RLWE inter-ciphertext multiplications, while OnionPIR [49] further
+improves efficiency by using RGSW-RLWE external products [18]
+for non-initial folding steps. OnionPIRv2 [14] further optimizes
+the design with hardware-friendly implementations and protocol
+fine-tuning. Spiral [46] explores MLWE [38] in place of RLWE, and
+Respire [11] leverages subring-based RLWE dimension reduction
+for small-record databases. KsPIR [42] instead proposes using en-
+crypted RLWE matrix-vector multiplications for poly-HE folding.
+In parallel, scalar-HE dimension folding has gained traction since
+its introduction in SimplePIR [31]. SimplePIR reduces communica-
+tion by requiring clients to download a large reusable hint. How-
+ever, this hint must be replaced for every DB update and requires a
+large client-side storage. Hintless protocols, including Tiptoe [30],
+HintlessPIR [39], and YPIR [47], apply various ring packing meth-
+ods to SimplePIR, building on packing techniques used in other
+contexts [12, 17, 41]. There are potentially more packing methods
+that may be applicable to PIR, such as HERMES [6]. InsPIRe [44]
+proposes a new packing method that leverages heavy precomputa-
+tion to reduce online computation cost, and introduces a poly-HE
+folding technique that interpolates DB entries into a function.
+Despite extensive work on improving PIR protocols, relatively
+few studies focus on their hardware acceleration. PIRonGPU [22]
+provides an open-source GPU implementation of SealPIR [4] using
+the HEonGPU library [23]. ShiftPIR [56] proposes a GPU-aware
+protocol that reduces client overhead by partially offloading query
+10
+
+
+--- Page 11 ---
+VIPIR: A Versatile GPU Framework for Integrating Private Information Retrieval Protocols
+generation to the server. Lam et al. [37] and CIP-PIR [29] explore
+GPU acceleration for multi-server PIR protocols, which rely on
+non-collusion assumptions that we consider restrictive and thus do
+not address in this work.
+Several recent architecture proposals also target PIR accelera-
+tion. IVE [35] proposes an ASIC accelerator design dedicated for
+processing batches of OnionPIR queries. INSPIRE [40] (distinct
+from InsPIRe) introduces an in-storage accelerator for PIR on SSDs.
+SmartPIR [16] extends this approach by offloading HE operations
+to computational storage devices (CSDs). Conflux [15] similarly
+leverages CSDs for keyword PIR, an extension of index-based PIR.
+8
+Conclusion
+We presented VIPIR, a versatile GPU framework that rethinks the
+design and implementation of PIR through a unified, GPU-centric
+perspective. By introducing a unified analytical model, we expose
+fundamental trade-offs in prior PIR protocols, particularly the ten-
+sion between ciphertext and DB (plaintext) bloating. Guided by these
+insights, we propose double-packing and hybrid protocols that
+improve communication efficiency without incurring prohibitive
+memory capacity demands. A key enabler is ExpPack, a novel ring
+packing technique that reduces communication cost while expos-
+ing massive parallelism well-suited for GPUs. VIPIR also includes
+various architecture-aware optimizations, including tensor-core-
+accelerated GEMMs, optimized NTT execution, memory-efficient
+scheduling, and multi-GPU support. Extensive evaluation shows
+that VIPIR achieves orders-of-magnitude performance improve-
+ments over prior CPU- and GPU-based PIR systems, while also
+reducing communication costs and avoiding out-of-memory fail-
+ures.
+References
+[1] Martin Albrecht, Melissa Chase, Hao Chen, Jintai Ding, Shafi Goldwasser, Sergey
+Gorbunov, Shai Halevi, Jeffrey Hoffstein, Kim Laine, Kristin Lauter, Satya Lokam,
+Daniele Micciancio, Dustin Moody, Travis Morrison, Amit Sahai, and Vinod
+Vaikuntanathan. 2021. Homomorphic Encryption Standard. In Protecting Privacy
+through Homomorphic Encryption. Springer, 31–62. doi:10.1007/978-3-030-77287-
+1_2
+[2] Martin R. Albrecht, Rachel Player, and Sam Scott. 2015. On the Concrete Hardness
+of Learning with Errors. Journal of Mathematical Cryptology 9, 3 (2015), 169–203.
+doi:10.1515/jmc-2015-0016
+[3] Asra Ali, Tancrède Lepoint, Sarvar Patel, Mariana Raykova, Phillipp Schopp-
+mann, Karn Seth, and Kevin Yeo. 2021. Communication–Computation Trade-offs
+in PIR. In USENIX Security Symposium. https://www.usenix.org/conference/
+usenixsecurity21/presentation/ali
+[4] Sebastian Angel, Hao Chen, Kim Laine, and Srinath Setty. 2018. PIR with Com-
+pressed Queries and Amortized Query Processing. In IEEE Symposium on Security
+and Privacy (SP). doi:10.1109/SP.2018.00062
+[5] Apple. 2024. Combining Machine Learning and Homomorphic Encryption in the
+Apple Ecosystem. https://machinelearning.apple.com/research/homomorphic-
+encryption
+[6] Youngjin Bae, Jung Hee Cheon, Jaehyung Kim, Jai Hyun Park, and Damien
+Stehlé. 2023. HERMES: Efficient Ring Packing Using MLWE Ciphertexts and
+Application to Transciphering. In Annual International Cryptology Conference
+(CRYPTO). doi:10.1007/978-3-031-38551-3_2
+[7] Paul Barrett. 1986. Implementing the Rivest Shamir and Adleman Public Key
+Encryption Algorithm on a Standard Digital Signal Processor. In Annual Inter-
+national Conference on the Theory and Application of Cryptographic Techniques.
+doi:10.5555/36664.36688
+[8] Zvika Brakerski. 2012. Fully Homomorphic Encryption without Modulus Switch-
+ing from Classical GapSVP. In Annual Cryptology Conference (CRYPTO). 868–886.
+doi:10.1007/978-3-642-32009-5_50
+[9] Zvika Brakerski and Vinod Vaikuntanathan. 2011. Efficient Fully Homomorphic
+Encryption from (Standard) LWE. In IEEE Annual Symposium on Foundations of
+Computer Science (FOCS). doi:10.1109/FOCS.2011.12
+[10] Brechy. 2025. Ethereum Privacy: Private Information Retrieval. https://pse.dev/
+blog/ethereum-privacy-pir
+[11] Alexander Burton, Samir Jordan Menon, and David J. Wu. 2024. Respire: High-
+Rate PIR for Databases with Small Records. In ACM Conference on Computer and
+Communications Security. doi:10.1145/3658644.3690328
+[12] Hao Chen, Wei Dai, Miran Kim, and Yongsoo Song. 2021. Efficient Homomorphic
+Conversion Between (Ring) LWE Ciphertexts. In Applied Cryptography and
+Network Security (ACNS). doi:10.1007/978-3-030-78372-3_18
+[13] Hao Chen, Kim Laine, and Rachel Player. 2017. Simple Encrypted Arithmetic
+Library - SEAL v2.1. In Financial Cryptography and Data Security. doi:10.1007/978-
+3-319-70278-0_1
+[14] Yue Chen and Ling Ren. 2025. OnionPIRv2: Efficient Single-Server PIR. IACR
+Cryptology ePrint Archive (2025). https://eprint.iacr.org/2025/1142
+[15] Zehao Chen, Zhaoyan Shen, Qian Wei, Hang Lu, and Lei Ju. 2026. Conflux: A
+High-Performance Keyword Private Retrieval System for Dynamic Datasets. In
+2026 IEEE International Symposium on High Performance Computer Architecture
+(HPCA). doi:10.1109/HPCA68181.2026.11408617
+[16] Zehao Chen, Honghui You, Qian Wei, Hang Lu, Lei ju, and Zhaoyan Shen.
+2025. SmartPIR: A Private Information Retrieval System using Computational
+Storage Devices. In Proceedings of the 58th IEEE/ACM International Symposium
+on Microarchitecture (MICRO). doi:10.1145/3725843.3756060
+[17] Ilaria Chillotti, Nicolas Gama, Mariya Georgieva, and Malika Izabachène. 2017.
+Faster Packed Homomorphic Operations and Efficient Circuit Bootstrapping for
+TFHE. In International Conference on the Theory and Applications of Cryptology
+and Information Security (Asiacrypt). doi:10.1007/978-3-319-70694-8_14
+[18] Ilaria Chillotti, Nicolas Gama, Mariya Georgieva, and Malika Izabachène. 2020.
+TFHE: Fast Fully Homomorphic Encryption over the Torus. Journal of Cryptology
+33, 1 (2020), 34–91. doi:10.1007/s00145-019-09319-x
+[19] Wonseok Choi, Jongmin Kim, and Jung Ho Ahn. 2026. Cheddar: A Swift Fully
+Homomorphic Encryption Library Designed for GPU Architectures. In ASPLOS.
+doi:10.1145/3760250.3762223
+[20] Jack Choquette, Olivier Giroux, and Denis Foley. 2018. Volta: Performance and
+Programmability. IEEE Micro 38, 2 (2018), 42–52. doi:10.1109/MM.2018.022071134
+[21] Benny Chor, Eyal Kushilevitz, Oded Goldreich, and Madhu Sudan. 1998. Private
+Information Retrieval. J. ACM 45, 6 (1998), 965–981. doi:10.1145/293347.293350
+[22] Ali Şah Özcan. 2024. PIRonGPU. https://github.com/Alisah-Ozcan/PIRonGPU.
+[23] Ali Şah Özcan and Erkay Savaş. 2024.
+HEonGPU: a GPU-based Fully Ho-
+momorphic Encryption Library 1.0. IACR Cryptology ePrint Archive (2024).
+https://eprint.iacr.org/2024/1543
+[24] Alex Davidson, Gonçalo Pestana, and Sofía Celi. 2023. FrodoPIR: Simple, Scalable,
+Single-Server Private Information Retrieval. Proceedings on Privacy Enhancing
+Technologies (2023), 365–383. doi:10.56553/popets-2023-0022
+[25] Leo de Castro, Kevin Lewi, and Edward Suh. 2024. WhisPIR: Stateless Private
+Information Retrieval with Low Communication. IACR Cryptology ePrint Archive
+(2024). https://eprint.iacr.org/2024/266
+[26] Junfeng Fan and Frederik Vercauteren. 2012. Somewhat Practical Fully Ho-
+momorphic Encryption. IACR Cryptology ePrint Archive 144 (2012).
+https:
+//eprint.iacr.org/2012/144
+[27] Shengyu Fan, Zhiwei Wang, Weizhi Xu, Rui Hou, Dan Meng, and Mingzhe Zhang.
+2023. TensorFHE: Achieving Practical Computation on Encrypted Data Using
+GPGPU. In HPCA. doi:10.1109/HPCA56546.2023.10071017
+[28] Craig Gentry, Amit Sahai, and Brent Waters. 2013. Homomorphic Encryp-
+tion from Learning with Errors: Conceptually-Simpler, Asymptotically-Faster,
+Attribute-Based. In Annual International Cryptology Conference (CRYPTO). doi:10.
+1007/978-3-642-40041-4_5
+[29] Daniel Günther, Maurice Heymann, Benny Pinkas, and Thomas Schneider. 2022.
+GPU-accelerated PIR with Client-Independent Preprocessing for Large-Scale Ap-
+plications. In USENIX Security Symposium. https://www.usenix.org/conference/
+usenixsecurity22/presentation/gunther
+[30] Alexandra Henzinger, Emma Dauterman, Henry Corrigan-Gibbs, and Nickolai
+Zeldovich. 2023. Private Web Search with Tiptoe. In Proceedings of the 29th
+Symposium on Operating Systems Principles. doi:10.1145/3600006.3613134
+[31] Alexandra Henzinger, Matthew M. Hong, Henry Corrigan-Gibbs, Sarah Meikle-
+john, and Vinod Vaikuntanathan. 2023. One Server for the Price of Two: Simple
+and Fast Single-Server Private Information Retrieval. In USENIX Security Sym-
+posium.
+https://www.usenix.org/conference/usenixsecurity23/presentation/
+henzinger
+[32] Hyesung Ji, Sangpyo Kim, Jaewan Choi, and Jung Ho Ahn. 2024. Accelerating
+Programmable Bootstrapping Targeting Contemporary GPU Microarchitecture.
+IEEE Computer Architecture Letters (2024). doi:10.1109/LCA.2024.3418448
+[33] Wonkyung Jung, Sangpyo Kim, Jung Ho Ahn, Jung Hee Cheon, and Younho Lee.
+2021. Over 100x Faster Bootstrapping in Fully Homomorphic Encryption through
+Memory-centric Optimization with GPUs. IACR Transactions on Cryptographic
+Hardware and Embedded Systems 2021, 4 (2021), 114–148. doi:10.46586/tches.
+v2021.i4.114-148
+[34] Andrew Kerr, Duane Merrill, Julien Demouth, and John Tran. 2017. CUTLASS:
+Fast Linear Algebra in CUDA C++. https://developer.nvidia.com/blog/cutlass-
+linear-algebra-cuda
+11
+
+
+--- Page 12 ---
+Jongmin Kim, Hyesung Ji, Jean-Luc Watson, Charles Gouert, G. Edward Suh, and Jung Ho Ahn
+[35] Sanpyo Kim, Hyesung Ji, Jongmin Kim, Wonseok Choi, Jaiyoung Park, and Jung
+Ho Ahn. 2026. IVE: An Accelerator for Single-Server Private Information Re-
+trieval Using Versatile Processing Elements. In 2026 IEEE International Symposium
+on High Performance Computer Architecture (HPCA). doi:10.1109/HPCA68181.
+2026.11408461
+[36] E. Kushilevitz and R. Ostrovsky. 1997. Replication is not needed: single database,
+computationally-private information retrieval. In Proceedings 38th Annual Sympo-
+sium on Foundations of Computer Science. 364–373. doi:10.1109/SFCS.1997.646125
+[37] Maximilian Lam, Jeff Johnson, Wenjie Xiong, Kiwan Maeng, Udit Gupta, Yang
+Li, Liangzhen Lai, Ilias Leontiadis, Minsoo Rhu, Hsien-Hsin S. Lee, Vijay Janapa
+Reddi, Gu-Yeon Wei, David Brooks, and G. Edward Suh. 2024. GPU-based
+Private Information Retrieval for On-Device Machine Learning Inference. In
+Proceedings of the 29th ACM International Conference on Architectural Support for
+Programming Languages and Operating Systems, Volume 1 (ASPLOS). 197–214.
+doi:10.1145/3617232.3624855
+[38] Adeline Langlois and Damien Stehlé. 2015. Worst-case to average-case reductions
+for module lattices. Designs, Codes and Cryptography 75, 3 (2015), 565–599.
+doi:10.1007/s10623-014-9938-4
+[39] Baiyu Li, Daniele Micciancio, Mariana Raykova, and Mark Schultz-Wu. 2024.
+Hintless Single-Server Private Information Retrieval. In Annual International
+Cryptology Conference (CRYPTO). 183–217. doi:10.1007/978-3-031-68400-5_6
+[40] Jilan Lin, Ling Liang, Zheng Qu, Ishtiyaque Ahmad, Liu Liu, Fengbin Tu, Trinabh
+Gupta, Yufei Ding, and Yuan Xie. 2022. INSPIRE: In-storage Private Information
+Retrieval via Protocol and Architecture Co-design. In Proceedings of the 49th
+Annual International Symposium on Computer Architecture (ISCA). doi:10.1145/
+3470496.3527433
+[41] Wen-jie Lu, Zhicong Huang, Cheng Hong, Yiping Ma, and Hunter Qu. 2021.
+PEGASUS: Bridging Polynomial and Non-polynomial Evaluations in Homomor-
+phic Encryption. In IEEE Symposium on Security and Privacy (SP). doi:10.1109/
+SP40001.2021.00043
+[42] Ming Luo, Feng-Hao Liu, and Han Wang. 2024. Faster FHE-Based Single-Server
+Private Information Retrieval. In Proceedings of the 2024 on ACM SIGSAC Con-
+ference on Computer and Communications Security (CCS). doi:10.1145/3658644.
+3690233
+[43] Vadim Lyubashevsky, Chris Peikert, and Oded Regev. 2010. On Ideal Lattices
+and Learning with Errors over Rings. In Annual International Conference on the
+Theory and Applications of Cryptographic Techniques (Eurocrypt). doi:10.1007/978-
+3-642-13190-5_1
+[44] Rasoul Akhavan Mahdavi, Sarvar Patel, Joon Young Seo, and Kevin Yeo. 2025.
+InsPIRe: Communication-Efficient PIR with Server-side Preprocessing. IACR
+Cryptology ePrint Archive (2025). https://eprint.iacr.org/2025/1352
+[45] Carlos Aguilar Melchor, Joris Barrier, Laurent Fousse, and Marc-Olivier Killijian.
+2016. XPIR: Private information retrieval for everyone. Proceedings on Privacy
+Enhancing Technologies (2016), 155–174. doi:10.1515/popets-2016-0010
+[46] Samir Jordan Menon and David J. Wu. 2022. SPIRAL: Fast, High-Rate Single-
+Server PIR via FHE Composition. In IEEE Symposium on Security and Privacy
+(SP). doi:10.1145/3460120.3485381
+[47] Samir Jordan Menon and David J. Wu. 2024. YPIR: High-Throughput Single-
+Server PIR with Silent Preprocessing. In USENIX Security Symposium. https:
+//www.usenix.org/conference/usenixsecurity24/presentation/menon
+[48] Peter L. Montgomery. 1985. Modular Multiplication without Trial Division. Math.
+Comp. 44, 170 (1985), 519–521. doi:10.1090/S0025-5718-1985-0777282-X
+[49] Muhammad Haris Mughees, Hao Chen, and Ling Ren. 2021. OnionPIR: Response
+efficient single-server PIR. In ACM Conference on Computer and Communications
+Security. doi:10.1145/3460120.3485381
+[50] Muhammad Haris Mughees and Ling Ren. 2023. Vectorized Batch Private Infor-
+mation Retrieval. In IEEE Symposium on Security and Privacy (SP). doi:10.1109/
+SP46215.2023.10179329
+[51] NVIDIA. 2026. CUTLASS. https://github.com/NVIDIA/cutlass.
+[52] NVIDIA. 2026. NVIDIA Collective Communications Library (NCCL). https:
+//developer.nvidia.com/nccl.
+[53] NVIDIA Corporation. 2026. PTX ISA. https://docs.nvidia.com/cuda/parallel-
+thread-execution/.
+[54] Özgün Özerk, Can Elgezen, Ahmet Can Mert, Erdinç Öztürk, and Erkay Savaş.
+2022. Efficient number theoretic transform implementation on GPU for homo-
+morphic encryption. The Journal of Supercomputing 78, 2 (2022), 2840–2872.
+doi:10.1007/s11227-021-03980-5
+[55] Oded Regev. 2009. On Lattices, Learning with Errors, Random Linear Codes, and
+Cryptography. J. ACM 56, 6, Article 34 (2009), 40 pages. doi:10.1145/1568318.
+1568324
+[56] Zihan Wang, Lutan Zhao, Ming Luo, Zhiwei Wang, Haoqi He, Wenzhe Lv, Xuan
+Ding, Dan Meng, and Rui Hou. 2025. ShiftPIR: An Efficient PIR System with
+Gravity Shifting from Client to Server. In ACM Conference on Computer and
+Communications Security. 1143–1157. doi:10.1145/3719027.3765153
+[57] Mingxun Zhou, Andrew Park, Wenting Zheng, and Elaine Shi. 2024. Piano:
+Extremely Simple, Single-Server PIR with Sublinear Server Computation. In IEEE
+Symposium on Security and Privacy (SP). doi:10.1109/SP54263.2024.00055
+A
+Cryptographic Background & Symbols
+We introduce the cryptographic constructions of LWE-based scalar-
+HE and RLWE-based poly-HE in this appendix.
+A.1
+LWE scalar-HE and its parameters
+LWE has a plaintext modulus 𝑝LWE and a ciphertext modulus 𝑞LWE.
+For an LWE degree 𝑛, the client samples a length-𝑛secret vector
+s = (𝑠0,𝑠1, · · · ,𝑠𝑛−1) ∈{−1, 0, 1}𝑛from a uniform ternary distri-
+bution, a length-𝑛random vector a = (𝑎0,𝑎1, · · · ,𝑎𝑛−1) ∈Z𝑛
+𝑞LWE
+from a uniform distribution in Z𝑞LWE, and an error value 𝑒∈Z
+from a discrete Gaussian distribution with a standard deviation 𝜎.
+Typically, 𝜎is set to 3.2 and 𝑒is clipped to ensure that |𝑒| < 6𝜎.
+We can encrypt a single plaintext scalar 𝑚∈Z𝑝LWE by the fol-
+lowing:
+Encrypt(𝑚) →ct = (a,𝑏) ∈Z𝑛+1
+𝑞LWE,
+𝑏+ a𝑇s = 𝑏+
+𝑛−1
+∑︁
+𝑖=0
+𝑎𝑖· 𝑠𝑖= Δ · 𝑚+ 𝑒
+(mod 𝑞LWE)
+Here, Δ is called the scale and is determined as Δ = 𝑞LWE
+𝑝LWE .
+It is convenient to define the phase of an LWE ciphertext:
+𝜙(ct) = 𝑏+ a𝑇s = Δ · 𝑚+ 𝑒
+(mod 𝑞LWE),
+𝜙(ct) ∈
+h
+−𝑞LWE
+2
+, 𝑞LWE
+2
+−1
+i
+The client can recover the plaintext 𝑚∈[−𝑝LWE
+2 , 𝑝LWE
+2
+] by com-
+puting
+Decrypt(ct) = round
+ 1
+Δ · 𝜙(ct)
+
+= round(𝑚+ 𝑒
+Δ) →𝑚,
+provided that |𝑒| < Δ
+2 .
+For ciphertexts ct = (a,𝑏) and ct′ = (a′,𝑏′), we can perform
+following inter-ciphertext additions and plaintext-ciphertext multi-
+plications:
+ct + ct′ = (a + a′,𝑏+ 𝑏′) ∈Z𝑛+1
+𝑞LWE
+𝑐· ct𝑖= (𝑐· a,𝑐· 𝑏) ∈Z𝑛+1
+𝑞LWE
+The phase of the result will be (for sufficiently small 𝑐and 𝑚):
+𝜙(ct + ct′) = Δ · (𝑚+ 𝑚′) + (𝑒+ 𝑒′) = 𝜙(ct) + 𝜙(ct′)
+𝜙(𝑐· ct) = Δ · (𝑐· 𝑚) + (𝑐· 𝑒) = 𝑐· 𝜙(ct)
+In this paper, we exclusively use the following parameters for
+LWE: 𝑝LWE = 28, 𝑞LWE = 232, 𝜎= 3.2, 𝑛= 1,280, and Δ = 224.
+The notations 𝑝LWE and 𝑞LWE are only used in this subsection of
+appendix.
+A.2
+RLWE poly-HE and its parameters
+RLWE also has a plaintext modulus 𝑝and a ciphertext modulus
+𝑞. Let R𝑞= Z𝑞[𝑋]/(𝑋𝑁+ 1) be the cyclotomic polynomial ring
+with a power-of-two polynomial ring degree 𝑁. The client samples
+a secret polynomial 𝑠(𝑋) = 𝑠0 + 𝑠1𝑋+ · · · + 𝑠𝑁−1𝑋𝑁−1, where
+each 𝑠𝑖is sampled from a uniform ternary distribution in {−1, 0, 1}.
+RLWE enables encrypting a plaintext polynomial 𝑚(𝑋) = 𝑚0 +
+𝑚1𝑋+ · · · + 𝑚𝑁−1𝑋𝑁−1 ∈R𝑝in a ciphertext. Thus, we can put
+𝑁log𝑝bits of information in a single ciphertext. For encrypting
+𝑚(𝑋), the client samples a random polynomial 𝑎(𝑋) ∈R𝑞, whose
+coefficients are sampled from a uniform distribution in Z𝑞, and
+an error polynomial 𝑒(𝑋) ∈Z[𝑋]/(𝑋𝑁+ 1), whose coefficients
+12
+
+
+--- Page 13 ---
+VIPIR: A Versatile GPU Framework for Integrating Private Information Retrieval Protocols
+are sampled from a discrete Gaussian distribution with a standard
+deviation 𝜎. Then, the client computes the following:
+Encrypt(𝑚(𝑋)) →ct = (𝑎(𝑋),𝑏(𝑋)) ∈R2
+𝑞
+𝑎(𝑋) · 𝑠(𝑋) + 𝑏(𝑋) = Δ · 𝑚(𝑋) + 𝑒(𝑋)
+(mod 𝑞)
+Here, Δ is determined as Δ = ⌊𝑞
+𝑝⌋(floored result).
+We define the phase of an RLWE ciphertext in the similar way
+as LWE:
+𝜙(ct) = 𝑎(𝑋) · 𝑠(𝑋) + 𝑏(𝑋) = Δ · 𝑚(𝑋) + 𝑒(𝑋)
+(mod 𝑞),
+where each coefficient of the phase is in
+h
+−𝑞−1
+2 , 𝑞−1
+2
+i
+range.
+The client can recover the plaintext 𝑚(𝑋) with its coefficients
+in
+h
+−𝑝−1
+2 , 𝑝−1
+2
+i
+range by computing
+Decrypt(ct) = round
+ 1
+Δ · 𝜙(ct)
+
+,
+given that each coefficient of 𝑒(𝑋) is in  −Δ
+2 , Δ
+2
+ range.
+Inter-ciphertext additions and plaintext-ciphertext multiplica-
+tions are performed by polynomial additions and polynomial multi-
+plications, respectively. For ct = (𝑎(𝑋),𝑏(𝑋)) and ct′ = (𝑎′(𝑋),𝑏′(𝑋)),
+they are computed as follows:
+ct + ct′ = (𝑎(𝑋) + 𝑎′(𝑋),𝑏(𝑋) + 𝑏′(𝑋))
+𝑐(𝑋) · ct = (𝑐(𝑋) · 𝑎(𝑋),𝑐(𝑋) · 𝑏(𝑋))
+In this paper, we use 𝑝= 218, 𝑞≃287 (#RNS = 3), 𝜎= 3.2,
+𝑁= 212, and Δ = ⌊𝑞
+𝑝⌋≃269 as the default parameters. However,
+for our implementation of the OnionPIRv2 [14] protocol, we use
+𝑝= 232, 𝑞≃2108 (#RNS = 4), and Δ ≃276.
+A.3
+Notations and symbols
+Table 4 summarizes the major notations and symbols used in the
+main text of this paper.
+Table 4: Notations and symbols.
+Symb.
+Explanation
+DB
+Database.
+𝐷𝑖
+𝑖-th DB dimension.
+𝑛
+LWE dimension (1,280 throughout this paper).
+R𝑞
+Polynomial ring Z𝑞[𝑋]/(𝑋𝑁+ 1).
+𝑁
+Degree of R𝑞(typically 212).
+𝑞
+Modulus of R𝑞.
+𝑞𝑖
+𝑖-th RNS prime composing 𝑞.
+#RNS
+The number of RNS primes composing 𝑞.
+A.4
+RNS prime selection
+When selecting the RNS primes (𝑞𝑖’s), we make sure that
+𝑞𝑖= 1 mod 2𝑁,
+which is a sufficient condition for enabling NTT.
+Further, we make sure that 2𝑁divides the RLWE plaintext mod-
+ulus 𝑝and
+𝑞𝑖= 1 mod 𝑝.
+This RNS prime selection minimizes the errors from RLWE because
+Δ · 𝑝+ 1 = 𝑞for scale Δ = ⌊𝑞
+𝑝⌋.
+With this setting, overflows/downflows in the plaintext domain
+only result in small error increases. For example, 3
+8𝑝+ 3
+8𝑝→−1
+4𝑝
+in R𝑝translates to:
+Δ · 3
+8𝑝+ Δ · 3
+8𝑝= Δ · 3
+4𝑝= Δ ·
+
+−1
+4𝑝
+
+−1
+(mod 𝑞)
+For the following sections, we ignore such errors in RLWE ci-
+phertexts that stem from overflows/downflows in the plaintext
+domain, as our RNS prime selection make them have minimal im-
+pact on precision; errors from other sources (e.g., encryption) are
+much greater. Then, we can calculate the phase of inter-ciphertext
+addition and plaintext-ciphertext multiplication results of RLWE
+ciphertexts as follows:
+𝜙(ct + ct′) = Δ · (𝑚(𝑋) + 𝑚′(𝑋)) + (𝑒(𝑋) + 𝑒′(𝑋))
+= 𝜙(ct) + 𝜙(ct′)
+𝜙(𝑐(𝑋) · ct) = Δ · (𝑐(𝑋) · 𝑚(𝑋)) + (𝑐(𝑋) · 𝑒(𝑋))
+= 𝑐(𝑋) · 𝜙(ct)
+We can observe that the phase function 𝜙has a linear property
+for both LWE and RLWE ciphertexts when ignoring the plaintext-
+domain overflows/downflows.
+Also, we select primes that are smaller than 229. This leaves
+extra room for numbers beyond the typical ranges for numbers in
+Z𝑞𝑖, specifically
+h
+−𝑞𝑖−1
+2 , 𝑞𝑖−1
+2
+i
+or [0,𝑞𝑖−1], which allows applying
+modular reductions in a lazy manner [19, 33].
+B
+Experimental Materials Utilized
+For the evaluation of prior studies, we mainly utilized their open-
+source implementations listed in Table 5. We used the main branch
+of each repository as of April 1st, 2026.
+Table 5: Prior PIR studies and their data sources.
+Prior studies
+Data source (GitHub)
+Spiral [46]
+menonsamir/spiral
+OnionPIRv2 [14, 49]
+chenyue42/OnionPIRv2
+HintlessPIR [39]
+google/hintless_pir
+Simple/DoublePIR [31] & YPIR [47]
+menonsamir/ypir
+InsPIRe [44]
+google/private-membership
+PIRonGPU [22]
+Alisah-Ozcan/PIRonGPU
+All implementations were evaluated using their default library
+parameter configurations unless otherwise specified. We consider
+DB containing 𝐷records in total. For OnionPIRv2, we used 𝐷0 = 29.
+𝑁= 212, 𝑞≃2108, and plaintext modulus 𝑝= 232, which pro-
+vides lower latency than the default configuration. For HintlessPIR,
+SimplePIR, DoublePIR, and YPIR, we set 𝐷0 ≈
+√
+𝐷following their
+default configurations. For InsPIRe, we selected 𝐷0 which mini-
+mizes communication cost and also evaluated various 𝐷0 values
+for Figure 1: 𝐷0 ∈{210, 211, 212} for 1GiB DB, 𝐷0 ∈{212, 213, 214}
+for 4GiB DB, and 𝐷0 ∈{214, 215, 216} for 16GiB DB. Increasing 𝐷0 re-
+duces execution time but increases communication cost, reflecting
+13
+
+
+--- Page 14 ---
+Jongmin Kim, Hyesung Ji, Jean-Luc Watson, Charles Gouert, G. Edward Suh, and Jung Ho Ahn
+the trade-off inherent in the protocol. PIRonGPU supports vari-
+ous choices of 𝑁with significantly different performance; we used
+𝑁= 215, which yields the lowest execution time.
+C
+Formal Description of ExpPack
+We provide the formal specification of our expansion-based ring
+packing (ExpPack) method, detailing the conversion from scalar-HE
+(LWE) ciphertexts to poly-HE (RLWE) ciphertexts.
+For simplicity, suppose we want to convert a collection of 𝑁LWE
+ciphertexts to a single RLWE ciphertext, where each LWE ciphertext
+encrypts a scalar value 𝑚𝑖(0 ≤𝑖< 𝑁) under the same secret vector
+s = (𝑠0,𝑠1, · · · ,𝑠𝑛−1) ∈{−1, 0, 1}𝑛. These LWE ciphertexts can be
+collectively represented as ctpack = (A, b), where A ∈Z𝑁×𝑛
+𝑝
+and
+b ∈Z𝑁
+𝑝. We are using 𝑝as the LWE ciphertext modulus and the
+RLWE plaintext modulus at the same time.
+This ctpack is constructed by setting the a-part of the 𝑖-th LWE
+ciphertext as the 𝑖-th row of a, and the 𝑏-part as the 𝑖-th element
+of b. Then, we can similarly define the phase of this collection of
+LWE ciphertexts as:
+𝜙(ctpack) = A · s + b =
+(Δ · 𝑚0 + 𝑒0, Δ · 𝑚1 + 𝑒1, · · · , Δ · 𝑚𝑁−1 + 𝑒𝑁−1),
+|𝑒𝑖| < Δ
+2 .
+C.1
+Tiptoe-style ring packing
+To facilitate packing, we perform a column-wise decomposition of
+the LWE matrix A as A = [A0 | A1 | · · · | A𝑛−1]. This allows us to
+rewrite the phase as a summation:
+𝜙(ctpack) = b +
+𝑛−1
+∑︁
+𝑖=0
+A𝑖· 𝑠𝑖= m
+(mod 𝑝)
+(2)
+Tiptoe [30] leverages this linear structure for packing, utilizing
+a method previously established in the context of column-based
+ring packing [17]. Under this construction, the client prepares 𝑛
+independent RLWE ciphertexts, each encrypting one element of
+the secret vector s:
+ctPack,𝑖←Encrypt(𝑠𝑖).
+We define an isomorphism 𝜄that maps a length-𝑁vector over
+Z𝑝to a polynomial in the ring R𝑝by treating the vector elements
+as coefficients:
+𝜄: Z𝑁
+𝑝∋(𝑎0,𝑎1, . . . ,𝑎𝑁−1) ↦→
+𝑁−1
+∑︁
+𝑗=0
+𝑎𝑗𝑋𝑗∈R𝑝
+By selecting RLWE parameters such that the plaintext domain is
+R𝑝and the ciphertext domain is R𝑞(where𝑞is the RLWE ciphertext
+modulus), the server can perform a homomorphic evaluation of
+Eq. 2. The computation is formulated as:
+(0, Δ · 𝜄(b)) +
+𝑛−1
+∑︁
+𝑖=0
+𝜄(A𝑖) · ctPack,𝑖→ctres
+(3)
+In this expression, (0, Δ · 𝜄(b)) represents a trivial RLWE en-
+cryption used to incorporate the offset vector b into the result; it
+is trivial that 𝜙((0, Δ · 𝜄(b))) = Δ · 𝜄(b). The terms 𝜄(A𝑖) · ctPack,𝑖
+denote plaintext-ciphertext multiplications. Because the phase com-
+putation and 𝜄has a linear property, the phase of ctres becomes:
+𝜙(ctres) = Δ · 𝜄(b) +
+𝑛−1
+∑︁
+𝑖=0
+𝜄(A𝑖) · (Δ · 𝑠𝑖+ 𝑒𝑖(𝑋))
+= Δ ·
+ 
+𝜄(b) +
+𝑛−1
+∑︁
+𝑖=0
+𝜄(Ai) · 𝑠𝑖
+!
++
+𝑛−1
+∑︁
+𝑖=0
+𝜄(A𝑖) · 𝑒𝑖(𝑋)
+= Δ · 𝜄
+ 
+b +
+𝑛−1
+∑︁
+𝑖=0
+Ai · 𝑠𝑖
+!
++
+𝑛−1
+∑︁
+𝑖=0
+𝜄(A𝑖) · 𝑒𝑖(𝑋)
+= Δ · 𝜄(m) +
+𝑛−1
+∑︁
+𝑖=0
+𝜄(A𝑖) · 𝑒𝑖(𝑋)
+Thus, ctres can be decrypted to obtain 𝜄(m) when the sum of the
+error terms (𝜄(A𝑖) · 𝑒𝑖(𝑋)) is small enough.
+To ensure computational efficiency, the server lifts the coeffi-
+cients of 𝜄(A𝑖) and 𝜄(b) from Z𝑝to Z𝑞and transforms them into
+the NTT domain. The resulting process enables the server to pack
+multiple scalar LWE instances into a single RLWE ciphertext as
+illustrated in Figure 2.
+C.2
+Expansion-based packing (ExpPack)
+To minimize communication overhead, ExpPack replaces the re-
+quirement for 𝑛individual ciphertexts with a single RLWE cipher-
+text. The client constructs an RLWE ciphertext ctExpPack by encod-
+ing the secret scalars 𝑠𝑖as coefficients of a single polynomial:
+ctExpPack ←Encrypt
+ 𝑛−1
+∑︁
+𝑖=0
+𝑠𝑖𝑋𝑖
+!
+(4)
+Note that the specific assignment of 𝑠𝑖to coefficients may vary
+depending on the chosen expansion schedule (e.g., bit-reversed
+ordering).
+To recover the individual encryptions, the server applies the
+recursive expansion process described in SealPIR [4]. A known
+property of this expansion method is that it yields ciphertexts en-
+crypting 2⌈log2 𝑛⌉· 𝑠𝑖rather than 𝑠𝑖directly. To normalize these
+values, the server pre-scales the initial ciphertext ctExpPack by the
+modular inverse 2−⌈log2 𝑛⌉(mod 𝑞) prior to the expansion. While
+2−⌈log2 𝑛⌉is a large integer in Z𝑞, it is canceled out by the 2⌈log2 𝑛⌉
+scaling during expansion.
+D
+Security & Precision
+The security of our protocols follows directly from the security of
+their underlying components; we refer to SimplePIR [31], SealPIR [4],
+and Tiptoe [30] for detailed analyses.
+For precision, we require a more careful error analysis as HE
+errors may propagate across PIR components.
+D.1
+Error isolation via reinterpretation and
+ExpPack
+When performing reinterpretation, encrypted data is treated as
+a stream of plaintexts that are directly recovered by the client
+via decryption. As a result, prior context about errors is lost, and
+previously accumulated errors are not propagated to subsequent
+steps. As a result, precision analysis can be conducted independently
+14
+
+
+--- Page 15 ---
+VIPIR: A Versatile GPU Framework for Integrating Private Information Retrieval Protocols
+for each segment separated by reinterpretation, most of which have
+already been analyzed in SimplePIR [31].
+Also, our ExpPack construction similarly treats scalar-HE ci-
+phertexts as plaintexts (see Eq. 3), making packing errors largely
+independent of previously accumulated errors.
+Thus, the only remaining path that requires verification is Exp-
+Pack followed by the poly-HE dimension folding steps in our hybrid
+protocol.
+D.2
+Error analysis of scalar-HE rounding
+Before performing the main computations of ExpPack, we reduce
+the ciphertext modulus of scalar-HE ciphertexts from 232 to 𝑝=
+218, following Tiptoe [30]. This is equivalent to introducing an
+additional rounding error term into each element of a scalar-HE
+ciphertext (𝑎0,𝑎1, · · · ,𝑎𝑛−1,𝑏) ∈Z𝑛+1
+232 , which originally decrypts
+as
+𝑏· 𝑠𝑛+
+𝑛−1
+∑︁
+𝑖=0
+𝑎𝑖· 𝑠𝑖= Δ · 𝑚+ 𝑒.
+We are using a ternary secret (𝑠0, . . . ,𝑠𝑛−1), and a scale Δ = 224.
+We assume the previously accumulated error is sufficiently small:
+|𝑒| < Δ
+4 .
+Let 𝑟a,𝑖(for 0 ≤𝑖< 𝑛) and 𝑟𝑏denote the rounding errors for
+𝑎𝑖and 𝑏, respectively, where |𝑟𝑖| < 213. Each rounding error is in
+range (−231
+𝑝, 231
+𝑝)
+The total additional error becomes
+𝐸round = 𝑟𝑏+
+𝑛
+∑︁
+𝑖=0
+𝑟a,𝑖· 𝑠𝑖.
+To ensure correctness, it suffices to guarantee
+|𝐸round| < Δ
+4 .
+Assuming that these rounding errors are i.i.d. uniform over
+(−231
+𝑝, 231
+𝑝), where 𝑠𝑖values are also i.i.d. and is −1, 0, or 1, we
+can bound the tail probability using Hoeffding’s inequality. Each
+term lies in an interval of width 232
+𝑝, and there are (𝑛+ 1) terms.
+Thus,
+Pr [|𝐸round| ≥𝑡] ≤2 exp
+
+−
+2𝑡2
+(𝑛+ 1) · (232/𝑝)2
+
+.
+For this LWE rounding, we use parameters 𝑝= 218, which is also
+used as the RLWE plaintext modulus, 𝑛= 1,280, and Δ = 224 (LWE
+scale). When we plug in these values with 𝑡= 1
+4Δ = 222, we obtain
+Pr
+
+|𝐸round| ≥Δ
+4
+
+≤2 exp(−102) < 2−146,
+which is negligible. Even if we have trillion (240) ciphertexts, the
+union bound probability (< 2−106) is still negligible.
+D.3
+Error analysis of ExpPack
+For ExpPack, we show that the maximum (not probabilistic) error
+remains sufficiently small. As mentioned before, the error from the
+input scalar-HE ciphertexts have minimal impact as we interpret
+them as plaintexts during packing. Suppose the error of ctPack,i
+is bounded by |𝐸expand|. As we accumulate 𝑛plaintext-ciphertext
+multiplication results as shown in Eq. 3, we can bound the total
+error to 𝑛· |𝐸expand|. We make this sufficiently small by setting the
+ciphertext modulus 𝑞large enough (e.g., 𝑞≃287).
+|𝐸expand| is determined by the expansion process. If the error
+of a freshly encrypted ciphertext is bounded by 6𝜎(typically 𝜎=
+3.2), the maximum size of error from expansion is determined as
+follows [46]:
+|𝐸expand| < 2⌈log2 𝑛⌉· (ℓ𝑡+ 1) · 6𝜎.
+Here, ℓis the decomposition degree for the expansion keys, and
+𝑡is determined as
+𝑡= 2⌈log2 𝑞
+ℓ
+⌉.
+The parameters we use are 𝑛= 1,280, 𝑞≃287, ℓ= 5, 𝑡= 218, and
+𝜎= 3.2. Plugging in these values, we roughly get |𝐸expand| < 235.6.
+Thus, the maximum error from ExpPack with expansion is strictly
+bounded by:
+|𝐸ExpPack| < 𝑛|𝐸expand| < 246,
+which does not affect the precision as it is much smaller than the
+poly-HE ciphertext scale Δ = 𝑞
+𝑝≃269 for 𝑝= 218.
+D.4
+Error in poly-HE folding for our hybrid
+protocol
+Although poly-HE folding steps directly follow ExpPack, the errors
+introduced during poly-HE folding are additive and do not depend
+on the errors already accumulated in the RLWE ciphertexts. As we
+have shown that these prior errors remain sufficiently small relative
+to the scale Δ, the remaining error analysis for poly-HE folding
+follows directly from OnionPIR [49], which we defer a detailed
+analysis to. The only difference is that the expansion process is
+shared with that used for the special ExpPack ciphertexts.
+D.5
+Error analysis of RLWE modulus switching
+At the end of each packing (except in our hybrid protocol, where it
+is deferred to the end of the online server computation), we perform
+modulus switching on the resulting RLWE ciphertexts, reducing the
+modulus from 𝑞to approximately 229, corresponding to #RNS = 1.
+This modulus reduction has similar effects to scalar-HE rounding.
+For an RLWE ciphertext ct = (𝑎(𝑋) = 𝑎0 + 𝑎1𝑋+ · · · + 𝑎𝑁−1 ·
+𝑋𝑁−1,𝑏(𝑋) = 𝑏0 + 𝑏1𝑋+ · · · + 𝑏𝑁−1 · 𝑋𝑁−1), which decrypts as:
+𝑎(𝑋) · 𝑠(𝑋) +𝑏(𝑋) = (Δ ·𝑚0 + 𝑒0) + · · · + (Δ ·𝑚𝑁−1 + 𝑒𝑁−1)𝑋𝑁−1
+for a ternary secret 𝑠(𝑋) = 𝑠0 + 𝑠1𝑋+ · · · + 𝑠𝑁−1𝑋𝑁−1 and scale Δ,
+which is set to ⌊𝑞
+𝑝⌋when coupled with scalar-HE rounding.
+If we only look at the coefficient of 𝑋𝑘, the following holds:
+𝑏𝑘+
+𝑁−1
+∑︁
+𝑖=0
+𝑎𝑖· 𝑠(𝑘−𝑖) mod 𝑁= Δ · 𝑚𝑘+ 𝑒𝑘.
+Assume that the previously accumulated error is sufficiently small:
+|𝑒𝑘| < Δ
+4 .
+When reducing the modulus from 𝑞to 229, each coefficient of
+𝑎(𝑋) and 𝑏(𝑋) incurs a rounding error. Let 𝑟𝑎,𝑖denote the rounding
+error for 𝑎𝑖and 𝑟𝑏,𝑖for 𝑏𝑖, where |𝑟𝑎,𝑖|, |𝑟𝑏,𝑖| <
+𝑞
+230 . The resulting
+additional error for the 𝑘-th coefficient becomes
+𝐸round = 𝑟𝑏,𝑖+
+𝑁−1
+∑︁
+𝑖=0
+𝑟𝑎,𝑖· 𝑠(𝑘−𝑖) mod 𝑁.
+15
+
+
+--- Page 16 ---
+Jongmin Kim, Hyesung Ji, Jean-Luc Watson, Charles Gouert, G. Edward Suh, and Jung Ho Ahn
+To guarantee correct decryption, it suffices to ensure
+|𝐸round| < Δ
+4 .
+Assuming the rounding errors are i.i.d. and uniformly distributed
+in
+
+−𝑞
+230 , 𝑞
+230
+
+, we can bound the tail probability using Hoeffding’s
+inequality. Since each term is bounded within an interval of width
+𝑞
+229 and there are (𝑁+ 1) terms, we have
+Pr [|𝐸round| ≥𝑡] ≤2 exp
+
+−
+2𝑡2
+(𝑁+ 1) · (𝑞/229)2
+
+.
+By plugging in our parameters, which are 𝑁= 212, 𝑝= 218,
+Δ = ⌊𝑞
+𝑝⌋, and 𝑡= Δ
+4 , we get:
+Pr
+
+|𝐸round| ≥Δ
+4
+
+≤2 exp(−128) < 2−183.
+Even if we consider all the 𝑁= 212 coefficients and trillion (240)
+ciphertexts, the union bound probability (< 2−131) remains negligi-
+ble.
+16
