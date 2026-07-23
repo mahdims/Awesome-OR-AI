@@ -1,0 +1,2188 @@
+--- Page 1 ---
+PEARL: Solver-in-the-Loop Interactive Optimization
+Modeling from Natural Language
+Hongliang Lu1∗
+Zhong Li2∗
+Yuxuan Chen1
+Yuan Lan3
+Fan Zhang3
+Zaiwen Wen1(B)
+1Peking University 2Great Bay University 3Huawei Technologies Co., Ltd
+(B)Corresponding author: wenzw@pku.edu.cn (Zaiwen Wen)
+∗Equal contributions.
+Abstract
+Optimization modeling is the process of translating real-world decision problems,
+often described in natural language, into formal mathematical formulations and
+executable solver code. While recent advances in large language models have
+shown promise in automating this process, most existing approaches remain one-
+shot: a model produces a formulation once, without executing it, conditioning
+on solver feedback, or iteratively revising errors. This stands in sharp contrast to
+real-world optimization modeling, which is inherently interactive and proceeds
+through repeated solve–debug–revise cycles. We introduce PEARL, a system for
+interactive optimization modeling that uses Python execution and mathematical pro-
+gramming solvers inside this loop. Rather than relying on a fixed repair workflow,
+PEARL learns when to test partial models, how to revise from solver diagnos-
+tics, and when to stop. It operates in a multi-turn tool-integrated setting where
+intermediate execution results, feasibility signals, and solution checks are used
+to improve both formulations and solver code before finalization. Across diverse
+optimization benchmarks, PEARL substantially improves verified solve rates over
+strong one-shot and tool-augmented baselines; notably, our PEARL-Qwen3-4B
+model outperforms the much larger DeepSeek-V3.2-685B in both macro- and
+micro-averaged accuracy on optimization modeling tasks.
+1
+Introduction
+Optimization modeling is the process of translating real-world decision problems, often described in
+natural language (NL), into formal mathematical models and generating corresponding solver code.
+It provides the critical link between high-level problem descriptions and the low-level solvers [Anand
+et al., 2017] that compute optimal or feasible decisions. Across domains [Singh, 2012, Antoniou
+and Lu, 2007] ranging from energy systems to logistics, finance, and manufacturing, the quality
+of this modeling step largely determines whether optimization can be applied. However, modeling
+typically requires substantial domain knowledge, careful specification of variables and constraints,
+and repeated debugging of data pipelines and solver implementations [Huang et al., 2025, Jiang et al.,
+2025]. In practice, even seemingly minor issues—such as a missing constraint, an incorrect index, or
+inconsistent data bindings—can make a model infeasible or lead to silent but severe errors.
+Recent advances in large language models (LLMs) have spurred growing interest in automating
+optimization modeling from natural language [Xiao et al., 2025]. Existing approaches can be
+broadly grouped into three categories. Prompting-based methods [Prasath and Karande, 2023]
+treat optimization modeling as a single-pass or weakly iterative generation task. Workflow-based
+systems [Xiao et al., 2024, Ahmaditeshnizi et al., 2024] decompose modeling into multiple stages
+such as drafting, execution, and repair, typically orchestrated by fixed prompting logic or search
+Preprint.
+arXiv:2607.18256v1  [cs.AI]  14 May 2026
+
+
+--- Page 2 ---
+procedures. Training-based approaches [Huang et al., 2025, Lu et al., 2025, Chen et al., 2025]
+improve base models through supervised fine-tuning or reinforcement learning (RL) on curated
+optimization-modeling data.
+4B
+7B
+8B
+32B
+235B
+685B
+Undisclosed
+20
+30
+40
+50
+60
+70
+Reported Model Scale
+Parameter count is shown when publicly disclosed.
+Macro Avg Pass@1 (%)
+PEARL [Ours]
+(Qwen3-4B)
+Qwen3
+(4B-Think)
+Qwen3
+(4B-Instruct-2507)
+SIRL
+(Qwen2.5-7B)
+OptMATH
+(Qwen2.5-7B)
+Qwen3
+(8B)
+ORLM
+(LLaMA-3-8B)
+OptMATH
+(Qwen2.5-32B)
+SIRL
+(Qwen2.5-32B)
+Qwen3
+(235B-A22B-Think-2507)
+Qwen3
+(235B-A22B-Instruct-2507)
+DeepSeek-V3.2
+(685B-Think)
+DeepSeek-V3.2
+(685B)
+GPT-5-Codex
+GPT-5
+Figure 1: Macro-averaged Pass@1 versus reported model scale across representative optimization-
+modeling methods. PEARL (Ours) uses a 4B backbone yet matches or exceeds much larger general-
+purpose models such as DeepSeek-V3.2-685B, highlighting that solver-mediated interaction and
+optimization-specific training can deliver strong accuracy in a compact model regime that is more
+practical for repeated agentic invocation [Kwon et al., 2023, Abdin et al., 2024, Belcak et al., 2025].
+Across these paradigms, LLMs demonstrate a nontrivial ability to capture modeling structure. How-
+ever, a shared limitation persists: optimization modeling is still fundamentally treated as a one-shot
+generation problem. Even in workflow-based systems [Xiao et al., 2024, Ahmaditeshnizi et al., 2024],
+the control flow that governs tool use and revision is typically hand-designed, and models are not ex-
+plicitly trained to make multi-turn decisions based on solver feedback. Given a natural-language (NL)
+specification, the model is expected to produce a complete formulation and solver implementation in
+a single pass, without executing partial models, conditioning on solver diagnostics, or revising errors.
+As a result, generated outputs frequently hallucinate constraints, produce infeasible formulations, or
+fail at runtime. Some recent systems [Chen et al., 2025] iteratively execute and repair solver code
+using tool feedback, but these interactions are orchestrated by heuristics rather than learned policies.
+Crucially, the underlying models are not trained to decide when to invoke tools, how to interpret
+solver feedback, or whether to revise or terminate. This mismatch between training objectives and
+real-world modeling workflows limits performance, particularly as problem descriptions become
+longer, noisier, and more underspecified.
+In contrast, real-world optimization modeling is inherently interactive [Zhang et al., 2024]. Human
+modelers rarely produce a correct model in a single pass; instead, they follow a solve–debug–revise
+loop. Partial formulations are tested, solver errors or infeasibility reports are inspected, constraints
+or data processing are adjusted, and the process repeats until the model passes verification. This
+workflow naturally involves temporally extended decision-making, partial observability, and tool-
+mediated feedback. These characteristics align closely with the emerging paradigm of agentic
+reinforcement learning [Zhang et al., 2025], which treats LLMs as policies operating in multi-turn,
+tool-integrated environments rather than as one-shot generators.
+Motivated by this perspective, we argue that optimization modeling should be formulated not as static
+text generation, but as an interactive decision process. To this end, we introduce PEARL (interactive
+optimization modeling with tool-integrated agentic reinforcement learning), a method for modeling
+and solving optimization problems via tool-integrated agentic reinforcement learning (Agentic RL).
+In PEARL, an agent incrementally constructs mathematical formulations and solver implementations,
+invokes tools such as Python execution and optimization solvers, observes execution traces and solver
+feedback, and revises its outputs across multiple turns until verification succeeds. Rather than relying
+on fixed heuristics or prompting logic, the agent is trained to learn how to interact with tools, when to
+test partial models, how to repair failures, and when to terminate.
+To support this behavior, we design an optimization-specific Agentic RL environment with structured
+tool interfaces and solver-based observations. We further introduce a verifiable reward decomposition
+that combines interaction-format validity with solver-checked solution correctness, while execution
+traces and feasibility signals are fed back as observations for revision. This design enables long-
+2
+
+
+--- Page 3 ---
+horizon credit assignment over modeling decisions, rather than only over final outputs. Building on
+recent advances in tool-integrated Agentic RL, we adapt training recipes and curricula to the unique
+challenges of optimization tasks, including sparse terminal rewards, solver nondeterminism, and
+heterogeneous failure modes arising from data processing, modeling, and implementation errors.
+We evaluate PEARL on a diverse set of optimization modeling benchmarks, ranging from standard
+natural-language-to-optimization (NL-to-Opt) tasks to long-context and industrial-style problem
+descriptions. Across these settings, training optimization modeling as an interactive agent leads to
+substantial improvements in verified solve rates over strong one-shot and tool-augmented baselines.
+In particular, PEARL significantly reduces common failure modes such as missing constraints,
+infeasible formulations, and brittle solver code, highlighting the benefits of explicitly learning solve–
+debug–revise behavior. As previewed in Figure 1, this is not merely a scale effect: a 4B PEARL
+policy trained for solver-mediated interaction outperforms the much larger DeepSeek-V3.2-685B
+in macro-averaged Pass@1, while its compact backbone makes repeated agentic invocation more
+practical by reducing the serving burden of multi-turn tool use [Kwon et al., 2023, Abdin et al., 2024,
+Chen and Li, 2024, Belcak et al., 2025].
+Contributions. Our main contributions are threefold: (1) We reconceptualize optimization modeling
+as an inherently interactive process rather than a one-shot generation task, and formalize it as a
+multi-turn, tool-integrated decision problem in which solver execution and diagnostic feedback are
+treated as part of the agent’s observable state; (2) Building on this formulation, we introduce the
+first agentic reinforcement learning approach for optimization modeling, enabling the agent to learn
+when to execute, revise, and terminate through solver-grounded rewards and an optimization-specific
+training curriculum; (3) Through extensive experiments across diverse NL-to-Opt benchmarks, we
+demonstrate that PEARL substantially improves verified solve rates over existing baselines; notably,
+our PEARL-Qwen3-4B outperforms the much larger DeepSeek-V3.2-685B [Liu et al., 2025] in both
+macro- and micro-averaged accuracy on optimization modeling tasks (see Figure 1).
+2
+Related Work
+LLMs for optimization modeling. A growing body of work studies natural-language-to-optimization
+modeling, covering decision variables, objectives, constraints, and executable solver code [Xiao et al.,
+2025]. Prompting-based methods rely on templates or in-context examples to elicit formulations
+from pretrained LLMs [Prasath and Karande, 2023]. Workflow-based systems decompose modeling
+into drafting, execution, and repair, using hand-designed control logic or search, as in Autoformu-
+lation [Astorga et al., 2025], Chain-of-Experts [Xiao et al., 2024], and OptiMUS [Ahmaditeshnizi
+et al., 2024]. Training-based methods such as ORLM [Huang et al., 2025], LLMOPT [Jiang et al.,
+2025], and OptMATH [Lu et al., 2025] improve formulation and code generation through supervised
+adaptation. These approaches improve executability and modeling accuracy, but typically optimize
+single-pass generation or fixed repair procedures rather than learned interaction policies.
+Recent RL-based methods use solver outcomes as verifiable supervision. SIRL [Chen et al., 2025]
+optimizes complete generations using executability, feasibility, and correctness rewards, while OR-
+R1 [Ding et al., 2026], MURKA [Xie et al., 2025], StepORLM [Zhou et al., 2026], and STORM [Tang
+et al., 2025] explore richer objectives, curricula, or step-level signals. Despite these advances, solver
+execution is mainly used for scoring, preference construction, or post-hoc evaluation over fixed
+traces. Several recent systems also use iterative or agent-style optimization workflows, including
+OptLLM [Zhang et al., 2024], OptiTree [Liu et al., 2026b], LLMOPT [Jiang et al., 2025], and
+MM-Agent [Liu et al., 2026a]; they are complementary to PEARL because they rely mainly on
+prompt-time decomposition, tree search, or supervised adaptation, whereas PEARL trains the policy
+itself to decide when to invoke tools, how to revise, and when to terminate. A systematic comparison
+with prior RL-based methods is provided in Table 2 (Appendix A.1).
+Agentic reinforcement learning. Agentic reinforcement learning formulates LLMs as policies
+in temporally extended, partially observable environments whose actions may include reasoning
+steps and tool calls [Zhang et al., 2026]. Recent systems such as rStar2-Agent [Shang et al., 2025],
+ReTool [Feng et al., 2026], SimpleTIR [Xue et al., 2026], and Agent-R1 [Cheng et al., 2025] show that
+end-to-end RL can induce tool use, self-correction, and verification behavior with code interpreters,
+calculators, or search engines. Optimization modeling adds domain-specific structure: solvers expose
+partially verifiable signals such as feasibility, status, and objective values, while failures may arise
+3
+
+
+--- Page 4 ---
+from data processing, formulation, implementation, or solver limits. PEARL adapts the Agentic RL
+paradigm to this setting by making solver interaction, revision, and termination trainable decisions in
+a multi-turn optimization-modeling environment.
+3
+Methodology: Optimization Modeling via Agentic Reinforcement Learning
+Problem Statement. We study automated optimization modeling from natural language as a
+sequential decision-making problem. Given a natural-language problem specification and associated
+data artifacts, the goal is to produce a mathematically correct optimization formulation together with
+executable solver code that passes verification. Crucially, correctness cannot be reliably assessed
+from the generated text alone: it must be established through execution, solver feedback, and (when
+available) validation against reference solutions. This setting naturally induces multi-step interaction,
+partial observability, and delayed rewards.
+Optimization Modeling as a POMDP. We formalize agentic optimization modeling as an episodic
+partially observable Markov decision process (POMDP) defined by the tuple [Zhang et al., 2026]
+⟨S, O, A, P, R, T⟩.
+S denotes the latent environment state, which includes the true optimization problem semantics, hid-
+den modeling errors, solver-internal states, and execution side effects that are not directly observable
+to the agent. The agent does not observe st ∈S directly; instead, it receives observations ot ∈O
+consisting of the natural-language specification, the conversation history, intermediate code artifacts,
+and tool feedback such as runtime outputs, solver logs, feasibility status, and validation reports.
+The action space A consists of two classes of actions: (i) natural-language actions that revise or extend
+the current mathematical formulation and implementation plan, and (ii) tool-invocation actions that
+execute code or trigger validation procedures. Transitions P(st+1 | st, at) are induced by the effects
+of code execution, solver behavior, and internal environment updates. The reward function R maps
+trajectories and intermediate environment feedback to scalar signals that reflect execution validity,
+solver feasibility, and (when available) solution correctness. Crucially, rewards are not restricted to
+terminal outcomes but may depend on intermediate tool interactions and solver diagnostics, enabling
+long-horizon credit assignment over modeling decisions. An episode terminates when the agent emits
+a final answer (formulation plus solver code) or when a turn or wall-clock budget T is exhausted.
+This problem formalization explicitly distinguishes agentic optimization modeling from traditional
+one-shot generation, which corresponds to a degenerate MDP with horizon T = 1 and no intermediate
+observations. We next describe the environment and tool interface (Section 3.1), action space
+and output format (Section 3.2), reward design (Section 3.3), and training objective and policy
+optimization (Section 3.4). The overall workflow is demonstrated in Figure 2.
+Problem
+Instance x
+Observation
+NL + History
++ Feedback
+Agent Policy
+πθ
+NL Action
+Draft / Revise
+Tool Action
+Execute / Validate
+Solver /
+Validator
+Final
+Answer
+Execution
+Feedback
+Reward R(τ)
+rfmt + rcorr
+Figure 2: Workflow of PEARL. Colors indicate elements of the POMDP ⟨S, O, A, P, R, T⟩: ob-
+servations O (blue), agent policy πθ (red), actions A (purple), environment transitions P (orange),
+reward R (green, dashed), and termination T (gray). The latent state S is not shown.
+3.1
+Environment and Tool Interface
+At each step, the agent conditions on the full observation history o≤t, including the NL specification,
+intermediate modeling artifacts, and feedback from prior tool interactions. The environment exposes
+two primary tools—Execute and Validate—that mediate interaction with the underlying optimization
+process and are treated as first-class components of the environment rather than post-hoc evaluators.
+The Execute tool runs model-generated Python code in a sandboxed, resource-bounded runtime to
+safely perform data parsing, optimization model construction (e.g., via Pyomo), solver invocation,
+4
+
+
+--- Page 5 ---
+and solution extraction. Execution returns structured feedback, including stdout/stderr logs, runtime
+exceptions, solver status (e.g., optimal, infeasible, unbounded, or time limit), objective values, and
+extracted primal solutions when available. Complementarily, the Validate tool performs deterministic
+verification checks on the current artifacts, such as constraint satisfaction and internal consistency
+tests, and, when reference solutions are available, agreement of objective values within a specified tol-
+erance. Crucially, execution traces, solver diagnostics, and validation outcomes are incorporated into
+the observation stream rather than treated solely as terminal rewards, enabling feedback-conditioned,
+multi-turn decision making in which the agent can iteratively revise formulations, adjust implementa-
+tions, and decide when to terminate.
+3.2
+Action Space and Output Format
+At each turn t, the agent selects an action at ∈A that explicitly controls the optimization modeling
+workflow. The action space consists of two categories: (1) natural-language actions modify or extend
+the current modeling state, including revising decision variables, objectives, constraints, indexing
+schemes, or implementation plans. These actions correspond to reasoning and editing steps typically
+performed by human modelers prior to execution; and (2) tool-invocation actions trigger interaction
+with the environment via the Execute or Validate tools, enabling the agent to test partial formulations,
+inspect solver behavior, and verify correctness.
+The choice between natural-language revision and tool invocation is part of the learned policy,
+allowing the agent to decide when to execute, what to test, and whether further revision is warranted.
+An episode terminates when the agent emits a designated terminal action, which outputs a final answer
+consisting of: (1) a complete mathematical formulation—including decision variables, objective, and
+constraints—expressed in a standardized template, and (2) executable solver code that produces a
+solution and an accompanying verification report. This explicit termination decision enables learning
+over long-horizon solve–debug–revise trajectories rather than fixed-length generation.
+3.3
+Reward Design
+We design rewards to be verifiable, solver-grounded, and aligned with the semantics of optimization
+modeling. Let τ = (a1:T ) denote a multi-turn interaction trajectory and R(τ) its return. Because the
+correctness of an optimization model cannot be reliably assessed from text alone and typically only
+becomes evident after execution, reward signals are sparse and delayed.
+In practice, we define the return as the sum of two components: R(τ) = rfmt(τ) + rcorr(τ), which
+jointly encourage correct interaction protocols and solver-verifiable modeling outcomes.
+Format reward. The format reward rfmt provides small, dense incentives for correct tool usage and
+response structure. It assigns positive reward when the agent produces well-formed tool invocations
+and returns a final response that adheres to the required output format. This component stabilizes
+training by discouraging invalid interactions that would otherwise prevent execution-based evaluation.
+Correctness reward. The correctness reward rcorr is grounded in solver execution. After extracting
+and executing the generated optimization code, we obtain the solver-reported objective value vpred.
+When a reference optimal value vlabel is available, the agent receives a positive reward if |vpred −
+vlabel| ≤ϵ, where ϵ is a small numerical tolerance. This reward directly reflects whether the generated
+model is solver-correct, rather than heuristically well-formed.
+By grounding rewards in executable code and solver-verifiable outcomes, this design avoids text-based
+correctness proxies. While sparse at the modeling level, the reward provides a clear supervision signal
+aligned with the end goal of optimization modeling: producing executable models that yield correct
+solver behavior. Exact reward values and implementation details are provided in Appendix A.2.
+3.4
+Training Objective and Policy Optimization
+We train the optimization-modeling agent using agentic reinforcement learning with multi-turn
+rollouts in a tool-augmented POMDP. The policy is initialized from a pretrained language model and
+subsequently optimized via GRPO-style reinforcement learning with DAPO-inspired stabilization
+details such as decoupled clipping [Shao et al., 2024, Yu et al., 2025]. This recipe is well suited for
+sparse, delayed rewards and high-variance tool-augmented trajectories. The learning procedure is
+summarized in Algorithm 1 (see Appendix A.3).
+5
+
+
+--- Page 6 ---
+Objective. We train the agent to maximize expected performance over multi-turn optimization-
+modeling episodes. Let x ∼D denote a single optimization modeling instance, consisting of a
+natural-language problem description and associated data artifacts. Given x, the agent induces a
+multi-turn trajectory τ = (o1:T , a1:T ) ∼πθ(· | x), where each observation ot encapsulates the
+conversation history and tool feedback accumulated up to turn t, and each action at corresponds to
+either a natural-language modeling step or a tool invocation. The episode terminates after T turns or
+upon producing a final formulation and solver implementation. Each trajectory τ receives a scalar
+return R(τ) derived from solver execution and validation signals, as described in Section 3.3. We
+optimize the expected trajectory-level return:
+max
+θ
+J(θ) = Ex∼D Eτ∼πθ(·|x)[R(τ)] .
+(1)
+where πθ is the agent policy being optimized. This objective encourages improvement in long-horizon,
+solver-verified performance in a high-variance, tool-augmented environment.
+Policy update with decoupled clipping. We perform on-policy policy optimization using trajectories
+sampled from the current policy. Let πθold denote the policy used to generate rollouts in the current
+iteration. For each token-level action at conditioned on observation ot, we define the standard
+importance sampling ratio ρt(θ) =
+πθ(at|ot)
+πθold(at|ot), where πθ is the updated policy being optimized.
+Given an advantage estimate At for action at, we adopt the decoupled clipping strategy introduced in
+DAPO [Yu et al., 2025], which applies asymmetric clipping depending on the sign of the advantage:
+¯ρt(θ) =
+min(ρt(θ), 1 + ϵ+),
+At ≥0,
+max(ρt(θ), 1 −ϵ−),
+At < 0,
+(2)
+Lpg(θ) = E[min(ρt(θ) At, ¯ρt(θ) At)] ,
+(3)
+where ϵ+ and ϵ−control the clipping range for positive and negative advantages. This asymmetric
+design stabilizes learning under high-variance returns in tool-augmented, multi-turn environments.
+Because rewards in optimization modeling are typically sparse and only become available after solver
+execution or validation, we compute returns at the trajectory level. Specifically, for each modeling
+instance xi, we sample a trajectory τi ∼πθ(· | xi) and compute a scalar return R(τi) based on solver
+and validator feedback. To stabilize policy optimization under high-variance returns, we normalize
+these trajectory-level returns within each training batch and use the normalized values as advantages:
+Ai = R(τi) −µ
+σ + δ
+,
+µ = 1
+|B|
+X
+xi∈B
+R(τi),
+σ2 = 1
+|B|
+X
+xi∈B
+ R(τi) −µ
+2,
+(4)
+where B denotes the batch of optimization modeling instances sampled in the current iteration, µ and
+σ are the mean and standard deviation of returns within the batch, and δ is a small constant added for
+numerical stability. This normalization assigns relative credit across instances while accounting for
+the substantial variability in solver outcomes and modeling difficulty.
+Optimization-specific structure. Optimization modeling exhibits properties uncommon in generic
+tool-use tasks. Solver nondeterminism and time limits are treated as environment noise. Problem
+difficulty varies sharply with context length and specification completeness, motivating a curriculum
+from short, fully specified instances to long-context and industrial-style inputs. Finally, solver
+and validator outputs decompose modeling errors from implementation errors, enabling feedback-
+conditioned revision rather than undifferentiated terminal supervision.
+4
+Experiments
+Research questions. Our experiments aim to answer the following questions: RQ1. Does modeling
+optimization as an interactive, agentic decision process improve verified solve rates over one-shot
+generation and heuristic tool-augmented baselines across diverse benchmarks? RQ2. How do key
+training choices influence performance and stability in agentic optimization modeling? RQ3. How
+does agentic training alter the distribution of failure modes compared to non-agentic approaches?
+4.1
+Experimental Setup
+Benchmarks and tasks. We evaluate on a range of established optimization modeling benchmarks,
+including NL4Opt [Ramamonjison et al., 2022], MAMO EasyLP and ComplexLP [Huang et al.,
+6
+
+
+--- Page 7 ---
+2024], NLP4LP [Ahmaditeshnizi et al., 2024], OptMATH [Lu et al., 2025], IndustryOR [Huang et al.,
+2025], ComplexOR [Xiao et al., 2024], and Resocratic [Yang et al., 2024]. Across all benchmarks,
+the task is end-to-end optimization modeling: given a natural-language specification and associated
+data, the model must produce a mathematically correct formulation and executable solver code that
+yields a feasible (ideally optimal) solution and passes verification.
+The suite spans linear, integer, mixed-integer, nonlinear, and second-order cone programs, but it
+does not exhaust real-world optimization modeling. Stochastic, robust, and highly domain-specific
+enterprise settings remain under-represented, so our claims should be read as evidence for the current
+public NL-to-Opt regime rather than universal coverage.
+For PEARL training, we use a mixed corpus of roughly 14k optimization-modeling instances:
+about 10k cleaned open-source instances drawn from OR-Instruct/ORLM [Huang et al., 2025],
+OptMATH [Lu et al., 2025], and OptiBench-style data [Yang et al., 2024], plus about 3.8k newly
+constructed and manually curated instances.
+Compared methods. Our primary system is PEARL-Qwen-3-4B-Instruct-2507. We compare it with
+baselines spanning different model scales, training regimes, and inference settings. Direct Prompt
+baselines include open-weight and closed-source LLMs evaluated without task-specific training;
+for models that support different reasoning behaviors, either via distinct variants or inference-time
+configurations, we report both standard and reasoning-enabled results when available. These include
+Qwen-3-4B-Instruct/Think, Qwen-3-235B-A22B-Instruct/Think, DeepSeek-V3.2-685B/Think, and
+the GPT-5-family endpoints used during our method development and evaluation, GPT-5 and GPT-
+5-CodeX. Fine-Tuned baselines are prior optimization-modeling systems adapted via supervised
+fine-tuning and/or reinforcement learning, including SIRL-Qwen2.5-7B/32B, ORLM-LLaMA-3-8B,
+and OptMATH-Qwen2.5-7B/32B. Unless otherwise specified, all methods are evaluated under the
+same execution, solver, and verification pipeline.
+Evaluation metrics. Evaluation is performed at both the instance and dataset levels. At the instance
+level, a generated solution is deemed correct if its objective value matches the reference within a
+relative tolerance, i.e., |ypred−ylabel|
+|ylabel|+1
+< 10−6. At the dataset level, we report pass@1 accuracy, defined
+as the fraction of instances for which a single model-generated solution satisfies this criterion. All
+models generate exactly one solution attempt per instance; by default, we run each pass@1 evaluation
+three times and report mean ± standard deviation. Unless otherwise specified, inference is conducted
+with a sampling temperature of 0.6. Additional evaluation details and parameter settings are provided
+in Appendix B. Code and datasets are provided at https://github.com/AuroraLHL/PEARL.
+4.2
+Experimental Results and Analysis
+The main text answers RQ1 by measuring overall effectiveness against prompting and fine-tuned
+baselines (Sec. 4.2.1; setup details, baseline-selection caveats, and extended comparisons in Ap-
+pendix B and Appendix B.4), RQ2 by analyzing training choices for stable agentic optimization
+modeling (Sec. 4.2.2; ablations and training dynamics in Appendix D), and RQ3 by attributing how
+failures change after PEARL training (Sec. 4.2.3; diagnostic definitions in Appendix C).
+4.2.1
+RQ1: Overall Effectiveness of Agentic Optimization Modeling
+Table 1 answers RQ1 by comparing PEARL with direct prompting and prior task-specific fine-tuning
+baselines across all benchmarks. We draw the following takeaways.
+Takeaway 1: learned interaction, not just scale, drives the main gain. PEARL substantially
+improves over same-scale direct prompting baselines: the 4B PEARL model reaches 69.71 macro
+average, compared with 22.20 for Qwen-3-4B-Instruct and 30.86 for Qwen-3-4B-Think. It also
+achieves the strongest macro average among fine-tuned models, indicating that the learned interaction
+policy adds value beyond task-specific adaptation without training the full solve–debug–revise loop.
+Takeaway 2: the gains are largest where optimization modeling is genuinely interactive. On
+simpler datasets such as NL4Opt and MAMO EasyLP, improvements are modest because many
+strong models already achieve high solve rates. In contrast, on harder benchmarks such as MAMO
+ComplexLP and Resocratic, PEARL achieves large absolute gains, suggesting improved robustness to
+underspecified requirements, noisy natural-language descriptions, and complex constraint interactions.
+7
+
+
+--- Page 8 ---
+This pattern supports our central claim that explicitly training solve–debug–revise behavior yields
+benefits beyond one-shot generation or fixed repair workflows.
+Table 1: Pass@1 accuracy (%) across benchmarks (higher is better). Each entry reports the mean ±
+standard deviation over three runs.
+Method
+NL4Opt
+MAMO-E
+MAMO-C
+NLP4LP
+OptMATH
+IndustryOR
+ComplexOR
+Resocratic
+Macro Avg
+Micro Avg
+Direct Prompt
+Qwen-3-4B-Instruct
+48.13±1.40
+2.20±0.45
+13.51±2.20
+55.62±1.25
+2.41±0.50
+16.66±3.10
+5.56±2.78
+33.50±1.80
+22.20±0.75
+22.42±0.55
+Qwen-3-4B-Think
+48.60±2.80
+27.34±2.50
+6.31±1.90
+59.55±2.10
+1.81±0.45
+30.95±4.10
+22.22±5.56
+50.12±2.50
+30.86±0.95
+35.06±0.80
+Qwen3-235B-A22B-Instruct-2507
+74.92±1.77
+91.62±0.69
+38.74±5.41
+88.95±0.33
+20.88±3.09
+58.73±5.50
+38.89±0.00
+70.64±1.41
+60.42±1.13
+72.26±0.69
+Qwen3-235B-A22B-Think-2507
+79.59±5.42
+89.79±3.07
+40.84±6.64
+91.20±5.54
+30.72±1.59
+71.43±4.12
+50.00±5.56
+74.36±4.50
+65.99±1.68
+74.95±1.39
+DeepSeek-V3.2-685B
+83.18±3.07
+94.07±2.29
+50.75±9.38
+92.70±2.81
+25.10±3.03
+58.73±11.98
+51.85±6.42
+75.68±2.52
+66.51±1.88
+77.07±1.22
+DeepSeek-V3.2-Think-685B
+85.20±1.18
+95.53±0.59
+53.15±3.12
+97.38±0.86
+30.32±1.25
+64.29±2.39
+50.00±5.56
+77.67±0.43
+69.19±0.65
+79.58±0.41
+GPT-5
+83.80±0.97
+94.31±0.32
+59.16±0.52
+94.76±0.65
+31.33±0.61
+73.02±4.95
+53.70±8.49
+81.14±1.29
+71.40±1.55
+80.31±0.41
+GPT-5-Codex
+80.37±0.94
+95.60±0.19
+61.56±0.52
+97.94±0.32
+32.13±0.69
+69.05±2.38
+55.56±5.56
+78.99±0.38
+71.40±0.37
+80.27±0.15
+Fine-Tuned
+SIRL-Qwen2.5-7B
+76.17±1.45
+82.20±1.20
+2.70±1.35
+93.26±0.75
+6.02±0.80
+21.43±3.60
+11.11±3.92
+63.03±1.60
+36.81±0.90
+55.34±0.70
+SIRL-Qwen2.5-32B
+87.38±1.10
+98.90±0.45
+70.27±3.20
+97.75±0.50
+22.89±1.40
+59.52±4.10
+33.33±5.56
+78.16±1.10
+60.07±0.75
+73.65±0.60
+ORLM-LLaMA-3-8B
+78.50±1.80
+82.30±1.60
+41.44±3.80
+89.54±1.20
+6.02±0.90
+42.86±4.70
+38.89±5.56
+70.22±1.50
+56.22±0.95
+67.97±0.75
+OptMATH-Qwen2.5-7B
+84.11±1.30
+77.61±1.80
+33.33±3.40
+89.47±1.30
+22.29±1.50
+30.95±4.10
+33.33±5.56
+91.32±0.80
+57.80±0.85
+72.94±0.65
+OptMATH-Qwen2.5-32B
+85.51±1.05
+95.05±0.80
+44.14±3.60
+95.51±0.65
+37.35±1.70
+45.24±4.60
+50.00±5.56
+83.37±0.95
+67.02±0.70
+80.26±0.45
+PEARL-Qwen-3-4B-Instruct (Ours)
+85.28±0.99
+91.65±0.65
+76.12±3.19
+93.25±1.59
+16.87±1.70
+67.86±8.42
+41.66±3.92
+84.99±0.52
+69.71±0.13
+79.84±0.25
+Takeaway 3: the tool scaffold alone is insufficient. Appendix D.4 reports a controlled scaffold
+comparison in which the base Qwen3-4B-Instruct-2507 model uses the same tool interface, execution-
+feedback loop, and repair budget as PEARL. The base model can invoke tools, but it uses them more
+sparsely and achieves lower accuracy across all benchmarks, indicating that the gains come from a
+learned interaction policy rather than from simply wrapping a model in a multi-turn scaffold.
+Takeaway 4: PEARL-4B is competitive with much larger general-purpose models, but not
+a universal winner. We compare PEARL against substantially larger models, including Qwen-
+3-235B-A22B, DeepSeek-V3.2-685B, DeepSeek-V3.2-Think-685B, GPT-5, and GPT-5-CodeX.
+Despite being orders of magnitude smaller, PEARL-4B outperforms DeepSeek-V3.2-685B in both
+macro-averaged accuracy (69.71 vs. 66.51) and micro-averaged accuracy (79.84 vs. 77.07), with
+particularly strong results on MAMO ComplexLP and Resocratic. At the same time, GPT-5-family
+models and DeepSeek-V3.2-Think remain highly competitive or stronger on some aggregate metrics.
+The result is therefore not that small models always dominate, but that optimization-specific agentic
+training can close much of the scale gap for solver-grounded modeling tasks.
+Takeaway 5: compact backbones make repeated agentic inference more practical. Agentic
+optimization modeling amplifies inference cost because each problem may require several policy
+calls interleaved with code execution and solver feedback, making serving memory and throughput
+constraints increasingly salient [Kwon et al., 2023]. Recent reports show that 3–4B models can
+be capable enough for local deployment [Abdin et al., 2024], 2B on-device models can support
+function-calling agents with strong latency advantages [Chen and Li, 2024], and specialized repetitive
+agentic routines are natural targets for small language models [Belcak et al., 2025]. We therefore
+view PEARL-4B as evidence that optimization-specific agentic training can move solver-grounded
+modeling into a more deployable parameter regime, while not making a universal wall-clock or
+dollar-cost claim across different serving stacks.
+4.2.2
+RQ2: Impact of Training Choices
+(a) Tool Calls
+(b) Response Length
+(c) SFT Initialization
+(d) Trajectory Filtering
+Figure 3: Main ablations for PEARL training choices. Tool use converges early, response length
+continues to grow under GRPO, SFT mainly serves as a warm-start for less aligned models, and
+aggressive trajectory filtering is not beneficial in this solver-feedback setting.
+We study training dynamics and design choices that affect the stability and efficiency of agentic opti-
+mization modeling; Figure 3 summarizes the main evidence, with additional details in Appendix D.1.2,
+Appendix D.2.2, and Appendix D.3. We make four observations: (1) Tool-use behavior is learned
+early. Figure 3(a) shows that the average number of tool calls stabilizes early in training, suggesting
+that PEARL quickly learns when external execution and solver feedback are useful. (2) Later
+8
+
+
+--- Page 9 ---
+training mainly refines solution traces. Figure 3(b) shows that response length continues to grow
+after tool usage has stabilized, indicating that GRPO training increasingly improves the detail and
+structure of the generated modeling trajectory rather than simply increasing tool frequency. (3) SFT
+is a warm-start, not the final driver. Figure 3(c) indicates that supervised fine-tuning is important
+for less aligned starting models, but direct agentic RL reaches comparable performance to SFT+ARL
+when starting from Qwen3-4B-Instruct; thus, SFT helps initialize the policy, while solver-grounded
+agentic RL determines the final interaction behavior. (4) Aggressive trajectory filtering is un-
+necessary in this solver-feedback setting. Figure 3(d) shows that, unlike some general tool-use
+domains [Xue et al., 2026, Shang et al., 2025], filtering truncated or format-violating trajectories
+does not improve performance and can slightly hurt it, likely because tool use per instance is limited,
+observations are length-capped, and solver-based rewards saturate quickly.
+4.2.3
+RQ3: Failure Mode Analysis
+0
+20
+40
+60
+80
+100
+Share within failed cases (%)
+Qwen3-4B-Instruct
+PEARL-Qwen3-4B-Instruct
+Base failures solved by PEARL
+66.2
+14.3
+11.3
+14.3
+53.4
+14.6
+15.5
+73.8
+12.6
+9.2
+Code/runtime
+Objective mismatch
+Infeasible/solver
+Format/extraction
+Timeout
+Other
+Figure 4: Failure attribution before and after PEARL training under the main pass@1 evaluation
+setting. Bars are normalized within failed cases; attribution setup, category definitions, and detailed
+interpretation are provided in Appendix C.
+To understand how agentic training changes model behavior, we compare the failure attribution of
+the base model and PEARL under the main pass@1 evaluation setting. We make three observations:
+(1) PEARL shifts failures away from execution and parsing. Compared with the base model,
+PEARL fixes many code/runtime and format or extraction failures, indicating improved ability to
+emit executable solver programs, follow the required output protocol, and recover from tool feedback.
+(2) The corrected base-model failures are mostly repairable implementation failures. Among
+base-model failures that PEARL later solves, most are code/runtime failures, suggesting that the
+learned policy mainly teaches the model to execute, inspect, and repair solver programs rather than
+merely produce longer answers. (3) The remaining failures are more modeling-centric and expose
+the limits of solver feedback. After PEARL removes many basic execution failures, a larger share of
+the remaining errors comes from objective mismatch and solver-side issues. These residual cases are
+more likely to reflect formulation quality, ambiguous specifications, or optimization difficulty. Solver
+and compiler messages are useful but incomplete evidence for structural correctness, so PEARL
+combines execution feedback with deterministic validation and, when available, objective-value
+agreement against references; nevertheless, these checks remain partial oracles.
+5
+Conclusion
+We presented PEARL, an agentic RL framework that treats optimization modeling from natural
+language as an interactive, multi-turn decision process. By integrating solver execution and validation
+feedback directly into the training loop, PEARL learns solver-aware behaviors such as when to
+test, how to revise formulations, and when to terminate. PEARL substantially improves verified
+solve rates over existing approaches across various benchmarks. Notably, compact PEARL models
+match or outperform much larger general-purpose models, demonstrating that learned interaction
+and feedback utilization can outweigh raw model scale in structured decision-making problems.
+Our current evidence is still limited by bounded interaction budgets, benchmark coverage, and the
+partial nature of solver-based validation. Future work should extend agentic optimization modeling to
+stochastic, robust, and domain-specific settings with richer validators and more adaptive interaction
+policies. Limitations and broader impact are discussed in Appendix G.
+9
+
+
+--- Page 10 ---
+References
+Marah Abdin, Jyoti Aneja, Hany Awadalla, Ahmed Awadallah, Ammar Ahmad Awan, Nguyen
+Bach, Amit Bahree, Arash Bakhtiari, Jianmin Bao, Harkirat Behl, Alon Benhaim, Misha Bilenko,
+Johan Bjorck, Sébastien Bubeck, Martin Cai, Qin Cai, Vishrav Chaudhary, Dong Chen, Dongdong
+Chen, Weizhu Chen, Yen-Chun Chen, Yi-Ling Chen, Hao Cheng, Parul Chopra, Xiyang Dai,
+Matthew Dixon, Ronen Eldan, Victor Fragoso, Jianfeng Gao, Mei Gao, Min Gao, Amit Garg,
+Allie Del Giorno, Abhishek Goswami, Suriya Gunasekar, Emman Haider, Junheng Hao, Russell J.
+Hewett, Wenxiang Hu, Jamie Huynh, Dan Iter, Sam Ade Jacobs, Mojan Javaheripi, Xin Jin,
+Nikos Karampatziakis, Piero Kauffmann, Mahoud Khademi, Dongwoo Kim, Young Jin Kim, Lev
+Kurilenko, James R. Lee, Yin Tat Lee, Yuanzhi Li, Yunsheng Li, Chen Liang, Lars Liden, Xihui
+Lin, Zeqi Lin, Ce Liu, Liyuan Liu, Mengchen Liu, Weishung Liu, Xiaodong Liu, Chong Luo,
+Piyush Madan, Ali Mahmoudzadeh, David Majercak, Matt Mazzola, Caio César Teodoro Mendes,
+Arindam Mitra, Hardik Modi, Anh Nguyen, Brandon Norick, Barun Patra, Daniel Perez-Becker,
+Thomas Portet, Reid Pryzant, Heyang Qin, Marko Radmilac, Liliang Ren, Gustavo de Rosa,
+Corby Rosset, Sambudha Roy, Olatunji Ruwase, Olli Saarikivi, Amin Saied, Adil Salim, Michael
+Santacroce, Shital Shah, Ning Shang, Hiteshi Sharma, Yelong Shen, Swadheen Shukla, Xia Song,
+Masahiro Tanaka, Andrea Tupini, Praneetha Vaddamanu, Chunyu Wang, Guanhua Wang, Lijuan
+Wang, Shuohang Wang, Xin Wang, Yu Wang, Rachel Ward, Wen Wen, Philipp Witte, Haiping
+Wu, Xiaoxia Wu, Michael Wyatt, Bin Xiao, Can Xu, Jiahang Xu, Weijian Xu, Jilong Xue, Sonali
+Yadav, Fan Yang, Jianwei Yang, Yifan Yang, Ziyi Yang, Donghan Yu, Lu Yuan, Chenruidong
+Zhang, Cyril Zhang, Jianwen Zhang, Li Lyna Zhang, Yi Zhang, Yue Zhang, Yunan Zhang, and
+Xiren Zhou. Phi-3 technical report: A highly capable language model locally on your phone, 2024.
+URL https://arxiv.org/abs/2404.14219.
+Ali Ahmaditeshnizi, Wenzhi Gao, and Madeleine Udell. OptiMUS: Scalable optimization modeling
+with (MI)LP solvers and large language models. In Ruslan Salakhutdinov, Zico Kolter, Katherine
+Heller, Adrian Weller, Nuria Oliver, Jonathan Scarlett, and Felix Berkenkamp, editors, Proceedings
+of the 41st International Conference on Machine Learning, volume 235 of Proceedings of Machine
+Learning Research, pages 577–596. PMLR, 21–27 Jul 2024. URL https://proceedings.mlr.
+press/v235/ahmaditeshnizi24a.html.
+Rimmi Anand, Divya Aggarwal, and Vijay Kumar. A comparative analysis of optimization solvers.
+Journal of Statistics and Management Systems, 20(4):623–635, 2017.
+Andreas Antoniou and Wu-Sheng Lu. Practical optimization: algorithms and engineering applica-
+tions. Springer, 2007.
+Nicolás Astorga, Tennison Liu, Yuanzhang Xiao, and Mihaela van der Schaar. Autoformulation of
+mathematical optimization models using LLMs. In Forty-second International Conference on
+Machine Learning, 2025. URL https://openreview.net/forum?id=33YrT1j0O0.
+Peter Belcak, Greg Heinrich, Shizhe Diao, Yonggan Fu, Xin Dong, Saurav Muralidharan, Yingyan Ce-
+line Lin, and Pavlo Molchanov. Small language models are the future of agentic ai. arXiv preprint
+arXiv:2506.02153, 2025.
+Michael L Bynum, Gabriel A Hackebeil, William E Hart, Carl D Laird, Bethany L Nicholson, John D
+Siirola, Jean-Paul Watson, David L Woodruff, et al. Pyomo-optimization modeling in python,
+volume 67 of Springer Optimization and Its Applications. Springer, 2021.
+Wei Chen and Zhiyuan Li. Octopus v2: On-device language model for super agent, 2024. URL
+https://arxiv.org/abs/2404.01744.
+Yitian Chen, Jingfan Xia, Siyu Shao, Dongdong Ge, and Yinyu Ye. Solver-informed RL: Grounding
+large language models for authentic optimization modeling. In The Thirty-ninth Annual Conference
+on Neural Information Processing Systems, 2025. URL https://openreview.net/forum?id=
+80L235oVBe.
+Mingyue Cheng, Jie Ouyang, Shuo Yu, Ruiran Yan, Yucong Luo, Zirui Liu, Daoyu Wang, Qi Liu,
+and Enhong Chen. Agent-R1: Training Powerful LLM Agents with End-to-End Reinforcement
+Learning, November 2025. URL http://arxiv.org/abs/2511.14460. arXiv:2511.14460
+[cs].
+10
+
+
+--- Page 11 ---
+Zezhen Ding, Zhen Tan, Jiheng Zhang, and Tianlong Chen. Or-r1: Automating modeling and solving
+of operations research optimization problem via test-time reinforcement learning. In Proceedings
+of the AAAI Conference on Artificial Intelligence, volume 40, pages 228–236, 2026.
+Jiazhan Feng, Shijue Huang, Xingwei Qu, Ge Zhang, Yujia Qin, Baoquan Zhong, Chengquan
+Jiang, Jinxin Chi, and Wanjun Zhong. Retool: Reinforcement learning for strategic tool use in
+LLMs. In The Fourteenth International Conference on Learning Representations, 2026. URL
+https://openreview.net/forum?id=tRk1nofSmz.
+Chenyu Huang, Zhengyang Tang, Shixi Hu, Ruoqing Jiang, Xin Zheng, Dongdong Ge, Benyou
+Wang, and Zizhuo Wang. Orlm: A customizable framework in training large models for automated
+optimization modeling. Operations Research, 2025.
+Xuhan Huang, Qingning Shen, Yan Hu, Anningzhe Gao, and Benyou Wang. Mamo: a Mathemat-
+ical Modeling Benchmark with Solvers, 2024. URL https://arxiv.org/abs/2405.13144.
+Publisher: arXiv Version Number: 2.
+Caigao Jiang, Xiang Shu, Hong Qian, Xingyu Lu, JUN ZHOU, Aimin Zhou, and Yang Yu. LLMOPT:
+Learning to define and solve general optimization problems from scratch. In The Thirteenth
+International Conference on Learning Representations, 2025. URL https://openreview.net/
+forum?id=9OMvtboTJg.
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph
+Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model
+serving with pagedattention. In Proceedings of the 29th symposium on operating systems principles,
+pages 611–626, 2023.
+Aixin Liu, Aoxue Mei, Bangcai Lin, Bing Xue, Bingxuan Wang, Bingzheng Xu, Bochao Wu, Bowei
+Zhang, Chaofan Lin, Chen Dong, et al. Deepseek-v3. 2: Pushing the frontier of open large language
+models. arXiv preprint arXiv:2512.02556, 2025.
+Fan Liu, Zhe-Rui Yang, Cancheng Liu, Tianrui SONG, Xiaofeng Gao, and Hao Liu. MM-agent: LLM
+as agents for real-world mathematical modeling problem. In The Thirty-ninth Annual Conference
+on Neural Information Processing Systems, 2026a. URL https://openreview.net/forum?
+id=o8n5oNDsiq.
+Haoyang Liu, Jie Wang, Yuyang Cai, Xiongwei Han, Yufei Kuang, and Jianye HAO. Optitree:
+Hierarchical thoughts generation with tree search for LLM optimization modeling. In The Thirty-
+ninth Annual Conference on Neural Information Processing Systems, 2026b. URL https://
+openreview.net/forum?id=Ej20yjWMCj.
+Hongliang Lu, Zhonglin Xie, Yaoyu Wu, Can Ren, Yuxuan Chen, and Zaiwen Wen. Optmath:
+A scalable bidirectional data synthesis framework for optimization modeling. In Forty-second
+International Conference on Machine Learning, 2025.
+Ganesh Prasath and Shirish Karande. Synthesis of mathematical programs from natural language
+specifications. arXiv preprint arXiv:2304.03287, 2023.
+Rindranirina Ramamonjison, Timothy Yu, Raymond Li, Haley Li, Giuseppe Carenini, Bissan Ghaddar,
+Shiqi He, Mahdi Mostajabdaveh, Amin Banitalebi-Dehkordi, Zirui Zhou, and Yong Zhang. NL4Opt
+Competition: Formulating Optimization Problems Based on Their Natural Language Descriptions.
+In Proceedings of the NeurIPS 2022 Competitions Track, volume 220 of Proceedings of Machine
+Learning Research, pages 189–203. PMLR, 2022. URL https://proceedings.mlr.press/
+v220/ramamonjison23a.html.
+Ning Shang, Yifei Liu, Yi Zhu, Li Lyna Zhang, Weijiang Xu, Xinyu Guan, Buze Zhang, Bingcheng
+Dong, Xudong Zhou, Bowen Zhang, Ying Xin, Ziming Miao, Scarlett Li, Fan Yang, and Mao
+Yang. rStar2-Agent: Agentic Reasoning Technical Report, August 2025. URL http://arxiv.
+org/abs/2508.20722. arXiv:2508.20722 [cs].
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang,
+Mingchuan Zhang, YK Li, Yang Wu, et al. Deepseekmath: Pushing the limits of mathemat-
+ical reasoning in open language models. arXiv preprint arXiv:2402.03300, 2024.
+11
+
+
+--- Page 12 ---
+Ajay Singh. An overview of the optimization modelling applications. Journal of Hydrology, 466:
+167–182, 2012.
+Zhengyang Tang, Zihan Ye, Chenyu Huang, Xuhan Huang, Chengpeng Li, Sihang Li, Guanhua
+Chen, Ming Yan, Zizhuo Wang, Hongyuan Zha, Dayiheng Liu, and Benyou Wang. CALM
+Before the STORM: Unlocking Native Reasoning for Optimization Modeling. In Submitted
+to The Fourteenth International Conference on Learning Representations, 2025. URL https:
+//openreview.net/forum?id=DILQqCQIJ3.
+Ziyang Xiao, Dongxiang Zhang, Yangjun Wu, Lilin Xu, Yuan Wang, Xiongwei Han, Xiaojin Fu, Tao
+Zhong, Jia Zeng, Mingli Song, and Gang Chen. CHAIN-OF-EXPERTS: WHEN LLMS MEET
+COMPLEX OPERATIONS RESEARCH PROBLEMS. In The Twelfth International Conference
+on Learning Representations, 2024. URL https://openreview.net/forum?id=HobyL1B9CZ.
+Ziyang Xiao, Jingrong Xie, Lilin Xu, Shisi Guan, Jingyan Zhu, Xiongwei Han, Xiaojin Fu, WingYin
+Yu, Han Wu, Wei Shi, Qingcan Kang, Jiahui Duan, Tao Zhong, Mingxuan Yuan, Jia Zeng, Yuan
+Wang, Gang Chen, and Dongxiang Zhang. A survey of optimization modeling meets LLMs:
+Progress and future directions. In James Kwok, editor, Proceedings of the Thirty-Fourth Interna-
+tional Joint Conference on Artificial Intelligence, IJCAI-25, pages 10742–10750. International
+Joint Conferences on Artificial Intelligence Organization, 8 2025. doi: 10.24963/ijcai.2025/1192.
+URL https://doi.org/10.24963/ijcai.2025/1192. Survey Track.
+Wantong Xie, Yi-Xiang Hu, Jieyang Xu, Feng Wu, and Xiangyang Li. Murka: Multi-reward
+reinforcement learning with knowledge alignment for optimization tasks. In The Thirty-ninth
+Annual Conference on Neural Information Processing Systems, 2025.
+Zhenghai Xue, Longtao Zheng, Qian Liu, Yingru Li, Xiaosen Zheng, Zejun MA, and Bo An.
+SimpleTIR: End-to-end reinforcement learning for multi-turn tool-integrated reasoning.
+In
+The Fourteenth International Conference on Learning Representations, 2026.
+URL https:
+//openreview.net/forum?id=EplNy91Xqh.
+Zhicheng Yang, Yiwei Wang, Yinya Huang, Zhijiang Guo, Wei Shi, Xiongwei Han, Liang Feng,
+Linqi Song, Xiaodan Liang, and Jing Tang. OptiBench Meets ReSocratic: Measure and Improve
+LLMs for Optimization Modeling, October 2024. URL http://arxiv.org/abs/2407.09887.
+arXiv:2407.09887 [cs].
+Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, Xiaochen Zuo, Yu Yue, Weinan Dai, Tiantian
+Fan, Gaohong Liu, Lingjun Liu, Xin Liu, Haibin Lin, Zhiqi Lin, Bole Ma, Guangming Sheng,
+Yuxuan Tong, Chi Zhang, Mofan Zhang, Wang Zhang, Hang Zhu, Jinhua Zhu, Jiaze Chen, Jiangjie
+Chen, Chengyi Wang, Hongli Yu, Yuxuan Song, Xiangpeng Wei, Hao Zhou, Jingjing Liu, Wei-
+Ying Ma, Ya-Qin Zhang, Lin Yan, Mu Qiao, Yonghui Wu, and Mingxuan Wang. DAPO: An
+Open-Source LLM Reinforcement Learning System at Scale, May 2025. URL http://arxiv.
+org/abs/2503.14476. arXiv:2503.14476 [cs].
+Guibin Zhang, Hejia Geng, Xiaohang Yu, Zhenfei Yin, Zaibin Zhang, Zelin Tan, Heng Zhou, Zhong-
+Zhi Li, Xiangyuan Xue, Yijiang Li, Yifan Zhou, Yang Chen, Chen Zhang, Yutao Fan, Zihu Wang,
+Songtao Huang, Francisco Piedrahita Velez, Yue Liao, Hongru WANG, Mengyue Yang, Heng Ji,
+Jun Wang, Shuicheng YAN, Philip Torr, and LEI BAI. The landscape of agentic reinforcement
+learning for LLMs: A survey. Transactions on Machine Learning Research, 2026. ISSN 2835-8856.
+URL https://openreview.net/forum?id=RY19y2RI1O. Survey Certification.
+Hanchen Zhang, Xiao Liu, Bowen Lv, Xueqiao Sun, Bohao Jing, Iat Long Iong, Zhenyu Hou, Zehan
+Qi, Hanyu Lai, Yifan Xu, Rui Lu, Hongning Wang, Jie Tang, and Yuxiao Dong. AgentRL: Scaling
+Agentic Reinforcement Learning with a Multi-Turn, Multi-Task Framework, October 2025. URL
+https://openreview.net/forum?id=zq3vAmuUk9.
+Jihai Zhang, Wei Wang, Siyan Guo, Li Wang, Fangquan Lin, Cheng Yang, and Wotao Yin. Solving
+General Natural-Language-Description Optimization Problems with Large Language Models. In
+Yi Yang, Aida Davani, Avi Sil, and Anoop Kumar, editors, Proceedings of the 2024 Conference
+of the North American Chapter of the Association for Computational Linguistics: Human Lan-
+guage Technologies (Volume 6: Industry Track), pages 483–490, Mexico City, Mexico, June
+2024. Association for Computational Linguistics. URL https://aclanthology.org/2024.
+naacl-industry.42.
+12
+
+
+--- Page 13 ---
+Chenyu Zhou, Tianyi Xu, Jianghao Lin, and Dongdong Ge.
+StepORLM: A Self-Evolving
+Framework With Generative Process Supervision For Operations Research Language Mod-
+els. In The Fourteenth International Conference on Learning Representations, 2026. URL
+https://openreview.net/forum?id=ZrgxU8WMmG.
+Zilin Zhu, Chengxing Xie, Xin Lv, and slime Contributors. slime: An llm post-training framework
+for rl scaling. https://github.com/THUDM/slime, 2025. GitHub repository. Corresponding
+author: Xin Lv.
+13
+
+
+--- Page 14 ---
+Appendix for PEARL: Solver-in-the-Loop Interactive Optimization Modeling
+from Natural Language
+Table of Contents
+A Design Details on PEARL
+A.1 Comparison with RL-Based Methods
+A.2 Reward Function Design
+A.3 PEARL Training Algorithm
+A.4 Training and Inference Loop
+A.5 Training Hyperparameters
+B Experiment Setup
+B.1 Workflow Overview
+B.2 Training Setup and Loss Masking
+B.3 Inference Setup
+B.4 8B Model Comparison
+C Failure Mode Attribution
+D Ablation Study and Sensitivity Analysis
+D.1 Supervised Fine-Tuning Initialization
+D.1.1 Theoretical Analysis
+D.1.2 Experiments
+D.2 Adaptive Sampling with Trajectory Filtering
+D.2.1 Theoretical Analysis
+D.2.2 Experiments
+D.3 Training Dynamics
+D.4 Tool-Use Depth and Termination
+E PEARL Rollout Example
+F Prompt Templates
+F.1 Training Prompt
+F.2 Direct Testing Prompt
+G Limitations and Broader Impact
+A
+Design Details on PEARL
+A.1
+Comparison of PEARL and other RL-based Methods
+Table 2 compares PEARL with recent reinforcement learning–based methods for optimization
+modeling, including SIRL [Chen et al., 2025], OR-R1 [Ding et al., 2026], MURKA [Xie et al., 2025],
+StepORLM [Zhou et al., 2026], and STORM [Tang et al., 2025]. These methods make important
+progress by replacing purely supervised imitation with solver- or preference-grounded learning
+signals. In particular, they show that executability, feasibility, numerical correctness, preference
+alignment, process supervision, or curriculum-shaped rewards can improve optimization-modeling
+outputs. However, they typically preserve the same high-level generation abstraction: the model
+produces a complete solution or a fixed reasoning trace, and the solver or reward model is then used
+to score that completed artifact.
+The key distinction is where RL is applied. Prior RL-based methods mainly optimize outputs:
+a trajectory is usually a single response, and the learned behavior is to make that final response
+more likely to be correct, executable, preferred, or process-consistent. PEARL instead applies RL
+to the modeling process. The trajectory consists of multiple interaction steps, where the policy can
+decide to draft, revise, execute code, inspect solver feedback, and terminate. Thus, PEARL does not
+merely learn what a good final solver program looks like; it learns a control policy for navigating the
+solve–debug–revise loop.
+PEARL treats solver interaction as part of the environment. In prior methods, solver execution is
+usually post-hoc: it provides a terminal score, a preference signal, or data for later reward construction.
+In PEARL, solver calls are first-class actions inside a stateful, partially observable environment. The
+14
+
+
+--- Page 15 ---
+returned observations—runtime errors, solver status, objective values, infeasibility messages, and
+validation reports—become part of the next decision context. This enables conditional behavior: the
+same prompt can lead to different revisions depending on whether the current code crashes, solves
+with a wrong objective, violates constraints, or passes validation.
+This agentic formulation gives PEARL three practical advantages. First, it supports adaptive
+computation: the policy can stop early on easy instances and spend additional tool calls on harder
+ones. Second, it supports solver-aware repair: errors are not only penalized after the fact, but are
+observed and acted upon during the trajectory. Third, it supports long-horizon credit assignment:
+choices such as indexing schemes, data parsing, or early execution can receive credit based on their
+downstream effect on final solver-verified correctness. These advantages are especially relevant for
+optimization modeling, where many failures are not visible from the generated text alone and only
+emerge through execution.
+The comparison in Table 2 should therefore be read as a methodological distinction rather than a claim
+that prior RL methods are ineffective. Prior methods improve the quality of optimization-modeling
+outputs under static or weakly interactive generation. PEARL targets a different training problem:
+learning an agent that can use solver feedback during generation as an observable signal for deciding
+when to execute, how to revise, and when to terminate.
+Table 2: Comparison between agentic reinforcement learning and prior reinforcement learning–based
+methods for optimization modeling. The table highlights differences in temporal structure, action
+space, environment modeling, solver interaction, and reward design.
+Dimension
+SIRL
+OR-R1
+MURKA
+StepORLM
+STORM
+PEARL (Ours)
+Temporal structure
+Single-pass trajectory
+Single-pass trajectory
+Single-pass trajectory
+Single-pass trajectory
+Single-pass trajectory
+Multi-turn, multi-step interaction
+Action space
+Token-level generation
+Token-level generation
+Token-level generation
+Token-level generation
+Token-level generation
+Natural language actions + tool invocation
+Environment modeling
+Static prompt-to-output
+Static prompt-to-output
+Static prompt-to-output
+Static prompt-to-output
+Static prompt-to-output
+Stateful, partially observable environment
+Tool usage
+Post-hoc solver execution
+Post-hoc solver execution
+Post-hoc solver execution
+Post-hoc solver execution
+Post-hoc solver execution
+Solver calls as first-class actions
+Feedback availability
+Terminal reward only
+Terminal reward only
+Preference-level reward
+Process-augmented reward
+Curriculum-shaped reward
+Intermediate, observable, and conditional feedback
+Reward design
+Outcome-based solver reward
+Outcome-based solver reward
+Preference-based alignment reward
+Hybrid outcome + process reward
+Curriculum-shaped alignment reward
+Decomposed, trajectory-level reward from solver interaction
+Learned decisions
+Output quality only
+Output quality only
+Output preference alignment
+Reasoning trajectory quality
+Curriculum-adapted generation
+When to execute, revise, and terminate
+Optimization objective
+Outcome correctness
+Outcome correctness
+Preference satisfaction
+Process-level consistency
+Curriculum-guided alignment
+Long-horizon interaction return
+Agentic formulation
+×
+×
+×
+×
+×
+✓
+A.2
+Details on Reward Function Design
+The reward function is designed to encourage correct formatting, proper tool usage, and accurate
+optimization modeling. The total reward is decomposed into format-based rewards and correctness-
+based rewards:
+• Format Reward (rfmt):
+– A reward of 0.1 is assigned if the agent correctly formats a tool invocation using the
+<code> tags.
+– A reward of 0.2 is assigned if the final answer follows the required structure, i.e.,
+enclosing the response within <answer> tags and the Python implementation within
+”’python ...
+”’ blocks.
+• Correctness Reward (rcorr): The correctness of the generated optimization model is verified
+by executing the extracted code and comparing the computed optimal objective value against
+the ground truth. Specifically, the system appends a value probe to the generated code to
+capture the solver’s output.
+– If the code executes successfully (return code 0) and produces an optimal value vpred,
+we compare it with the ground truth label vlabel.
+– If the absolute difference |vpred −vlabel| ≤10−3, the solution is deemed correct, and a
+reward of 1.0 is granted.
+The total reward for a response is the sum of these components, incentivizing the agent to not only
+solve the problem correctly but also adhere to the specified interaction protocols.
+A.3
+PEARL Training Algorithm
+Algorithm 1 gives the training loop corresponding to the objective in Section 3.4. The algorithm
+starts from a reference policy πref, which is either an instruction-tuned backbone or an SFT-warm-
+started model depending on the experiment. Each training iteration samples optimization-modeling
+instances from D and rolls out the current policy in the PEARL environment. A rollout is not a single
+15
+
+
+--- Page 16 ---
+completion: it is a multi-turn trajectory in which the agent may draft a formulation, invoke Python or
+solver tools, observe execution feedback, revise the formulation or implementation, and eventually
+emit a final answer.
+The return R(τi) is computed at the trajectory level using the reward components described in
+Appendix A.2: format validity encourages well-formed tool calls and final answers, while correct-
+ness rewards are obtained from execution, feasibility checks, and objective-value agreement when
+references are available. We then convert returns into normalized advantages, so credit is assigned
+to complete solver-grounded interaction traces rather than to isolated text spans. This design is
+important in optimization modeling because early actions, such as choosing an indexing scheme or
+deciding when to execute, may only reveal their value after several tool calls.
+Finally, the policy is updated with the GRPO-style objective described in Section 3.4, using DAPO-
+inspired decoupled clipping with thresholds ϵ+ and ϵ−. In the main PEARL runs, KL and entropy
+coefficients are set to zero after initialization; the update is therefore driven by solver-grounded
+returns and stabilized by clipping and batch-level advantage normalization. The high-level loop
+in Algorithm 1 omits engineering details such as loss masking over tool observations, execution
+timeouts, and distributed rollout scheduling, which are summarized in Appendix B.2 and Table 3.
+Algorithm 1: PEARL: NL-to-Opt via Agentic RL
+Input: Dataset D of optimization modeling instances; reference policy πref; clipping thresholds ϵ+, ϵ−
+Initialize policy πθ ←πref
+while not converged do
+foreach xi ∼D do
+Sample multi-turn, tool-augmented trajectory τi ∼πθ(· | xi)
+// NL modeling + execution + solver calls
+Compute trajectory return R(τi)
+// Execution, feasibility, correctness
+Compute advantage Ai from R(τi)
+// Credit assignment for optimization modeling
+Update πθ via decoupled-clipped policy gradient
+// Agentic RL over multi-turn optimization modeling
+Figure 5 complements the pseudo-code by showing how training and inference share the same
+generate–execute–revise–verify loop: during training, solver feedback is converted into rewards for
+policy updates, whereas during inference the same feedback is used by the learned policy to decide
+whether to revise or terminate.
+Optimization 
+problems 
+Generation
+(Draft/Reflection/Revise/Terminate)
+Tool Use
+(Python/Solver)
+Observation
+(Tool Response)
+PEARL Agent
+Solvers(Gurobi,Glpk,Mosek etc.)
+Multi-turn
+Rollouts
+Invocation
+Feedback
+   Reward Calculation 
+(format reward,accuracy 
+reward,...)
+Environment
+Answers
+Final Trajectory
+Policy Updates
+cot
+tool
+use
+tool
+response
+final
+answer
+...
+solver code
+Optimal Value
+from pyomo.environ import *
+# Create a concrete model
+model = ConcreteModel()
+                       .....
+Solution
+Verification
+Process 
+Figure 5: Overview of the PEARL training and inference loop for optimization modeling with tool
+use.
+16
+
+
+--- Page 17 ---
+Table 3: Main hyperparameters for Qwen3-4B-Instruct-2507 PEARL training.
+Hyperparameter
+Value
+Base model
+Qwen3-4B-Instruct-2507
+Hardware
+1 node, 4×H100 , Ray-based training
+Rollout engine
+SGLang tool-call rollout (colocated), 4 GPUs per engine
+Algorithm
+GRPO with decoupled clipping (ϵ=0.2, ϵhigh=0.28)
+KL regularization
+disabled in main runs, coefficient 0.0
+Entropy regularization
+coefficient 0.0
+Rollouts (training)
+3000 rollouts total, shuffle enabled
+Samples per prompt
+8
+Rollout batch size
+16 prompts per rollout batch
+Global batch size
+128
+Max response length
+16384 tokens
+Sampling temperature
+0.8
+Optimizer
+Adam, constant LR
+Learning rate
+1 × 10−6
+Adam betas
+(0.9, 0.98)
+Weight decay
+0.1
+Parallelism
+tensor MP=2, context MP=2, pipeline MP=1, sequence parallel on
+Memory / efficiency
+dynamic batch size, max tokens per GPU 9216, activation recompute enabled
+Checkpointing
+save interval 20
+PEARL-specific tool-use settings
+Max turns per rollout
+8
+Max observations per turn
+2000 tokens
+Tool concurrency
+64
+Python tool timeout
+120 seconds
+Python tool memory limit
+4 GB
+Return log probabilities
+enabled
+B
+Experiment Setup
+B.1
+Workflow overview
+As shown in Figure 5, we cast optimization modeling from natural language as an interactive
+decision process. Given a problem description, the PEARL agent incrementally constructs the final
+solution via staged generation (Draft/Reflection/Revise/Terminate) and queries external tools (Python
+/ solvers) to obtain verifiable feedback such as execution traces, solver status, and objective values.
+Each interaction yields a multi-turn trajectory that contains intermediate reasoning, tool calls, tool
+observations, and the final modeling write-up with runnable code. We then run an execution-and-
+verification pipeline: we extract the model code from the final answer, execute it, obtain the predicted
+optimal value and feasibility signals, and compare them against references or deterministic validators.
+Finally, we aggregate multiple reward dimensions (e.g., format and correctness) into a composite
+reward and use it for policy updates, closing the generate–execute–revise–verify loop during training.
+The maximum turn budget is only an upper bound: the policy can terminate early by emitting the
+final <answer> action. In practice, tool use stabilizes at a small number of calls for most instances,
+supporting a bounded-horizon interaction policy.
+B.2
+Training setup
+Implementation and tool environment. We implement training with the SLIME framework [Zhu
+et al., 2025], using its tool-augmented rollout engine and distributed training stack.
+Roll-
+outs are generated with an engine that supports multi-turn tool calling, where the model
+can emit <code>...</code> blocks to run Python in a sandbox and observe results in
+<interpreter>...</interpreter> blocks, and finally return a single <answer>...</answer>
+block containing the finalized formulation and verified runnable code. We use Pyomo Bynum et al.
+[2021] as the modeling language for optimization formulations. An example of PEARL Agent
+solving an optimization problem can be found in Appendix E.
+We train the policy with GRPOShao et al. [2024] . Table 3 summarizes the main hyperparameters for
+our Qwen3-4B-Instruct-2507 experiments.
+Loss masking for observation tokens. In our policy optimization procedure, the token-level losses
+are computed over multi-turn rollout sequences. In PEARL, each rollout sequence consists of both
+agent-generated tokens (modeling steps, reasoning, tool invocations in <code>...</code> blocks)
+and observation tokens returned by external tools (execution traces, solver outputs, error messages in
+<interpreter>...</interpreter> blocks). While optimizing agent-generated tokens enhances
+the model’s ability to formulate optimization problems, interact with solvers, and perform multi-turn
+17
+
+
+--- Page 18 ---
+reasoning, applying the same optimization to observation tokens can lead to unintended learning
+dynamics, as these tokens represent deterministic tool outputs rather than learned agent behavior.
+To address this, we introduce loss masking for observation tokens, ensuring the policy gradient
+objective is computed only over agent-generated tokens, excluding tool-returned observations from
+the optimization process. This approach stabilizes training while preserving the agent’s ability to
+leverage solver feedback for iterative model refinement.
+B.3
+Inference setup
+For evaluation, we deploy the trained PEARL model using vLLM for efficient inference. Table 4
+summarizes the inference configuration.
+Table 4: Inference parameters for Qwen3-4B-Instruct-2507 PEARL evaluation.
+Parameter
+Value
+Provider
+vLLM (optrl_vllm)
+Model
+Qwen/Qwen3-4B-Instruct-2507
+Tokenizer
+Qwen/Qwen3-4B-Instruct-2507
+Max model length
+16384 tokens
+Max output tokens
+16384 tokens
+Timeout
+300 seconds
+Engine configuration
+Tensor parallel size
+1
+GPU memory utilization
+0.8
+Sampling parameters
+Temperature
+0.6
+Top-p
+0.95
+Top-k
+50
+B.4
+8B Model Comparison
+Table 5: Pass@1 accuracy (%) for 8B-related comparisons. The 8B rows are reported in the appendix
+to keep the main table focused on the primary 4B PEARL model and representative baselines.
+Method
+NL4Opt
+MAMO-E
+MAMO-C
+NLP4LP
+OptMATH*
+IndustryOR
+ComplexOR
+Resocratic
+Macro Avg
+Micro Avg
+Qwen-3-8B
+38.32±1.60
+38.53±2.20
+12.61±2.30
+46.07±1.90
+3.01±0.55
+2.38±1.35
+5.56±2.78
+37.47±1.70
+22.99±0.70
+32.56±0.60
+PEARL-Qwen-3-8B
+86.45±1.10
+94.68±0.75
+57.66±3.40
+94.38±1.20
+24.10±1.65
+64.29±6.20
+38.89±4.80
+81.39±0.90
+67.73±0.55
+79.61±0.30
+PEARL-Qwen-3-4B-Instruct-2507
+85.28±0.99
+91.65±0.65
+76.12±3.19
+93.25±1.59
+16.87±1.70
+67.86±8.42
+41.66±3.92
+84.99±0.52
+69.71±0.13
+79.84±0.25
+Table 5 shows that PEARL training yields a large improvement over the raw Qwen-3-8B baseline,
+confirming that the learned interaction policy is beneficial beyond the 4B backbone. Comparing
+PEARL-Qwen-3-8B with PEARL-Qwen-3-4B-Instruct-2507, the 8B model improves on some easier
+or scale-sensitive benchmarks but does not dominate the 4B model overall, suggesting that both
+backbone choice and training data/interface stability matter. StepORLM does not release its training
+data, so we do not include it in this direct data-controlled comparison.
+C
+Failure Mode Attribution
+Figure 4 in the main text summarizes the failure attribution analysis. We include the detailed setup
+and interpretation here to avoid overloading the compact main-text figure.
+Attribution setup. We analyze failures from the Qwen3-4B-Instruct base model and the PEARL-
+Qwen3-4B-Instruct model under the main pass@1 evaluation setting. For each instance that fails
+the pass@1 correctness criterion, we assign one primary failure category using the execution-and-
+verification pipeline. The categories are: code/runtime, where the generated program crashes,
+imports fail, variables are undefined, parsing fails, or no executable solver result can be obtained;
+format/extraction, where the response violates the required answer or code format or the evaluator
+cannot reliably extract the intended implementation; timeout, where execution exceeds the configured
+budget; infeasible/solver, where the generated model reaches the solver but produces an infeasible,
+unbounded, or otherwise solver-side invalid status; objective mismatch, where the code executes and
+18
+
+
+--- Page 19 ---
+produces a candidate solution but the objective value does not match the reference within tolerance;
+and other, which covers residual failures that do not cleanly fit the preceding categories. Each bar
+in Figure 4 is normalized within the corresponding set of failed cases, so the figure describes the
+composition of failures rather than the overall pass rate.
+Rows in the figure. The first two rows compare the failure composition before and after PEARL
+training. The first row aggregates failures of Qwen3-4B-Instruct under the PEARL evaluation pipeline,
+while the second row aggregates failures of PEARL-Qwen3-4B-Instruct. The third row is a paired
+subset analysis: it considers only instances that the base model failed but PEARL later solved, and
+attributes those solved cases according to the base model’s original failure mode. This row therefore
+answers a different question from the first two rows: instead of describing what PEARL still gets
+wrong, it identifies which base-model failure modes PEARL most often repairs.
+Main interpretation. The base model’s failures are dominated by code/runtime issues, which
+account for 66.2% of its failed cases. This means that many errors occur before the evaluator can
+even assess the mathematical quality of the generated optimization formulation: the model may emit
+non-runnable code, inconsistent variable names, invalid data handling, or solver calls that fail at
+runtime. After PEARL training, the code/runtime share drops to 14.3%, indicating that interactive
+execution and solver feedback teach the model to produce substantially more executable solver
+programs.
+The PEARL failure distribution is instead dominated by objective mismatch, which accounts for
+53.4% of PEARL’s remaining failed cases. This increase should be interpreted as a conditional shift
+among failures, not as evidence that PEARL creates more objective errors overall. Because PEARL
+fixes many low-level execution and formatting failures, the residual error mass becomes concentrated
+in harder cases where the code runs but the formulation, objective, indexing, or constraints still do
+not match the reference semantics. In other words, agentic training moves the dominant failure mode
+from “cannot execute or parse” toward “executes but is mathematically wrong,” which is a more
+substantive optimization-modeling failure.
+The paired subset in the third row further clarifies what PEARL repairs. Among base-model failures
+that PEARL later solves, 73.8% were originally code/runtime failures, followed by objective mismatch
+(12.6%) and format/extraction errors (9.2%). This supports the claim that the learned interaction
+policy is especially effective at implementation repair: PEARL learns to run partial code, inspect
+exceptions or solver messages, and revise the program until it reaches a valid execution path. It
+also repairs some modeling-level failures, but the dominant improvement comes from making the
+solver-grounded workflow operational.
+Finally, the remaining PEARL failures show the limits of solver feedback as an oracle. Solver logs
+and compiler errors are highly useful for detecting runtime, feasibility, and formatting problems, but
+they do not fully identify all semantic mismatches between the intended optimization problem and
+the generated formulation. Objective-value checks catch many such mismatches when references are
+available, yet they remain partial: different formulations can agree on an objective for one instance but
+differ structurally, while ambiguous problem statements may admit multiple plausible interpretations.
+This motivates the broader validation agenda discussed in Appendix G.
+D
+Ablation Study and Sensitivity Analysis
+D.1
+Supervised Fine-Tuning Initialization
+D.1.1
+Theoretical Analysis
+Alternatively, before agentic reinforcement learning, we can initialize the policy using supervised
+fine-tuning (SFT) to obtain a stable and competent reference model for subsequent multi-turn opti-
+mization. This initialization follows standard practice in optimization modeling and tool-augmented
+language modeling, and is not intended to encode interactive decision-making or solver-driven control
+behaviors.
+Training data. The SFT stage uses a mixture of publicly available optimization modeling datasets and
+curated instruction-style data, including OR-Instruct from ORLM [Huang et al., 2025], OptMATH [Lu
+et al., 2025], and OptiBench-style modeling instances [Yang et al., 2024]. These datasets consist
+of paired natural-language problem descriptions and corresponding solver-ready formulations or
+19
+
+
+--- Page 20 ---
+executable code, covering a broad range of optimization domains, constraint structures, and problem
+scales.
+Training objective. Supervised fine-tuning is performed using standard autoregressive next-token
+prediction over complete solution traces, which may include natural-language reasoning, mathematical
+formulations, and solver code. Formally, let DSFT denote the supervised dataset of input–output
+pairs (x, y), where x is a natural-language optimization prompt and y = (y1, . . . , y|y|) is the target
+output sequence. The SFT objective is defined as:
+LSFT(θ) = −E(x,y)∼DSFT
+
+
+|y|
+X
+t=1
+log pθ(yt | x, y<t)
+
+,
+(5)
+where θ denotes the model parameters and pθ(yt | x, y<t) is the conditional probability of generating
+the t-th token given the input prompt and all preceding tokens.
+Importantly, SFT training is restricted to single-pass generation: the model is not exposed to multi-
+turn interaction, intermediate solver feedback, partial execution results, or revision behavior during
+this stage.
+Role of SFT in PEARL. The purpose of SFT is to endow the base model with fundamental
+optimization modeling competence and syntactic validity, ensuring that generated formulations and
+solver code are executable at the outset of reinforcement learning. The resulting model defines the
+reference policy πref, which serves solely as an initialization for agentic reinforcement learning.
+All interactive behaviors in PEARL—such as deciding when to invoke solvers, how to interpret
+solver diagnostics, and whether to revise or terminate—are learned exclusively during the agentic
+reinforcement learning stage described in Section 3.4.
+D.1.2
+Experiments
+In our main experiments, we directly apply reinforcement learning to instruction-tuned models.
+However, when we attempted to train Qwen3-8B-Base (a base model without instruction tuning), we
+observed poor performance and training instability. As shown in Figure 6, the model struggles to
+follow the required output format in early training stages, leading to training collapse with rewards
+declining after approximately 60 steps. This suggests that for base models without instruction
+tuning, a supervised fine-tuning (SFT) warm-start is necessary to establish basic format-following
+capabilities.
+0
+20
+40
+60
+80
+Step
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+Raw Reward
+Figure 6: Training reward curve when directly applying PEARL to Qwen3-8B-Base without prior
+instruction tuning. The reward begins to decline after 60 steps, indicating training collapse due to the
+model’s inability to consistently follow the required output format.
+Recall that, to obtain SFT data, we use a curated set of supervised solution traces. We conduct an
+ablation study to evaluate whether performing SFT before RL benefits the PEARL agent. As shown
+in Table 6, SFT alone (SFT-Qwen-3-4B-Instruct) substantially improves the model’s capabilities
+compared to the base model. However, the SFT-only model does not reach the performance ceiling of
+PEARL. Under this controlled ablation setting, adding PEARL after SFT improves MAMO-C from
+55.86 to 76.57, while direct PEARL from the instruction-tuned model reaches 63.96 on MAMO-C
+but remains comparable in Macro/Micro average (70.40/80.38 versus 69.63/80.32 for PEARL after
+SFT). This appendix ablation is separate from the final main-result checkpoint reported in Table 1,
+20
+
+
+--- Page 21 ---
+where the PEARL MAMO-C result is 76.12±3.19. The results indicate that while SFT provides a
+useful warm-start for base models, instruction-tuned models can achieve similar final performance
+through direct RL training, bypassing the need for an intermediate SFT stage.
+NL4Opt
+MAMO-E
+MAMO-C
+NLP4LP
+OptMATH
+IndustryOR
+ComplexOR
+Resocratic
+0
+20
+40
+60
+80
+100
+Pass@1 Accuracy (%)
+SFT
+SFT+ARL
+ARL
+Figure 7: Analyzing the role of SFT prior to agentic RL. Results are obtained using the same base
+model, Qwen3-4B-Instruct, under three training regimes: (i) SFT only, (ii) SFT followed by agentic
+RL (SFT+ARL), and (iii) direct agentic RL without SFT (ARL).
+Table 6: Ablation study on the role of supervised fine-tuning (SFT) before PEARL training. We
+compare three controlled ablation settings using Qwen3-4B-Instruct as the base: (1) SFT only, (2)
+SFT followed by PEARL training, and (3) direct PEARL training without SFT. This ablation is
+separate from the final main-result checkpoint in Table 1. Results show that while SFT provides
+substantial gains, the ultimate performance ceiling is similar whether SFT is used as an intermediate
+step or not.
+Method
+NL4Opt
+MAMO-E
+MAMO-C
+NLP4LP
+OptMATH
+IndustryOR
+ComplexOR
+Resocratic
+Macro Avg
+Micro Avg
+SFT-Qwen-3-4B-Instruct
+83.64
+92.66
+55.86
+93.82
+14.46
+52.38
+44.44
+79.90
+64.64
+76.86
+PEARL-SFT-Qwen-3-4B-Instruct
+85.98
+91.19
+76.57
+94.38
+23.49
+61.90
+38.89
+84.62
+69.63
+80.32
+PEARL-Qwen-3-4B-Instruct
+86.45
+91.01
+63.96
+94.93
+30.12
+61.90
+50
+84.86
+70.40
+80.38
+D.2
+Adaptive Sampling with Trajectory Filtering
+D.2.1
+Theoretical Analysis
+Agentic RL training, which incorporates external feedback from tool interactions, is highly susceptible
+to training instability and model collapse [Xue et al., 2026, Shang et al., 2025]. Tool-augmented
+rollouts may fail for reasons unrelated to modeling quality, including malformed tool calls, runtime
+crashes, and solver timeouts. Treating such failures as ordinary negative rewards introduces substantial
+variance and biases the policy update toward avoiding tool use altogether. To ensure stable training
+and achieve better model performance, prior work has adopted trajectory filtering strategies to exclude
+obviously anomalous negative samples [Xue et al., 2026, Shang et al., 2025]. To verify whether
+such filtering is effective in the optimization modeling scenario, we investigate a dynamic sampling
+strategy with trajectory filtering, inspired by DAPO-style filtering ideas [Yu et al., 2025] but adapted
+to optimization modeling.
+For each modeling instance xi, we repeatedly sample trajectories τi,j from the current policy until a
+minimum number of valid trajectories is obtained. Formally, let τi,j denote the j-th sampled trajectory
+for instance xi, and let q(τi,j) ∈{0, 1} be a binary quality indicator that tests whether the trajectory
+is usable for learning. We define the set of retained trajectories as
+Vi = { j ≤Ki : q(τi,j) = 1 },
+Ki = min
+
+
+k :
+X
+j≤k
+q(τi,j) ≥Kmin
+
+
+∧Kmax,
+(6)
+where Kmin specifies the minimum number of valid trajectories required for instance xi, and Kmax
+caps the total number of rollouts to control computational cost.
+The quality gate q(τ) filters out trajectories that are structurally invalid or uninformative, including
+malformed tool-call schemas, incomplete final outputs, or execution failures that occur before any
+21
+
+
+--- Page 22 ---
+meaningful solver interaction. By conditioning learning on Vi rather than on all sampled trajectories,
+this mechanism reduces gradient noise while allocating more sampling budget to difficult instances
+with low validity rates.
+Algorithm 2: PEARL-Filter: NL-to-Opt via Agentic RL with adaptive sampling
+Input: Dataset D of optimization modeling instances; reference policy πref; Kmin, Kmax; clipping
+thresholds ϵ+, ϵ−
+Initialize policy πθ ←πref
+while not converged do
+foreach xi ∼D do
+Vi ←∅, j ←0
+//Valid solver-reaching trajectories
+while |Vi| < Kmin and j < Kmax do
+Sample trajectory τi,j ∼πθ(· | xi)
+//Multi-turn NL modeling with execution and solver calls
+if q(τi,j) = 1 then
+Vi ←Vi ∪{j}
+//Executable and reaches solver/validation
+j ←j + 1
+foreach j ∈Vi do
+Compute return R(τi,j)
+//Execution, feasibility, correctness
+Compute group-normalized advantages Ai,j
+//Instance-wise credit assignment
+Update πθ via decoupled-clipped policy gradient
+//Agentic RL over multi-turn optimization modeling
+D.2.2
+Experiments
+As described above, we adopt an adaptive sampling strategy with trajectory filtering to mitigate
+training instability in agentic RL. Here, we empirically evaluate whether such filtering is necessary
+in the optimization modeling domain. We use Qwen3-4B-Instruct-2507 as the base model and
+train on a combination of curated and open-source samples. Due to the large context requirement
+with max_response_length set to 32k tokens, the training requires 8 H100 GPUs with context
+parallelization set to 4.
+We explore three trajectory filtering strategies: (1) Normal: no filtering of negative samples; (2) Filter
+Truncated: filtering only truncated negative samples; and (3) Filter All: filtering both truncated and
+format-violating negative samples. As shown in Figure 9, under the Normal setting, the model’s
+responses grow increasingly longer during training (reflected in extended rollout time in Figure 9c),
+leading to a progressively higher truncation ratio during the rollout process (Figure 9d). This results
+in more truncated negative samples being included in the training data.
+Interestingly, despite the increasing presence of truncated negative samples, the model does not
+exhibit training collapse. In fact, as shown in Figure 9a, the Normal setting achieves slightly better
+performance on the benchmarks (average of MAMO-C and IndustryOR) compared to the filtering
+strategies. We attribute this robustness to several factors specific to our training scenario: (1) the
+average number of tool calls is relatively low (2-4 calls per problem), (2) each tool feedback is capped
+at 2,000 tokens, (3) the training set saturates quickly, resulting in a significantly higher proportion
+of positive samples, and (4) the negative samples generated from truncated or format-violating
+trajectories do not dominate the learning signal. These observations suggest that in scenarios with
+limited tool usage and rapid training convergence, aggressive filtering of negative samples may not
+be necessary and could even slightly hurt performance.
+D.3
+Training Dynamics
+We visualize the training dynamics of PEARL in Figure 10. The model is trained using Qwen3-4B-
+Instruct-2507 as the base model, with open-source and curated data as the training corpus. Throughout
+22
+
+
+--- Page 23 ---
+0
+50
+100
+150
+200
+Step
+0.2
+0.4
+0.6
+Pass@1 Accuracy
+Normal
+Filter Truncated
+Filter All
+Figure 8: Impact of trajectory filtering strategies on PEARL training. We compare three settings—
+Normal, Filter Truncated, and Filter All—and report average Pass@1 accuracy on MAMO-C and
+IndustryOR throughout training.
+0
+100
+200
+300
+400
+500
+Step
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+Pass@1 Accuracy
+Normal
+Filter Truncated
+Filter All
+(a) Pass@1 Accuracy (Avg. of MAMO-C & Indus-
+tryOR)
+0
+100
+200
+300
+400
+500
+Step
+0.4
+0.6
+0.8
+1.0
+1.2
+Raw Reward
+Normal
+Filter Truncated
+Filter All
+(b) Raw Reward
+0
+100
+200
+300
+400
+500
+Step
+0
+2500
+5000
+7500
+10000
+12500
+15000
+17500
+Rollout Time (s)
+Normal
+Filter Truncated
+Filter All
+(c) Rollout Time
+0
+100
+200
+300
+400
+500
+Step
+0.00
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+0.35
+Truncated Ratio
+Normal
+Filter Truncated
+Filter All
+(d) Truncated Ratio
+Figure 9: Impact of trajectory filtering strategies on PEARL training. We compare three settings:
+Normal (no filtering), Filter Truncated (filtering only truncated negative samples), and Filter All
+(filtering both truncated and format-violating negative samples). (a) Average Pass@1 accuracy on
+MAMO-C and IndustryOR benchmarks. (b) Training set raw reward. (c) Rollout time per step. (d)
+Truncated ratio during training.
+the training process, we monitor three key benchmarks (IndustryOR, MAMO-C, and NL4LP) as
+evaluation metrics. As shown in Figure 10a, the Pass@1 accuracy on all three benchmarks consistently
+increases during training, demonstrating the model’s improved problem-solving capabilities.
+The training set reward (Figure 10b) also exhibits an upward trend, though it begins to saturate in the
+later stages of training. This saturation indicates that the model successfully solves most problems
+in the training set, resulting in diminished gradient signals and convergence behavior. Notably, the
+model rapidly learns to utilize tool calls (Figure 10d), with this metric converging early in the training
+process. This suggests that tool usage is one of the first capabilities the model acquires. Additionally,
+under GRPO training, we observe that the response length (Figure 10c) continues to grow throughout
+the training process, reflecting the model’s tendency to generate more detailed and comprehensive
+solutions.
+23
+
+
+--- Page 24 ---
+0
+200
+400
+600
+800
+Step
+0.2
+0.4
+0.6
+0.8
+1.0
+Pass@1 Accuracy
+eval_IndustryOR
+eval_mamo_c
+eval_nl4lp
+avg
+(a) Pass@1 Accuracy on Three Benchmarks
+0
+200
+400
+600
+800
+Step
+0.4
+0.6
+0.8
+1.0
+1.2
+Raw Reward
+(b) Raw Reward
+0
+200
+400
+600
+800
+Step
+2000
+4000
+6000
+8000
+10000
+Response Length
+(c) Response Length
+0
+200
+400
+600
+800
+Step
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+3.5
+Tool Calls
+(d) Tool Calls
+Figure 10: Training dynamics of PEARL using Qwen3-4B-Instruct-2507 as the base model. The
+model is trained on open-source and curated data. (a) Pass@1 accuracy across three evaluation
+benchmarks (IndustryOR, MAMO-C, and NL4LP), showing consistent improvement during training.
+(b) Raw reward from the training set, demonstrating increasing performance that saturates in later
+stages. (c) Response length increases throughout training under GRPO optimization. (d) Tool calls
+rapidly converge, indicating the model quickly learns to utilize tools effectively.
+D.4
+Tool-Use Depth and Termination
+Table 7: Scaffold-control comparison under the same PEARL inference process. Accuracy is pass@1
+(%); tool calls are averaged per instance.
+Benchmark
+Acc.
+Tool Calls
+Base
+PEARL
+Base
+PEARL
+NL4Opt
+68.22
+85.28
+0.47
+1.31
+MAMO-Easy
+41.28
+91.65
+0.85
+1.42
+MAMO-Complex
+12.61
+76.12
+0.15
+1.55
+NLP4LP
+81.29
+93.25
+0.19
+1.29
+OptMATH
+5.42
+16.87
+0.23
+4.43
+IndustryOR
+19.05
+67.86
+0.69
+1.62
+ComplexOR
+11.11
+41.66
+0.28
+2.28
+Resocratic
+51.61
+84.99
+0.35
+1.83
+Average interaction depth alone is not sufficient evidence that PEARL benefits from a learned multi-
+turn policy: a fixed wrapper could also create additional opportunities for tool interaction. To isolate
+this effect, we evaluate the base Qwen3-4B-Instruct-2507 model under the same PEARL inference
+process, keeping the tool interface, execution-feedback loop, and repair budget fixed. For PEARL, we
+report the final checkpoint values from Table 1 so that the accuracy column is aligned with the main
+result table. Table 7 reports both pass@1 accuracy and the average number of tool calls per instance.
+The base model occasionally uses the available tools, but it does so much more sparsely and less
+effectively than trained PEARL. PEARL achieves higher accuracy on every benchmark, with espe-
+24
+
+
+--- Page 25 ---
+cially large gains on MAMO-C, MAMO-E, IndustryOR, and Resocratic. These results suggest that
+the improvement is not due to the hand-written multi-turn scaffold alone. Rather, agentic training
+teaches a control policy for deciding when to execute code, how to interpret solver feedback, and
+whether to continue revising.
+Figure 11: Distribution of tool-call counts for PEARL across the Table 1 benchmarks. Although
+the maximum budget allows up to eight tool calls, most trajectories terminate after one or two calls,
+while harder instances form a longer debugging tail.
+The eight-turn inference budget should be interpreted as an upper bound rather than a target interaction
+length. The agent can terminate early by emitting the final <answer> action. As shown in Figure 11,
+trained trajectories span the full 0–8 tool-call range, but the mass is concentrated at one or two calls,
+with a longer tail for harder instances. The benchmark-level averages in Table 7 similarly remain
+small for most datasets, rising most noticeably on OptMATH. This pattern is more consistent with
+adaptive self-termination than with simple budget truncation.
+25
+
+
+--- Page 26 ---
+E
+PEARL Rollout Example
+PEARL Agent Response (Sanitized Excerpt)
+We are given a complex production system with multiple stages. Let’s model this as a
+mixed-integer linear program.
+Decision Variables:
+• R: raw material units; esold, etoT, etoBS: engine block allocation
+• tsold, ttoBS: transmission allocation; bsold: brake systems sold
+Objective: Maximize profit: 25esold + 35tsold + 45bsold −68R −5etoT −10etoBS −12ttoBS
+Key Constraints: Engine/transmission/brake system material balance, contract requirements
+(bsold ≥4000), market demand caps, machine time limit.
+Now implementing in Pyomo...
+<code> from pyomo.environ import *; model = ConcreteModel(); ...
+<interpreter> Error:
+Constraint ’eb_balance[1]’ does not have proper
+value.
+Found function object instead of expression.
+▷Reflection: Ah, I see the issue! I’m passing the function object instead of calling it. Let me
+fix the constraint definition...
+<code>
+model.eb_balance.add(eb_balance_rule(model)) # Fixed:
+call
+the rule
+<interpreter>
+Optimal Solution:
+R=3772.0, e_sold=20000.0,
+e_toT=2399.0, ... Maximum Profit:
+851534.0
+▷Reflection: We’re getting non-integer values like 3772.0. However, these are actually inte-
+gers displayed with .0 suffix. Let’s verify the solution satisfies integrality and all constraints...
+Checking: R = 3772 (integer ✓), etoT = 2399 (integer ✓), all constraints satisfied ✓
+<answer>
+Modeling: 7 decision variables (all Z+), 1 objective (maximize profit), 6 constraint
+groups (material balance, contract, demand, machine time)
+Implementation: Complete Pyomo code with constraint rules, GLPK solver
+from
+pyomo.environ
+import *
+model = ConcreteModel ()
+# Variables
+model.R = Var(domain= NonNegativeIntegers )
+model.e_sold = Var(domain= NonNegativeIntegers )
+...
+# Constraints
+model.eb_balance = ConstraintList ()
+model.eb_balance.add( eb_balance_rule (model))
+...
+# Solve
+solver = SolverFactory ('glpk ')
+results = solver.solve(model)
+print(f"Maximum
+Profit: {value(model.objective)}")
+26
+
+
+--- Page 27 ---
+Problem Description
+AutoParts Ltd. manufactures three types of automotive components: Engine Block,
+Transmission, and Brake System. The company sources raw materials at a cost of $60
+per unit. Each unit of raw material can be processed into 7 units of Engine Block
+and 3 units of Transmission. Processing one unit of raw material requires $8 in
+energy costs and 7 hours of machine time.\n\nEngine Block can be used in three
+ways:\n- Sold directly for $25 per unit.\n- Processed into 1 unit of Transmission,
+requiring 4 hours of machine time and $5 in additional costs.\n- Processed into 1
+unit of Brake System, requiring 6 hours of machine time and $10 in additional
+costs.\n\nTransmission can be used in two ways:\n- Sold directly for $35 per
+unit.\n- Processed into 1 unit of Brake System, requiring 5 hours of machine time
+and $12 in additional costs.\n\nBrake System is sold for $45 per unit. The company
+has a maximum machine time capacity of 60,000 hours per year. Additionally, there
+is a contractual obligation to produce at least 4,000 units of Brake System
+annually. The maximum market demand for each component is as follows:\n- Engine
+Block: 20,000 units\n- Transmission: 15,000 units\n- Brake System: 12,000
+units\n\nDetermine how AutoParts Ltd. can maximize its annual profit while meeting
+all constraints.
+,→
+,→
+,→
+,→
+,→
+,→
+,→
+,→
+,→
+,→
+,→
+,→
+,→
+,→
+,→
+,→
+F
+Prompt Templates
+F.1
+Training Prompt
+RL Training Prompt (System, Pyomo)
+You are an optimization modeling agent.
+Goal:
+- Convert the user problem statement into a correct optimization
+model and a runnable Python implementation.
+,→
+- Use Python tool calls to compute, sanity-check, and verify your
+formulation when needed.
+,→
+- The final code must be verified runnable, and you must validate the
+optimal value/solution against the problem statement: check all
+constraints are satisfied and no requirement is violated.
+,→
+,→
+Modeling notes:
+- Check variable meaning: if x is a quantity (integer/continuous), do
+NOT use binary-only logic like x_i + x_j <= 1.
+,→
+- For logical constraints about whether a product is produced (x_i >
+0), introduce indicator y_i in {0,1}.
+,→
+- Link quantity and indicator with tight bounds: x_i <= M_i * y_i;
+add x_i >= y_i only if selecting implies x_i >= 1.
+,→
+- Encode implications with indicators: (A => B) becomes y_A <= y_B;
+(A => not B) becomes y_A + y_B <= 1.
+,→
+- Choose M_i as small as possible using known bounds (e.g., from
+resource constraints) to keep the MIP stable.
+,→
+- Carefully distinguish variable types. Common nouns -> types:
+amount/production/flow/distance/time/cost = nonnegative
+continuous; counts
+(trips/machines/workers/vehicles/orders/batches) = nonnegative
+integer; yes/no decisions (select/open/visit/build) = binary;
+assignment/matching/edge-used (i->j) = binary; sequence/rank =
+integer (with subtour-elimination / uniqueness constraints).
+,→
+,→
+,→
+,→
+,→
+,→
+- Keep units consistent across constraints (e.g., hours vs. units, kg
+vs. g); unit mistakes often cause 10x/1000x objective gaps.
+,→
+27
+
+
+--- Page 28 ---
+- Implementation sanity: check solver termination is optimal before
+reading values; access indexed vars as model.x[i] (not getattr).
+,→
+Implementation requirement:
+- Use Pyomo to implement and solve the optimization model. Your code
+should follow this skeleton:
+,→
+from pyomo.environ import *
+model = ConcreteModel()
+# Solve
+You may use SolverFactory('glpk') for linear/MIP problems.
+You may use SolverFactory('ipopt') or SolverFactory('gurobi') for
+nonlinear programming (NLP).
+,→
+solver = SolverFactory('glpk')
+results = solver.solve(model)
+Tool calling:
+- When you need to run Python, output exactly:
+<code>
+...python code...
+</code>
+- After a tool call, you will receive the execution result inside:
+<interpreter>
+...tool output...
+</interpreter>
+- You may call the tool multiple times.
+Final answer:
+- When you are done, output exactly one final block:
+<answer>
+# Modeling:
+define decision variables, objective, constraints (clear and
+complete).
+,→
+# Implementation:
+include runnable code wrapped as:
+'''python
+...python code...
+'''
+</answer>
+F.2
+Direct Prompts
+Direct Testing Prompt (Pyomo)
+You are a professional mathematical optimization expert. Please use
+Python and Pyomo to solve the following optimization problem.
+,→
+# Question:
+{description}
+# Note:
+- Use Pyomo to implement and solve the optimization model. Your code
+should follow this skeleton:
+,→
+```python
+import pyomo.environ as pyo
+28
+
+
+--- Page 29 ---
+model = pyo.ConcreteModel()
+solver = pyo.SolverFactory("glpk")
+results = solver.solve(model)
+```
+- Make sure the model variable is named `model`.
+- Carefully determine whether the variable is an integer or a
+continuous variable.
+,→
+G
+Limitations and Broader Impact
+Our evaluation provides evidence for tool-integrated agentic optimization modeling, but it has
+several limitations. First, PEARL operates under a bounded turn budget and fixed observation
+limits. This makes training and evaluation tractable, but it may under-estimate problems that require
+long debugging chains, richer data inspection, or interaction with multiple domain-specific tools.
+Multi-turn inference also incurs additional serving cost relative to one-shot generation, so future
+systems should learn when interaction is worth the cost and when a direct solution is sufficient.
+Second, the benchmark suite covers linear, integer, mixed-integer, nonlinear, and second-order cone
+programs, but it still under-represents stochastic, robust, online, and highly domain-specific enterprise
+optimization problems. Real deployments may involve longer documents, richer data interfaces,
+domain-specific modeling languages, interactive human oversight, or substantially larger industrial
+instances.
+Third, solver execution and objective-value checks are strong but partial validation signals. They
+make evaluation auditable and practically meaningful, but they can miss semantically valid alternative
+formulations, ambiguous specifications, or formulations that satisfy the tested instance while failing
+broader requirements. This limitation is common in optimization-modeling evaluation: objective
+agreement, executability, formulation matching, and solver-checked outputs are practical proxies for
+correctness, but none can fully score all mathematically equivalent formulations or latent structural
+defects. Future work should therefore develop richer validators, uncertainty-aware evaluation, and
+training procedures for broader classes of real-world optimization workflows.
+The potential positive impact of this line of research is substantial. Reliable interactive optimization
+modeling could lower the expertise barrier that currently limits the use of mathematical optimization
+in domains such as logistics, manufacturing, planning, energy systems, and resource allocation. By
+emphasizing solver execution and validation feedback, PEARL may also reduce modeling errors and
+encourage a more transparent style of LLM-based decision-support generation centered on verifiable
+artifacts rather than surface-level text.
+At the same time, this capability carries meaningful risks. Optimization models are often used in
+high-stakes settings, and flawed formulations may yield infeasible, unsafe, unfair, or economically
+harmful decisions while still appearing superficially plausible. A system that generates convincing
+but incorrect solver code could create a false sense of reliability, especially for non-expert users.
+PEARL should therefore be understood as a sandboxed modeling and verification system, not as
+evidence that current agents are ready for autonomous deployment in decision-critical environments.
+All outputs require human interpretation and validation before real-world use. We hope this work
+helps promote stronger solver-grounded verification, better structural interpretability, clearer human
+oversight, and safer standards for optimization-oriented AI systems.
+29
