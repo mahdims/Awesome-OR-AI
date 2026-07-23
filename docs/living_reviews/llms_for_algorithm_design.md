@@ -1,10 +1,29 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-07-21
+**Last Updated:** 2026-07-23
 
 ---
 
 ## Recent Papers
+
+#### 2026-07-23 (2 papers)
+
+### [Automated Discovery Has No Universally Superior Harness](https://arxiv.org/abs/2607.18235)
+
+**2026-07-20** | UC Berkeley, MIT, MIT-IBM Watson AI Lab, Weizmann Institute of Science | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Systematic decomposition and statistical evaluation of LLM-guided discovery harnesses (evolutionary search and tree-based search) with adaptive online allocation | *LLM role:* heuristic_generator
+
+> Gupta et al. systematically decompose and evaluate LLM-guided discovery harnesses across 3.1 million rollouts to show that no single fixed harness universally generalizes across models and problems. The results are highly rigorous, utilizing budget-matched statistical bootstrap tests to prove that complex evolutionary machinery often underperforms simpler tree-search or epsilon-greedy baselines. The key insight is that early search progress strongly predicts final performance, enabling an online adaptive allocation strategy that prunes weak partial runs and reallocates compute to surviving trajectories. This is a must-read for our work in LLM evolutionary search, as it dictates a shift away from engineering complex, fixed search harnesses toward implementing dynamic, early-stopping compute allocation to maximize sample efficiency.
+
+### [Autonomous Discovery of Wireless Communications Algorithms](https://arxiv.org/abs/2607.17762)
+
+**2026-07-20** | NVIDIA | M=8 P=7 I=8 **MUST-READ** *discuss*
+
+*Method:* LLM-driven evolutionary search with agentic code generation and multi-objective Pareto optimization | *LLM role:* evolutionary_search
+
+> Aït Aoudia et al. introduce AITE, an LLM-driven evolutionary search framework that uses a two-tier orchestrator-worker architecture with agentic tool-use to autonomously discover wireless communication algorithms. The framework produces real, empirically validated results, discovering an OTFS equalizer that is 3.6x faster than the state-of-the-art with better error rates, and the first explainable pilotless OFDM receiver matching neural network performance. The most transferable methodological insights are the post-processing adherence check (where an LLM verifies if the generated code actually implemented the assigned idea before updating the orchestrator's leaderboard) and the prompt refinement stage (which critiques worker execution journals to improve instructions for the next generation). This is highly relevant to our work in LLM evolutionary search; while the telecom application is outside our scope, the architectural enhancements for agentic code generation, adherence filtering, and prompt refinement directly address sample efficiency and search observability.
+
 
 #### 2026-07-21 (4 papers)
 
