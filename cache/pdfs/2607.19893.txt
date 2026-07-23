@@ -1,0 +1,1304 @@
+--- Page 1 ---
+Odin: Primitive-Level Synchronization for Distributed
+Point-Based Neural Rendering
+Zhenxiang Ma
+Shanghai Jiao Tong University
+Shanghai, China
+Shanghai AI Laboratory
+Shanghai, China
+mazhenxiang@sjtu.edu.cn
+Zeyu He
+Shanghai AI Laboratory
+Shanghai, China
+hezeyu@pjlab.org.cn
+Yuanzhen Zhou
+Shanghai AI Laboratory
+Shanghai, China
+zhouyuanzhen@pjlab.org.cn
+Zhenyu Yang
+Shanghai AI Laboratory
+Shanghai, China
+yangzhenyu@pjlab.org.cn
+Yuchang Zhang
+Shanghai AI Laboratory
+Shanghai, China
+zhangyuchang@pjlab.org.cn
+Miao Tao
+Shanghai AI Laboratory
+Shanghai, China
+taomiao@pjlab.org.cn
+Rong Fu
+Shanghai AI Laboratory
+Shanghai, China
+furong@pjlab.org.cn
+Jidong Zhai
+Tsinghua University
+Beijing, China
+zhaijidong@tsinghua.edu.cn
+Hengjie Li∗
+Shanghai AI Laboratory
+Shanghai, China
+Shanghai Innovation Institute
+Shanghai, China
+lihengjie@pjlab.org.cn
+Abstract
+Point-based neural rendering (PBNR) represents 3D scenes as ex-
+plicit, trainable primitives and has become an important foundation
+for high-quality reconstruction and emerging embodied-AI and
+world-model pipelines. Unlike layer-structured neural networks,
+PBNR exposes primitive-indexed dependencies: each view observes
+and updates only a sparse, view-dependent subset of the mutable
+scene state. As large scenes push PBNR toward distributed train-
+ing and optimized renderers reduce per-view computation, global
+task- or iteration-level barriers increasingly place synchronization,
+rather than rendering, on the critical path.
+Odin breaks these barriers with primitive-level synchronization.
+Its ahead-of-time scheduler uses stable PBNR locality and phase
+order to place low-conflict overlap windows, while the runtime
+validates primitive publication before later state observation and
+publishes the pending updates that later work may observe. Odin
+provides a quality-first path that preserves synchronized-training
+visibility and a throughput-first path that uses overlap and gradient
+evidence to admit only small, low-impact delayed reads; structural
+changes and high-impact cases remain synchronized.
+Across four existing PBNR pipelines and 13 non-city 8-GPU
+scenes, Odin improves throughput by 1.22× on average and hides
+82% of critical-path wait while preserving reconstruction quality.
+In a MatrixCity mixed-parallel case study up to 64 GPUs, Odin
+improves over Grendel by up to 1.89× without changing renderer
+kernels, optimizers, training budgets, or model capacity.
+∗Corresponding author.
+Keywords
+distributed training, point-based neural rendering, Gaussian splat-
+ting, primitive-level synchronization, communication–computation
+overlap
+1
+Introduction
+Point-based neural rendering (PBNR), represented by 3D Gaussian
+Splatting (3DGS) [1] and follow-up methods [2–6], is becoming
+a foundational algorithmic family for embodied intelligence and
+world models [7, 8]. It reconstructs explicit, trainable 3D scene
+state from multi-view observations and trains each camera view by
+rendering, backpropagating, and updating only visible primitives.
+At the systems level, PBNR follows a tensor-training execution
+model: GPU kernels operate over aligned primitive-attribute and
+optimizer-state tensors. Semantically, each view only reads and
+updates a sparse, view-dependent subset of primitive indices. This
+creates a systems mismatch absent from regular layer-by-layer
+neural networks: the dependency unit is a primitive index, but
+current distributed PBNR commonly publishes updates through
+global task- or iteration-level barriers. Consequently, a later view
+can be forced to wait for primitive updates outside its observable
+scope.
+Recent PBNR optimizations make this mismatch increasingly
+costly. They shorten rendering and update phases while leaving
+synchronization exposure largely intact. Coarse barriers have al-
+ways existed in distributed PBNR, but earlier computation-heavy
+pipelines could hide more of their cost. Figure 1 shows this trend:
+exposed communication rises from 22.9% in 3DGS to 29.5% in Tam-
+ingGS and 32.3% in DashGS. In an 8-GPU run, per-GPU idle time
+also ranges from 1% to 26%, indicating that coarse barriers amplify
+imbalance across workers. The key systems question is therefore
+1
+arXiv:2607.19893v1  [cs.DC]  22 Jul 2026
+
+
+--- Page 2 ---
+Ma et al.
+Figure 1: Motivating synchronization overhead in distributed
+point-based neural rendering (PBNR). Top: optimized vari-
+ants expose a growing communication fraction as rendering
+and update computation shrink. Bottom: per-GPU idle time
+in an 8-GPU run shows that a global barrier turns rank-local
+skew into system-wide waiting.
+not only how much state is exchanged, but which primitive updates
+actually need to block a later view.
+Existing systems optimize where PBNR state and views run, but
+not when a primitive update becomes visible to later views. Dis-
+tributed PBNR systems exploit locality for ownership, placement,
+partitioning, sparse exchange, or load balance [9–11]; Gaian [11],
+the closest locality-based system, uses point-based differentiable-
+rendering access patterns for point placement and image-to-GPU
+assignment. These systems decide where primitives and views run
+and how much state moves, but their remaining exchange still
+becomes visible through coarse task- or iteration-level barriers.
+General distributed deep-learning schedulers operate at layer, ten-
+sor, stage, or collective boundaries, while relaxed-gradient methods
+have mainly been validated for dense neural networks or tensor-
+averaging regimes. PBNR has no deep layer hierarchy, and its rele-
+vant conflicts sit below the tensor boundary: two tasks with identi-
+cal phase order can be independent or conflicting solely because
+their views activate different primitive indices.
+The challenge is that the activated primitives that determine
+whether a barrier is necessary are irregular, dynamic, and implicit
+at scheduling time. They are irregular: activation depends on ge-
+ometry, opacity, visibility, and numerical state. They are dynamic:
+densification, pruning, and reset change the primitive set during
+training. They are also implicit: the phase task graph exposes only le-
+gal phase order, while tensor-level execution hides primitive-index
+dependencies. Early geometry and co-visibility are available in time
+to schedule, but they overestimate conflicts. Realized activity and
+gradient impact are more faithful, but they arrive after the over-
+lap window must already have been placed. A useful system must
+therefore schedule tentative overlap early, then validate primitive
+publication before state observation.
+We break global barriers with static prediction and runtime cor-
+rection over primitive publication. The design first builds a relative
+locality graph (RLG) from stable co-visibility, then schedules task-
+unit order and places overlap windows between communication
+and computation jointly with the phase task graph. Runtime execu-
+tion uses Shadow Graph to give overlapped units versioned logical
+views over shared physical state. Before a later task observes state,
+the runtime validates the predicted window and publishes only
+the primitive updates that task may observe. When a prediction is
+unsafe, it falls back to primitive-level waiting rather than rollback.
+We implement this design as Odin, a distributed PBNR training
+system.
+Odin supports two paths. The quality-first path is equivalent to
+synchronized training under the scheduled order: it removes only
+waits whose primitive scopes are validated as disjoint, or whose ob-
+servable updates have already been published. The throughput-first
+path targets deployment workloads and capture patterns where
+small, low-impact RAW overlaps block larger overlap windows.
+This is PBNR-specific rather than generic asynchronous training:
+compositing, occlusion, and transmittance give primitive interac-
+tions physical and numerical weights, making some dominant and
+others weak [12, 13]. Odin admits only delayed reads with both
+small delayed scope and small producer gradients; writes, structural
+changes, missing evidence, and high-impact cases stay synchro-
+nized. Across four PBNR pipelines and 13 non-city 8-GPU scenes,
+Odin improves throughput by 1.22× on average; in a MatrixCity
+mixed-parallel case study up to 64 GPUs, it reaches 1.89× over
+Grendel.
+In summary, this paper makes the following contributions:
+• We identify a synchronization-boundary mismatch in dis-
+tributed PBNR: optimized renderers expose global barriers,
+while view dependencies remain sparse at primitive-index
+granularity (Sections 1–3).
+• We introduce primitive-level synchronization to break these
+barriers. Odin publishes only primitive updates that later
+views may observe, replacing whole-task or whole-iteration
+waits with validated primitive publication (Sections 4–4.3).
+• We present a two-graph scheduler/runtime co-design. The
+AOT scheduler augments the phase task graph with RLG
+to expose overlap missed by phase order; runtime valida-
+tion corrects unsafe windows, while Shadow Graph stages
+overlap without full replication (Sections 4–5).
+• We implement Odin in four PBNR pipelines without chang-
+ing kernels, optimizers, budgets, or model capacity; evalua-
+tion shows 1.22× average speedup, up to 1.89× over Grendel,
+stable quality, and ablations that attribute gains to primitive-
+scoped synchronization (Section 6).
+2
+Background
+2.1
+Point-Based Neural Rendering
+Figure 2 gives the semantic abstraction used throughout the paper.
+A PBNR model is not a deep stack of layers; it is a mutable pool of
+explicit point-like scene primitives, denoted by Θ. Each primitive
+contains geometry, opacity, appearance parameters, and optimizer
+state. Implementations store these fields as aligned tensors for GPU
+efficiency, but the dependency unit remains the primitive index
+2
+
+
+--- Page 3 ---
+Odin
+Figure 2: Running four-view locality example. Left: four num-
+bered training views over the same primitive pool. Right:
+beige, blue, and purple show geometry locality, computa-
+tional locality, and importance locality. They are progres-
+sively later and more selective evidence: candidate primitives
+a view may touch, primitives it actually activates, and active
+primitives with small measured impact.
+across those tensors. Each numbered item on the left of the figure
+is a training view: it renders one camera, computes an image loss,
+and updates only the primitives that participate in that view. The
+systems opportunity is visible immediately: although the primitive
+pool is global, a single view usually touches only a localized subset.
+The right side of Figure 2 shows the three locality signals that
+Odin uses. They are not three separate correctness models; they
+are the same view–primitive relation observed at different times.
+Geometry locality is the earliest signal. Before rendering, camera
+geometry or owner-region metadata gives a conservative candidate
+set of primitives a view may touch. It is available in time for sched-
+uling, but it can include primitives that later contribute little or
+not at all. Computational locality is the realized active set after ren-
+dering and backpropagation. It is more faithful, because it records
+which primitives actually participate in the computation, but it is
+only fully known after the view has executed. Importance locality
+attaches gradient evidence to the realized active set. It captures
+the PBNR-specific observation that some realized interactions are
+numerically small, which creates the throughput-first opportunity
+used later in the paper.
+This timing is the central difficulty. If a scheduler waits for real-
+ized activity and gradients, the overlap window has already passed.
+If it trusts only early geometry, it often keeps unnecessary barriers.
+Odin therefore uses these signals according to when they appear:
+stable early locality guides scheduling, conservative scopes vali-
+date the quality-first path before state observation, and importance
+evidence gates bounded RAW delayed reads in the throughput-
+first path. Structural changes such as densification, pruning, and
+opacity reset still affect the primitive pool globally and remain
+barrier-scoped.
+The synchronization checks later in the paper rely on three levels
+of view–primitive scope: the full primitive pool, a conservative pre-
+observation scope, and the realized active set. For a view 𝑖, these
+scopes follow the nesting shown in Figure 2:
+Θ ⊇G𝑖⊇C𝑖.
+Θ is the full mutable primitive pool. G𝑖is the conservative candidate
+scope available before the view reads mutable state. C𝑖is the realized
+Table 1: Key primitive-scope notation used by Odin.
+Symbol
+Meaning
+Θ
+Mutable primitives in the scene.
+G𝑖
+Geometry locality: candidate primitive scope before
+state observation.
+C𝑖
+Computational locality: realized active primitive set
+after execution.
+𝑅+
+𝑖,𝑊+
+𝑖
+Conservative read/update scopes used for admission.
+𝑔𝑈(𝑝)
+Gradient evidence for active primitive 𝑝.
+Figure 3: Locality-scope ratios in real scenes after 7,000 itera-
+tions. Each bar reports the primitive fraction retained by one
+view under geometry locality, computational locality, or im-
+portance locality. The drop from geometry to realized activity
+shows why early scopes are conservative; the further drop
+after importance filtering shows why bounded low-impact
+RAW delayed reads can expose additional throughput oppor-
+tunity.
+active subset observed after execution. Figure 2 can therefore be
+read as a simple rule: beige is early but conservative, blue is faithful
+but late, and purple adds measured impact.
+A task unit is a small batch of training views. We call the first
+point at which a task reads mutable primitive parameters or opti-
+mizer state its state-observation point. For a single view, 𝑅+
+𝑖and
+𝑊+
+𝑖are conservative read and update scopes used before that point.
+The + superscript means an admission upper bound, not the exact
+set that will execute. For the render-loss phases evaluated here,
+𝑊+
+𝑖
+⊆𝑅+
+𝑖⊆G𝑖; pipelines with broader update effects declare a
+wider 𝑊+
+𝑖or synchronize the phase.
+For task unit 𝑈, Odin takes the union over its views: 𝑅+(𝑈) =
+∪𝑖∈𝑈𝑅+
+𝑖, 𝑊+(𝑈) = ∪𝑖∈𝑈𝑊+
+𝑖, and C𝑈= ∪𝑖∈𝑈C𝑖. For an active prim-
+itive 𝑝, 𝑔𝑈(𝑝) is the accumulated per-primitive gradient magnitude
+after the pipeline’s normal gradient scaling. These post-execution
+signals support later refinement and importance-aware admission;
+the early scopes support scheduling and quality-first validation.
+Real scenes show the same pattern at scale. Figure 3 reports that
+even conservative geometry-locality scopes are smaller than the full
+primitive pool, while scopes from computational and importance lo-
+cality are smaller still. The gap creates scheduling opportunity, and
+the scene-to-scene variation explains why Odin combines ahead-
+of-time scheduling with runtime validation.
+3
+
+
+--- Page 4 ---
+Ma et al.
+Figure 4: Primitive-index synchronization over aligned ten-
+sor state. Colors mark view scopes and hatching marks
+shared indices; the few columns shown are schematic, while
+real PBNR scenes typically have 𝑁in the millions. Pan-
+els (b) and (c) emphasize dependency and publication order
+rather than proportional execution cost; block lengths are
+schematic. Standard iteration-level synchronization waits
+after each publication. Odin schedules a low-conflict order,
+overlaps disjoint scopes, and validates primitive publication
+before later state reads; shared pending indices wait for pub-
+lication.
+2.2
+Distributed PBNR
+Distributed PBNR usually scales training through data parallelism
+(DP) or partitioned-state execution such as mixed parallelism (MP) [9].
+DP replicates Θ and reconciles updates; MP shards Θ and com-
+municates view-needed state. Both reduce memory pressure or
+communication volume, but typically keep task- or iteration-level
+synchronization.
+Figure 4 translates the locality abstraction into the program state
+seen by a distributed runtime. In memory, PBNR state is stored
+as aligned tensors; semantically, each column across those tensors
+is one primitive index. This makes the mismatch independent of
+whether execution uses DP replication or MP sharding: the physical
+state may be tensor-shaped, but visibility conflicts are primitive-
+index scoped. A standard barrier serializes views even when their
+primitive-index scopes are disjoint. Odin instead schedules low-
+conflict views to expose overlap and validates primitive publication
+before state reads, so only shared pending primitive updates delay
+later work.
+3
+Motivation and Approach
+Figures 2 and 4 expose both the opportunity and the constraint. The
+locality example shows that views usually touch only a subset of
+the global primitive pool. The tensor-index example shows why this
+subset must become a synchronization boundary: a global barrier
+makes a later view wait even when primitive-index scopes are
+disjoint, but removing synchronization entirely would let a view
+read shared pending indices. The system problem is therefore to
+replace an iteration-wide boundary with scheduled primitive-level
+synchronization checks over only the updates a later view may
+observe.
+Odin follows a predict-and-validate principle because exact primitive-
+index conflicts are unavailable when the overlap window must be
+placed. A purely ahead-of-time scheduler can use early geometry,
+but that signal is conservative; a purely reactive scheduler observes
+faithful primitive activity only after the overlap opportunity has
+passed. Odin therefore predicts task-unit order and overlap win-
+dows from a stable locality prior and phase order, then validates
+each planned window before state observation. Failed predictions
+trigger primitive-scoped synchronization on the affected updates,
+while realized activity and gradients refine later dispatch and ad-
+mission decisions.
+Primitive scopes tell Odin when a later task can run without
+observing conflicting unpublished updates; global structural events
+remain synchronized. This is the quality-first path: it preserves
+synchronized-training visibility while replacing a global barrier
+with primitive-level waits. In practical distributed PBNR runs, how-
+ever, a small read-after-write overlap can still block an otherwise
+useful window. The throughput-first path addresses this second
+bottleneck with a delayed-scope ratio and producer-gradient gate,
+admitting only RAW delayed reads whose PBNR rendering signals
+indicate small numerical effect. Odin therefore first narrows syn-
+chronization to primitive scopes, then uses importance to broaden
+that boundary where the workload supports it, rather than replac-
+ing training with generic asynchronous execution.
+4
+Method
+Odin’s method is organized into three parts: graph construction,
+graph scheduling, and graph execution. Graph construction builds
+the relative locality graph (RLG) and binds it to the phase task graph,
+giving Odin both a data-relation signal and the legal phase order
+of the PBNR pipeline. Graph scheduling performs the ahead-of-
+time optimization: static data scheduling arranges task-unit order,
+and static asynchronous scheduling places candidate overlap win-
+dows on the phase task graph. Graph execution is the dynamic
+counterpart for shared tensor state: it executes overlapped units
+through Shadow Graph, refines ready-unit dispatch through dy-
+namic data scheduling, and uses dynamic asynchronous scheduling
+to revalidate planned windows before state observation.
+4.1
+Graph Construction
+The first stage constructs the graph abstraction over which Odin
+schedules. Odin separates opportunity discovery from visibility
+validation: the static graph ranks promising view-pair overlaps, and
+graph execution validates observable primitive updates before state
+is consumed. This lets the RLG use a strong, stable locality prior
+without fixing absolute primitive dependencies before training.
+4.1.1
+Relative locality graph. The core abstraction is a relative lo-
+cality graph (RLG), a weighted undirected graph
+R = (V, E,𝑤),
+where each vertex 𝑣𝑖∈V represents a training data item, instan-
+tiated as an input view in PBNR; E stores retained locality edges;
+and 𝑤𝑖𝑗is a relative coupling score between views 𝑖and 𝑗. Larger
+weights mean stronger expected contention. The RLG is an addi-
+tional scheduling input outside the phase task graph and renderer
+4
+
+
+--- Page 5 ---
+Odin
+Figure 5: Relative locality graph (RLG) for the four-view
+example. Nodes are views and edges are predicted coupling.
+The panels compare no graph, geometry-, computation-, and
+importance-based RLGs. Odin builds the ahead-of-time RLG
+from stable co-visibility and uses later evidence to refine
+dispatch or admission.
+autograd graph: it ranks overlap opportunities with stable, update-
+able locality evidence, while runtime validates visibility. This suits
+PBNR because primitive positions and update regions move during
+training; view-pair coupling is more stable than sampling-space
+indices such as octrees. For scheduling scores, a missing edge uses
+𝑤𝑖𝑗= 0 and is validated at runtime, not treated as proven indepen-
+dence.
+Figure 5 shows why RLG construction is a design choice rather
+than a direct lookup. Coarse signals yield dense graphs and few
+schedulable opportunities; faithful signals appear too late or change
+too quickly to serve as the initial RLG.
+Geometry-based RLG. A geometry-based RLG from projection
+overlap or owner-region metadata is cheap, early, and useful for con-
+servative scopes. It is a natural fit for top-down city-scale captures,
+where cross-view coupling is often weaker and spatial coverage is
+more separable. For general PBNR, however, it is too coarse: over-
+lapping projected regions may correspond to different surfaces,
+occlusions, or weakly shared primitives, making the graph dense
+and discarding many useful overlap windows.
+Computation-based RLG. A computation-based RLG follows
+an inspector–executor pattern: first trace or pre-run visibility and
+primitive accesses, then schedule against the materialized depen-
+dency graph. It is faithful, and Odin uses realized activity after
+execution for summaries and dispatch refinement. As the ahead-of-
+time RLG, however, it is impractical: tracing is expensive, arrives
+after the useful overlap window, and becomes stale as primitives
+move, split, or disappear.
+Importance-based RLG. It should rank not only whether two
+views overlap, but whether their overlap is likely to matter. Gra-
+dients provide one numeric signal: compositing, occlusion, and
+transmittance make some nonzero primitive overlaps dominant
+and others weak [12, 13]. This post-backward evidence supports
+delayed-scope and gradient gates in Graph Execution, but it cannot
+place the initial overlap window.
+Odin instead builds the ahead-of-time RLG from a physical im-
+portance prior: stable co-visibility. We use SfM tracks [14, 15]: ob-
+servations that repeatedly share tracks are likely to access related
+scene content, while observations without shared tracks are less
+likely to do so. This gives the scheduler an importance-like ranking
+before gradients exist, more selective than coarse geometry and
+more stable than a traced primitive-access graph.
+Let P𝑖denote the set of SfM tracks associated with data item 𝑖. If
+P𝑖∪P𝑗is nonempty, Odin defines the RLG edge weight by Jaccard
+similarity:
+𝑤𝑖𝑗= |P𝑖∩P𝑗|
+|P𝑖∪P𝑗| .
+(1)
+If the union is empty, Odin sets 𝑤𝑖𝑗= 0 and relies on runtime
+validation rather than treating the pair as proven independent. For
+task-unit scheduling, Odin summarizes two units by the largest re-
+tained view-pair coupling between them. We compute shared-track
+counts through an inverse track-to-item mapping, cap unusually
+long tracks to limit outliers, and retain only the top-𝑘neighbors
+per item, where lowercase 𝑘is the neighbor-retention parameter
+and uppercase 𝐾later denotes the number of logical regions. These
+choices affect only ranking; publication safety is checked at runtime.
+Table 3 reports the overhead.
+SfM-based construction is one RLG instantiation; later realized
+activity and gradient evidence can refresh transition scores. Out-
+dated edges reduce scheduling quality rather than quality-first
+safety, because Graph Execution validates planned overlap before
+state observation.
+4.1.2
+Phase task graph. In addition to the RLG, Odin uses the ex-
+isting phase task graph of a PBNR training pipeline. This graph
+records legal phase order, such as scope extraction, preprocess-
+ing, rendering, backward computation, communication, optimizer
+update, and required barriers. It is not the tensor-level autograd
+graph inside the renderer; it is the coarse execution scaffold that
+existing systems can schedule. The phase task graph constrains
+legal execution but lacks the data-relation signal needed to identify
+low-conflict view transitions. Odin schedules on both graphs: the
+phase task graph preserves legal execution order, while the RLG
+supplies that missing primitive-state coupling signal.
+4.2
+Graph Scheduling
+Given the RLG and the phase task graph, Odin compiles locality into
+a scheduled graph in three steps: logical partitioning, static data
+scheduling, and static asynchronous scheduling. Figure 6 shows the
+intended transformation: the original phase order contains repeated
+communication/update barriers, LP and SDS reorder work so that
+weakly coupled regions appear near overlap opportunities, and
+SAS marks where communication can be launched ahead of a later
+validation point. The output records region assignment, task-unit
+order, candidate overlap windows, and validation points. It is not
+a final visibility decision: graph execution later dispatches ready
+work and validates, refines, or delays each planned window before
+state observation.
+Logical Partitioning (LP). LP partitions the RLG into 𝐾logical
+groups: scheduling bins, not state shards or device owners. A good
+partition balances groups, keeps strong coupling within groups,
+and leaves weak edges across groups; 𝐾controls the granularity of
+SDS’s inter-group rotation. The planner also keeps a region-level
+coupling summary so later steps can choose weakly coupled region
+transitions before selecting individual views. We use lightweight
+balanced clustering [16, 17]; other clustering choices can replace it
+without changing Odin’s publication rules.
+5
+
+
+--- Page 6 ---
+Ma et al.
+Figure 6: Odin scheduling pipeline on four ranks. Static sched-
+uling uses the RLG prior and phase order to arrange task
+units and place candidate overlap windows; runtime execu-
+tion adjusts dispatch and validates admission before state
+observation. Blue/green cells are computation from two logi-
+cal regions, orange cells are communication and optimizer-
+update barriers where publication may occur, and white gaps
+are idle bubbles.
+Static Data Scheduling (SDS). SDS rotates over the 𝐾groups to
+build task-unit order, preserving the epoch workload, task-unit size,
+and phase precedence while exposing low-conflict transitions. Odin
+first chooses a traversal over logical groups using the region-level
+coupling summary, preferring weakly coupled successors while
+keeping groups balanced. It then instantiates this traversal into
+concrete task units: each new unit is filled from the selected group
+by greedy local selection against the preceding scheduled unit𝑈prev.
+A candidate item 𝑣is scored by
+𝑠(𝑣| 𝑈prev) =
+∑︁
+𝑢∈𝑈prev
+𝑤𝑢𝑣.
+(2)
+SDS repeatedly selects low-score candidates until the unit is filled.
+It does not need to make every adjacent pair independent; it only
+increases the number of transitions worth attempting. If an ordering
+prediction is wrong, Graph Execution synchronizes the affected
+primitive updates before the later task observes state.
+Static Asynchronous Scheduling (SAS). Using the 𝐾-group
+SDS order, SAS maps task-unit transitions onto PBNR phases in-
+stead of treating each unit as an indivisible job. Each phase operator
+is bound to a task-unit id, producing events such as preprocessing,
+rendering, backward computation, communication, and optimizer
+update for 𝐴and 𝐵. For adjacent 𝐴→𝐵, a global barrier waits
+for 𝐴’s backward-generated primitive updates to communicate and
+publish before 𝐵’s state observation. SAS statically marks this edge
+as blocking or as a candidate overlap window: candidates launch
+Figure 7: Shadow Graph execution for overlapped task units.
+Phase labels 𝑃/𝑅/𝐵/𝑈/𝐶denote preprocessing, rendering,
+backward computation, optimizer update, and communi-
+cation; suffixes 0/1 identify two task units. Each unit uses
+private logical views for local execution and staged gradient
+publication while physical model state remains shared. Num-
+bered arrows summarize private read, local autograd, staged
+update, staged publication after validation, shared-state re-
+fresh, and reuse.
+𝐴’s publication communication asynchronously and place a valida-
+tion point before 𝐵observes state; high RLG coupling, structural
+phases, or windows whose profiled live state exceeds the memory
+budget stay blocking. The decision combines RLG coupling with a
+lightweight phase profile of coarse render, backward, communica-
+tion, and update durations. If the planned window is shorter than
+the actual publication time, Graph Execution leaves a residual wait,
+shown as white bubbles in Figure 6. SAS never admits reads by
+itself; Graph Execution validates primitive scopes at the marked
+point.
+4.3
+Graph Execution
+Graph execution realizes the scheduled graph produced by graph
+scheduling. The scheduled graph fixes task-unit order and candi-
+date overlap windows, but runtime behavior determines which
+ready unit should run next and whether a planned window is safe
+before state observation. Odin therefore executes the plan with
+three coupled mechanisms: Shadow Graph supports overlapped
+execution without full model replication, dynamic data scheduling
+refines ready-unit dispatch under observed load, and dynamic asyn-
+chronous scheduling validates or corrects planned overlap using
+primitive scopes and realized evidence.
+Shadow Graph execution. A direct execution issue arises once
+Odin overlaps phase-level work across task units. The synchroniza-
+tion boundary is primitive-index scoped, but the physical model
+state remains a set of shared aligned tensors and training loops
+normally expose one serialized producer–consumer chain over that
+state. If a later unit computes while an earlier unit communicates,
+the two units can otherwise alias the same buffers or observe incon-
+sistent primitive versions. Replicating model-visible state for every
+in-flight unit would remove aliasing but would be too expensive.
+Odin avoids this overhead with Shadow Graph (Figure 7). Shadow
+Graph gives each in-flight unit a private logical view of data access
+and gradient staging while keeping the underlying physical model
+6
+
+
+--- Page 7 ---
+Odin
+state shared. The numbered arrows in Figure 7 have the following
+meaning: (1) each unit reads from a virtualized data buffer; (2)
+each unit executes with its own instance-local autograd graph;
+(3) gradients are written into a shared two-slot ring buffer that
+also serves as the communication source; (4) once the required
+primitive-publication condition is satisfied, the produced slot is
+committed to the shared gradient view; (5) the optimizer consumes
+this shared gradient view to update model data; and (6) the data
+view is refreshed for subsequent units. Shadow Graph therefore
+resolves aliasing by virtualizing access and staging publication; this
+adds small metadata and staging cost, measured in Figure 16, while
+avoiding full model replication.
+Quality-first path. The quality-first path follows one publica-
+tion rule: before a later task unit 𝐵reads mutable primitive state,
+every earlier unpublished update from 𝐴that could affect that read
+must either be disjoint under conservative scopes or already pub-
+lished. Let 𝑅+(𝑋) and 𝑊+(𝑋) be the conservative read and update
+scopes of task unit 𝑋. Odin checks the primitive-state hazards
+𝐶+
+WAW(𝐴, 𝐵) =𝑊+(𝐵) ∩𝑊+(𝐴),
+𝐶+
+RAW(𝐴, 𝐵) = (𝑅+(𝐵) \𝑊+(𝐵)) ∩𝑊+(𝐴),
+𝐶+
+WAR(𝐴, 𝐵) =𝑊+(𝐵) ∩(𝑅+(𝐴) \𝑊+(𝐴)).
+RAW and WAW conflicts wait for 𝐴’s primitive publication; WAR
+conflicts wait until 𝐴’s state-observing phase has completed. The
+RAW expression excludes 𝑊+(𝐵) because overlap with 𝐵’s update
+scope is already covered by WAW. If all three sets are empty, 𝐵
+may proceed while unrelated communication remains in flight.
+Missing scopes, invalid structural versions, densification, pruning,
+reset, or overly broad mutable candidate selection synchronize the
+affected phase. Thus the quality-first path replaces the global barrier
+with primitive-level waits while preserving synchronized-training
+visibility under the declared primitive-scope interface.
+Throughput-first path. This path addresses a deployment pain
+point: in overlapping or dense PBNR captures, a small nonzero RAW
+overlap can still block a useful overlap window. Such overlap is not
+automatically high impact. Compositing, occlusion, and transmit-
+tance give primitive interactions physical and numerical weights,
+making some dominant and others weak [12, 13]. Throughput-first
+therefore changes only RAW waits that pass both admission tests
+and uses one admission parameter 𝜏∈[0, 1] to bound delayed-
+scope ratio and producer-gradient magnitude. For a candidate tran-
+sition, Odin defines the delayed-read set as
+𝐷+(𝐴, 𝐵) = 𝐶+
+RAW(𝐴, 𝐵)
+and measures 𝜌(𝐴, 𝐵) = |𝐷+(𝐴, 𝐵)|/|𝑅+(𝐵)| when 𝑅+(𝐵) ≠∅; an
+empty consumer read scope has no RAW delayed-read admission
+to perform. The delayed read is considered only when 𝜌(𝐴, 𝐵) ≤𝜏.
+Each delayed primitive 𝑝must also have producer-gradient evi-
+dence no larger than a 𝜏-scaled active-set mean, where ∥𝑔𝐴(𝑝)∥is
+the per-primitive gradient magnitude after pipeline-level normal-
+ization:
+∥𝑔𝐴(𝑝)∥≤𝜏·
+1
+|C𝐴|
+∑︁
+𝑞∈C𝐴
+∥𝑔𝐴(𝑞)∥.
+The gradient gate is evaluated only when C𝐴is nonempty and all
+delayed primitives have producer evidence. If either test fails, or if
+evidence is missing, Odin waits exactly as in the quality-first path.
+WAW, WAR, writes, structural changes, high-impact cases, and
+missing evidence are never admitted by this path. Each admitted
+primitive reads the last version published before 𝐴’s pending up-
+date. Per-primitive publication metadata prevents a second delayed
+producer from being admitted on the same primitive, so a read can
+skip at most one unpublished update. The default 𝜏setting is fixed
+for the main results and validated in Section 6; quality-sensitive
+reconstructions can use the quality-first path.
+Dynamic Data Scheduling (DDS). Static Data Scheduling de-
+termines which data items belong to each task unit and in what
+order these units appear on the scheduled graph, but it does not
+fix how ready task units should be dispatched to ranks at runtime.
+In practice, phase durations vary across units and ranks, so purely
+static dispatch may expose avoidable stragglers and bubbles even
+when the task-unit order is well chosen.
+Odin therefore performs lightweight online refinement. When-
+ever multiple ready task units are simultaneously admissible under
+current graph and synchronization rules, the runtime assigns them
+to ranks using recent load estimates and queue state. This refine-
+ment does not rewrite data assignment inside task units and does
+not alter the offline order; it only adjusts the spatial dispatch of
+already admissible work to reduce short-term skew and improve
+utilization.
+Dynamic Asynchronous Scheduling (DAS). SAS places can-
+didate overlap windows before exact primitive activity is known.
+DAS revalidates these windows as more faithful evidence becomes
+available. The initial RLG is constructed from stable co-visibility
+for static planning. Before a task unit observes mutable state, a
+pre-observation scope hook exposes conservative primitive scopes.
+After execution, the backward phase reports realized activity and
+gradient magnitude, refining later dispatch and throughput-first
+decisions.
+If current scopes do not support a planned overlap, DAS inserts
+the missing primitive-level synchronization as a stream dependency
+and delays the consumer until the producer publication completes.
+Because this check runs before the consumer observes conflicting
+state, correction requires neither rollback nor kernel re-execution;
+it only reduces planned overlap and may expose residual bubbles.
+Together, DDS and DAS keep the original method symmetry: Graph
+Scheduling predicts data order and overlap opportunities, while
+Graph Execution refines dispatch and validates publication before
+state observation using the best available scope evidence.
+5
+Implementation
+Odin is implemented as a scheduling and runtime layer around
+existing PBNR training pipelines. The offline planner consumes
+camera metadata, SfM tracks, phase boundaries, and a coarse phase
+profile to build the RLG, form 𝐾logical groups, rotate task units, and
+mark candidate overlap windows. Planning is tied to stable scene
+metadata and training-loop phases rather than renderer internals, so
+it does not change model representation, renderer kernels, optimizer
+math, training budget, or model capacity.
+7
+
+
+--- Page 8 ---
+Ma et al.
+At runtime, Odin requires three integration points, implemented
+as hooks in our adapters. A pre-state-observation scope hook ex-
+poses conservative primitive ids before mutable parameter, opacity,
+candidate metadata, or optimizer-state reads. A post-backward hook
+reports realized active primitive ids and normalized per-primitive
+gradient magnitudes. A publication callback marks completed com-
+munication/reduction and the corresponding optimizer update.
+Across 3DGS, 2DGS, TamingGS, and DashGS, adapter code maps
+each renderer’s candidate and active primitive sets to this interface;
+the optimized TamingGS/DashGS kernels keep the same primitive-
+id namespace. If a pre-read bound is unavailable, Odin widens the
+scope to an owner region or synchronizes the phase. Densifica-
+tion, pruning, opacity reset, or optimizer/model schedule changes
+advance the structural version and force a barrier.
+At execution time, Odin uses separate compute and communica-
+tion streams, Shadow Graph staging, structural version metadata,
+publication state, and active-unit metadata to realize the scheduled
+graph. The same publication rules apply to data-parallel and mixed-
+parallel execution: in DP, Odin overlaps replica communication
+with compatible computation; in MP, it validates sparse cross-shard
+exchange the same way. The implementation changes when later
+work may observe primitive state, while preserving the underlying
+PBNR training pipeline.
+6
+Evaluation
+We evaluate Odin with 8-GPU experiments across four PBNR pipelines
+and 13 non-city scenes, plus a separate MatrixCity mixed-parallel
+case study up to 64 GPUs. The experiments ask whether primitive
+publication improves throughput, whether throughput-first execu-
+tion keeps quality within the normalized reporting band, whether
+quality-first falls back conservatively on dense scopes, and whether
+gains come from primitive-level wait hiding rather than fewer bytes
+or unscoped asynchrony.
+6.1
+Experimental Setup
+Hardware. We run on nodes with NVIDIA RTX 4090 GPUs.
+Within a node, GPUs use PCIe 4.0 ×16. Across nodes, we use a
+160 Gbps network with eRDMA. Each node has Intel Xeon 6462C
+CPUs and runs Ubuntu 22.04 LTS. We evaluate both single-node
+and multi-node settings, scaling up to 64 GPUs.
+Datasets. We benchmark on the datasets in Table 2, spanning
+indoor, outdoor-360◦, object-scale, and city-scale scenes. Unless
+noted otherwise, results are averaged over all scenes in each dataset.
+MatrixCity is MP-only: replicating the full city-scale tensor state
+and optimizer buffers for DDP exceeds per-GPU memory at the
+evaluated model capacity, so a DDP run would require reducing
+capacity or changing training.
+Table 2: Evaluation datasets. The table lists scene count, cap-
+ture type, and scale; MatrixCity is a single-region MP case
+study, while the other datasets use both DP and MP unless
+stated.
+Dataset
+#Scenes
+Type
+Scale
+MipNeRF360 [18]
+9
+in/out-360◦
+mixed
+Tanks & Temples [19]
+2
+outdoor/object medium
+DeepBlending [20]
+2
+indoor/room
+medium
+MatrixCity [21]
+1
+aerial/city
+large
+Pipelines and baselines. We evaluate four representative PBNR
+pipelines: 3DGS, TamingGS, DashGS, and 2DGS. For DP, we com-
+pare against PyTorch DistributedDataParallel (DDP) with the same
+PBNR-specific densification and pruning behavior as the corre-
+sponding pipeline; for MP, we compare against Grendel [9]. Gaian
+uses point-based differentiable-rendering access patterns for point
+placement and image-to-GPU assignment. To isolate Odin’s syn-
+chronization boundary, we keep placement and exchange fixed
+(DDP in DP, Grendel-style partitioned state in MP) and change only
+ordering, admission, validation, and publication. Generic distributed-
+training schedulers overlap communication within declared layer/tensor
+boundaries but do not expose primitive publication decisions; we
+therefore use controls for locality-only ordering, no-locality async
+overlap, partitionless HOGWILD-style execution [22], and execu-
+tion without dynamic validation.
+All comparisons use the same renderer kernels, optimizer, den-
+sification/pruning schedule, global batch size, training iterations,
+communication backend, and quality checkpoint as the correspond-
+ing baseline. Odin changes task-unit ordering, admission, validation,
+and publication; it does not change renderer math or model capacity.
+Quality comparisons use the same epoch workload, random seed,
+and training budget, so reported deltas include any effect of Odin’s
+ordering and execution path.
+Metrics. We report end-to-end training throughput, reconstruc-
+tion quality, and runtime overhead. Throughput is
+throughput = 𝑁iter · 𝐵
+𝑇wall
+,
+where 𝑁iter is the number of iterations, 𝐵is global batch size, and
+𝑇wall is wall-clock time. Unless otherwise stated, the per-GPU batch
+size is 𝐵gpu = 2. Reconstruction quality uses PSNR, SSIM, and
+LPIPS [23]; quality figures report normalized aggregate deltas from
+the synchronized baseline against a ±1% reporting band. We also
+report communication hiding, overheads, and fallback behavior.
+Execution paths. We report a quality-first path and a throughput-
+first path. The quality-first path admits only disjoint or already
+published primitive scopes and conservatively synchronizes ev-
+ery conflicting primitive update. The throughput-first path enables
+importance-aware admission with logical-region count 𝐾= 4 and
+joint admission parameter𝜏= 0.2 unless stated otherwise; 𝜏bounds
+the delayed primitive-set ratio and selects gradients below a 𝜏-
+scaled active-set mean. The headline 1.22× is the arithmetic mean
+of Odin/base throughput ratios over the evaluated non-city 8-GPU
+runs with throughput-first execution; Figure 8 groups the same
+8
+
+
+--- Page 9 ---
+Odin
+runs for readability, so visible group labels are not an averaging
+recipe. We also report the quality-first path on an 8-GPU 3DGS fall-
+back stress subset; with importance-aware delayed reads disabled,
+speedup ranges from 1.00× on dense kitchen to 1.23× on sparse
+scenes.
+6.2
+End-to-End Acceleration
+Single-node DP. Figures 8–10 test single-node DP training with
+the same renderer kernels and communication backend as the base-
+line. Figure 8 shows gains across 3DGS, 2DGS, TamingGS, and
+DashGS because all retain iteration-level publication. Gains are
+larger on less optimized pipelines, where communication and rank
+skew remain more exposed; TamingGS and DashGS leave less re-
+movable waiting after their kernel and update-pipeline optimiza-
+tions.
+Figure 8: End-to-end 8-GPU throughput, excluding Matrix-
+City. Each group is one pipeline–dataset setting; paired bars
+compare the task- or iteration-synchronized baseline with
+Odin’s default throughput-first setting, labels are grouped
+speedup, and higher samples/s is better. The headline 1.22× is
+computed over scene-level non-city 8-GPU Odin/base ratios.
+Figure 9 breaks down the same question by scene. Per-scene speedup
+varies substantially. The low-gain Stump case is consistent with
+denser view–primitive coupling and fewer admitted overlap win-
+dows, while higher-gain scenes leave cleaner structural signals and
+more decomposable interaction patterns. Speedup therefore follows
+dependency structure rather than pipeline identity alone.
+Figure 9: Per-scene 3DGS speedup over DDP on 8 GPUs. One
+bar is one scene; colors distinguish above-mean and below-
+mean gains. Higher observed speedup corresponds to more
+admitted overlap under this setup. Stump is the low-overlap
+case.
+Figure 10 sweeps GPU count and global batch size. Odin improves
+throughput throughout the sweep, while relative gain narrows
+as 𝐵increases because larger batches create fewer synchroniza-
+tion boundaries per sample. This is the expected signature of a
+primitive-level synchronization optimization: it helps most when
+communication remains on the critical path and enough later work
+exists to overlap with it.
+Figure 10: 3DGS throughput on DeepBlending across GPU
+counts and global batch 𝐵. Gray is PyTorch/DDP, blue is Odin,
+labels are speedup over DDP, and higher samples/s is better.
+Larger 𝐵narrows relative gain.
+Parallel regimes and scale. Figures 11–13 test whether Odin
+remains useful when the baseline already uses partitioned state.
+Grendel reduces memory pressure and communication volume
+through spatial partitioning; Odin still improves throughput be-
+cause it addresses whether the remaining sparse exchange must
+block unrelated later work. The gain is smaller than the DP gain
+at some single-node points because Grendel already removes part
+of the exposed cost, but it persists in the fragmented MP regime.
+Primitive-level synchronization is therefore complementary to com-
+munication sparsification.
+Figure 11: Mixed-parallel scaling across datasets. Dashed line
+is the 1-GPU reference; bars compare Grendel with Gren-
+del+Odin in each regime; labels are overall speedup over the
+1-GPU reference, and higher speedup is better.
+Figure 12 compares DP and MP on truck. Adding Odin moves both
+regimes closer to ideal scaling, reaching 7.6× with DDP+Odin and
+improving Grendel as well. Figure 13 extends the result to multi-
+node MatrixCity: gain grows from 1.27× at 32 GPUs to 1.89× at 64
+GPUs, consistent with greater synchronization exposure at larger
+scale. Even in this communication-heavy case, Odin improves effec-
+tive scaling by moving compatible sparse exchange off the critical
+path.
+6.3
+Operating Point and Overheads
+Figures 14–17 and Table 3 characterize throughput-first sensitivity,
+quality, ahead-of-time cost, Shadow Graph overhead, and quality-
+first fallback.
+9
+
+
+--- Page 10 ---
+Ma et al.
+Figure 12: Overall multi-GPU speedup on truck. Bars
+compare PyTorch/DDP, PyTorch+Odin, Grendel, and Gren-
+del+Odin against the 1-GPU reference; the marker is ideal
+8-GPU speedup. Odin reaches 7.6×.
+Figure 13: Multi-node MP throughput on single-region Ma-
+trixCity. X-axis is GPU count, y-axis samples/s, gray Gren-
+del, blue Grendel+Odin, and red labels Odin-over-Grendel
+speedup: 1.27× at 32 GPUs and 1.89× at 64 GPUs.
+Figure 14: Scheduling-parameter sensitivity. Left sweeps
+logical-region count 𝐾; right sweeps joint admission param-
+eter 𝜏. Default setting: 𝐾= 4,𝜏= 0.2.
+Figure 14 shows that increasing 𝐾or 𝜏can enlarge the schedulable
+region, but the return is not monotonic. Too few logical regions
+leave coupled views adjacent; too many fragment scheduling and
+increase live-state pressure. A larger𝜏admits more pending updates
+by widening both tests. The default setting 𝐾= 4,𝜏= 0.2 is used
+unchanged in the main results.
+Figure 15 evaluates the default throughput-first setting. At 𝐾=
+4,𝜏= 0.2, all plotted PSNR, SSIM, and LPIPS aggregate deltas stay
+within the ±1% reporting band. This matches the admission rule:
+delayed reads are limited to small nonzero overlap scopes and
+weak producer-gradient updates, which typically correspond to
+Figure 15: Reconstruction quality at 𝜏= 0.2. Groups sweep
+global batch 𝐵, colors are datasets, and bars are normalized
+aggregate deltas from the task- or iteration-synchronized
+baseline. Dashed box marks the ±1% reporting band.
+non-dominant interactions under PBNR compositing and occlu-
+sion. The quality-first path remains the conservative choice when
+delayed reads are unacceptable.
+Table 3: End-to-end ahead-of-time (AOT) overhead from track
+metadata, in seconds. Includes graph construction and sched-
+ule compilation; excludes SfM/reconstruction.
+Images
+1,000
+2,000
+5,000
+10,000
+20,000
+50,000
+Time
+0.013
+0.028
+0.161
+0.464
+1.673
+9.450
+Table 3 shows that the ahead-of-time scheduler is lightweight for
+production-scale captures: 50,000 images take 9.45 seconds for
+graph construction and schedule compilation, excluding SfM/reconstruction
+already present in common PBNR inputs. The dominant work is
+the inverse track-to-image mapping; scheduling itself adds little
+overhead. This one-time cost is amortized over training.
+Figure 16: Shadow Graph overhead. Left: extra memory ver-
+sus logical-region count 𝐾; right: per-operation virtualization
+cost. Compared with full logical-state replication, Odin keeps
+memory nearly flat and cuts operation cost by up to 257×.
+Figure 16 shows that Shadow Graph avoids full logical-state repli-
+cation: extra memory stays nearly flat with 𝐾, and per-operation
+overhead is up to 257× lower than the replication-based alternative.
+Figure 17 disables importance-aware delayed reads to stress quality-
+first execution. Sparse playroom/drjohnson reject only 1.3% and 0.8%
+of planned overlaps, while dense kitchen rejects 98.6% and returns
+to 1.00×. Intermediate scenes retain speedup despite nontrivial fall-
+back; failed predictions become primitive-scoped synchronization
+rather than rollback or re-execution. The pattern matches Odin’s
+conservative fallback design.
+10
+
+
+--- Page 11 ---
+Odin
+Figure 17: Runtime fallback under the quality-first path.
+Gray bars are rejected planned overlaps, blue points speedup,
+and purple points wait per fallback event. Sparse Play-
+room/drjohnson still speed up; dense kitchen falls back to
+synchronization.
+6.4
+Ablation Study
+Component and wait attribution. Figures 18 and 19 attribute
+gains to coordinated ordering, admission, validation, and wait hid-
+ing.
+Figure 18: Ablation on a representative 8-GPU 3DGS run
+(𝐾= 4,𝜏= 0.2). Bars show throughput, red line shows PSNR,
+and “w/o LP” is the partitionless HOGWILD-style control.
+Figure 18 shows that removing SAS largely removes the gain, con-
+firming that barrier removal and communication–computation
+overlap are the main source of acceleration. Removing SDS also
+hurts because useful overlap depends on arranging weakly coupled
+transitions near candidate windows. The dynamic components are
+complementary: DDS reduces short-term imbalance, while DAS
+protects the plan from outdated or inaccurate locality predictions.
+The partitionless asynchronous control loses throughput and qual-
+ity, arguing against a simple HOGWILD-style interpretation. Full
+Odin is therefore a coordinated design rather than a single rule.
+Figure 19 connects the ablation back to the motivation: Odin hides
+82% of critical-path exposed wait through primitive-level synchro-
+nization and validation, not renderer changes, model reduction, or
+unscoped asynchrony. The remaining exposed time comes from
+globally synchronized phases, rejected overlap windows, or ranks
+without enough compatible ready work.
+Figure 19: Runtime breakdown on a representative 8-GPU
+3DGS run. Left shows timeline components; right shows ex-
+posed wait after overlap. Odin hides 82% of critical-path wait,
+not raw bytes.
+7
+Related Work
+PBNR representation and single-device systems. Recent PBNR
+work improves scene representation or single-device execution.
+Representation methods revise primitive geometry, compactness,
+or quality [2, 24], while system optimizations accelerate kernels,
+memory movement, pruning, or update pipelines [25–33]. These
+advances are complementary: they shrink computation and expose
+the barrier mismatch that Odin targets. Odin changes when primi-
+tive updates become visible to later work, not the representation or
+renderer kernels.
+Distributed PBNR systems. Existing distributed PBNR sys-
+tems mainly optimize where state and work reside. CityGaussian,
+VastGaussian, hierarchical 3DGS, and DOGS use spatial decom-
+position, hierarchy, or blockwise consensus to reduce memory
+pressure and communication [10, 34–36]; Grendel partitions pa-
+rameters and uses mixed parallelism [9]. Gaian [11] is the closest
+work in spirit: it exploits point-based differentiable-rendering ac-
+cess patterns for locality-aware point placement and image-to-GPU
+assignment. Odin uses the same broad property–localized primitive
+access–for a different boundary. Placement decides where primi-
+tives and views run and how much state moves; Odin decides when
+a pending primitive update must become visible at a later state
+read.
+General distributed training and relaxed updates. General
+distributed-training systems hide communication through collec-
+tive scheduling, layer or tensor overlap, or pipeline stages [37–41].
+These techniques assume explicit neural-network boundaries such
+as layers, tensors, or stages. PBNR has a shallow phase structure
+and a mutable primitive set whose active scope depends on view-
+dependent numerical state, so the relevant conflict boundary lies
+below the exposed abstraction. Delayed-update and partial-update
+methods [22, 42–44] study stale or partial updates in dense neural
+networks, sparse optimization, or tensor averaging, but they can-
+not be directly applied to PBNR without identifying low-impact
+primitive RAW overlaps. Odin specializes this case with static
+locality-guided scheduling, runtime primitive-scope validation, and
+a throughput path gated by delayed-scope ratio and producer-
+gradient evidence.
+11
+
+
+--- Page 12 ---
+Ma et al.
+8
+Discussion
+Scope and fallback. Odin requires conservative primitive scopes
+before state observation, publication points after communication/update,
+and late active-id and gradient evidence. If these signals are unavail-
+able, or if structural mutations, dense fields, global regularizers, or
+unversioned mutable candidate selection dominate, Odin widens
+the scope or synchronizes the affected phase.
+Relationship to other scaling techniques. Odin is not a re-
+placement for partitioning, sparse exchange, or renderer optimiza-
+tion. Gaian and Grendel decide where primitives and views run;
+Odin decides when pending primitive updates become visible at
+state reads.
+Operating modes. Quality-first is the conservative choice for
+dense scenes, strict quality constraints, or insufficient scope evi-
+dence. Throughput-first targets latency-sensitive runs and admits
+only gated RAW delayed reads; rejected windows fall back to prim-
+itive synchronization.
+Beyond PBNR. Odin targets a workload class rather than a
+single application: explicit mutable state with read/write scopes,
+publication points, and late refinement evidence. This condition
+explains why the same mechanism applies across 3DGS, 2DGS,
+TamingGS, DashGS, DP, and MP without changing renderer ker-
+nels or optimizer math. It also suggests a broader direction for
+sparse explicit-state AI systems such as online reconstruction, neu-
+ral mapping, and object-, voxel-, or map-level world models; dense
+all-to-all state, hidden mutable kernel state, or unavoidable global
+regularization remains conservative.
+9
+Conclusion
+Odin shows that global barriers are not inherent to distributed
+PBNR. Primitive-level publication, static locality planning, runtime
+validation, and Shadow Graph staging improve throughput by 1.22×
+on average and 1.89× over Grendel without changing kernels, opti-
+mizers, budgets, or model capacity.
+References
+[1] Bernhard Kerbl, Georgios Kopanas, Thomas Leimkuehler, and George Drettakis.
+2023. 3D Gaussian Splatting for Real-Time Radiance Field Rendering. ACM Trans.
+Graph. 42, 4, Article 139 (July 2023), 14 pages. doi:10.1145/3592433
+[2] Binbin Huang, Zehao Yu, Anpei Chen, Andreas Geiger, and Shenghua Gao.
+2024. 2D Gaussian Splatting for Geometrically Accurate Radiance Fields. In
+ACM SIGGRAPH 2024 Conference Papers (Denver, CO, USA) (SIGGRAPH ’24).
+Association for Computing Machinery, New York, NY, USA, Article 32, 11 pages.
+doi:10.1145/3641519.3657428
+[3] Guangchi Fang and Bing Wang. 2024. Mini-Splatting: Representing Scenes
+with a Constrained Number of Gaussians. In Computer Vision – ECCV 2024, Aleš
+Leonardis, Elisa Ricci, Stefan Roth, Olga Russakovsky, Torsten Sattler, and Gül
+Varol (Eds.). Springer Nature Switzerland, Cham, 165–181.
+[4] Sharath Girish, Kamal Gupta, and Abhinav Shrivastava. 2025. EAGLES: Efficient
+Accelerated 3D Gaussians with Lightweight EncodingS. In Computer Vision –
+ECCV 2024, Aleš Leonardis, Elisa Ricci, Stefan Roth, Olga Russakovsky, Torsten
+Sattler, and Gül Varol (Eds.). Springer Nature Switzerland, Cham, 54–71.
+[5] Joo Chan Lee, Daniel Rho, Xiangyu Sun, Jong Hwan Ko, and Eunbyung Park.
+2024. Compact 3D Gaussian Representation for Radiance Field. In 2024 IEEE/CVF
+Conference on Computer Vision and Pattern Recognition (CVPR). 21719–21728.
+doi:10.1109/CVPR52733.2024.02052
+[6] Lukas Radl, Michael Steiner, Mathias Parger, Alexander Weinrauch, Bernhard
+Kerbl, and Markus Steinberger. 2024. StopThePop: Sorted Gaussian Splatting for
+View-Consistent Real-time Rendering. ACM Trans. Graph. 43, 4, Article 64 (July
+2024), 17 pages. doi:10.1145/3658187
+[7] Jad Abou-Chakra, Krishan Rana, Feras Dayoub, and Niko Sünderhauf. 2024.
+Physically Embodied Gaussian Splatting: A Realtime Correctable World Model
+for Robotics. arXiv preprint arXiv:2406.10788 (2024).
+[8] Guanxing Lu, Baoxiong Jia, Puhao Li, Yixin Chen, Ziwei Wang, Yansong Tang,
+and Siyuan Huang. 2025. GWM: Towards Scalable Gaussian World Models for
+Robotic Manipulation. arXiv:2508.17600 [cs.RO] https://arxiv.org/abs/2508.17600
+[9] Hexu Zhao, Haoyang Weng, Daohan Lu, Ang Li, Jinyang Li, Aurojit Panda, and
+Saining Xie. 2025. On Scaling Up 3D Gaussian Splatting Training. In Computer
+Vision – ECCV 2024 Workshops, Alessio Del Bue, Cristian Canton, Jordi Pont-Tuset,
+and Tatiana Tommasi (Eds.). Springer Nature Switzerland, Cham, 14–36.
+[10] Yang Liu, Chuanchen Luo, Lue Fan, Naiyan Wang, Junran Peng, and Zhaoxiang
+Zhang. 2025. CityGaussian: Real-Time High-Quality Large-Scale Scene Render-
+ing with Gaussians. In Computer Vision – ECCV 2024, Aleš Leonardis, Elisa Ricci,
+Stefan Roth, Olga Russakovsky, Torsten Sattler, and Gül Varol (Eds.). Springer
+Nature Switzerland, Cham, 265–282.
+[11] Hexu Zhao, Xiaoteng Liu, Xiwen Min, Jianhao Huang, Youming Deng, Yanfei Li,
+Ang Li, Jinyang Li, and Aurojit Panda. 2025. Scaling Point-based Differentiable
+Rendering for Large-scale Reconstruction. arXiv:2512.20017 [cs.DC] https:
+//arxiv.org/abs/2512.20017
+[12] Shiyong Liu, Xiao Tang, Zhihao Li, Yingfan He, Chongjie Ye, Jianzhuang Liu,
+Binxiao Huang, Shunbo Zhou, and Xiaofei Wu. 2025. OccluGaussian: Occlusion-
+Aware Gaussian Splatting for Large Scene Reconstruction and Rendering. In
+Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV).
+26643–26652.
+[13] Chai-Rong Lee, Ting-Yu Yen, Kai-Wen Hsiao, Shih-Hsuan Hung, Sheng-Chi Hsu,
+Min-Chun Hu, Chih-Yuan Yao, and Hung-Kuo Chu. 2024. ODA-GS: Occlusion-
+and Distortion-aware Gaussian Splatting for Indoor Scene Reconstruction. In SIG-
+GRAPH Asia 2024 Technical Communications (SA ’24). Association for Computing
+Machinery, New York, NY, USA, Article 29, 4 pages. doi:10.1145/3681758.3697997
+[14] Johannes L. Schönberger and Jan-Michael Frahm. 2016. Structure-from-Motion
+Revisited. In 2016 IEEE Conference on Computer Vision and Pattern Recognition
+(CVPR). 4104–4113. doi:10.1109/CVPR.2016.445
+[15] Jianyuan Wang, Minghao Chen, Nikita Karaev, Andrea Vedaldi, Christian Rup-
+precht, and David Novotny. 2025. VGGT: Visual Geometry Grounded Trans-
+former. In 2025 IEEE/CVF Conference on Computer Vision and Pattern Recognition
+(CVPR). 5294–5306. doi:10.1109/CVPR52734.2025.00499
+[16] James B McQueen. 1967. Some methods of classification and analysis of multi-
+variate observations. In Proc. of 5th Berkeley Symposium on Math. Stat. and Prob.
+281–297.
+[17] S. Lloyd. 1982. Least squares quantization in PCM. IEEE Transactions on Infor-
+mation Theory 28, 2 (1982), 129–137. doi:10.1109/TIT.1982.1056489
+[18] Jonathan T. Barron, Ben Mildenhall, Dor Verbin, Pratul P. Srinivasan, and Peter
+Hedman. 2022. Mip-NeRF 360: Unbounded Anti-Aliased Neural Radiance Fields.
+In 2022 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR).
+5460–5469. doi:10.1109/CVPR52688.2022.00539
+[19] Arno Knapitsch, Jaesik Park, Qian-Yi Zhou, and Vladlen Koltun. 2017. Tanks
+and temples: benchmarking large-scale scene reconstruction. ACM Trans. Graph.
+36, 4, Article 78 (July 2017), 13 pages. doi:10.1145/3072959.3073599
+[20] Peter Hedman, Julien Philip, True Price, Jan-Michael Frahm, George Drettakis,
+and Gabriel Brostow. 2018. Deep blending for free-viewpoint image-based
+rendering. ACM Trans. Graph. 37, 6, Article 257 (Dec. 2018), 15 pages. doi:10.
+1145/3272127.3275084
+[21] Yixuan Li, Lihan Jiang, Linning Xu, Yuanbo Xiangli, Zhenzhi Wang, Dahua Lin,
+and Bo Dai. 2023. MatrixCity: A Large-scale City Dataset for City-scale Neural
+Rendering and Beyond. In 2023 IEEE/CVF International Conference on Computer
+Vision (ICCV). 3182–3192. doi:10.1109/ICCV51070.2023.00297
+[22] Feng Niu, Benjamin Recht, Christopher Re, and Stephen J. Wright. 2011. HOG-
+WILD! a lock-free approach to parallelizing stochastic gradient descent. In Pro-
+ceedings of the 25th International Conference on Neural Information Processing
+Systems (Granada, Spain) (NIPS’11). Curran Associates Inc., Red Hook, NY, USA,
+693–701.
+[23] Richard Zhang, Phillip Isola, Alexei A. Efros, Eli Shechtman, and Oliver Wang.
+2018. The Unreasonable Effectiveness of Deep Features as a Perceptual Metric. In
+2018 IEEE/CVF Conference on Computer Vision and Pattern Recognition. 586–595.
+doi:10.1109/CVPR.2018.00068
+[24] Antoine Guédon and Vincent Lepetit. 2024. SuGaR: Surface-Aligned Gaussian
+Splatting for Efficient 3D Mesh Reconstruction and High-Quality Mesh Render-
+ing. In 2024 IEEE/CVF Conference on Computer Vision and Pattern Recognition
+(CVPR). 5354–5363. doi:10.1109/CVPR52733.2024.00512
+[25] Saswat Subhajyoti Mallick, Rahul Goel, Bernhard Kerbl, Markus Steinberger,
+Francisco Vicente Carrasco, and Fernando De La Torre. 2024. Taming 3DGS:
+High-Quality Radiance Fields with Limited Resources. In SIGGRAPH Asia 2024
+Conference Papers (Tokyo, Japan) (SA ’24). Association for Computing Machinery,
+New York, NY, USA, Article 2, 11 pages. doi:10.1145/3680528.3687694
+[26] Youyu Chen, Junjun Jiang, Kui Jiang, Xiao Tang, Zhihao Li, Xianming Liu, and
+Yinyu Nie. 2025. DashGaussian: Optimizing 3D Gaussian Splatting in 200 Seconds.
+In 2025 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR).
+11146–11155. doi:10.1109/CVPR52734.2025.01041
+12
+
+
+--- Page 13 ---
+Odin
+[27] Junseo Lee, Seokwon Lee, Jungi Lee, Junyong Park, and Jaewoong Sim. 2024.
+GSCore: Efficient Radiance Field Rendering via Architectural Support for 3D
+Gaussian Splatting. In Proceedings of the 29th ACM International Conference on
+Architectural Support for Programming Languages and Operating Systems, Volume
+3 (La Jolla, CA, USA) (ASPLOS ’24). Association for Computing Machinery, New
+York, NY, USA, 497–511. doi:10.1145/3620666.3651385
+[28] Houshu He, Gang Li, Fangxin Liu, Li Jiang, Xiaoyao Liang, and Zhuoran Song.
+2025. GSArch: Breaking Memory Barriers in 3D Gaussian Splatting Training via
+Architectural Support. In 2025 IEEE International Symposium on High Performance
+Computer Architecture (HPCA). 366–379. doi:10.1109/HPCA61900.2025.00037
+[29] Alex Hanson, Allen Tu, Geng Lin, Vasu Singla, Matthias Zwicker, and Tom
+Goldstein. 2025. Speedy-Splat: Fast 3D Gaussian Splatting with Sparse Pixels and
+Sparse Primitives. In 2025 IEEE/CVF Conference on Computer Vision and Pattern
+Recognition (CVPR). 21537–21546. doi:10.1109/CVPR52734.2025.02006
+[30] Lukas Höllein, Aljaž Božič, Michael Zollhöfer, and Matthias Nießner. 2025. 3DGS-
+LM: Faster Gaussian-Splatting Optimization with Levenberg-Marquardt. In Pro-
+ceedings of the IEEE/CVF International Conference on Computer Vision (ICCV).
+[31] Hexu Zhao, Xiwen Min, Xiaoteng Liu, Moonjun Gong, Yiming Li, Ang Li, Saining
+Xie, Jinyang Li, and Aurojit Panda. 2026. CLM: Removing the GPU Memory
+Barrier for 3D Gaussian Splatting. In Proceedings of the 31st ACM International
+Conference on Architectural Support for Programming Languages and Operating
+Systems, Volume 2 (USA) (ASPLOS ’26). Association for Computing Machinery,
+New York, NY, USA, 377–393. doi:10.1145/3779212.3790140
+[32] Donghyun Lee, Dawoon Jeong, Jae W. Lee, and Hongil Yoon. 2026. GS-Scale:
+Unlocking Large-Scale 3D Gaussian Splatting Training via Host Offloading. In
+Proceedings of the 31st ACM International Conference on Architectural Support for
+Programming Languages and Operating Systems, Volume 2 (USA) (ASPLOS ’26).
+Association for Computing Machinery, New York, NY, USA, 860–875. doi:10.
+1145/3779212.3790167
+[33] Weikai Lin, Yu Feng, and Yuhao Zhu. 2025. MetaSapiens: Real-Time Neural
+Rendering with Efficiency-Aware Pruning and Accelerated Foveated Rendering.
+In Proceedings of the 30th ACM International Conference on Architectural Sup-
+port for Programming Languages and Operating Systems, Volume 1 (Rotterdam,
+Netherlands) (ASPLOS ’25). Association for Computing Machinery, New York,
+NY, USA, 669–682. doi:10.1145/3669940.3707227
+[34] Jiaqi Lin, Zhihao Li, Xiao Tang, Jianzhuang Liu, Shiyong Liu, Jiayue Liu, Yangdi
+Lu, Xiaofei Wu, Songcen Xu, Youliang Yan, and Wenming Yang. 2024. Vast-
+Gaussian: Vast 3D Gaussians for Large Scene Reconstruction. In 2024 IEEE/CVF
+Conference on Computer Vision and Pattern Recognition (CVPR). 5166–5175.
+doi:10.1109/CVPR52733.2024.00494
+[35] Bernhard Kerbl, Andreas Meuleman, Georgios Kopanas, Michael Wimmer,
+Alexandre Lanvin, and George Drettakis. 2024. A Hierarchical 3D Gaussian
+Representation for Real-Time Rendering of Very Large Datasets. ACM Trans.
+Graph. 43, 4, Article 62 (July 2024), 15 pages. doi:10.1145/3658160
+[36] Yu Chen and Gim Hee Lee. 2024. DOGS: distributed-oriented Gaussian splatting
+for large-scale 3D reconstruction via Gaussian consensus. In Proceedings of the
+38th International Conference on Neural Information Processing Systems (Vancou-
+ver, BC, Canada) (NIPS ’24). Curran Associates Inc., Red Hook, NY, USA, Article
+1087, 26 pages.
+[37] Abhinav Jangda, Jun Huang, Guodong Liu, Amir Hossein Nodehi Sabet, Saeed
+Maleki, Youshan Miao, Madanlal Musuvathi, Todd Mytkowicz, and Olli Saarikivi.
+2022. Breaking the computation and communication abstraction barrier in
+distributed machine learning workloads. In Proceedings of the 27th ACM Inter-
+national Conference on Architectural Support for Programming Languages and
+Operating Systems (Lausanne, Switzerland) (ASPLOS ’22). Association for Com-
+puting Machinery, New York, NY, USA, 402–416. doi:10.1145/3503222.3507778
+[38] Lin Zhang, Shaohuai Shi, Xiaowen Chu, Wei Wang, Bo Li, and Chengjian Liu.
+2023. DeAR: Accelerating Distributed Deep Learning with Fine-Grained All-
+Reduce Pipelining. In 2023 IEEE 43rd International Conference on Distributed
+Computing Systems (ICDCS). 142–153. doi:10.1109/ICDCS57875.2023.00054
+[39] Shenggan Cheng, Shengjie Lin, Lansong Diao, Hao Wu, Siyu Wang, Chang Si,
+Ziming Liu, Xuanlei Zhao, Jiangsu Du, Wei Lin, and Yang You. 2025. Concerto:
+Automatic Communication Optimization and Scheduling for Large-Scale Deep
+Learning. In Proceedings of the 30th ACM International Conference on Architectural
+Support for Programming Languages and Operating Systems, Volume 1 (Rotterdam,
+Netherlands) (ASPLOS ’25). Association for Computing Machinery, New York,
+NY, USA, 198–213. doi:10.1145/3669940.3707223
+[40] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Mia Xu Chen, Dehao
+Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V. Le, Yonghui Wu, and Zhifeng
+Chen. 2019. GPipe: efficient training of giant neural networks using pipeline
+parallelism. Curran Associates Inc., Red Hook, NY, USA.
+[41] Yanghua Peng, Yibo Zhu, Yangrui Chen, Yixin Bao, Bairen Yi, Chang Lan,
+Chuan Wu, and Chuanxiong Guo. 2019.
+A generic communication sched-
+uler for distributed DNN training acceleration. In Proceedings of the 27th
+ACM Symposium on Operating Systems Principles (Huntsville, Ontario, Canada)
+(SOSP ’19). Association for Computing Machinery, New York, NY, USA, 16–29.
+doi:10.1145/3341301.3359642
+[42] Xupeng Miao, Xiaonan Nie, Yingxia Shao, Zhi Yang, Jiawei Jiang, Lingxiao
+Ma, and Bin Cui. 2021. Heterogeneity-Aware Distributed Machine Learning
+Training via Partial Reduce. In Proceedings of the 2021 International Conference
+on Management of Data (Virtual Event, China) (SIGMOD ’21). Association for
+Computing Machinery, New York, NY, USA, 2262–2270. doi:10.1145/3448016.
+3452773
+[43] Shigang Li, Tal Ben-Nun, Salvatore Di Girolamo, Dan Alistarh, and Torsten
+Hoefler. 2020. Taming unbalanced training workloads in deep learning with
+partial collective operations. In Proceedings of the 25th ACM SIGPLAN Symposium
+on Principles and Practice of Parallel Programming (San Diego, California) (PPoPP
+’20). Association for Computing Machinery, New York, NY, USA, 45–61. doi:10.
+1145/3332466.3374528
+[44] Weigao Sun, Zhen Qin, Weixuan Sun, Shidi Li, Dong Li, Xuyang Shen, Yu
+Qiao, and Yiran Zhong. [n. d.]. CO2: Efficient Distributed Training with Full
+Communication-Computation Overlap. In The Twelfth International Conference
+on Learning Representations.
+13
