@@ -1,10 +1,21 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-07-23
+**Last Updated:** 2026-07-28
 
 ---
 
 ## Recent Papers
+
+#### 2026-07-28 (1 papers)
+
+### [Search Hardness-Aware LLM-Based Problem Formulation for Expensive Simulation-Driven Design](https://arxiv.org/abs/2607.21220)
+
+**2026-07-23** | Xidian University, Victoria University of Wellington | M=7 P=6 I=7 *discuss*
+
+*Method:* LLM-based problem formulation with search hardness-aware evolutionary refinement | *LLM role:* formulation_generator, formulation_repairer, state_judge, evolutionary_operator
+
+> This paper proposes an LLM-based evolutionary framework to automatically generate and refine optimization problem formulations (objectives and constraints) for expensive simulation-driven design. The authors empirically demonstrate on a hydrology task and five antenna design benchmarks that their evolved formulations require significantly fewer expensive simulator evaluations to reach feasible designs compared to expert-designed or zero-shot LLM formulations. The key insight is using initial random simulation data to identify 'hard but promising' (rare and non-dominated) states, and then using a candidate formulation's ability to prioritize these anchor states as the fitness signal for the evolutionary search. This is highly relevant for research in LLM evolutionary search and automated OR modeling, as it provides a concrete method for constructing proxy rewards that improve sample efficiency when evaluating generated code is computationally expensive.
+
 
 #### 2026-07-23 (2 papers)
 

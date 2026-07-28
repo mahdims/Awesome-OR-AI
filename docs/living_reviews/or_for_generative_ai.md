@@ -1,10 +1,21 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-07-23
+**Last Updated:** 2026-07-28
 
 ---
 
 ## Recent Papers
+
+#### 2026-07-28 (1 papers)
+
+### [TileSight: A First-Principles Tile-Centric Analytical GPU Performance Model from Cores to Clusters](https://arxiv.org/abs/2607.22432)
+
+**2026-07-24** | Imperial College London, Peking University, Microsoft Research, University of Edinburgh, Shanghai Jiao Tong University, Tile-AI | M=6 P=8 I=7 *discuss*
+
+*Method:* Unified tile-centric analytical execution engine with hierarchical pipeline envelope modeling, tile reuse-distance cache modeling, and placement-based cross-device tile access | *LLM role:* none
+
+> TileSight is a first-principles, tile-centric analytical performance model that predicts GPU kernel and end-to-end LLM serving latency by simulating intra-tile resource usage, inter-tile cache reuse, and cross-device communication. The results are rigorously backed by hardware measurements, achieving 12.35% MAPE on single-GPU kernels and 13.52% wMAPE on end-to-end vLLM serving across diverse architectures (A100 to B6000), outperforming learned predictors. The key insight is that lifting performance modeling to the tile abstraction (rather than thread or cache-line level) enables fast, schedule-sensitive, and deterministic latency predictions without requiring per-architecture ML training. This is highly relevant for research in LLM serving scheduling and GPU resource allocation, as TileSight can serve as a highly accurate, white-box cost estimator for optimization formulations.
+
 
 #### 2026-07-23 (5 papers)
 

@@ -1,10 +1,37 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-07-23
+**Last Updated:** 2026-07-28
 
 ---
 
 ## Recent Papers
+
+#### 2026-07-28 (3 papers)
+
+### [SpecAHD: Localize to Specialize for Automated Heuristic Design in Large-Scale Routing Problems](https://arxiv.org/abs/2607.23676)
+
+**2026-07-26** | Guangdong University of Technology | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Coupled bilevel AHD framework using LLM-guided evolutionary search to co-evolve region exposure policies and repair heuristics, with submodular repertoire selection and a response archive for region-conditioned routing. | *LLM role:* evolutionary_search
+
+> SpecAHD introduces a bilevel LLM evolutionary search framework that co-evolves an upper-level program to expose local repair regions and a lower-level repertoire of specialized constructive heuristics to repair them. The results are rigorously backed by extensive empirical evidence, showing cost reductions of up to 57.7% against state-of-the-art AHD baselines (like EoH and ReEvo) on large-scale routing benchmarks including CVRP and VRPTW up to 10,000 nodes. The key insight is the 'Repair Response Archive'—a memory mechanism that logs heuristic performance on specific local structures during training, allowing a k-NN router to dynamically select the best specialized heuristic for new regions at inference time. This is highly relevant for our work in LLM evolutionary search and large-scale routing, as it provides a concrete, scalable architecture for within-instance specialization and memory-augmented heuristic selection.
+
+### [Teaching LLMs to Self-Evolve: Cultivating Core Meta-Skills with Reinforcement Learning](https://arxiv.org/abs/2607.21971)
+
+**2026-07-24** | University of Illinois Urbana-Champaign | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Reinforcement Learning with Group Relative Policy Optimization (GRPO) on synthesized evolution trajectories | *LLM role:* evolutionary_search
+
+> Wu et al. introduce METAEVOLVE, a framework that uses reinforcement learning (GRPO) to explicitly train LLMs to perform iterative self-evolution and refinement. The results are rigorously backed by execution-based metrics, showing a 24% absolute improvement over AlphaEvolve on out-of-distribution coding tasks and a 46% relative speedup on open-ended algorithm optimization benchmarks. The key insight is that instead of relying on zero-shot prompting in an evolutionary loop, researchers can synthesize evolution trajectories (current code, fitness, history) from static datasets and use execution feedback as a verifiable reward to fine-tune the mutator LLM. This is a highly significant paper for our work in LLM evolutionary search, as it provides an actionable, scalable blueprint for RL-infused evolution that directly improves sample efficiency and search quality.
+
+### [NeurGO: Learning to Generate Elite Candidates for Meta-Black-Box Expensive Optimization](https://arxiv.org/abs/2607.23408)
+
+**2026-07-26** | China University of Geosciences | M=6 P=6 I=7 *discuss*
+
+*Method:* Generative Meta-Black-Box Optimization (MetaBBO) framework using an attention-based Transformer encoder (PCE) and an MLP-based Elite Synthesis Decoder (ESD) trained with a Quality–Diversity (QD) loss | *LLM role:* none
+
+> NeurGO is a generative meta-black-box optimization framework that uses a Transformer encoder to capture population search trends and an MLP decoder to directly synthesize a small set of elite candidates for expensive optimization tasks. The method is backed by strong empirical results on CEC 2008 and COCO BBOB benchmarks (D=10), demonstrating faster convergence and better final performance than Bayesian Optimization and other MetaBBO baselines under a strict 300-evaluation budget. The key insight is that instead of generating raw candidate coordinates, the decoder outputs contribution weights used to recombine the existing population's representations, ensuring generated candidates remain anchored to known promising regions and avoiding out-of-distribution proposals. This architectural design is highly relevant for continuous latent-space optimization and could be directly adapted to improve sample efficiency when optimizing continuous representations of algorithms or heuristics.
+
 
 #### 2026-07-23 (2 papers)
 
