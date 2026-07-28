@@ -1,0 +1,1706 @@
+--- Page 1 ---
+Learn2Zinc: Fine-tuning Small Language Models
+for Text-to-Model Translation in MiniZinc
+Serdar Kadıoğlu1, 2 and Karthik Uppuluri1
+1AI Center of Excellence, Fidelity Investments
+2Department of Computer Science, Brown University
+serdark@cs.brown.edu
+Abstract
+Large language models excel at code generation for mainstream programming
+languages but struggle with rare, domain-specific languages such as MiniZinc, a
+constraint modeling language for combinatorial problems. We investigate whether
+targeted fine-tuning can teach small language models (0.6B to 20B parameters)
+to generate syntactically correct and semantically valid MiniZinc models from
+natural language problem descriptions.
+Our key finding is that syntax errors
+dominate failures when working with this domain specific language: the out-
+of-the-box execution accuracy of small language models such as Qwen3, LLaMa,
+Gemma, and GPT-OSS is near-zero. We propose a cross-model error bootstrapping
+approach that collects syntax errors from multiple LLM runs and leverage those to
+curate an error correction training dataset. This dataset allows us fine-tune small
+language models that consistently improves both direct code generation and chain-
+of-thought approaches across all model sizes. With self-reflection and ensembling,
+our approach achieves up to 98% execution accuracy. In parallel, solution accuracy
+still remains at 35%, indicating that while syntax is learnable, constraint reasoning
+remains a challenge. We contribute our fine-tuning pipeline, datasets, and models
+to opens-source for further research on text-to-model translation.
+1
+Introduction
+Optimization technology has achieved significant advancements, ranging from dramatic improve-
+ments in solver efficiency to the development of high-level modeling languages to enhance usability.
+Nevertheless, the fundamental decision-making framework has remained unchanged for decades, ad-
+hering to the de facto model-and-run strategy. Within this status quo, users are required to manually
+convert problem descriptions into optimization models, which are subsequently processed by solvers
+to obtain solutions.
+Over the years, high-level modeling languages such as MiniZinc (Nethercote et al. 2007),
+CPMpy (Guns 2019), and GAMS (Bussieck & Meeraus 2004) have partially addressed the ac-
+cessibility challenge by providing solver-agnostic approaches that are powerful and flexible. These
+modeling frameworks enable practitioners to focus on describing their problems without worrying
+about specific solution methods, making them especially useful for real-world applications, where
+requirements often change over time. However, the cognitive barrier of translating problem descrip-
+tions into formal constraint models persists. This barrier is particularly acute, as domain experts who
+deeply understand their problem domain often lack the specialized knowledge required for formal
+modeling. The resulting dependency on modeling experts creates operational bottlenecks and can
+lead to misinterpretation of domain-specific requirements during the translation process.
+In parallel, Large Language Models (LLMs) have emerged as the communication medium with
+machines (OpenAI et al. 2024, Team et al. 2025, DeepSeek-AI et al. 2025). While language models
+are powerful at interfacing with natural text, they struggle with the consistency and precision required
+in formal, declarative approaches, from basic type declarations to complex constraint relations. They
+face significant challenges in handling the mathematical and logical reasoning needed for text-to-
+model translation (Simchi-Levi et al. 2025, Wasserkrug et al. 2025, Kadıoğlu et al. 2024)1.
+1https://skadio.github.io/text2model
+1
+arXiv:2607.20456v1  [cs.CL]  14 May 2026
+
+
+--- Page 2 ---
+This current gap between understanding textual descriptions and turning them into problem formu-
+lations indicates that more work is needed for modeling assistants.
+A critical observation motivating this work is that MiniZinc, as a domain-specific language, has far
+less representation in typical LLM pretraining corpora compared to established languages such as
+Python, C++, or Java. For perspective, the GitHub topic page for MiniZinc lists on the order of a
+hundred repositories, compared to millions for Python or JavaScript. This limited presence means
+that LLMs have had minimal exposure to MiniZinc syntax during their pretraining. Supporting this
+observation, four out of five models we tested; Qwen3, LLaMa, and Gemini, achieve 0.0% execution
+accuracy on MiniZinc generation, and the largest model (GPT-OSS-20B) reaches only 6.0%. This
+confirms that MiniZinc is clearly out-of-distribution for the current best small language models.
+This raises a fundamental research question: Can targeted fine-tuning teach small language models
+a domain-specific programming language such as MiniZinc?. This is exactly what we study in this
+paper.
+1.1
+Our Contributions
+Our contributions are as follows:
+1. We present the first systematic study of fine-tuning small language models from 0.6B to
+20B parameters for MiniZinc code generation.
+2. To make fine-tuning possible, we introduce a cross-model error bootstrapping approach that
+collects syntax errors from multiple LLM runs and leverage this to create a realistic error
+correction training dataset.
+3. We propose three fine-tuning strategies of increasing sophistication and show that augment-
+ing the training data with error correction examples consistently outperforms both direct
+code generation and chain-of-thought approaches across all model sizes.
+4. Our performance, when using an ensemble of our fine-tuned models, achieves 98% ex-
+ecution accuracy, up from 0.0-6.0% out-of-the-box accuracy, effectively solving the
+MiniZinc syntax problem. At the same time, we identify constraint reasoning as the
+remaining bottleneck with only 35% solution accuracy with a detailed analysis on error
+modes.
+5. We open-source our fine-tuning pipeline 2, the best-performing fine-tuned model at various
+scale 0.6B, 1B, 3B, 9B, and 20B parameters3, and our instruction-tuning datasets4 to
+facilitate reproducibility and future research in text-to-model generation.
+2
+Background
+Let us briefly review the constraint modeling language used in this study, MiniZinc, the dataset used
+for benchmarking, Text2Zinc, and our LLM copilot approaches, Text2Model.
+2.1
+MiniZinc
+MiniZinc (Nethercote et al. 2007) is a high-level constraint modeling language that supports both
+discrete and continuous optimization and satisfaction problems. Its solver-agnostic design allows
+communication with various solver backends, including Constraint Programming (CP), (Mixed)
+Integer Programming (MIP), and Boolean Satisfiability/Lazy Clause Generation (SAT). This flex-
+ibility is achieved through compilation to FlatZinc, an intermediate language that interfaces with
+different solvers, allowing the same MiniZinc model to be used across multiple backends without
+code modifications.
+A key feature of MiniZinc is its use of global constraints, which significantly simplify the modeling
+process. For example, the all_different constraint specifies that a set of variables must take
+distinct values, replacing numerous pairwise inequality constraints.
+2https://github.com/skadio/learn2zinc
+3https://huggingface.co/skadio/learn2zinc
+4https://huggingface.co/datasets/skadio/learn2zinc
+2
+
+
+--- Page 3 ---
+The MiniZinc language structure consists of four main components: decision variables, constraints,
+parameters, and an objective function (for optimization) or a satisfaction goal.
+MiniZinc also
+separates models (.mzn files) from data instances (.dzn files), allowing a single model to be reused
+across multiple problem instances.
+This paper builds on two previous complementary works: Text2Zinc dataset to establish a common
+benchmark for this task, and Text2Model copilots to establish a baseline performance of various
+LLM approaches.
+2.2
+Text2Zinc Dataset
+Text2Zinc (Singirikonda et al. 2025) introduces a cross-domain dataset for modeling optimization
+and satisfaction problems in MiniZinc. It is the first dataset in this line of research that covers both
+satisfaction and optimization problems in a solver- and paradigm-agnostic language. The dataset
+brings together 1,775 problems from multiple sources, including Nlp4lp (AhmadiTeshnizi et al.
+2024), Hakank, ComplexOr (Xiao et al. 2023), LpWp (Ramamonjison et al. 2022), CspLib, and
+problems from Cardinal Operations covering both Mamo and Nl4Opt (Kadıoğlu et al. 2024) collec-
+tions (see Table 1 for a full breakdown by category). Of these, 110 are fully verified with manually
+written MiniZinc models, complete metadata, and validated solutions. For the remaining problems,
+which originate from IndustryOr, Mamo, and Nl4Opt, ground-truth objective values are avail-
+able through the original sources for verification purposes. The dataset provides 𝑖𝑠_𝑜𝑝𝑡𝑖𝑚𝑖𝑧𝑎𝑡𝑖𝑜𝑛,
+𝑖𝑠_𝑠𝑎𝑡𝑖𝑠𝑓𝑎𝑐𝑡𝑖𝑜𝑛, ℎ𝑎𝑠_𝑣𝑒𝑟𝑖𝑓𝑖𝑒𝑑_𝑜𝑏𝑗, ℎ𝑎𝑠_𝑣𝑒𝑟𝑖𝑓𝑖𝑒𝑑_𝑚𝑧𝑛, ℎ𝑎𝑠_𝑑𝑧𝑛to distinguish among these
+properties.
+2.3
+Text2Model Copilots
+Text2Model (Kadıoğlu et al. 2026) introduces a suite of copilots for text-to-model translation
+using frontier LLMs.
+It evaluates several strategies of varying complexity on the Text2Zinc
+dataset, including zero-shot prompting, chain-of-thought reasoning, knowledge-graph representa-
+tions, grammar-based syntax encoding, and agentic approaches. A key observation is that even
+frontier LLMs with sophisticated prompting strategies are not yet a push-button technology for
+combinatorial modeling.
+3
+Learn2Zinc: Fine-Tuning Small Language Models
+The important insight that led to this work is as follows. Running several Text2Model copilots on
+hundreds of Text2Zinc instances generate a considerable amount MiniZinc models, even though
+the MiniZinc models are not manually written. While generation is straightforward, the key ad-
+vantage stems from the verification loop: the output can be verified with known objective value for
+optimization problems, and feasibility can be asserted for satisfaction problems. This yields a large
+pool of verified ⟨𝑡𝑒𝑥𝑡, 𝑚𝑜𝑑𝑒𝑙⟩pairs that makes fine-tuning possible.
+In this paper, we go beyond dependency on large frontier models for generating constraint models and
+investigate whether targeted fine-tuning can teach small language models (0.6B–20B parameters)
+to generate MiniZinc code. Crucially, this effort requires designing a fine-tuning dataset. Our
+fine-tuning dataset starts from the verified MiniZinc solutions in Text2Zinc. In addition, we draw
+samples leveraging the Or-Instruct dataset (Huang et al. 2024)5. The Or-Instruct dataset contains
+optimization problems with Copt models written in Python. Given these problem descriptions, their
+Copt model, and verified objective value, we use GPT-5.2 to generate a translation from Copt to
+MiniZinc. We add the result to our fine-tuning dataset if and only if MiniZinc output matches the
+known objective.
+As shown in Table 1, when MiniZinc models for Text2Zinc and Or-Instruct are combined, they
+together cover a set of 2,208 unique problems. Importantly, instances might be associated with
+alternative MiniZinc models generated by different Text2Model copilot strategy. Overall, this
+yields 8,014 instruction-tuning ⟨𝑡𝑒𝑥𝑡, 𝑚𝑜𝑑𝑒𝑙⟩pairs for fine-tuning small language models.
+5We are indebted to the creators of the Or-Instruct dataset for their valuable contribution to the community.
+3
+
+
+--- Page 4 ---
+Dataset
+Source
+Instances
+Percentage
+Orlm (Huang et al. 2024)
+Or-Instruct-3K
+1,351
+61.2%
+Text2Zinc (Singirikonda et al. 2025)
+Mamo
+604
+27.4%
+Nl4Opt
+200
+9.1%
+Nlp4Lp
+30
+1.4%
+Hakank
+10
+0.5%
+ComplexOr
+5
+0.2%
+LpWp
+5
+0.2%
+CspLib
+3
+0.1%
+Total
+2,208
+100%
+Table 1: Distribution of unique problem instances by source. Problems from Text2Zinc were
+verified against known objectives using Text2Model copilot strategies. Or-Instruct problems
+were translated from Copt models written in Python to MiniZinc via GPT-5.2.
+4
+Learn2Zinc: Fine-tuning Methodology
+Our fine-tuning methodology consists of a combination of different small language models at varying
+parameter sizes and different fine-tuning datasets. We consider both a generation fine-tuning and
+error-correction fine-tuning to teach SLMs MiniZinc syntax (§ 5).
+4.1
+Small Language Models (Slms)
+We consider four different families of small languages models (SLMs): Qwen, LLaMa, Gemma, and
+GPT. In particular, we fine-tune five different variants to cover different parameter sizes: Qwen3-
+0.6B (the smallest to test the lower bound of capability), LLaMA-3.2-1B and LLaMA-3.2-3B,
+Gemma-2-9B, and GPT-OSS-20B (the largest number of parameters).
+4.2
+Datasets & Setup
+We consider three different fine-tuning instruction datasets to consider a baseline, a chain-of-thought,
+and a mixed strategy.
+Learn2Zinc-Base.
+We obtain 8,014 instances with ⟨𝑡𝑒𝑥𝑡, 𝑚𝑜𝑑𝑒𝑙⟩pairs as described in § 4.
+Learn2Zinc-CoT (Chain-of-Thought).
+We take the baseline dataset with ⟨𝑡𝑒𝑥𝑡, 𝑚𝑜𝑑𝑒𝑙⟩pairs,
+and prompt a reasoning model, GPT4o. to generate reasoning chain from the problem text to the
+constraint model and identify variables, parameters, constraints, objective. Accordingly, this dataset
+also has 8,014 pairs of the form ⟨𝑡𝑒𝑥𝑡, 𝑟𝑒𝑎𝑠𝑜𝑛𝑖𝑛𝑔, 𝑚𝑜𝑑𝑒𝑙⟩.
+Learn2Zinc-Base+CoT.
+We combine both Learn2Zinc-Base and Learn2Zinc-CoT examples
+leading to 16,028 pairs.
+In Appendix A, we present examples of our baseline and CoT pairs. Notice how the CoT version
+introduces the reasoning chain as an intermediary in between the problem description and the
+constraint model.
+In our experiments, we fine-tune five different SLMs on three different fine-tuning datasets. The
+details of training hyperparameters are given in Appendix-Table 10. We employ Low-Rank Adapta-
+tion (LoRA) with 8-bit quantization for all models, except 4-bit for GPT-OSS-20B, to fit on a single
+A100 GPU.
+We choose LoRA over full fine-tuning for two reasons. First, our fine-tuning datasets are relatively
+small, with the base dataset comprising only 8,014 instances. At this scale, full fine-tuning is prone to
+overfitting and offers limited gains over parameter-efficient alternatives. Second, LoRA significantly
+reduces memory and compute requirements, allowing us to fine-tune models ranging from 0.6B to
+4
+
+
+--- Page 5 ---
+Model
+Strategy
+Exec Acc (%)
+Sol Acc (%)
+Qwen3-0.6B
+Original-8bit
+0.0
+0.0
+Learn2Zinc-Base
+51.0
+9.0
+Learn2Zinc-CoT
+44.0
+10.0
+Learn2Zinc-Base+CoT
+51.0
+12.0
+Learn2Zinc-Augmented
+64.0
+13.0
+LLaMA-3.2-1B
+Original-8bit
+0.0
+0.0
+Learn2Zinc-Base
+44.0
+4.0
+Learn2Zinc-CoT
+22.0
+1.0
+Learn2Zinc-Base+CoT
+46.0
+4.0
+Learn2Zinc-Augmented
+57.0
+8.0
+LLaMA-3.2-3B
+Original-8bit
+0.0
+0.0
+Learn2Zinc-Base
+62.0
+10.0
+Learn2Zinc-CoT
+47.0
+9.0
+Learn2Zinc-Base+CoT
+58.0
+12.0
+Learn2Zinc-Augmented
+70.0
+17.0
+Gemma-2-9B
+Original-8bit
+0.0
+0.0
+Learn2Zinc-Base
+74.0
+22.0
+Learn2Zinc-CoT
+49.0
+15.0
+Learn2Zinc-Base+CoT
+70.0
+21.0
+Learn2Zinc-Augmented
+72.0
+22.0
+GPT-OSS-20B
+Original-4bit
+6.0
+5.0
+Learn2Zinc-Base
+66.0
+27.0
+Learn2Zinc-CoT
+52.0
+21.0
+Learn2Zinc-Base+CoT
+63.0
+27.0
+Learn2Zinc-Augmented
+76.0
+32.0
+GPT-5.2†
+Agentic + Code (Kadıoğlu et al. (2026))
+86.0
+57.0
+Table 2: Execution and Solution Accuracy (%) across models and fine-tuning strategies. Best results
+per model are highlighted. †GPT-5.2 results are from Kadıoğlu et al. (2026) and shown for reference.
+20B parameters on a single GPU, where full fine-tuning would not be feasible. Among parameter-
+efficient fine-tuning (PEFT) approaches, LoRA is well-established and widely adopted, offering a
+strong balance between task adaptation and training efficiency, making it a suitable choice for our
+experimental setting.
+4.3
+Evaluation Metrics
+We use Execution Accuracy (the constraint model compiles and runs) and Solution Accuracy (the
+objective value found by solving the constraint model matches the ground truth) as used previously
+in several studies, e.g., Kadıoğlu et al. (2026).
+4.4
+Numerical Results
+For benchmarking, we use Text2Zinc-IndustryOr (100 problems) as our test set. It is important
+to note theses problems are not included in the fine-tuning. We use IndustryOr since it is the
+most challenging benchmark, as reported in Kadıoğlu et al. (2026), Huang et al. (2024), Liang et al.
+(2026), which shows 86% execution accuracy and 57% solution accuracy with an Agentic copilot
+using the frontier GPT-5.2 model. As the underlying solver, we use HiGHS in our experiments, with
+a 120-second timeout per problem.
+Table 2 presents execution and solution accuracy for each model and fine-tuning strategy. Please
+omit the augmented row in the table for now as we discuss this later in § 5. Figure 1 visualizes the
+same results to reveal emerging patterns.
+5
+
+
+--- Page 6 ---
+Qwen3-0.6B
+LLaMA-1B
+LLaMA-3B
+Gemma-9B
+GPT-OSS-20B
+0
+20
+40
+60
+80
+100
+Execution Accuracy (%)
+Learn2Zinc-Base
+Learn2Zinc-CoT
+Learn2Zinc-Base+CoT
+Learn2Zinc-Augmented
+Figure 1: Execution accuracy (%) across fine-tuning strategies and model sizes. Learn2Zinc-
+Augmented (green) consistently achieves the highest execution accuracy across all models, while
+Learn2Zinc-CoT (blue) underperforms all other strategies.
+Several patterns emerge from results in Table 2. First of all, original SLMs achieve near-zero
+accuracy. All models score 0%, except for GPT-OSS-20B with 6.0% execution and 5.0% solution
+accuracy. This confirms the main motivation of this paper: MiniZinc is clearly out-of-distribution
+for current best SLMs. With our fine-tuning, Gemma-2-9B achieves a remarkable boost from
+its original 0% execution accuracy to 74%. As a comparison between SLMs and frontier models,
+according to Kadıoğlu et al. (2026), GPT-5.2 performs 86% execution and 57% solution accurac
+on the same test set to generate MiniZinc models, as reported at the bottom row of Table 2.
+As Figure 1 makes it clear, interestingly, Learn2Zinc-CoT underperforms Learn2Zinc-Base
+across all models. This finding contrasts with several existing results where chain-of-thought often
+helps Kadıoğlu et al. (2026), Singirikonda et al. (2025), hinting that, unlike frontier models, SLMs
+cannot take advantage of reasoning traces. A possible interpretation is, reasoning traces cannot
+compensate for missing syntax when the small model has not been trained for MiniZinc at scale.
+Similarly, simply mixing Learn2Zinc-Base and Learn2Zinc-CoT examples provides no consis-
+tent improvement over Learn2Zinc-Base alone. Based on these findings, we therefore pursue a
+dedicated approach next to teach SLMs MiniZinc syntax.
+5
+Teaching Slms MiniZinc Syntax
+Our initial fine-tuning experiments with five SLMs and three fine-tuning strategies reveals a consistent
+pattern: SLM outputs are riddled with syntax errors. SLMs, even with our careful fine-tuning, cannot
+produce correct MiniZinc code where the best execution accuracy is still at 76%. Before we could
+even evaluate whether SLMs capture correct combinatorial semantics, most outputs fail to capture
+MiniZinc syntax and compile.
+Execution accuracy, even before solution accuracy, remains an
+immediate bottleneck.
+This observation shifts our focus. If we could potentially improve execution rates, models would have
+more opportunity to produce correct solutions. The question then becomes: how can we teach SLMs
+to avoid and correct their syntax mistakes? So far, we approached fined-tuning for text-to-model
+translation as generation fine-tuning and we now shift our focus to error-correction fine-tuning.
+For this purpose, we design an augmented training strategy that explicitly teaches syntax correction.
+The key insight is that models need exposure to common errors and their fixes, not just correct
+outputs.
+6
+
+
+--- Page 7 ---
+Rule ID
+Difficulty
+Description
+Example
+E1_drop_semicolon
+Easy
+Remove trailing semicolon from a
+statement
+var int: x = 5; →var int: x =
+5
+E2_drop_comma
+Easy
+Remove a comma from a list, array,
+or parameter list
+[1, 2, 3] →[1 2, 3]
+E3_2d_array_open
+Easy
+Replace [| with [ in 2D array literal
+[| 1, 2 | 3, 4 |] →[ 1, 2 | 3, 4
+|]
+E4_2d_array_close
+Easy
+Replace |] with ] in 2D array literal
+[| 1, 2 | 3, 4 |] →[| 1, 2 | 3, 4
+]
+E5_drop_row_pipe
+Easy
+Remove | row separator in 2D array
+[| 1, 2 | 3, 4 |] →[| 1, 2 3, 4 |]
+E6_drop_close_paren
+Easy
+Remove a closing parenthesis
+sum(x) →sum(x
+E7_drop_close_bracket
+Easy
+Remove a closing bracket
+array[1..N] →array[1..N
+M1_drop_var
+Medium
+Remove "var" keyword from vari-
+able declaration
+var int: x →int: x
+M2_drop_of
+Medium
+Remove "of" keyword from type ex-
+pression
+set of int →set int
+M3_solve_keyword
+Medium
+Replace
+"maximize"/"minimize"
+with invalid "max"/"min"
+solve maximize obj →solve
+max obj
+M4_capitalize_keyword
+Medium
+Capitalize a MiniZinc keyword
+(case-sensitive error)
+constraint x > 0 →Con-
+straint x > 0
+M5_split_endif
+Medium
+Split "endif" into "end if" or "elseif"
+into "else if"
+endif →end if
+M6_drop_gen_in
+Medium
+Remove "in" from generator expres-
+sion
+forall(i in 1..N) →forall(i
+1..N)
+H1_drop_then
+Hard
+Remove "then" from if-then-else ex-
+pression
+if x > 0 then y →if x > 0 y
+H2_drop_let_in
+Hard
+Remove "in" keyword after let block
+closing brace
+let { var int: t } in t →let {
+var int: t } t
+H3_swap_type_ident
+Hard
+Swap type and identifier in declara-
+tion
+var int: x →x: var int
+H4_triple_dot_range
+Hard
+Replace ".." range operator with "..."
+(invalid)
+1..N →1...N
+H5_wrong_logic_op
+Hard
+Replace /\ with && or \/ with ||
+(invalid C-style operators)
+x /\ y →x && y
+H6_extra_semicolon
+Hard
+Insert extra semicolon in the middle
+of a constraint
+constraint x + y = z →con-
+straint x +; y = z
+H7_drop_close_brace
+Hard
+Remove a closing brace }
+{1, 2, 3} →{1, 2, 3
+Table 3: Complete taxonomy of MiniZinc syntax corruption rules derived from the BNF grammar.
+7
+
+
+--- Page 8 ---
+Figure 2: Top-15 MiniZinc grammar corruption rules color coded by difficulty.
+5.1
+Error Correction Dataset
+For error correction fine-tuning, we draw data samples from two different strategies; synthetic
+corruption and cross-model error bootstrapping.
+Synthetic Corruptions.
+We leverage the Backus-Naur Form (BNF) grammar of MiniZinc6 to
+derive 20 corruption rules, each grounded in a specific grammar production.
+These rules are
+organized into three difficulty levels: easy (7 rules targeting delimiters and punctuation, e.g., missing
+semicolons, dropped commas, unbalanced brackets), medium (6 rules targeting keywords and types,
+e.g., invalid solver directives, dropped var or of keywords, split compound tokens like endif),
+and hard (7 rules targeting structural elements, e.g., swapped declaration order, invalid operators,
+misplaced semicolons).
+Table 3 lists the complete taxonomy of grammar-based corruption rules. To generate the training data,
+we sample instances from the baseline dataset and apply corruptions at controlled difficulty with 30%
+easy, 30% medium, 30% hard, and 10% identity. Within each difficulty we sample the rule to apply
+proportionally with our empirical observations. In case of identity, the model needs to recognize that
+no fix is necessary. Each corrupted model is verified using the MiniZinc compiler to ensure the gold
+code passes and the corrupted code fails syntax checking; pairs that do not satisfy both conditions are
+discarded. This process yields 4,452 verified instances with ⟨𝑡𝑒𝑥𝑡, 𝑚𝑜𝑑𝑒𝑙, 𝑐𝑜𝑟𝑟𝑢𝑝𝑡_𝑚𝑜𝑑𝑒𝑙⟩triples.
+Figure 2 shows the distribution of rules applied in the resulting dataset color coded by their difficulty.
+Cross-Model Error Bootstrapping.
+Our probabilistic synthetic error generation from MiniZinc
+grammar may not capture actual failure modes of LLMs at test time. We address this by collecting
+errors and their fixed version as follows:
+1. We run all five SLMs across all three fine-tuning strategies (base, CoT, mixed) on the base
+dataset with multiple sampling temperatures to increase variety of error cases.
+2. When we obtain an execution failure, for each ⟨𝑡𝑒𝑥𝑡, 𝑐𝑜𝑟𝑟𝑢𝑝𝑡_𝑚𝑜𝑑𝑒𝑙, 𝑒𝑟𝑟𝑜𝑟_𝑚𝑒𝑠𝑠𝑎𝑔𝑒⟩,
+we employ GPT-5.2 to attempt a fix. A natural alternative would be to pair the failed
+output directly with a correct generation from the same model. However, we found that
+correct and incorrect generations from the same SLM often differ substantially in structure
+and variable naming, meaning the pairing would not represent a targeted fix but rather a
+6We thank Guido Tack for sharing this grammar with us.
+8
+
+
+--- Page 9 ---
+Model
+T=0.2
+T=0.5
+T=0.8
+Total
+%
+LLaMA-3.2-1B
+230
+262
+286
+778
+34.0
+Qwen3-0.6B
+217
+256
+274
+747
+32.7
+LLaMA-3.2-3B
+139
+126
+192
+457
+20.0
+Gemma-2-9B
+85
+101
+118
+304
+13.3
+Total
+671
+745
+870
+2,286
+100.0
+%
+29.4
+32.6
+38.1
+Table 4: Distribution of correction pairs by error-producing SLM and sampling temperatures.
+Strategy
+Errors
+Percentage
+Learn2Zinc-Base
+640
+28.0%
+Learn2Zinc-CoT
+1,003
+43.9%
+Learn2Zinc-Base+CoT
+643
+28.1%
+Total
+2,286
+100%
+Table 5: Errors by training strategy during bootstrapping.
+complete rewrite. Such examples would poorly represent the error correction task. Instead,
+we prompt GPT-5.2 with the corrupted model and its error message, instructing it to make
+only the minimal changes necessary to fix the error while preserving the original code
+structure. This produces training pairs where the correction is localized to the actual fault.
+(a) If the fix succeeds, i.e, the updated model compiles and produces the correct output, we
+add ⟨𝑡𝑒𝑥𝑡, 𝑐𝑜𝑟𝑟𝑢𝑝𝑡_𝑚𝑜𝑑𝑒𝑙, 𝑐𝑜𝑟𝑟𝑒𝑐𝑡_𝑚𝑜𝑑𝑒𝑙⟩to our fine-tuning dataset. This process
+yields 2,286 verified instances and is aimed at teaching SLMS error correction.
+Table 4 shows the distribution of error-correction examples over SLMs varied by tem-
+perature. In total, the cross-model error bootstrapping process creates a diverse error
+corpus. As expected, smaller models (Qwen3-0.6B and LLaMA-3.2-1B) contribute
+the most correction examples. Fine-tuning SLMs with this dataset has an interesting
+property: small models (e.g., Qwen3-0.6B) learn from large model (e.g., GPT-OSS-
+20B) mistakes, and vice versa. Higher sampling temperatures also produce more errors
+with temperature 0.8 accounting for 38.1% of corrections vs. 29.4% at temperature
+0.2.
+Table 5 shows the distribution of errors in this cross-model dataset by the fine-tuning
+strategy. Notice that, Learn2Zinc-CoT training produces the most errors during boot-
+strapping (43.9%), suggesting again that reasoning traces without syntax knowledge
+may actually introduce more mistakes.
+3. Alternatively, when we obtain execution and solution success, we collect a new positive
+generation example, ⟨𝑡𝑒𝑥𝑡, 𝑐𝑜𝑟𝑟𝑒𝑐𝑡_𝑚𝑜𝑑𝑒𝑙⟩to our fine-tuning dataset. This process yields
+8,911 verified instances, i.e., slightly extends our base dataset from 8,014, and is aimed at
+teaching SLMs constraint model generation.
+Overall, as shown in Table 6, when we combine cross-model error correction bootstrapping instances
+(6,728) and generation task instances together (8,911), we obtain 15,649 instances for fine-tuning.
+Task Type
+Count
+Error-Correction tasks (total)
+6,738
+- Synthetic corruptions
+4,452
+- Cross-model corrections
+2,286
+Generation task
+8,911
+Total
+15,649
+Table 6: Breakdown of the augmented dataset by task type.
+9
+
+
+--- Page 10 ---
+Single Pass
+Self-Reflection@5
+Model
+Exec (%)
+Sol (%)
+Exec (%)
+Sol (%)
+Avg Attempts
+Qwen3-0.6B-Augmented
+64.0
+13.0
+72.0
+13.0
+2.22
+LLaMA-3.2-1B-Augmented
+57.0
+8.0
+71.0
+8.0
+2.35
+LLaMA-3.2-3B-Augmented
+70.0
+17.0
+80.0
+17.0
+1.90
+Gemma-2-9B-Augmented
+72.0
+22.0
+84.0
+24.0
+1.79
+GPT-OSS-20B-Augmented
+76.0
+32.0
+89.0
+34.0
+1.62
+Table 7: Learn2Zinc-Augmented Slms: Single-pass vs. Self-reflection with five attempts.
+5.2
+Learn2Zinc-Augmented Fine-Tuning
+Given the the augmented fine-tuning dataset in Table 6, which hosts 15,649 instances in combination,
+we conduct the same fine-tuning protocol on all five SLMs.
+This produces our Learn2Zinc-
+Augmented fine-tuned model families. Notice that compared to our previous fine-tuning in §4, this
+augmented fine-tuning has two simultaneous objectives; a generation task and an error-correction
+task.
+As previously reported in Table 2, the Learn2Zinc-Augmented strategy achieves the best execution
+accuracy on all models, except one, and more importantly, achieves the best solution accuracy among
+all approaches. When analyzing SLMs individually, Qwen3-0.6B jumps from 0.0% execution to 51%
+with our initial fine-tuning, and then to 65% accuracy with our augmented fine-tuning. Similarly,
+LLaMa-3.2-1B goes from 0.0% to 46% and then to 57%. Gemma-2-9B goes from 0.0% to 74%
+and 72%. GPT-OSS-20B goes from 6.0% to 66% and then to 76%. Our best zero-shot results
+achieves 76% using augmented GPT-OSS-20B. This validates that training for error correction
+directly addresses the syntax bottleneck.
+6
+Learn2Zinc with Self-Reflection & Ensemble
+So far, we only considered a zero-shot strategy, even though we fined-tuned for error correction.
+As such, we next utilize a self-reflection loop and ensemble on top of the Learn2Zinc-Augmented
+strategies. Since other fine-tuning strategies have never seen error correction examples, we only
+consider results of Learn2Zinc-Augmented strategy for self-reflection and ensembling.
+6.1
+Self-Reflection Loop
+We run augmented fine-tuned models up to five attempts to produce executable code. On each failed
+attempt, the model receives its broken code and the compiler error message, then tries again, until
+hitting the limit.
+As shown in Table 7, adding reflection improves execution accuracy considerably and slightly
+improves solution accuracy. Notice that reflections reach a running model, on average, in less than
+two trials, with larger SLMs requiring fewer attempts.
+Execution accuracy improves substantially with retries, confirming that Learn2Zinc-Augmented
+training teaches models to fix their own mistakes at inference time. Our augmented GPT-OSS-20B
+reaches 89% execution accuracy, up from 76% on the initial fine-tuning, and significantly up
+from its original 6.0%. In other words, our augmented fine-tuning with self-reflection enables
+GPT-OSS achieve an on par execution accuracy (89%) compared to its frontier variant, GPT-5.2
+(86%). This is one of our main contributions.
+However, solution accuracy remains flat. SLMs that fail to solve a problem on their first executable
+attempt do not succeed later. This suggests a separation between syntax errors (fixable through
+retry) and semantic errors (not fixable due to SLM capacity). Once the code compiles, the model
+has already committed to a constraint formulation. If that formulation is wrong, producing further
+executable code does not help.
+10
+
+
+--- Page 11 ---
+Model
+Approach
+Execution (%)
+Solution (%)
+GPT-OSS-20B
+Original-4bit
+6.0
+5.0
+GPT-OSS-20B
+Learn2Zinc-Base
+66.0
+27.0
+GPT-OSS-20B
+Learn2Zinc-Augmented
+76.0
+32.0
+GPT-OSS-20B
+Learn2Zinc-Aug+Self-Reflection
+89.0
+34.0
+Our fined-tuned SLMs
+Learn2Zinc-Ensemble
+98.0
+35.0
+GPT-5.2
+Agentic + Code (Kadıoğlu et al. 2026)
+86.0
+57.0
+Table 8: Learn2Zinc overall comparison with different strategies.
+6.2
+Ensemble
+Finally, as an alternative to self-reflection and instead of multiple attempts using the same SLM,
+we evaluate a top-down ensemble (largest SLM first) to exploit the variation across SLMs. In our
+ensemble, models are tried in descending order of capability: GPT-OSS-20B →Gemma-2-9B →
+LLaMA-3.2-3B →LLaMA-3.2-1B →Qwen3-0.6B. If a model fails to produce executable code after
+retries, the next model is attempted. We consider a top-down strategy to increase the chance of getting
+an executable model where the solution accuracy remains highest (stronger models). Conversely, if
+we build this ensemble bottom-up (smallest SLM first) we risk obtaining an executing model when
+the solution reasoning capacity is lowest.
+Table 8 presents the main takeaways from our work Learn2Zinc. We start with the original GPT-
+OSS-20B, the largest of our SLMs, which has an extremely poor performance on generating MiniZinc
+models with only 6% execution and 5% solution accuracy. Next, our fine-tuning, the initial base
+strategy, Learn2Zinc-Base, detailed in §4, and its augmented version, Learn2Zinc-Augmented
+for error-correction detailed in §5 steadily improve MiniZinc coding abilities of GPT-OSS with up to
+76% execution accuracy. The solution accuracy also jumps from 5% to 32%. Our augmented version,
+Learn2Zinc-Augmented, has the additional property to serve well in self-reflection loops to fix
+its coding errors, which it is exactly trained for, that leads to another boost in execution accuracy
+to 89%. Finally, our ensemble of fined-tuned SLMS achieves a remarkable 98% execution
+accuracy closing the syntactic aspect of the text-to-model translation task. As a reference, the
+frontier GPT-5.2 achieves only 86% execution accuracy for MiniZinc code with the best copilot,
+Agentic + Code, from Kadıoğlu et al. (2026). We show that it is possible to teach SLMs domain
+specific languages for text-to-model translation via fine-tuning.
+Overall, this is the central finding of our approach: with Learn2Zinc-Augmented fine-tuning, self-
+reflection, and SLM ensembles, the execution problem is effectively solved for MiniZinc. Our method
+allows pushing bottleneck to shift entirely to semantic reasoning about constraint modeling.
+Beyond the syntax, what remains is the gap in solution accuracy for formal reasoning. Our SLM
+fine-tuning saturates around 35% on solution accuracy. Even the frontier models such as GPT-5.2
+struggles with this at 57%. The best known solution on IndustrOR comes from Liang et al. (2026)
+with 65% using Gemini 3 Pro for generating Gurobi models in Python, as we discuss next.
+7
+Learn2Zinc vs. Prior Work
+We compare Learn2Zinc with prior work on the same IndustryOr benchmark from Orlm (Huang
+et al. 2024) and Lean-Lllm-Opt (Liang et al. 2026). Before numerical comparisons, let us first
+highlight that such a comparison is subject to several caveats and should be treated only directionally.
+First, target constraint languages differ. Orlm (Huang et al. 2024) generates Python code for the
+Copt solver whereas Lean-Lllm-Opt (Liang et al. 2026) generates Python code for the Gurobi
+solver.
+Python is a general-purpose programming language and is abundant in the LLM pretraining data. As
+such, LLMs produce syntactically valid code easily for Python. Contrarily, our approach generates
+MiniZinc, a domain-specific modeling language, and as shown in our experiments, remains out-of-
+distribution, especially for SLMs. An important contribution of Learn2Zinc is to address syntax
+challenge which is taken for granted in Pythonic approaches.
+11
+
+
+--- Page 12 ---
+Method
+Model
+LLM Calls
+IndustryOr (%)
+Fine-tuning approach for Copt in Python
+ORLM (Pass@1)
+LLaMA-3-8B
+1
+38.0
+ORLM (Pass@8)
+LLaMA-3-8B
+8
+49.0
+Agentic framework for Gurobi in Python
+Lean-Lllm-Opt†
+GPT-OSS-20B
+5+
+59.0
+Lean-Lllm-Opt†
+GPT-4.1
+5+
+65.0
+Direct prompting for Gurobi in Python†
+–
+GPT-OSS-20B
+1
+42.0
+–
+GPT-4.1
+1
+54.0
+–
+GPT-5
+1
+58.0
+–
+GPT-5.2
+1
+56.0
+–
+Gemini 3 Pro
+1
+65.0
+Text2Model copilots for MiniZinc
+Text2Model: Agentic + Code
+GPT-OSS-20B
+1
+5.0
+Text2Model: Agentic + Code
+GPT-5.2
+1
+49.0
+Text2Model: Agentic + Code
+GPT-5.2
+5
+57.0
+Fine-tuning MiniZinc (this paper)
+Learn2Zinc-Augmented
+GPT-OSS-20B
+1
+32.0
+Learn2Zinc-Augmented+Self-Reflection
+GPT-OSS-20B
+1.62
+34.0
+Table 9: IndustryOr comparisons across Orlm, generating Copt models in Python, Lean-Lllm-
+Opt generating Gurobi models in Python, Text2Model and Learn2Zinc generating MiniZinc
+across different LLMs and SLMs. Results marked with † are from Liang et al. (2026).
+Second, evaluation protocols differ.
+Orlm reports Pass@k by sampling k independent outputs
+and counting success if any one is correct. Our evaluation protocol reflects an agentic loop: we
+iterate until execution succeeds or a budget is exhausted, while sharing error messages in between,
+and counting the total number of LLM calls in average termination. These results are not directly
+comparable, but we report both for context.
+Third, the underlying LLMs differ. Orlm fine-tunes over LLaMA-3-8B, similar but not exactly
+identical to our case, while Lean-Lllm-Opt is based on GPT-4.1 and GPT-OSS-20B. For a complete
+picture, we also include results on GPT and Gemini for generating Gurobi-Python from (Liang et al.
+2026), as-is, as well as results on GPT for generating MiniZinc from (Kadıoğlu et al. 2026) as-is.
+Table 9 shows results on IndustryOr benchmark for Orlm (Huang et al. 2024), Lean-Lllm-
+Opt (Liang et al. 2026), Text2Model (Kadıoğlu et al. 2026), and Learn2Zinc. Our best fine-tuned
+GPT-OSS-20B achieves 34% on IndustryOr, below the Pythonic methods. This gap reflects two
+factors. First, MiniZinc syntax remains harder than Python even though Learn2Zinc-Augmented
+can address it. Second, our SLM are lighter than the frontier models used by other methods. The
+Text2Model result (57% with GPT-5.2) shows that stronger models with MiniZinc can approach
+Pythonic performance.
+The value of Learn2Zinc is complementary and methodological: we produce solver- and paradigm-
+agnostic MiniZinc models that can solve optimization and satisfaction problems, whereas Orlm is
+tied to Copt and Lean-Lllm-Opt is tied to Gurobi. We maintain solver and paradigm flexibility
+while addressing SLMs’s disadvantage on domain-specific languages via Learn2Zinc fine-tuning.
+8
+Discussions & Error Analysis
+Our immediate obsersation is that out-of-the-box SLMs achieve near 0% performance. Three
+factors combine to make MiniZinc out-of-distribution for current LLMs.
+First, MiniZinc has
+minimal GitHub presence compared to mainstream languages. Second, it uses a declarative paradigm
+unlike the imperative code that makes up most pretraining data. Third, no syntactically similar
+language exists for transfer learning.
+The combination of rare syntax and unfamiliar paradigm
+explains the complete failure of unfinetuned models.
+12
+
+
+--- Page 13 ---
+We also notice that CoT is not effective when fine-tuning SLMs as Learn2Zinc-CoT underper-
+forms. When prompting an LLM, CoT often helps because models already know the target language
+and they benefit from structured reasoning but fine-tuning is different. Learn2Zinc-CoT requires the
+SLM to reason about valid MiniZinc constructs it has seldom or never seen. SLMs might not reason
+about syntax that they have not acquired. The reasoning traces may actually confuse the model and
+introduces error. That said, the errors we observe suggest that a different kind of Learn2Zinc-CoT
+could help. Specifically, Learn2Zinc-CoT focused on mathematical and constraint-level reasoning
+rather than simple step-by-step narration may reduce the semantic failures that current models make.
+This is one possible future study.
+Regarding execution accuracy, error-correction is clearly helpful for fine-tuning.
+The
+Learn2Zinc-Augmented strategy directly targets the main bottleneck of syntax errors. By training
+on realistic error-correction examples collected through cross-model bootstrapping, S:< learn to both
+generate code and fix common mistakes. Using errors from multiple model sizes gives broad cover-
+age of failure patterns. It would be interesting to curate such fine-tuning datasets for domain-specific
+languages.
+Regarding solution accuracy, our ensemble that has 98% execution accuracy only achieves 35%
+solution accuracy. This gap shows a clear split: while syntax is learnable, but constraint modeling
+remains hard for SLMs. The models produce valid MiniZinc code that compiles and runs, but
+often get the problem semantics wrong. In our error anaylsis find two main categories of semantic
+error:
+Type I Error: Contradictory constraints causing infeasibility. Models introduce auxiliary vari-
+ables with two incompatible definitions. For example, a variable may be constrained to equal both
+the leftover supply and the truck count computed from the same shipped quantity. The solver returns
+unsat even though the underlying problem is perfectly feasible. An example of this type of error is
+given in Appendix C.1. As shown in Appendix-Table 11 (Type I), fixing these contradictions alone
+could improve solution accuracy by up to 18 percentage points depending on the model.
+Type II Error: Phantom variables forcing zero objectives. Models create unnecessary decision
+variables (for example, binary indicators in a pure LP) and constrain them to equal expressions
+that exceed their declared bounds. The only way to satisfy these constraints is to set all decision
+variables to zero, which gives a trivially wrong objective. An example of this type of error is given
+in Appendix C.2. Appendix-Table 11 (Type II) shows this affects up to 20 percentage points.
+9
+Related Work
+There is growing interest in leveraging LLMs for optimization tasks to transform the way that decision
+makers interact with solvers in the form of a co-pilot system (Simchi-Levi et al. 2025, Wasserkrug
+et al. 2025, Kadıoğlu et al. 2026, Tsouros et al. 2023).
+From Natural Language to Optimization Models:
+Earlier systems relied on rule-based parsing
+to construct mixed-integer or logic models (e.g., LGPSolver for logic-grid puzzles (Jabrayilzade &
+Tekir 2020) and AutoLP for linear programs (Islam et al. 2021)). The Nl4Opt competition (Rama-
+monjison et al. 2022) formalized the task as a two-step pipeline: named-entity recognition followed
+by code generation. Follow-up works such as LaTeX2Solver (Ramamonjison et al. 2023) extended
+parsing to mathematical documents, while the “Holy Grail 2.0” blueprint (Tsouros et al. 2023)
+envisioned conversational assistants that refine models interactively.
+Prompt-Driven and Learning-based Copilots:
+The Ner4Opt line of works (Dakle et al. 2023,
+Kadıoğlu et al. 2024) showed that fine-tuning transformers on optimization-specific corpora and
+inline entity tags boosts accuracy. Retrieval-augmented prompting specific to Constraint Program-
+ming settings has also proven effective (Michailidis et al. 2024). Modular agent pipelines push
+this further: ComplexOR employs a chain-of-experts architecture for difficult OR problems (Xiao
+et al. 2023), while OptiMUS decomposes formulation, debugging, and solving into separate GPT
+agents (AhmadiTeshnizi et al. 2024). The recent Gala framework builds global agents for CP (Cai
+et al. 2025). Fine-tuning approaches include Orlm (Huang et al. 2024) and LllmOpt (Jiang et al.
+2025).
+13
+
+
+--- Page 14 ---
+Code Generation for Rare Languages:
+EsoLang-Bench (Sharma & Chopra 2026) shows frontier
+models drop from 85-95% to 0-11% on rare languages, with few-shot and self-reflection providing
+negligible benefit when pretraining coverage is absent. Our work differs in that we study whether
+fine-tuning, rather than prompting, can close this gap for constraint programming.
+Datasets and Evaluation:
+Optimization-centric corpora include Nl4Opt (Ramamonjison et al.
+2022), Nlp4Lp (AhmadiTeshnizi et al. 2024), IndustryOr (Huang et al. 2024), and MILP synthesis
+datasets (Li et al. 2023). Recent datasets include Planetarium (Zuo et al. 2025) for planning domain
+definition language (PDDL), Ehop (Duchnowski et al. 2025) for everyday NP-Hard problems, and
+DualSchool (Klamkin et al. 2025) for optimization education. Evaluation metrics have evolved
+from exact string match to execution and solution accuracy.
+Our work on Learn2Zinc builds on the Text2Zinc dataset Singirikonda et al. (2025) and
+Text2Model copilotsKadıoğlu et al. (2026), which together provide the data and baselines for
+the fine-tuning study presented here. The closest to our approach on Learn2Zinc is the work on
+OptiMindZhang et al. (2026) which fine-tunes GPT-OSS-20B on optimization modeling for Gurobi
+modeling in Python. Interestingly, Kadıoğlu et al. (2026) reports that the MiniZinc capabilities of
+OptiMind fine-tuned GPT-OSS-20B is reduced to zero. This is a call for future research on fine-
+tuning models with potentially unintended consequences on losing capabilities in other domains.
+10
+Conclusion
+We presented Learn2Zinc, the first systematic study of fine-tuning small language models
+(SLMs) for generating MiniZinc constraint models from natural language. Our results show
+that MiniZinc is genuinely out-of-distribution for current models, with near-zero execution accuracy
+without fine-tuning. This highlights the limitations of prompt-based approaches for domain-specific
+languages with limited pretraining coverage.
+To address this, we introduced several fine-tuning strategies including cross-model error boot-
+strapping, a method for constructing realistic syntax error-correction datasets by leveraging failures
+across multiple models. Combined with grammar-based synthetic corruptions, this approach enables
+models to learn both code generation and targeted error correction. We further show that, unlike in
+prompting settings, chain-of-thought fine-tuning does not improve performance when foundational
+syntax knowledge is absent.
+Our Learn2Zinc-Augmented strategy significantly improves execution accuracy across all model
+sizes of SLMs. When combined with self-reflection and a simple top-down ensemble, we achieve
+98% execution accuracy, effectively resolving the syntax bottleneck for MiniZinc. However,
+solution accuracy saturates at 34%, revealing a clear gap between syntactic correctness and semantic
+reasoning. Our initial error analysis attributes this gap to recurring issues such as contradictory
+constraints and phantom variables. These findings suggest that while syntax can be learned efficiently
+through targeted fine-tuning, constraint reasoning remains the primary challenge for SLM-based text-
+to-model translation.
+Future work should focus on closing the execution-solution gap through improved supervision and
+reasoning support. Promising directions include training with structured reasoning traces aligned
+with constraint modeling subtasks, leveraging intermediate supervision for MiniZinc generation,
+and distilling reasoning capabilities from larger models. In addition, integrating fine-tuned models
+with grammar-constrained decoding, prompting strategies, and modular or agentic pipelines may
+further improve solution quality.
+References
+Ali AhmadiTeshnizi, Wenzhi Gao, Herman Brunborg, Shayan Talaei, and Madeleine Udell. Optimus-0.3:
+Using large language models to model and solve optimization problems at scale, 2024. URL https:
+//arxiv.org/abs/2407.19633.
+Michael R. Bussieck and Alex Meeraus. General Algebraic Modeling System (GAMS), pp. 137–157. Springer
+US, Boston, MA, 2004. ISBN 978-1-4613-0215-5. doi: 10.1007/978-1-4613-0215-5_8.
+Junyang Cai, Serdar Kadıoğlu, and Bistra Dilkina. Gala: Global llm agents for text-to-model translation, 2025.
+URL https://arxiv.org/abs/2509.08970.
+14
+
+
+--- Page 15 ---
+ParagPravinDakle, SerdarKadıoğlu, Karthik Uppuluri, Regina Politi, Preethi Raghavan, SaiKrishna Rallabandi,
+and Ravisutha Srinivasamurthy. Ner4opt: Named entity recognition for optimization modelling from
+natural language. In International Conference on Integration of Constraint Programming, Artificial
+Intelligence, and Operations Research, pp. 299–319. Springer, 2023.
+DeepSeek-AI et al. Deepseek-v3 technical report, 2025. URL https://arxiv.org/abs/2412.19437.
+Alex Duchnowski, Ellie Pavlick, and Alexander Koller. Ehop: A dataset of everyday np-hard optimization
+problems, 2025. URL https://arxiv.org/abs/2502.13776.
+Tias Guns. Increasing modeling language convenience with a universal n-dimensional array, cppy as python-
+embedded example. In Proceedings of the 18th workshop on Constraint Modelling and Reformulation
+at CP (Modref 2019), volume 19, 2019.
+Chenyu Huang, Zhengyang Tang, Dongdong Ge, Shixi Hu, Ruoqing Jiang, Benyou Wang, Zizhuo Wang, and
+Xin Zheng. Orlm: A customizable framework in training large models for automated optimization
+modeling, 2024. URL https://arxiv.org/abs/2405.17743.
+Md. Shahidul Islam, Fariha Mamud, Rakib Ul Haque, and Ahmed Y. Saber. Automatic formulation and
+optimization of linear problems from a structured paragraph. In Proc. 2021 Int. Conf. on Science &
+Contemporary Technologies (ICSCT), 2021. doi: 10.1109/ICSCT53883.2021.9642516.
+Elgun Jabrayilzade and Selma Tekir. LGPSolver – solving logic grid puzzles automatically. In Findings of the As-
+sociation for Computational Linguistics: EMNLP 2020, pp. 1118–1123. Association for Computational
+Linguistics, November 2020. doi: 10.18653/v1/2020.findings-emnlp.100.
+Caigao Jiang, Xiang Shu, Hong Qian, Xingyu Lu, Jun Zhou, Aimin Zhou, and Yang Yu. Llmopt: Learning to
+define and solve general optimization problems from scratch. In Proceedings of the 13th International
+Conference on Learning Representations (ICLR), Singapore, 2025. URL https://openreview.
+net/forum?id=9OMvtboTJg.
+SerdarKadıoğlu, ParagPravinDakle, Karthik Uppuluri, Regina Politi, Preethi Raghavan, SaiKrishna Rallabandi,
+and Ravisutha Srinivasamurthy. Ner4opt: named entity recognition for optimization modelling from
+natural language. Constraints, pp. 1–39, 2024.
+Serdar Kadıoğlu, Karthik Uppuluri, and Akash Singirikonda. Modeling copilots for text-to-model translation,
+2026. URL https://arxiv.org/abs/2604.12955.
+Michael Klamkin, Arnaud Deza, Sikai Cheng, Haoruo Zhao, and Pascal Van Hentenryck. Dualschool: How re-
+liable are llms for optimization education?, 2025. URL https://arxiv.org/abs/2505.21775.
+Qingyang Li, Lele Zhang, and Vicky Mak-Hau. Synthesizing mixed-integer linear programming models from
+natural language descriptions, 2023. URL https://arxiv.org/abs/2311.15271.
+Kuo Liang, Yuhang Lu, Jianming Mao, Shuyi Sun, Chunwei Yang, Congcong Zeng, Xiao Jin, Hanzhang Qin,
+Ruihao Zhu, and Chung-Piaw Teo. Large-scale optimization model auto-formulation: Harnessing llm
+flexibility via structured workflow, 2026. URL https://arxiv.org/abs/2601.09635.
+Kostis Michailidis, Dimos Tsouros, and Tias Guns. Constraint Modelling with LLMs Using In-Context Learning.
+In 30th International Conference on Principles and Practice of Constraint Programming (CP 2024),
+volume 307 of Leibniz International Proceedings in Informatics (LIPIcs), pp. 20:1–20:27. Schloss
+Dagstuhl – Leibniz-Zentrum für Informatik, 2024. doi: 10.4230/LIPIcs.CP.2024.20.
+Nicholas Nethercote, Peter J. Stuckey, Ralph Becket, Sebastian Brand, Gregory J. Duck, and Guido Tack.
+Minizinc: Towards a standard cp modelling language.
+In Christian Bessière (ed.), Principles and
+Practice of Constraint Programming – CP 2007, pp. 529–543, Berlin, Heidelberg, 2007. Springer Berlin
+Heidelberg. ISBN 978-3-540-74970-7.
+OpenAI et al. Gpt-4 technical report, 2024. URL https://arxiv.org/abs/2303.08774.
+Rindra Ramamonjison, Timothy Yu, Linzi Xing, Mahdi Mostajabdaveh, Xiaorui Li, Xiaojin Fu, Xiongwei Han,
+Yuanzhe Chen, Ren Li, Kun Mao, and Yong Zhang. LaTeX2Solver: a hierarchical semantic parsing of
+LaTeX document into code for an assistive optimization modeling application. In Proceedings of the 61st
+Annual Meeting of the Association for Computational Linguistics (Volume 3: System Demonstrations),
+pp. 471–478. Association for Computational Linguistics, July 2023. doi: 10.18653/v1/2023.acl-demo.45.
+Rindranirina Ramamonjison, Haley Li, Timothy T. Yu, Shiqi He, Vishnu Rengan, Amin Banitalebi-Dehkordi,
+Zirui Zhou, and Yong Zhang. Augmenting operations research with auto-formulation of optimization
+models from problem descriptions, 2022. URL https://arxiv.org/abs/2209.15565.
+Aman Sharma and Paras Chopra. Esolang-bench: Evaluating genuine reasoning in large language models via
+esoteric programming languages, 2026. URL https://arxiv.org/abs/2603.09678.
+David Simchi-Levi, Tinglong Dai, Ishai Menache, and Michelle Xiao Wu. Democratizing optimization with
+generative ai. Johns Hopkins Carey Business School Research Paper Forthcoming, October 24 2025.
+Akash Singirikonda, Serdar Kadıoğlu, and Karthik Uppuluri. Text2zinc: A cross-domain dataset for modeling
+optimization and satisfaction problems in minizinc, 2025. URL https://arxiv.org/abs/2503.
+10642.
+15
+
+
+--- Page 16 ---
+Gemini Team et al. Gemini: A family of highly capable multimodal models, 2025. URL https://arxiv.
+org/abs/2312.11805.
+Dimos Tsouros, Helene Verhaeghe, Serdar Kadıoğlu, and Tias Guns. Holy grail 2.0: From natural language to
+constraint models. arXiv preprint arXiv:2308.01589, 2023.
+Segev Wasserkrug, Leonard Boussioux, Dick den Hertog, Farzaneh Mirzazadeh, S. Ilker Birbil, Jannis Kurtz,
+and Donato Maragno. Enhancing decision making through the integration of large language models and
+operations research optimization. Proceedings of the AAAI Conference on Artificial Intelligence, 39(27):
+28643–28650, 2025. doi: 10.1609/aaai.v39i27.35090.
+Ziyang Xiao, Dongxiang Zhang, Yangjun Wu, Lilin Xu, Yuan Jessica Wang, Xiongwei Han, Xiaojin Fu, Tao
+Zhong, Jia Zeng, Mingli Song, et al. Chain-of-experts: When llms meet complex operations research
+problems. In The Twelfth International Conference on Learning Representations, 2023.
+Xinzhi Zhang, Zeyi Chen, Humishka Zope, Hugo Barbalho, Konstantina Mellou, Marco Molinaro, Janardhan
+Kulkarni, Ishai Menache, and Sirui Li. Optimind: Teaching llms to think like optimization experts, 2026.
+URL https://arxiv.org/abs/2509.22979.
+Max Zuo, Francisco Piedrahita Velez, Xiaochen Li, Michael L. Littman, and Stephen H. Bach. Planetarium:
+A rigorous benchmark for translating text to structured planning languages, 2025.
+URL https:
+//arxiv.org/abs/2407.03321.
+16
+
+
+--- Page 17 ---
+A
+Fine-tuning Examples
+Learn2Zinc-Base Example
+Instruction:
+Generate MiniZinc code for the following optimization problem.
+A rescue material distribution company needs to allocate rescue materials to three disaster-
+stricken areas: A, B, and C. These places have different degrees of disaster, so the required amount
+of rescue materials is also different. The goal is to minimize the total distribution time associated with
+these locations, with a distribution time weight of 50 hours for A, 100 hours for B, and 200 hours for C.
+The allocation must adhere to the following conditions:
+- The total amount of rescue materials for locations A and B cannot exceed 500 units.
+- The total amount of rescue materials for locations B and C must be at least 300 units.
+- The amount of rescue materials for location C cannot exceed the maximum demand of 600 units.
+- The amount of rescue materials for location A must be at least 50 units.
+Response:
+% Parameters (embed all data values directly here)
+int: wA = 50;
+int: wB = 100;
+int: wC = 200;
+int: A_min = 50;
+int: A_max = 500;
+int: B_min = 0;
+int: B_max = 400;
+int: C_min = 0;
+int: C_max = 600;
+int: AB_max = 500;
+int: BC_min = 300;
+% Variables
+var A_min..A_max: A;
+var B_min..B_max: B;
+var C_min..C_max: C;
+var 0..(wA*A_max + wB*B_max + wC*C_max): total_time;
+% Constraints
+constraint A + B <= AB_max;
+constraint B + C >= BC_min;
+constraint total_time = wA*A + wB*B + wC*C;
+% Objective
+solve minimize total_time;
+Learn2Zinc-CoT Example
+Instruction:
+Generate MiniZinc code for the following optimization problem.
+First outline your rea-
+soning, then provide the code.
+A rescue material distribution company needs to allocate rescue materials to three disaster-
+stricken areas: A, B, and C. These places have different degrees of disaster, so the required amount
+of rescue materials is also different. The goal is to minimize the total distribution time associated with
+these locations, with a distribution time weight of 50 hours for A, 100 hours for B, and 200 hours for C.
+The allocation must adhere to the following conditions:
+17
+
+
+--- Page 18 ---
+- The total amount of rescue materials for locations A and B cannot exceed 500 units.
+- The total amount of rescue materials for locations B and C must be at least 300 units.
+- The amount of rescue materials for location C cannot exceed the maximum demand of 600 units.
+- The amount of rescue materials for location A must be at least 50 units.
+Considering that each location has a specific demand for rescue materials (A: 0-500, B: 0-
+400, C: 0-600), and due to the limitation of the quantity of materials, since we cannot have fractional
+units of rescue materials, what is the minimum total distribution time in hours for the optimal
+allocation of rescue materials to the three locations within the specified demand ranges? Please
+round the answer to the nearest hour.
+Response:
+Reasoning:
+Variables: A ∈[50, 500], B ∈[0, 400], C ∈[0, 600]
+Constraints: A + B ≤500, B + C ≥300
+Objective: minimize total_time = 50*A + 100*B + 200*C
+Code:
+% Parameters (embed all data values directly here)
+int: wA = 50;
+int: wB = 100;
+int: wC = 200;
+int: A_min = 50;
+int: A_max = 500;
+int: B_min = 0;
+int: B_max = 400;
+int: C_min = 0;
+int: C_max = 600;
+int: AB_max = 500;
+int: BC_min = 300;
+% Variables
+var A_min..A_max: A;
+var B_min..B_max: B;
+var C_min..C_max: C;
+var 0..(wA*A_max + wB*B_max + wC*C_max): total_time;
+% Constraints
+constraint A + B <= AB_max;
+constraint B + C >= BC_min;
+constraint total_time = wA*A + wB*B + wC*C;
+% Objective
+solve minimize total_time;
+Syntax Correction Example
+Instruction:
+Fix the following MiniZinc code that has syntax errors.
+18
+
+
+--- Page 19 ---
+Problem:
+A shipping company needs to transport goods from a source port to a destination
+port. There are 3 ships available for selection: Ship A, B, and C. The cargo capacity, transportation
+cost, and transportation time for each ship are shown in the table below:
+Ship
+Capacity (tons)
+Cost (M yuan)
+Time (days)
+A
+1000
+10
+10
+B
+800
+8
+8
+C
+1200
+12
+7
+Now, there is a need to transport 3000 tons of cargo and it must arrive within 15 days. How should
+the ships be scheduled for transportation to minimize the total transportation cost? Each ship can
+only make one trip, and the amount of cargo transported cannot exceed its cargo capacity.
+Broken code:
+% Parameters (embed all data values directly here)
+int: NSHIPS = 3;
+set of int: SHIPS = 1..NSHIPS;
+array[SHIPS] of string: ship_name = ["A","B","C"];
+% Cargo capacities in tons
+array[SHIPS] of int: cap = [1000, 800, 1200];
+% Transportation costs (million yuan)
+array[SHIPS] of int: cost = [10, 8, 12];
+% Transportation times (days)
+array[SHIPS] of int: time = [10, 8, 7];
+int: demand = 3000;
+% tons
+int: max_days = 15;
+% Upper bounds for number of trips per ship
+int: max_trips = ceil(demand div min(cap));
+% 3 trips needed
+% Variables
+array[SHIPS] of var 0..max_trips: trips;
+var 0..demand: cargo_each;
+% tons per ship
+array[SHIPS] of var 0..demand: x;
+% tons shipped per ship
+var 0..(max_trips * max(cost)): total_cost;
+% Constraints
+constraint forall(i in SHIPS) (
+cargo_each[i] <= cap[i] /\
+x[i] = trips[i] * cargo_each[i] /\
+x[i] <= cap[i] /\
+x[i] >= 0
+);
+constraint sum(i in SHIPS)(x[i]) = demand;
+% Ship capacity limits (redundant but explicit)
+constraint forall(i in SHIPS) (
+cargo_each[i] <= cap[i] /\
+x[i] <= cap[i] /\
+x[i] >= 0
+);
+% Time window: all ships must be used (each ship makes one trip)
+constraint forall(i in SHIPS) (
+time[i] <= max_days /\
+time[i] >= 0
+);
+constraint total_cost = sum(i in SHIPS)(cost[i] * trips[i]);
+% Objective
+solve minimize total_cost;
+19
+
+
+--- Page 20 ---
+Error:
+type error:
+array access attempted on expression of type
+‘var int’
+Response:
+% Parameters (embed all data values directly here)
+int: N = 3;
+set of int: SHIPS = 1..N;
+array[SHIPS] of string: name = ["A","B","C"];
+array[SHIPS] of int: capacity = [1000, 800, 1200];
+% tons
+array[SHIPS] of int: cost = [10, 8, 12];
+% million yuan
+array[SHIPS] of int: time = [10, 8, 7];
+% days
+int: demand = 3000; % tons
+int: max_days = 15;
+% Variables
+array[SHIPS] of var 0..1: make_trip;
+array[SHIPS] of var 0..demand: cargo;
+var 0..(max_days * max(cost)): total_cost;
+% Constraints
+constraint forall(i in SHIPS) (
+cargo[i] <= capacity[i] * make_trip[i]
+);
+constraint sum(i in SHIPS)(cargo[i]) = demand;
+constraint forall(i in SHIPS) (
+make_trip[i] = bool2int(time[i] >= 1)
+);
+constraint sum(i in SHIPS)(time[i] * make_trip[i]) <= max_days;
+constraint total_cost = sum(i in SHIPS)(cost[i] * make_trip[i]);
+% Objective
+solve minimize total_cost;
+20
+
+
+--- Page 21 ---
+B
+Training Details
+Table 10: Training hyperparameters for each model. All models used max sequence length of 4,096
+tokens and batch size of 2.
+Model
+LoRA 𝑟
+LoRA 𝛼
+LR
+Epochs
+Quantization
+Qwen3-0.6B
+64
+64
+2e-4
+3
+8-bit
+LLaMA-3.2-1B
+64
+64
+2e-4
+3
+8-bit
+LLaMA-3.2-3B
+64
+64
+2e-4
+3
+8-bit
+Gemma-2-9B
+64
+64
+1e-4
+3
+8-bit
+GPT-OSS-20B
+32
+64
+2e-4
+3
+4-bit
+21
+
+
+--- Page 22 ---
+C
+Error Analysis
+C.1
+Type I: Contradictory Constraints
+LLM-Generated Constraint Errors in MiniZinc
+Problem Description. The full problem statement (Italian container transportation, 6 warehouses to 5 ports)
+can be found at: https://huggingface.co/datasets/CardinalOperations/IndustryOr/
+viewer/default/test?q=transportation+cost&row=6
+(a) LLM-Generated Code
+Result: UNSATISFIABLE
+% Parameters (embed all data values directly here
+)
+int: W = 6;
+int: P = 5;
+set of int: Warehouses = 1..W;
+set of int: Ports = 1..P;
+array[Warehouses] of string: wname =
+["Verona","Perugia","Rome",
+"Pescara","Taranto","Lamezia"];
+array[Ports] of string: pname =
+["Genoa","Venice","Ancona","Naples","Bari"];
+array[Warehouses] of int: supply =
+[10, 12, 20, 24, 18, 40];
+array[Ports] of int: demand =
+[20, 15, 25, 33, 21];
+% Truck capacity: 2 containers per truck
+int: cap = 2;
+% Distance (km) per container (for cost
+calculation)
+array[Warehouses, Ports] of int: dist =
+[| 290, 115, 355, 715, 810
+| 380, 340, 165, 380, 610
+| 505, 530, 285, 220, 450
+| 655, 450, 155, 240, 315
+| 1010, 840, 550, 305, 95
+| 1072, 1097, 747, 372, 333 |];
+int: cost_per_km = 30;
+% Variables
+array[Warehouses, Ports] of var 0..40: x;
+array[Warehouses] of var 0..40: used;
+array[Warehouses] of var 0..40: shipped;
+var 0..1000000: total_cost;
+% Constraints
+constraint
+forall(i in Warehouses) (
+shipped[i] = sum(j in Ports)(x[i,j])
+);
+constraint
+% BUG 1
+forall(i in Warehouses) (
+shipped[i] = supply[i] - used[i]
+);
+constraint
+forall(j in Ports) (
+sum(i in Warehouses)(x[i,j]) = demand[j]
+);
+% Each truck can carry up to 2
+% BUG 2
+% containers; count trucks
+constraint
+forall(i in Warehouses) (
+used[i] = sum(j in Ports)
+(x[i,j]) div cap
+);
+% Total cost
+% BUG 3
+constraint
+total_cost = cost_per_km
+* sum(i in Warehouses)(used[i])
+* cap;
+% Objective
+solve minimize total_cost;
+(b) Corrected Code
+Optimal cost: 904590
+% Parameters (embed all data values directly here
+)
+int: W = 6;
+int: P = 5;
+set of int: Warehouses = 1..W;
+set of int: Ports = 1..P;
+array[Warehouses] of string: wname =
+["Verona","Perugia","Rome",
+"Pescara","Taranto","Lamezia"];
+array[Ports] of string: pname =
+["Genoa","Venice","Ancona","Naples","Bari"];
+array[Warehouses] of int: supply =
+[10, 12, 20, 24, 18, 40];
+array[Ports] of int: demand =
+[20, 15, 25, 33, 21];
+% Truck capacity: 2 containers per truck
+int: cap = 2;
+% Distance (km)
+array[Warehouses, Ports] of int: dist =
+[| 290, 115, 355, 715, 810
+| 380, 340, 165, 380, 610
+| 505, 530, 285, 220, 450
+| 655, 450, 155, 240, 315
+| 1010, 840, 550, 305, 95
+| 1072, 1097, 747, 372, 333 |];
+% Cost = 30 euros per km per CONTAINER
+int: cost_per_km = 30;
+% The cost to transport each container on
+% route (i,j) is cost_per_km * dist[i,j]
+array[Warehouses, Ports] of int: cost =
+array2d(Warehouses, Ports,
+[cost_per_km * dist[i,j]
+| i in Warehouses, j in Ports]);
+% Variables
+array[Warehouses, Ports] of var 0..40: x;
+var 0..10000000: total_cost;
+% Constraints
+% Supply constraint: cannot ship more
+% than available
+constraint
+% FIX 1
+forall(i in Warehouses) (
+sum(j in Ports)(x[i,j]) <= supply[i]
+);
+% Demand constraint: each port must
+% receive exactly its demand
+constraint
+forall(j in Ports) (
+sum(i in Warehouses)(x[i,j]) = demand[j]
+);
+% Total cost: 30 euros * distance
+% FIX 2,3
+% * number of containers on each route
+constraint
+total_cost = sum(i in Warehouses,
+j in Ports)
+(cost[i,j] * x[i,j]);
+% Objective
+solve minimize total_cost;
+22
+
+
+--- Page 23 ---
+Key Errors
+Contradictory constraints (causes UNSATISFIABLE). Bugs 1 and 2 jointly force used[i] to sat-
+isfy two incompatible definitions:
+used[i] = supply[i] −shipped[i] and used[i] =
+shipped[i] div 2. Substituting, this requires supply[i] −shipped[i] = shipped[i]
+div 2 for every warehouse, which has no valid integer solution for most input values. The solver correctly
+reports the model as infeasible. The fix removes used[i] and shipped[i] entirely and replaces them
+with a single inequality sum(x[i,j]) <= supply[i].
+Wrong objective formula.
+Bug 3 computes cost as cost_per_km * sum(used[i]) * cap,
+which (a) never references the dist matrix, treating all routes as equally expensive, and (b) models cost
+per truck rather than per container. The problem states the rate is 30 euros/km per container, so the
+correct objective is simply sum(cost_per_km * dist[i,j] * x[i,j]) over all pairs, with no
+dependence on truck capacity.
+23
+
+
+--- Page 24 ---
+C.2
+Type II: Phantom Variables
+LLM-Generated Phantom Variable and Index Errors in MiniZinc
+Problem Description.
+A factory production planning LP (3 products, 3 equipment types, maxi-
+mize profit). Full statement at: https://huggingface.co/datasets/CardinalOperations/
+IndustryOr/viewer/default/test?q=3+products&row=53
+(a) LLM-Generated Code — Result: obj = 0
+% Parameters (embed all data values directly here
+)
+int: N = 3;
+set of int: P = 1..N;
+int: M = 3;
+set of int: E = 1..M;
+% Equipment codes: 1=A, 2=B, 3=C
+array[E] of int: avail = [300, 400, 420];
+% Profit per unit (per thousand yuan):
+% [3, 2, 2.9]
+array[P] of float: profit =
+[3.0, 2.0, 2.9];
+% Usage coefficients per unit:
+% BUG 1
+% [8, 2, 10] for I, II, III on A,B,C
+array[P, E] of int: use =
+array2d(P, E,
+[
+8, 2, 10,
+% I on A,B,C
+10, 5, 8,
+% II on A,B,C
+2, 13, 10
+% III on A,B,C
+]);
+% Variables
+% x[p] = production quantity of product p
+% (in "thousand yuan" units)
+array[P] of var 0..100000: x;
+% y[e,p] = whether to process
+% BUG 2
+% product p on equipment e (0/1)
+array[E, P] of var 0..1: y;
+% Constraints
+% 1. Link decision variables to whether
+% each product is processed on each
+% equipment
+constraint
+forall(e in E, p in P) (
+y[e,p] = sum(p in P)(x[p] * use[p,e])
+);
+% 2. Equipment capacity constraints
+constraint
+forall(e in E) (
+sum(p in P)(x[p] * use[p,e]) <= avail[e]
+);
+% Objective
+solve maximize
+sum(p in P)(x[p] * profit[p]);
+(b) Corrected Code — Optimal obj = 135.26
+% Parameters (embed all data values directly here
+)
+int: N = 3;
+set of int: P = 1..N;
+int: M = 3;
+set of int: E = 1..M;
+% Equipment codes: 1=A, 2=B, 3=C
+array[E] of int: avail = [300, 400, 420];
+% Profit per unit (per thousand yuan):
+% [3, 2, 2.9]
+array[P] of float: profit =
+[3.0, 2.0, 2.9];
+% Usage coefficients:
+% FIX 1
+% rows = equipment, cols = products
+array[E, P] of int: use =
+array2d(E, P,
+[
+8, 2, 10,
+% A on I, II, III
+10, 5, 8,
+% B on I, II, III
+2, 13, 10
+% C on I, II, III
+]);
+% Variables
+% FIX 2
+% x[p] = production quantity of product p
+array[P] of var 0.0..100000.0: x;
+% (y variables removed entirely)
+% Constraints
+% Equipment capacity constraints
+constraint
+forall(e in E) (
+sum(p in P)(x[p]
+* int2float(use[e,p]))
+<= int2float(avail[e])
+);
+% Objective
+var float: obj =
+sum(p in P)(x[p] * profit[p]);
+solve maximize obj;
+Key Errors
+Phantom binary variables force objective to zero. Bug 2 introduces binary variables y[e,p] (bounded
+0..1) and constrains each to equal sum(p in P)(x[p] * use[p,e]), a quantity that can reach
+hundreds. The only way to satisfy 0 <= result <= 1 is to set all x[p] = 0, which the solver does,
+producing an objective of zero. These variables have no role in the problem (it is a standard LP, not an
+assignment problem) and are removed entirely in the fix.
+Transposed index on the use matrix.
+Bug 1 declares the matrix as array[P, E] (products ×
+equipment) but fills it row-by-row from the problem table, whose rows are equipment. The first data
+row [8, 2, 10] represents equipment A’s hours for products I, II, III, not product I’s hours on A, B,
+C. With the wrong index the capacity constraint reads the wrong cell, so even if the phantom-variable bug
+were absent the solution would still be incorrect. The fix changes the declaration to array[E, P] and
+accesses it as use[e,p].
+24
+
+
+--- Page 25 ---
+Table 11: Two categories of exclusive constraint errors observed in small fine-tuned LLMs (our aug-
+mented fine-tuning variant) and their impact on solution accuracy. Type I: contradictory constraints
+causing the solver to return unsatisfiable. Type II: phantom variables forcing the objective to zero.
+Fixing these two classes of errors in combination has a considerable potential (52%) to improve
+solution accuracy, even improving over GPT-5.2@1 (49%).
+Type I: Contradictory Constraints (Unsatisfiable)
+Model
+Solution Acc. (%)
+Unsat Cases
+Potential Improvement (%)
+qwen3-0.6b-augmented
+13.0
+18
+31.0
+llama-3.2-1b-augmented
+8.0
+13
+21.0
+llama-3.2-3b-augmented
+17.0
+15
+32.0
+gemma-2-9b-augmented
+22.0
+17
+39.0
+gpt-oss-20b-augmented
+32.0
+8
+40.0
+Type II: Phantom Variables Forcing Objective to Zero
+Model
+Solution Acc. (%)
+Zero-Obj Cases
+Potential Improvement (%)
+qwen3-0.6b-augmented
+13.0
+12
+25.0
+llama-3.2-1b-augmented
+8.0
+20
+28.0
+llama-3.2-3b-augmented
+17.0
+7
+24.0
+gemma-2-9b-augmented
+22.0
+18
+40.0
+gpt-oss-20b-augmented
+32.0
+12
+44.0
+25
