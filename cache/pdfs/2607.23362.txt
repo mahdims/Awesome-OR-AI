@@ -1,0 +1,1612 @@
+--- Page 1 ---
+Preprint. Under review.
+Joint Optimization for Greedy Longest-match Tokenization
+Adhiraj Singh∗
+Deepanshu Mody∗
+Ghina Al Shdaifat
+Hamza Alshamy
+Center for Data Science, New York University
+New York, NY, USA
+{as19687,dm6262,gha2009,ha2486}@nyu.edu
+Adam Wiemerslage
+Varshini Reddy
+Craig W. Schmidt
+Kensho Technologies
+Cambridge, MA, USA
+{adam.wiemerlsage,varshini.bogolu,craig.schmidt}@kensho.com
+Abstract
+Recent work shows that subword vocabularies can be trained to directly
+optimize compression for a specific inference rule, rather than relying
+on a greedy merge heuristic like Byte Pair Encoding (BPE). For example,
+ToaST targets split-tree inference and ConvexTok targets shortest-path
+inference. We extend this approach to greedy left-to-right (GL2R) longest-
+match decoding, the fast and widely used inference rule of WordPiece. We
+introduce Joint Optimization for Greedy Longest-match Tokenization
+(JOLT), which formulates GL2R vocabulary learning as an integer program
+(IP) over vocabulary-selection and segmentation-choice variables. The
+key ingredient is a set of greedy-consistency constraints that force each
+pretoken’s segmentation to match exactly what GL2R produces under
+the selected vocabulary, making the optimized token count equal to the
+count realized at deployment. To solve the IP at scale, we use a linear
+program (LP) relaxation that escalates only unresolved pretokens to higher-
+order segmentations. The relaxation is near-integral: rounded solutions
+fall within 0.008–0.176% of the LP lower bound, certifying near-optimal
+GL2R compression on the training scope. The same bound reveals that
+BPE already sits within 1–2% of the LP lower bound on the training scope,
+confirming the heuristic is near-optimal for GL2R inference; JOLT closes
+89.6–99.4% of this gap. On held-out validation across four training scopes
+(N ∈{100k, 200k, 300k, 400k}) and two vocabulary sizes (|V| ∈{32k, 64k}),
+JOLT yields up to 0.78% fewer tokens than BPE, with gains growing with
+scope. Together, these results show that most of the compression headroom
+between BPE and the LP lower bound can be recovered through inference-
+aligned vocabulary optimization.
+1
+Introduction
+Most NLP tasks use a tokenizer as a first step, converting text into a sequence of tokens
+drawn from a fixed vocabulary. Byte Pair Encoding (BPE; Sennrich et al., 2016) is among the
+most frequently used subword tokenizers; WordPiece (Wu et al., 2016; Schuster & Nakajima,
+2012) and UnigramLM (Kudo, 2018) are also widely deployed. Originally proposed as a
+general-purpose compression algorithm (Gage, 1994) and later adapted for NLP (Sennrich
+et al., 2016), BPE greedily builds a vocabulary by repeatedly merging the most frequent
+adjacent token pair until it reaches its target size. Producing shorter token sequences is
+valuable for language models: it increases the amount of text in a given context window,
+and reduces inference cost. While the effect of compression on downstream accuracy is still
+contested (Gallé, 2019; Rust et al., 2021; Ali et al., 2024; Goldman et al., 2024; Schmidt et al.,
+2024), its practical benefits alone make compression worth optimizing.
+∗These authors contributed equally and are the corresponding authors.
+1
+arXiv:2607.23362v1  [cs.CL]  25 Jul 2026
+
+
+--- Page 2 ---
+Preprint. Under review.
+Recent work shows that vocabulary training need not be limited to greedy merge heuristics:
+ToaST (Schmidt et al., 2026) and ConvexTok (Tempus et al., 2026) show that one can directly
+optimize compression by formulating vocabulary training as an integer program (IP),
+relaxing it to a linear program (LP), and extracting a discrete vocabulary via rounding.1 This
+re-frames tokenizer design from heuristic, procedure-driven training to an inference-specific
+optimization problem. There is therefore no single notion of “best compressing tokenizer”
+independent of inference rule; optimality must be stated relative to the inference rule.
+Greedy left-to-right (GL2R) longest-match decoding is a simple and fast tokenization in-
+ference rule, most commonly used by WordPiece. Given a vocabulary, GL2R scans the
+input left to right and at each position emits the longest vocabulary token matching the
+bytes starting there, advancing by its length; with a full set of single-byte tokens in the
+vocabulary, this always succeeds without unknown tokens. Uzan et al. (2024) show that
+GL2R is effective even when applied to vocabularies trained by other methods. However,
+there has not been a vocabulary construction technique designed specifically to work with
+GL2R. We develop Joint Optimization for Greedy Longest-match Tokenization (JOLT),
+which follows the same high-level recipe as ToaST and ConvexTok (integer program →
+LP relaxation →rounding to a fixed vocabulary) but formulates the model specifically for
+GL2R inference, making the optimized token count equal to the one realized at deployment.
+Empirically, JOLT reduces greedy-L2R token counts on held-out text by up to 0.78% relative
+to BPE at equal vocabulary size across four training scopes (N ∈{100k, 200k, 300k, 400k}),
+with larger scopes consistently yielding equal or better compression. Beyond the compres-
+sion gains, the LP bound provides a structural diagnostic: BPE’s token count on the training
+scope falls within 1–2% of the LP lower bound, revealing that the BPE heuristic is already
+near-optimal under GL2R inference. JOLT closes 89.6–99.4% of this gap, and its rounded
+vocabularies fall within 0.008–0.176% of the LP bound, so rounding loses almost none of the
+LP-achievable compression. JOLT’s small margin over BPE on the held-out validation set
+therefore reflects the limited headroom above the LP bound, not a rounding artifact.
+2
+JOLT Model
+JOLT formulates vocabulary learning as a joint integer program over two coupled choices:
+which candidate tokens enter the vocabulary, and which candidate segmentation of each
+pretoken is selected. Under GL2R, the longest matching vocabulary token wins at each posi-
+tion, so a segmentation is GL2R-realizable only for vocabularies in which no longer token
+intrudes at any segment boundary. Enforcing this validity condition explicitly (Section 2.4)
+is what couples the vocabulary-selection and segmentation-choice variables. Because the
+number of candidate segmentations grows exponentially in pretoken length, JOLT does
+not instantiate them all up front, but initially works with a small number of candidate
+segmentations per pretoken, adding more as needed.
+2.1
+Pretokens, segmentations, and costs
+Pretokens.
+We first segment the training corpus into pretokens using a regular expression2
+and aggregate identical pretokens by count. Let P be the set of aggregated pretokens in the
+training data, with frequency cp ∈N for each pretoken p ∈P. We work with byte-level
+tokenization, so we define np = |p| as the byte length of pretoken p.
+For vocabulary training we retain the N highest-count pretokens; throughout the IP below,
+P denotes this restricted top-N set with counts cp, not the full pretoken vocabulary.
+Segmentations.
+A segmentation s partitions a pretoken p into contiguous, non-empty
+candidate tokens. We depict example segmentations visually divided by |, e.g. segmentation
+1Exact compression-oriented training is NP-complete in several standard formulations (Whitting-
+ton et al., 2025; Kastreva et al., 2026), so corpus-scale work solves an LP relaxation and rounds to a
+fixed vocabulary rather than optimizing the full IP.
+2We use a length limited version of the GPT-4o regex. See Appendix C for more details.
+2
+
+
+--- Page 3 ---
+Preprint. Under review.
+(a) Round 1
+(6 instantiated / 16 possible)
+Variable
+Visual
+cost(p, s)
+ztable, table
+t
+a
+b
+l
+e
+1
+ztable, t | able
+t
+a
+b
+l
+e
+2
+ztable, ta | ble
+t
+a
+b
+l
+e
+2
+ztable, tab | le
+t
+a
+b
+l
+e
+2
+ztable, tabl | e
+t
+a
+b
+l
+e
+2
+ztable, F
+—
+κp+1
+(b) Added if fallback selected in Round 1
+(six new order-3 segmentations)
+Variable
+Visual
+cost(p, s)
+ztable, t | a | ble
+t
+a
+b
+l
+e
+3
+ztable, t | ab | le
+t
+a
+b
+l
+e
+3
+ztable, t | abl | e
+t
+a
+b
+l
+e
+3
+ztable, ta | b | le
+t
+a
+b
+l
+e
+3
+ztable, ta | bl | e
+t
+a
+b
+l
+e
+3
+ztable, tab | l | e
+t
+a
+b
+l
+e
+3
+Figure 1: Instantiated segmentations Sp for pretoken p = table (np=5). (a) Round 1 (κp=2):
+whole pretoken, four order-2 segmentations, and fallback F. (b) Round 2: six order-3
+segmentations added when F was selected in round 1 (Section 2.5).
+s = ta | ble for pretoken p = table. The order of s is the number of pieces (tokens) in the
+partition. An order-r segmentation is determined by choosing r −1 internal split positions
+among the np −1 byte gaps, so there are exactly (np−1
+r−1 ) order-r candidates for p. Summing
+over orders shows the total grows exponentially in np:
+np
+∑
+r=1
+np −1
+r −1
+
+= 2np−1
+(1)
+In practice, however, a compression-oriented vocabulary will tokenize most pretokens
+with a low-order segmentation, so only a small fraction of the 2np−1 candidates need to be
+explicitly instantiated.
+To avoid the exponential number of potential segmentations, we instantiate only segmen-
+tations up to a bounded order per pretoken. Let κp denote the maximum segmentation
+order currently instantiated for p. For a given κp, let Sp be the finite set of segmentation
+choices for p: all s with order(s) ≤κp, together with a fallback F. The fallback is not itself a
+segmentation of p; choosing F means that none of the currently instantiated segmentations
+suffice and the solver would prefer a partition of order greater than κp. We initially set
+κp = 2, so Sp contains only the whole pretoken, all order-2 segmentations, and F; these are
+the only segmentation options for p in the first round. When the solver selects F for p, κp is
+incremented and the next order of segmentations is appended to Sp (Section 2.5). Thus,
+|Sp| =
+κp
+∑
+r=1
+np −1
+r −1
+
++ 1.
+(2)
+Escalation then increases κp and enriches Sp only for those pretokens (Section 2.5), rather
+than instantiating higher-order segmentations for every p ∈P up front. This selective
+escalation avoids instantiating high-order segmentations unnecessarily, reducing LP size
+and solve time.
+Tokens and costs.
+Training proceeds in a sequence of rounds. In each round, every pretoken
+p has a fixed limit κp on segmentation order, with a fixed finite set Sp. We build and solve
+the IP (or its LP relaxation); pretokens that select the fallback F trigger an increase in κp and
+a rebuild before the next round (Section 2.5).
+Figure 1(a) gives an example for the pretoken p = table with np = 5. There are 2np−1 = 16
+potential segmentations, but with the initial κp = 2 only six are instantiated choices: the
+whole pretoken, four order-2 segmentations, and F. When a pretoken selects the fallback, its
+κp is increased by one in the next round and those new candidates are appended (Section 2.5).
+Figure 1(b) shows the six extra order-3 segmentations added when κp increases to 3; all
+2np−1 segmentations enter Sp only if κp reaches np.
+Let B denote the set of all 256 single-byte tokens which are always retained in the extracted
+vocabulary (Equation (8)) to avoid unknown tokens. For each p ∈P and non-fallback s ∈Sp,
+3
+
+
+--- Page 4 ---
+Preprint. Under review.
+let Ep,s be the set of distinct token strings (byte subsequences) used by segmentation s. The
+global candidate token set for that round is
+T = B ∪
+[
+p∈P
+[
+s∈Sp\{F}
+Ep,s.
+(3)
+Elements t ∈T are byte strings; whenever any Sp grows, new segmentations may introduce
+token strings absent from the current T, so T is recomputed before the next LP solve.
+For non-fallback segmentations, cost(p, s) equals the order of s (token count under s). The
+fallback enters the objective through a stage-dependent cost:
+cost(p, F) =
+κp + 1,
+intermediate rounds,
+np,
+final repricing round,
+(4)
+In intermediate rounds, cost(p, F) = κp + 1 is intentionally one token above the largest cost
+among currently instantiated segmentations of order ≤κp, so any non-fallback segmentation
+is strictly cheaper than F. Section 2.5 uses this pricing to decide when to enrich Sp; the final
+round sets cost(p, F) = np so the reported score reflects the worst-case GL2R token count
+for any remaining fallback pretokens once Sp has converged.
+2.2
+Decision variables and objective
+Vocabulary-selection variables.
+For each candidate token t ∈T, define
+xt ∈{0, 1}
+∀t ∈T,
+(5)
+where xt = 1 means token t is in the vocabulary. For example, for pretoken table, xtab = 1
+means tab is globally available as a candidate token.
+Segmentation-choice variables.
+For each p ∈P and each s ∈Sp, we introduce a binary
+decision variable
+zp,s ∈{0, 1}
+∀p ∈P, ∀s ∈Sp,
+(6)
+where zp,s = 1 indicates that segmentation s is selected for pretoken p; the greedy-
+consistency constraints (Section 2.4) then enforce that the active segmentation is exactly
+the one GL2R produces. Because cost(p, s) < cost(p, F) for every non-fallback s, selecting
+F (i.e., zp,F = 1 in the integer problem, or LP mass on zp,F ≥θ in the relaxation; we use
+θ = 0.01) is the signal that the current Sp is too coarse; Section 2.5 acts on that signal to
+increase κp and reduce the use of fallbacks.
+Optimization objective.
+We minimize the corpus-weighted token count: each pretoken p
+selects exactly one segmentation s ∈Sp, paying cost(p, s) tokens, weighted by the aggre-
+gated count cp. The objective is:
+min
+x,z ∑
+p∈P ∑
+s∈Sp
+cp cost(p, s) zp,s
+(7)
+2.3
+Feasibility constraints
+Byte-completeness constraint.
+Single-byte tokens must be included in the vocabulary,
+ensuring any input can be tokenized without unknown-token failures:
+xb = 1
+∀b ∈B.
+(8)
+Vocabulary-budget constraint.
+We optimize a vocabulary of desired size |V|:
+∑
+t∈T
+xt ≤|V|.
+(9)
+Exactly-one-segmentation constraint.
+Exactly one segmentation is active per pretoken:
+∑
+s∈Sp
+zp,s = 1
+∀p ∈P.
+(10)
+4
+
+
+--- Page 5 ---
+Preprint. Under review.
+(a) s = ta | ble
+Type
+Inequality
+Segmentation
+Linking ztable, ta | ble ≤xta
+t
+a
+b
+l
+e
+ztable, ta | ble ≤xble
+t
+a
+b
+l
+e
+Greedy
+consist.
+ztable, ta | ble ≤1 −xtab
+t
+a
+b
+l
+e
+ztable, ta | ble ≤1 −xtabl
+t
+a
+b
+l
+e
+ztable, ta | ble ≤1 −xtable
+t
+a
+b
+l
+e
+(b) s = ta | b | le
+Type
+Inequality
+Segmentation
+Linking
+ztable, ta | b | le ≤xta
+t
+a
+b
+l
+e
+ztable, ta | b | le ≤xb
+t
+a
+b
+l
+e
+ztable, ta | b | le ≤xle
+t
+a
+b
+l
+e
+Greedy
+consist.
+ztable, ta | b | le ≤1 −xtab
+t
+a
+b
+l
+e
+ztable, ta | b | le ≤1 −xtabl
+t
+a
+b
+l
+e
+ztable, ta | b | le ≤1 −xtable
+t
+a
+b
+l
+e
+ztable, ta | b | le ≤1 −xbl
+t
+a
+b
+l
+e
+ztable, ta | b | le ≤1 −xble
+t
+a
+b
+l
+e
+Figure 2: Linking and greedy-consistency rows for p = table. (a) s = ta | ble. (b) s =
+ta | b | le. Blue: required token; red: forbidden longer prefix at that segment start.
+Linking constraint.
+For non-fallback s, recall from Section 2.1 that Ep,s is the set of tokens
+t used in segmentation s of pretoken p. A segmentation can be activated only if all of its
+tokens are selected in the vocabulary:
+zp,s ≤xt
+∀p ∈P, ∀s ∈Sp \ {F}, ∀t ∈Ep,s.
+(11)
+For example, splitting table as ta | ble requires both ta and ble to be in the vocabulary.
+The blue rows of Figure 2 show this for two example segmentations.
+2.4
+Greedy-consistency constraints
+The feasibility constraints above (Equations (8) to (11)) ensure budget compliance and
+that an activated segmentation uses tokens selected in the vocabulary, but they do not yet
+enforce that it is the segmentation GL2R would actually produce for the given vocabulary.
+A segmentation s is GL2R-realizable (under vocabulary V) if it is exactly the segmentation
+GL2R longest-prefix decoding emits on pretoken p. Greedy-consistency means that every
+choice with zp,s = 1 is GL2R-realizable; we enforce this with Equation (13).
+A segment g is one contiguous piece of a segmentation s; for s = ta | b | le the segments are
+ta, b, and le. Let G−
+s denote the non-final segments of s (here ta and b); the final segment has
+nothing downstream to displace, so it imposes no constraint. For byte strings u, v we write
+u ⪯v if u is a prefix of v, and u ≺v if additionally u̸ = v. Under GL2R, s is GL2R-realizable
+only if at the start of each non-final segment, no longer vocabulary token extends past that
+segment, otherwise GL2R would emit the longer token and shift all downstream boundaries.
+The red rows of Figure 2 illustrate this for two example segmentations.
+Consider a non-final segment g ∈G−
+s , and let w be the suffix of p that starts at g (so w
+begins with g, i.e. g ⪯w). For example, with p = table and g = ta we have w = table;
+with g = b we have w = ble. The forbidden-prefix set Lp,s,g comprises candidate tokens that
+strictly extend g while still matching the upcoming bytes of p:
+Lp,s,g =
+
+t ∈T : g ≺t ⪯w
+	
+∀p ∈P, ∀s ∈Sp \ {F}, ∀g ∈G−
+s .
+(12)
+For p = table, g = ta, and w = table, Equation (12) yields Lp,s,g = {tab, tabl, table}.
+Note g ≺t alone is not enough: tax extends ta but is not in Lp,s,g, since tax̸ ⪯table means
+GL2R never considers it here. A forbidden longer prefix need not be a segment of s (e.g.
+tab ∈Lp,s,g for ta | ble although tab is not one of its segments).
+If any t ∈Lp,s,g is in the vocabulary, s cannot be selected:
+zp,s ≤1 −xt
+∀p ∈P, ∀s ∈Sp \ {F}, ∀g ∈G−
+s , ∀t ∈Lp,s,g.
+(13)
+Together with the linking constraint Equation (11), which guarantees each segment string is
+itself in the vocabulary, Equation (13) ensures that whenever zp,s = 1 each chosen segment
+is the longest vocabulary match at its start position, exactly the segmentation GL2R longest-
+prefix decoding emits with vocabulary V.
+5
+
+
+--- Page 6 ---
+Preprint. Under review.
+2.5
+Fallback-driven escalation
+Equation (13) must be enforced for every segmentation variable we instantiate, so the size
+of the IP in Equations (7) to (13) is driven by |Sp| in each round. Section 2.1 explained why
+naively instantiating all orders for every pretoken in the top-N set would introduce too
+many variables and constraints, making the LP slow to solve; here we describe the schedule
+that keeps each solve tractable while preserving a globally coupled objective.
+Fallback as model-size control.
+Every pretoken has a distinct F ∈Sp with variable
+zp,F; setting it to 1 pays the higher cost(p, F) rather than committing to any instantiated
+segmentation. This is not a soft penalty but a model-size control: it lets us omit higher-order
+segmentations until the solver signals the current family is too coarse for p.
+Fallback-driven iterative escalation.
+Training solves a sequence of LP relaxations of
+the globally coupled IP, each with the same structure Equations (8) to (13) and objective
+Equation (7), but with pretoken segmentation sets Sp growing from round to round, and the
+candidate set T recomputed accordingly.
+Round 1. For every p ∈P, set κp = 2 and initialize Sp to the unsplit pretoken, all order-2
+segmentations (one internal split per byte gap), and F. To shrink the first LP, the Ntop=8000
+highest-count pretokens start with κp=1 (whole pretoken and F only): these extremely
+frequent tokens (common words like the, is, in, and common punctuation) carry the bulk of
+corpus mass and are near-certain vocabulary members as whole units regardless of budget,
+making their order-2 splits almost never worthwhile; omitting them removes a large fraction
+of variables and greedy-consistency rows (Equation (13)) with little empirical impact. Any
+pretoken that nonetheless activates F is promoted to the full order-2 family before the next
+round.
+Escalation loop. After the solution of each LP (Section 2.6) with optimal fractional values
+(x⋆, z⋆) in round i, read off the fallback-active set Fi = {p ∈P : z⋆
+p,F ≥θ} from the fractional
+solution. Only pretokens in Fi have κp incremented (up to cap M=3), their order-(κp+1)
+segmentations appended to Sp, T and the full IP rebuilt, and re-solved; Figure 1(b) illustrates
+the order-3 segmentations added for p = table ∈Fi. The loop continues until Fi = ∅or no
+κp changes.
+Final repricing. When the structure stabilizes, one last solve freezes each Sp and sets
+cost(p, F) = np via Equation (4), so resolved pretokens carry their exact GL2R inference
+cost while any remaining fallback mass is assigned a conservative byte-level upper bound.
+LP relaxation and vocabulary extraction from the final fractional solution are described in
+the next subsection.
+2.6
+LP relaxation and weighted rounding
+The IP instances in Equations (7) to (13) are too large to solve to optimality at corpus scale,
+even after iterative enrichment of the segmentation families. Following ToaST, JOLT works
+with an LP relaxation that replaces the binary domains in Equations (5) to (6) by
+0 ≤xt ≤1
+∀t ∈T,
+(14)
+0 ≤zp,s ≤1
+∀p ∈P, ∀s ∈Sp.
+(15)
+Solving the resulting LP with Gurobi (Gurobi Optimization, LLC, 2026) yields optimal
+fractional values (x⋆, z⋆). Relaxing integrality allows segmentation mass to split fractionally
+across Sp, but the relaxation remains globally coupled across pretokens: high-count p still
+pulls token mass toward compressing segmentations that survive GL2R linking and greedy-
+consistency coupling. In practice the final-round solution is empirically near-integral on our
+instances (many x⋆
+t near 0 or 1), which makes a simple rounding rule effective to construct
+a budget-feasible vocabulary under Equation (9) without solving the full IP to optimality.
+The optimal objective value is a valid lower bound on the corresponding instantiated IP
+objective.
+6
+
+
+--- Page 7 ---
+Preprint. Under review.
+Contribution-based rounding.
+We extract the vocabulary from (x⋆, z⋆) using the
+contribution-based weighted rounding of ToaST. The rule is unchanged: although JOLT’s
+segmentation variables zp,s range over GL2R-realizable segmentations rather than split-
+tree ones, rounding treats them only as generic segmentation variables, so the procedure
+transfers verbatim. Tokens with x⋆
+t ≥1 −ϵ are admitted to V outright (Appendix B); the
+remaining budget is filled from the fractional tier by objective contribution C⋆
+t , the count-
+weighted z⋆-mass flowing through t (Equation (16) in Appendix B). Selection therefore
+favors tokens the relaxation already used to compress high-frequency pretokens, rather
+than tokens with large x⋆
+t but little segmentation support. Inference applies GL2R decoding
+with V.
+3
+Experimental Setup
+3.1
+Data and pretokenization
+We train and evaluate all tokenizers on MiniPile (Kaddour, 2023), a subset of The Pile (Gao
+et al., 2020), using a document-level 75%/25% train/validation split. Both splits are pre-
+tokenized with GPT4O_REGEX_16 (details in Appendix C), which segments text into words,
+numbers, punctuation, and whitespace runs; tokens cannot cross pretoken boundaries. We
+write Pval for the full set of aggregated pretoken types on the validation holdout (100% of
+validation count mass); all token counts, % decrease, and Rényi efficiency in Section 4 are
+evaluated on Pval.
+3.2
+Baselines and Configurations
+Baselines.
+BPE, WordPiece, and UnigramLM are trained on the full training corpus using
+standard HuggingFace pipelines. BPE-native decodes with the standard BPE merge rule;
+BPE-greedy applies GL2R longest-prefix decoding to the same vocabulary, isolating the effect
+of inference rule from vocabulary construction. WordPiece-greedy and UnigramLM-greedy
+analogously pair standard vocabularies with GL2R decoding at evaluation. UnigramLM-
+greedy serves as a diagnostic for training-objective mismatch: it applies the same GL2R
+inference as JOLT but was trained to maximize unigram language-model likelihood rather
+than minimize token count, so its substantially higher token counts reflect training-objective
+divergence. All methods are evaluated at matched vocabulary sizes |V| ∈{32,000, 64,000};
+% improvements are relative to BPE-native merge decoding.
+JOLT
+configurations.
+We
+evaluate
+JOLT
+at
+four
+training
+scopes
+(N
+∈
+{100k, 200k, 300k, 400k}) and both vocabulary budgets, with all runs capped at es-
+calation order M=3.3 Because corpus-scale LP solves are far more expensive than standard
+baseline training, JOLT trains exclusively on the top-N pretokens (the set P of Section 2.1),
+while baselines train on the full distribution; both are evaluated on the same Pval. Pretoken
+frequencies are highly skewed, so even the smallest scope (N=100k) covers ≈95.8% of
+training count mass, rising to ≈98.3% at N=400k; nevertheless, this asymmetry can
+disadvantage JOLT for tail pretokens not seen during optimization, so reported validation
+margins may understate its compression quality on the training scope where LP certificates
+apply. The two larger scopes (N=300k and N=400k) use the round-2-only protocol of
+Section 3.3 to assess training scope sensitivity.
+3.3
+Extended-scope protocol (N=300k and N=400k)
+Full-pipeline runs at N=100k/200k provide our LP optimality certificates; extended scopes
+at N=300k/400k use a round-2-only protocol within our compute budget and are reported
+to assess whether validation compression continues to improve as N grows, not to claim
+an equivalent final-round bound. At N=300k and N=400k the final repricing LP becomes
+prohibitively expensive within our compute budget (See the full breakdown of solve times
+3We verified M=3 is sufficient: M=4 at |V|=32k/N=100k emits 368.7M tokens on Pval vs. 368.6M
+at M=3 (≈0.05% apart). Higher order adds substantial LP size with no compression gain.
+7
+
+
+--- Page 8 ---
+Preprint. Under review.
+|V| = 32k, N = 100k
+|V| = 64k, N = 100k
+|V| = 32k, N = 200k
+|V| = 64k, N = 200k
+940
+960
+980
+1000
+1020
+1040
+Token count on scope P (M)
+89.6% gap closed
+0.176% round gap
+99.4% gap closed
+0.008% round gap
+99.4% gap closed
+0.008% round gap
+93.1% gap closed
+0.070% round gap
+LP bound
+Rounded objective
+BPE-greedy on P
+Figure 3: LP bound, rounded greedy-L2R objective, and BPE-greedy token count on training
+scope P (in millions), with gap-closed % and round-gap annotated per group. JOLT closes
+89.6–99.4% of the BPE-greedy-to-LP slack; rounded solutions sit within 0.008–0.176% of the
+LP bound. Full-pipeline runs only (N ∈{100k, 200k}); extended-scope rows in Table 4.
+in Table 2, Appendix E), so we stop after iter-2 and skip the final LP; the iter-2 vocabulary
+from contribution-based rounding is directly used for validation scoring in Table 1.
+To keep gap-closed and round-gap diagnostics comparable across all training scopes in
+Table 4, we report the raw Gurobi iter-2 LP objective and the greedy-L2R token count
+on P from the iter-2 vocabulary. We do not correct the iter-2 fallback cost (κp+1=3) to the
+final-round byte-level penalty np: doing so after the fact would invalidate the relaxation
+bound, since z⋆was optimized under the original costs (Appendix I).
+Because the full pipeline remains affordable at N=100k and N=200k, we use those runs as
+a sanity check: extracting the iter-2 vocabulary and rounded count from saved checkpoints
+recovers full-pipeline rounded objectives to within 0.03% and validation token counts to
+within ≈0.5M tokens (Appendix I), justifying the round-2-only protocol at larger N.
+4
+Results and Analysis
+4.1
+Optimality Bounds and Gap Closure
+Figure 3 shows the LP bound, rounded JOLT token count, and BPE-greedy on the training
+scope P (not on Pval) for the four full-pipeline runs (N ∈{100k, 200k}, both vocabulary
+budgets). The LP objective is a valid lower bound on achievable GL2R token count under our
+formulation, and all four instances solve to OPTIMAL (Appendices D and J). The rounded
+score exceeds this LP bound by only 0.008–0.176%, so the extracted vocabularies nearly
+attain the relaxation optimum on P. Because rounded JOLT vocabularies sit this close to
+the LP bound, any margin over BPE-native on Pval reflects genuine LP-level compression
+gains, not rounding loss. On the matched training scope P (not on Pval, where tail pretokens
+outside P dilute the comparison), JOLT closes 89.6–99.4% of the BPE-greedy-to-LP gap,
+confirming most achievable compression under our formulation is recovered. BPE-greedy
+already sits near the LP lower bound on P, which is why heuristic training leaves only a
+small absolute margin on Pval. Intuitively, BPE’s left-to-right merge order naturally favors
+longer, more frequent substrings, which aligns structurally with GL2R’s longest-match rule.
+Even though BPE was not designed for GL2R, the two procedures share a preference for
+greedy length maximization that keeps BPE close to the GL2R-optimal bound.
+8
+
+
+--- Page 9 ---
+Preprint. Under review.
+Method
+Greedy-L2R
+tokens (M)
+% decrease
+vs BPE-native
+Rényi efficiency
+α = 2.5
+32k
+64k
+32k
+64k
+32k
+64k
+BPE-native merge decoding
+370.8
+351.9
+—
+—
+0.486
+0.448
+BPE-greedy
+370.4
+351.6
++0.08
++0.08
+0.486
+0.449
+WordPiece-greedy
+372.3
+352.8
+−0.42
+−0.25
+0.487
+0.449
+UnigramLM-greedy
+476.0
+460.6
+−28.37
+−30.91
+0.352
+0.334
+JOLT N=100k (ours)
+368.6
+354.1
++0.59
+−0.63
+0.485
+0.450
+JOLT N=200k (ours)
+367.9
+351.1
++0.77
++0.23
+0.485
+0.448
+JOLT N=300k (ours)†
+367.9
+351.0
++0.76
++0.26
+0.485
+0.449
+JOLT N=400k (ours)†
+367.9
+350.8
++0.78
++0.31
+0.485
+0.448
+Table 1: Intrinsic token-count comparison on Pval (Section 3.1). JOLT trains on the top-N
+pretokens; baselines train on the full corpus (Section 3). Token counts in millions (M); % de-
+crease relative to BPE-native (positive = fewer tokens). †Round-2-only protocol (Section 3.3).
+Rényi efficiencies cluster tightly across methods; differences in compression appear in token
+counts, not the Rényi spread.
+4.2
+Validation Compression Across Training Scopes
+Table 1 reports greedy-L2R intrinsic metrics on Pval for all four training scopes. Rows
+marked † use the round-2-only protocol (Section 3.3) and report validation compression
+only; LP optimality certificates come from the full pipeline at N=100k/200k (Section 4.1).
+At |V|=32k, JOLT beats BPE-native at every evaluated scope: +0.59% at N=100k, +0.77%
+at N=200k, +0.76% at N=300k, and +0.78% at N=400k. At |V|=64k, whether JOLT beats
+BPE-native depends entirely on scope: N=100k trails by 0.63%, while N ≥200k consistently
+beats it with the margin growing from +0.23% to +0.31% as N increases. BPE-native
+and BPE-greedy differ by only 0.08% at both vocabulary budgets, confirming that for
+BPE vocabularies the inference rule is almost irrelevant to compression. The gap between
+BPE and JOLT therefore reflects vocabulary construction, not inference-rule mismatch.
+WordPiece-greedy, despite being designed for GL2R inference, attains worse compression
+than BPE-native (−0.42% at 32k, −0.25% at 64k), consistent with its training objective—
+maximizing unigram language-model likelihood rather than minimizing token count—
+diverging from compression minimization. The rate of improvement with N differs by
+vocabulary budget: at |V|=32k gains plateau near N=200k but show a slight further increase
+at N=400k (+0.78%), while at |V|=64k compression improves more steadily through
+N=400k (+0.31%). The smaller budget saturates earlier because 32k tokens already cover a
+large fraction of the high-frequency pretoken tail at N=200k, whereas the larger vocabulary
+has more slots to account for the tail of lower frequency pretokens. Fallback mass after
+round 1 stays below 1.6% of training count, halves after order-3 escalation, and validation
+counts improve monotonically with each round; full diagnostics are in Appendix F. In
+Appendices G and H we compare rank-frequency profiles and token-length distributions
+across tokenizers; the overall profiles are largely similar, with the main structural signature
+being a modest shift toward length-1 tokens under JOLT.
+5
+Conclusion
+We developed a vocabulary construction method tailored to GL2R longest-match decoding,
+a widely deployed inference rule that lacked an inference-specific training method. JOLT
+fills this gap with a joint integer program whose greedy-consistency constraints force each
+pretoken’s segmentation to match exactly what GL2R realizes under the chosen vocabulary.
+The optimizer behaves as designed: rounded JOLT vocabularies close 89.6–99.4% of the
+BPE-greedy-to-LP gap on full-pipeline runs. Yet the headroom is small: BPE already sits
+within 1–2% of the bound, because its left-to-right merge order rewards the long, frequent
+9
+
+
+--- Page 10 ---
+Preprint. Under review.
+substrings that GL2R also prefers at decode time. The residual gap is driven primarily by
+vocabulary construction rather than the inference rule. Thus, JOLT’s margin — up to 0.78%
+fewer held-out tokens, increasing with scope — comes from reshaping the vocabulary, not
+from changing inference.
+The lasting contribution is therefore not the size of the margin but the ability to certify
+it relative to an LP lower bound. The LP bound separates optimizer quality from the
+headroom the inference rule allows, turning “how much better can a GL2R tokenizer be?”
+from an open question into a measured one. It also provides a reusable test for whether an
+inference-specific optimizer is worth building for any other decoding rule.
+Limitations
+All experiments use MiniPile, a predominantly English corpus, with a single train/vali-
+dation split and a fixed regex pretokenizer. Optimality claims are relative to the pretoken
+boundaries induced by this pretokenizer, and we do not evaluate transfer to languages
+without whitespace-delimited words. The IP covers only the top-N pretokens (≈95.8–98.3%
+of count-weighted training mass); the tail is excluded entirely from optimization. Within the
+training scope, segmentations above order cap M=3 (Section 3.2) are priced conservatively
+with np rather than optimized. Our certificates are empirical LP-gap measurements on the
+training scope, not proven general approximation bounds: the IP is never solved to integral
+optimality, and the rounding step carries no worst-case guarantee. Finally, our evaluation
+is intrinsic only. Our contribution lies in the joint modeling of vocabulary construction
+and GL2R segmentation, alongside the certification methodology, rather than a claim of
+downstream performance.
+References
+Mehdi Ali, Michael Fromm, Klaudia Thellmann, Richard Rutmann, Max Lübbering, Jo-
+hannes Leveling, Katrin Klug, Jan Ebert, Niclas Doll, Jasper Buschhoff, Charvi Jain,
+Alexander Weber, Lena Jurkschat, Hammam Abdelwahab, Chelsea John, Pedro Or-
+tiz Suarez, Malte Ostendorff, Samuel Weinbach, Rafet Sifa, et al. Tokenizer choice for LLM
+training: Negligible or crucial? In Findings of the Association for Computational Linguistics,
+2024.
+Philip Gage. A new algorithm for data compression. The C Users Journal, 12(2):23–38, 1994.
+Matthias Gallé. Investigating the effectiveness of BPE: The power of shorter sequences. In
+Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and
+the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP), pp.
+1375–1381, Hong Kong, China, 2019. Association for Computational Linguistics.
+Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason
+Phang, Horace He, Anish Thite, Noa Nabeshima, et al. The Pile: An 800GB dataset of
+diverse text for language modeling. arXiv preprint arXiv:2101.00027, 2020.
+Omer Goldman, Avi Caciularu, Matan Eyal, Kris Cao, Idan Szpektor, and Reut Tsarfaty.
+Unpacking tokenization: Evaluating text compression and its correlation with model
+performance. In Findings of the Association for Computational Linguistics: ACL 2024, pp.
+2274–2286, Bangkok, Thailand, 2024. Association for Computational Linguistics.
+Gurobi Optimization, LLC. Gurobi Optimizer Reference Manual, 2026. URL https://www.
+gurobi.com. Version 11.0.
+Jean Kaddour. The minipile challenge for data-efficient language models, 2023. URL
+https://arxiv.org/abs/2304.08442.
+Violeta Kastreva, Philip Whittington, Dennis Komm, and Tiago Pimentel. Tokenisation
+over bounded alphabets is hard. In The Fourteenth International Conference on Learning
+Representations, 2026. URL https://openreview.net/forum?id=Xhf9YqwlM4.
+10
+
+
+--- Page 11 ---
+Preprint. Under review.
+Taku Kudo. Subword regularization: Improving neural network translation models with
+multiple subword candidates. In Iryna Gurevych and Yusuke Miyao (eds.), Proceed-
+ings of the 56th Annual Meeting of the Association for Computational Linguistics (Volume 1:
+Long Papers), pp. 66–75, Melbourne, Australia, July 2018. Association for Computational
+Linguistics. doi: 10.18653/v1/P18-1007. URL https://aclanthology.org/P18-1007/.
+Phillip Rust, Jonas Pfeiffer, Ivan Vuli´c, Sebastian Ruder, and Iryna Gurevych. How good is
+your tokenizer? on the monolingual performance of multilingual language models. In
+Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the
+11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers),
+pp. 3118–3135, Online, 2021. Association for Computational Linguistics.
+Craig W. Schmidt, Varshini Reddy, Haoran Zhang, Alec Alameddine, Omri Uzan, Yuval
+Pinter, and Chris Tanner. Tokenization is more than compression. In Proceedings of the
+2024 Conference on Empirical Methods in Natural Language Processing, pp. 678–702, Miami,
+Florida, USA, 2024. Association for Computational Linguistics.
+Craig W. Schmidt, Michael Krumdick, Adam Wiemerslage, Seth Ebner, Varshini Reddy,
+Yuval Pinter, and Chris Tanner. Tokenization with split trees, 2026. URL https://arxiv.
+org/abs/2605.22705.
+Mike Schuster and Kaisuke Nakajima. Japanese and korean voice search. In 2012 IEEE
+International Conference on Acoustics, Speech and Signal Processing (ICASSP), pp. 5149–5152,
+2012. doi: 10.1109/ICASSP.2012.6289079.
+Rico Sennrich, Barry Haddow, and Alexandra Birch. Neural machine translation of rare
+words with subword units. In Katrin Erk and Noah A. Smith (eds.), Proceedings of the 54th
+Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pp.
+1715–1725, Berlin, Germany, August 2016. Association for Computational Linguistics. doi:
+10.18653/v1/P16-1162. URL https://aclanthology.org/P16-1162/.
+Jan Tempus, Philip Whittington, Craig W. Schmidt, Dennis Komm, and Tiago Pimentel.
+Tokenisation via convex relaxations, 2026. URL https://arxiv.org/abs/2605.22821.
+Omri Uzan, Craig W. Schmidt, Chris Tanner, and Yuval Pinter. Greed is all you need: An
+evaluation of tokenizer inference methods. In Lun-Wei Ku, Andre Martins, and Vivek
+Srikumar (eds.), Proceedings of the 62nd Annual Meeting of the Association for Computa-
+tional Linguistics (Volume 2: Short Papers), pp. 813–822, Bangkok, Thailand, August 2024.
+Association for Computational Linguistics. doi: 10.18653/v1/2024.acl-short.73. URL
+https://aclanthology.org/2024.acl-short.73/.
+Philip Whittington, Gregor Bachmann, and Tiago Pimentel. Tokenisation is NP-complete.
+In Wanxiang Che, Joyce Nabende, Ekaterina Shutova, and Mohammad Taher Pilehvar
+(eds.), Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics
+(Volume 1: Long Papers), pp. 28133–28153, Vienna, Austria, July 2025. Association for
+Computational Linguistics. ISBN 979-8-89176-251-0. doi: 10.18653/v1/2025.acl-long.1365.
+URL https://aclanthology.org/2025.acl-long.1365/.
+Yonghui Wu, Mike Schuster, Zhifeng Chen, Quoc V. Le, Mohammad Norouzi, Wolfgang
+Macherey, Maxim Krikun, Yuan Cao, Qin Gao, Klaus Macherey, Jeff Klingner, Apurva
+Shah, Melvin Johnson, Xiaobing Liu, Łukasz Kaiser, Stephan Gouws, Yoshikiyo Kato,
+Taku Kudo, Hideto Kazawa, Keith Stevens, George Kurian, Nishant Patil, Wei Wang, Cliff
+Young, Jason Smith, Jason Riesa, Alex Rudnick, Oriol Vinyals, Greg Corrado, Macduff
+Hughes, and Jeffrey Dean. Google’s neural machine translation system: Bridging the gap
+between human and machine translation, 2016.
+A
+JOLT Training Algorithm
+The pseudocode in Algorithm 1 summarizes the full training pipeline and experimental
+protocol.
+11
+
+
+--- Page 12 ---
+Preprint. Under review.
+Algorithm 1 Greedy-L2R Joint MIP with Fallback-Driven Escalation
+Require: Aggregated pretokens P with counts cp, target vocabulary cardinality |V|,
+byte set B, max segmentation order M, fallback-active threshold θ (default 0.01)
+Ensure: Learned vocabulary V ⊆T with |V| tokens
+1: Initialize escalation map κp ←2 for all p ∈P
+2: Initialize fallback-active set F ←∅
+3: repeat
+4:
+T ←B
+▷global candidate tokens for xt
+5:
+for each pretoken p ∈P do
+6:
+if whole-only shortcut active for p and p /∈F then
+7:
+Sp ←{whole, F}
+▷model-size shortcut for top-Ntop
+8:
+else
+9:
+Sp ←{whole} ∪Sκp
+r=2{order-r segmentations of p} ∪{F}
+10:
+end if
+11:
+Add all tokens used by Sp to the candidate token set T
+12:
+end for
+13:
+Create variables xt ∈{0, 1} ∀t ∈T, zp,s ∈{0, 1} ∀p ∈P, s ∈Sp
+14:
+Add constraints:
+15:
+(8): xb = 1, ∀b ∈B
+▷byte completeness
+16:
+(9): ∑t∈T xt ≤|V|
+▷vocabulary budget
+17:
+(10): ∑s∈Sp zp,s = 1, ∀p ∈P
+▷exactly one segmentation per pretoken
+18:
+(11): zp,s ≤xt, ∀p, ∀s ∈Sp \ {F}, ∀t ∈Ep,s
+▷linking
+19:
+(13): zp,s ≤1 −xt, ∀p, ∀s ∈Sp \ {F}, ∀g ∈G−
+s , ∀t ∈Lp,s,g
+▷
+greedy-consistency
+20:
+Set objective (7): min ∑p∈P ∑s∈Sp cp cost(p, s) zp,s
+21:
+Solve LP relaxation (or MIP variant) with Gurobi
+22:
+Extract fallback-active set F ←{p ∈P : z⋆
+p,F ≥θ}
+▷from z⋆before rounding
+23:
+V ←WEIGHTEDROUND(x⋆, z⋆, |V|)
+▷per-iteration rounded vocabulary
+24:
+for each p ∈F do
+25:
+Escalate only fallback-active pretokens: κp ←min(κp + 1, M)
+26:
+end for
+27: until F = ∅or no κp changes
+28: Final repricing round: set cost(p, F) ←|p|, rebuild and re-solve LP once
+29: V ←WEIGHTEDROUND(x⋆, z⋆, |V|)
+▷final vocabulary
+30: return selected vocabulary V, objectives, bounds, fallback stats
+31: procedure WEIGHTEDROUND(x⋆, z⋆, |V|)
+▷with ϵ = 10−6
+32:
+T1 ←{t ∈T : x⋆
+t ≥1 −ϵ}
+▷near-integral, accept all; B ⊆T1 via (8)
+33:
+TF ←{t ∈T : ϵ < x⋆
+t < 1 −ϵ}
+▷fractional candidates
+34:
+β ←|V| −|T1|
+▷remaining budget from TF
+35:
+Compute C⋆
+t ←∑(p,s): t∈Ep,s cp z⋆
+p,s for each t ∈TF
+36:
+return T1 ∪top-β (TF, C⋆· )
+▷cardinality |V| by construction
+37: end procedure
+B
+Contribution-Based Weighted Rounding
+We give the full rounding procedure summarized in Section 2.6; it is ToaST’s rule applied to
+JOLT’s LP solution (x⋆, z⋆). Let V ⊆T denote the vocabulary with desired size |V|. Partition
+T by the LP value x⋆
+t :
+T1 = {t ∈T : x⋆
+t ≥1 −ϵ},
+TF = {t ∈T : ϵ < x⋆
+t < 1 −ϵ},
+T0 = {t ∈T : x⋆
+t ≤ϵ},
+12
+
+
+--- Page 13 ---
+Preprint. Under review.
+with ϵ = 10−6. Every t ∈T1 is admitted into V outright. The budget still requires
+β = |V| −|T1| additional tokens, all drawn from the fractional tier TF (tokens in T0 are
+discarded).
+For each fractional t ∈TF, define the objective contribution
+C⋆
+t = ∑
+p∈P
+∑
+s∈Sp\{F} : t∈Ep,s
+cp z⋆
+p,s.
+(16)
+C⋆
+t is the count-weighted z-mass for t at the LP optimum: it measures how much of the
+relaxed objective is already “buying” t via the segmentations that depend on it. Rank TF in
+descending order of C⋆
+t and take the top β tokens:
+V = T1 ∪top-β (TF, C⋆
+· ).
+By construction, exactly |V| tokens are selected.
+C
+GPT4O_REGEX_16 Pretokenization Pattern
+We use GPT4O_REGEX_16 as the fixed regex pretokenizer for all experiments. This pattern is
+based on the publicly available GPT-4o/o200k_base-style tiktoken regex pretokenizer, but
+with explicit length caps added for computational tractability. The regex is used only to
+create the initial pretoken/count universe; the learned vocabulary is subsequently optimized
+by the LP/MIP formulation described in the main text.
+The pattern consists of seven alternatives: lower-case-dominant Unicode word spans with
+optional contractions, upper-case-dominant Unicode word spans with optional contractions,
+numeric chunks of length 1–3, punctuation/symbol runs, newline-associated whitespace,
+trailing whitespace, and general whitespace. The bounded version caps word-like spans
+through 32-character letter/mark groups and caps punctuation or whitespace runs at 16
+characters.
+GPT4O_REGEX_PARTS_16 = [
+r"[^\r\n\p{L}\p{N}]?"
+r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]{0,32}"
+r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]{1,32}"
+r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+r"[^\r\n\p{L}\p{N}]?"
+r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]{1,32}"
+r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]{0,32}"
+r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+r"\p{N}{1,3}",
+r" ?[^\s\p{L}\p{N}]{1,16}[\r\n/]{0,16}",
+r"\s{0,15}[\r\n]{1,16}",
+r"\s{1,16}(?!\S)",
+r"\s{1,16}",
+]
+GPT4O_REGEX_16 = "|".join(GPT4O_REGEX_PARTS_16)
+Listing 1: Bounded GPT-4o-style regex pretokenizer used in our experiments.
+In this work, GPT4O_REGEX_16 should therefore be interpreted as a deterministic preprocess-
+ing rule, not as a tokenizer training objective or learned vocabulary. Its role is to define
+stable pretoken boundaries before candidate segmentation generation, fallback escalation,
+and greedy-L2R vocabulary optimization.
+D
+Gurobi Solver Setup and Reproducibility
+All LP relaxations and MIP solves are run on a single host with Gurobi 11.0 (Gurobi
+Optimization, LLC, 2026) (academic license), Python 3.11, and the official gurobipy Python
+13
+
+
+--- Page 14 ---
+Preprint. Under review.
+bindings. We give the exact solver configuration we used so that the experiments can be
+reproduced from the pretoken/count universe alone.
+Hardware.
+Runs are executed on single shared-memory nodes (one solve per node) with
+at least 220 GB of RAM. We do not cap Gurobi’s thread count, so it uses all available cores,
+between 18 and 30 threads across our runs; we do not pin threads or NUMA nodes. No
+GPU is used. The barrier factorization dominates memory: it peaks at roughly 10 GB for the
+largest N=100k LP (32k, iter-2/final) and roughly 30 GB for the largest N=200k LP (32k,
+iter-2/final), comfortably within the 220–230 GB memory limit we impose.
+Solver parameters.
+We solve the LP relaxation with Gurobi’s default LP method (con-
+current, which on our models selects barrier followed by crossover) and default presolve
+and cut settings; we do not override Method, Crossover, Presolve, or Cuts. We set MIPGap=0
+and ConcurrentMIP=1. For the final repricing round we rebuild the model with the up-
+dated fallback cost (cost(p, F)=np), accept LP warm-start hints from the previous round
+(LPWarmStart=2), and raise NumericFocus=2 for tighter numerics; the reported solve times in
+Table 2 therefore include this warm start.
+Limits.
+We impose a per-solve soft memory limit (MemLimit) of 220–230 GB and a generous
+wall-clock limit (up to 4 × 105 s for the largest N=200k configuration). Neither limit is bind-
+ing: every solve in Table 2 reaches OPTIMAL via barrier, with factorization memory peaking
+near 30 GB. Solve time, however, spans three orders of magnitude across configurations,
+from 420 s (N=100k, 32k, iter-1) to 337,686.7 s (≈93.8 h; N=200k, 32k, final repricing round),
+so the N=200k runs require multi-day budgets while the N=100k runs finish within hours
+(largest 32k final, 35,020.9 s). We log Gurobi’s final status, objective bound, simplex/barrier
+iteration counts, and final residuals after every solve.
+Determinism.
+We do not set a solver seed and leave Gurobi’s concurrent LP at its default,
+so the LP objective is reproducible only up to floating-point summation order and solver
+concurrency (these depend on host and thread count). Given the LP solution, however, the
+rest of the pipeline is fully deterministic: contribution-based rounding breaks ties in C⋆
+t
+lexicographically on t, so the extracted vocabulary is uniquely determined by the (fixed)
+pretoken/count input and segmentation-family construction order.
+E
+Compute Time
+Detailed computational results are given in Table 2. The N=200k full-pipeline configuration
+(full 2 →3 escalation and a final repricing round) is the most expensive among the full-
+pipeline runs: end-to-end about 113 hours of wall-clock time at the 32k vocabulary budget
+and about 26 hours at 64k, with the 32k final-round LP alone taking 337,686.7 s (≈93.8 h).
+The wall-clock cost is dominated by the final-round LP solve in Table 2; the earlier rounds
+and the entire model-build phase together contribute roughly one to two additional hours.
+The cheaper N=100k variant runs in approximately 11 hours at 32k and under 3 hours at 64k
+(32k final-round LP solve of 35,020.9 s), a ∼10× speedup for only a ∼2.9× smaller constraint
+matrix. Within each scope, cost also varies with how binding the budget is: |V|=64k is
+cheaper than |V|=32k because the LP is less fractional.
+F
+Fallback and Escalation Diagnostics
+This section reports stage-wise fallback diagnostics for all JOLT configurations (Section 2.5).
+Each row gives the number of pretokens with LP mass on F at or above threshold θ=0.01,
+the count-weighted fallback mass, and greedy-L2R token totals on the training scope P
+and validation holdout Pval after contribution-based rounding at that stage. We report
+both fallback count and weighted mass by stage because they can move differently under
+repricing and rounding.
+14
+
+
+--- Page 15 ---
+Preprint. Under review.
+Variables
+Constraints
+Config
+#xt
+#(zp,s+zp,F )
+#linking
+#consist.
+#other
+NumNZs
+Solve time
+32k, 100k, i-1
+372,010
+758,732
+1,217,770
+2,415,746
+100,155
+8,397,774
+420.2 s
+32k, 100k, i-2
+491,350
+1,370,251
+3,052,335
+9,215,293
+100,155
+26,396,857
+5,123.5 s
+32k, 100k, final
+491,350
+1,370,251
+3,052,335
+9,215,293
+100,155
+26,396,857
+35,020.9 s
+64k, 100k, i-1
+372,010
+758,732
+1,217,770
+2,415,746
+100,155
+8,397,774
+727.6 s
+64k, 100k, i-2
+412,236
+896,648
+1,631,518
+3,946,349
+100,155
+12,464,618
+2,039.3 s
+64k, 100k, final
+412,236
+896,648
+1,631,518
+3,946,349
+100,155
+12,464,618
+6,287.7 s
+32k, 200k, i-1
+722,676
+1,586,135
+2,572,579
+5,169,227
+200,155
+17,792,423
+3,039.1 s
+32k, 200k, i-2
+1,009,710
+3,530,855
+8,406,747
+26,816,605
+200,155
+74,987,269
+64,795.3 s
+32k, 200k, final
+1,009,710
+3,530,855
+8,406,747
+26,816,605
+200,155
+74,987,269
+337,686.7 s
+64k, 200k, i-1
+722,676
+1,586,135
+2,572,579
+5,169,227
+200,155
+17,792,423
+2,591.9 s
+64k, 200k, i-2
+938,098
+2,655,184
+5,779,726
+17,407,409
+200,155
+49,967,552
+22,531.3 s
+64k, 200k, final
+938,098
+2,655,184
+5,779,726
+17,407,409
+200,155
+49,967,552
+69,055.7 s
+Table 2: LP problem-size and solve-time diagnostics for JOLT (N=100k and N=200k training
+scopes). #xt: vocabulary-selection variables; #(zp,s+zp,F): segmentation plus fallback
+variables; #consist.: greedy-consistency rows (Equation (13)). In the configuration column, i
+denotes escalation iteration.
+Config
+Stage
+Fallback
+Train tokens
+on P
+Val tokens
+on Pval
+Count
+Weighted
+%
+|V|=32k
+N=100k
+Iter-1 (κp=2)
+19,712
+9,387,096
+1.014
+986,263,187
+370,921,284
+Iter-2 (κp=3)
+9,785
+4,922,576
+0.531
+985,967,502
+369,039,323
+Final repricing
+4,605
+4,967,839
+0.536
+986,252,419
+368,576,235
+|V|=64k
+N=100k
+Iter-1 (κp=2)
+4,214
+1,252,383
+0.135
+943,020,279
+354,762,017
+Iter-2 (κp=3)
+438
+148,163
+0.016
+942,586,891
+354,171,929
+Final repricing
+1,039
+480,553
+0.052
+942,556,161
+354,108,243
+|V|=32k
+N=200k
+Iter-1 (κp=2)
+62,496
+14,968,925
+1.591
+1,024,420,706
+369,466,239
+Iter-2 (κp=3)
+34,314
+8,529,593
+0.907
+1,024,042,423
+368,120,996
+Final repricing
+19,772
+9,225,475
+0.980
+1,025,212,967
+367,886,014
+|V|=64k
+N=200k
+Iter-1 (κp=2)
+31,494
+4,910,159
+0.522
+978,678,879
+352,409,163
+Iter-2 (κp=3)
+12,902
+1,991,109
+0.212
+978,390,997
+351,401,677
+Final repricing
+5,500
+2,190,078
+0.233
+978,705,696
+351,064,086
+Table 3: Stage-wise fallbacks for JOLT at N=100k and N=200k training scopes. Greedy-L2R
+token columns score the optimization scope P and validation holdout Pval, respectively. The
+% column is the weighted fallback mass as a fraction of the full top-N pretoken count mass
+(926.2M at N=100k, 940.9M at N=200k).
+G
+Token Rank-Frequency on the Validation Holdout
+To test whether JOLT’s compression gains reshape the global vocabulary usage profile or
+arise from local segmentation choices, we plot log-log token rank–frequency curves after
+greedy-L2R decoding on the full validation holdout Pval (Section 3.1). Each curve ranks
+every token emitted on Pval by its count; BPE-greedy uses a vocabulary trained on the full
+training holdout, and JOLT curves use the rounded vocabularies from our N=100k and
+200k optimization scopes.
+At |V|=32k (left panel of Figure 5), all three series overlap across ranks. At |V|=64k (right
+panel), the high-frequency head remains aligned but the tails separate: N=200k tracks BPE-
+greedy more closely in the rare-token regime than the cheaper N=100k scope, consistent
+with its stronger validation margin in Table 1. No series introduces a qualitatively different
+Zipf shape; the effect is a modest tail adjustment rather than a wholesale redistribution.
+15
+
+
+--- Page 16 ---
+Preprint. Under review.
+iter-1
+iter-2
+final
+Escalation round
+103
+104
+Fallback pretoken count
+iter-1
+iter-2
+final
+Escalation round
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+Weighted fallback mass (%)
+|V| = 32k, N = 100k
+|V| = 32k, N = 200k
+|V| = 64k, N = 100k
+|V| = 64k, N = 200k
+Figure 4: Fallback diagnostics per escalation round for all four configurations (|V|=32k pink,
+|V|=64k purple; N=100k solid, N=200k dashed). Left: number of pretokens routed to the
+fallback (log scale). Right: weighted fallback mass as a percentage of the full top-N pretoken
+count mass (cf. Table 3). The iter-2 dip and slight final-round rise in fallback count reflect
+the repricing solve (Equation (4)), while validation scores continue to track the declining
+fallback mass.
+100
+101
+102
+103
+104
+Rank
+100
+101
+102
+103
+104
+105
+106
+107
+Validation token frequency
+|V| = 32k
+100
+101
+102
+103
+104
+105
+Rank
+|V| = 64k
+BPE
+JOLT top-100K
+JOLT top-200K
+Figure 5: Log-log token rank-frequency on the greedy-L2R-decoded validation set Pval for
+BPE-greedy and JOLT (N=100k and 200k optimization scopes), at both vocabulary budgets
+(|V|=32k, left; |V|=64k, right). Series overlap on the high-frequency head; they diverge
+only in the low-frequency tail at |V|=64k.
+H
+Token-Length Distribution: BPE-greedy vs. JOLT
+Beyond aggregate token-count metrics, we compare the token-length distribution each vo-
+cabulary induces under greedy-L2R decoding on Pval (Section 4.2), because local shifts
+in emitted token lengths can accompany even small changes in total count. Figure 6 re-
+ports count-weighted shares of output tokens by byte length, for both vocabulary budgets
+and the two full-pipeline scopes (N=100k and N=200k). BPE-greedy uses a vocabulary
+trained on the full training holdout; relative to it, JOLT shifts a modest amount of count-
+weighted mass toward length-1 tokens (by ≈0.9 percentage points at |V|=32k and ≈1.2 at
+|V|=64k for the top-100K scope), while every other length stays within about 1 percentage
+point. This counter-intuitive increase in single-byte token usage is a consequence of the
+greedy-consistency constraints: GL2R can emit a long token at position i only if no longer
+vocabulary token starts at i, so JOLT sometimes retains short (including single-byte) tokens
+precisely to suppress competing prefixes and allow a longer match a few bytes later, a trade
+that reduces total token count even though it raises the single-byte share. Enlarging JOLT’s
+16
+
+
+--- Page 17 ---
+Preprint. Under review.
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10 11 12
+Token length (bytes)
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+17.5
+% of tokens (count-weighted)
+|V| = 32k
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10 11 12
+Token length (bytes)
+|V| = 64k
+BPE
+JOLT top-100K
+JOLT top-200K
+Figure 6: Greedy-L2R token-length distribution on Pval (count-weighted) for BPE-greedy
+and JOLT at N=100k and 200k, at both vocabulary budgets.
+optimization scope from 100k to 200k pretokens shifts mass slightly away from length-2
+tokens (a relative drop of ∼2% at |V|=32k and ∼7% at |V|=64k) and into the length-3–4
+range, consistent with the LP using its larger budget on a longer pretoken tail. The shift is
+modest relative to BPE-greedy, complementing the token-count margins in Table 1.
+I
+Extended-Scope Protocol
+Round-2-only reporting in Table 4.
+For N=300k and N=400k we report the raw Gurobi
+iter-2 LP relaxation objective (fallback cost 3) and the true greedy-L2R token count on P from
+the iter-2 vocabulary. The LP objective is reported as-is: substituting the true byte-level cost
+np for fallback cost 3 in the saved solution z⋆would break the relaxation lower bound—z⋆
+was optimized under cost 3—and can inflate gap-closed above 100%.
+What the skipped final repricing round would change.
+In iter-2 the fallback cost is
+cost(p, F) = κp+1=3 for every remaining fallback pretoken, regardless of byte length
+np (Equation (4)).
+The full pipeline’s final repricing round rebuilds the model with
+cost(p, F) = np, re-solves, and may add whole-word tokens for long rare pretokens. To see
+why this matters for validation, consider ˙Glipopolysaccharide (np=19 bytes): in iter-2 it
+is charged only 3 tokens if it falls back, far below its true cost of 19 bytes, so Gurobi has
+no incentive to cover it. The full pipeline corrects this in the final repricing LP, adding
+˙Glipopolysaccharide, ˙Gcerebrovascular, and similar rare but long pretokens as whole to-
+kens, improving validation scores by approximately 0.46M tokens at |V|=32k/N=100k; the
+round-2-only protocol trades this refinement for the ability to optimize over a much larger
+pretoken scope.
+Sanity check.
+Because the full pipeline remains affordable at N=100k and N=200k but
+not at N=300k/400k, we validate the round-2-only protocol on the smaller scopes before
+trusting it at scale. We extract the iter-2 vocabulary and rounded greedy-L2R count on P
+from saved checkpoints for the N=100k and N=200k runs and compare against their full-
+pipeline values. Iter-2 rounded objectives agree with full-pipeline rounded objectives to
+within 0.03% across all four full-run configurations; validation token counts differ by at most
+≈0.5M tokens. This close agreement gives us confidence that the round-2-only numbers at
+N=300k and N=400k are comparable to the full-pipeline results.
+17
+
+
+--- Page 18 ---
+Preprint. Under review.
+J
+LP Bound and Rounding Diagnostics (All Training Scopes)
+Table 4 reports the LP relaxation objective and the greedy-L2R token count from contribution-
+based rounding on the JOLT optimization scope P for all configurations. For the full-pipeline
+runs (N ∈{100k, 200k}) the LP objective is the final-round bound with conservative byte-
+level fallback cost, and is a valid lower bound on achievable GL2R token count under our
+formulation. For the round-2-only runs (N ∈{300k, 400k}) the LP column is the raw Gurobi
+iter-2 relaxation objective (fallback cost 3); the rounded column is the true greedy-L2R
+count on P with the iter-2 vocabulary (appendix I). These rows close 75.2–86.5% of the
+BPE-greedy-to-iter-2-LP slack—informative, but not equivalent to the final-round certificate
+above.
+Config
+LP
+obj. (M)
+Rounded
+obj. (M)
+Round
+gap %
+BPE-greedy
+on P (M)
+Gap
+closed %
+Full pipeline (final repricing LP; valid lower bound)
+|V|=32k, N=100k
+984.5
+986.3
++0.176
+1,001.2
+89.6
+|V|=64k, N=100k
+942.5
+942.6
++0.008
+955.1
+99.4
+|V|=32k, N=200k
+1,025.1
+1,025.2
++0.008
+1,037.4
+99.4
+|V|=64k, N=200k
+978.0
+978.7
++0.070
+988.0
+93.1
+Round-2-only (raw iter-2 LP†)
+|V|=32k, N=300k
+1,036.6
+1,040.7
++0.398
+1,053.3
+75.2
+|V|=64k, N=300k
+992.3
+993.7
++0.138
+1,002.5
+86.5
+|V|=64k, N=400k
+1,001.1
+1,002.7
++0.163
+1,011.1
+83.8
+|V|=32k, N=400k
+1,046.0
+1,050.6
++0.439
+1,062.8
+72.5
+Table 4: LP bound vs. rounded greedy-L2R token count on the JOLT training scope P for all
+configurations. Round gap is 100 × (rounded −LP)/rounded. BPE-greedy uses the same
+|V| and GL2R decoding on P (vocabulary trained on the full training holdout). Gap closed
+is 100 × (BPE-greedy −rounded)/(BPE-greedy −LP). †Round-2-only: iter-2 Gurobi LP
+objective (fallback cost 3); rounded is greedy-L2R on P with the iter-2 vocabulary. Skipping
+final repricing leaves fallback costs understated relative to the full pipeline (Section 3.3
+and appendix I), but the raw objective remains a valid relaxation lower bound under the
+iter-2 formulation.
+18

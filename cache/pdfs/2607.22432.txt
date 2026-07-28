@@ -1,0 +1,2611 @@
+--- Page 1 ---
+TileSight: A First-Principles Tile-Centric Analytical
+GPU Performance Model from Cores to Clusters
+Zhiwen Mo1, Yu Cheng2, Lei Wang2, Zhengju Tang2, Lei Xu3, Guoyu Li1, Yuqi Dong2, Lingxiao Ma4,
+Yuqing Xia4, Jilong Xue4, Fan Yang5, Luo Mai6, Zhi Yang2, Wayne Luk1, Hongxiang Fan1
+1Imperial College London, 2Peking University, 3Shanghai Jiao Tong University, 4Tile-AI, 5Microsoft Research, 6University of Edinburgh
+Abstract
+Recent GPU programming frameworks, such as Triton, Tile-
+Lang, and CUDA Tile, have adopted the tile as a first-class
+language primitive, making tile-centric programming the
+prevailing approach for writing high-performance GPU ker-
+nels. Performance-analysis tooling for tile-based programs,
+however, has not followed suit: programmers still fall back on
+coarse roofline bounds, opaque ML-based predictors, or post-
+hoc profilers to reason about how their kernels actually run.
+This gap is increasingly painful for modern AI workloads, in
+which kernel fusion and distributed inference hinge on the
+interplay of tensor cores, CUDA cores, the cache hierarchy,
+memory pipelines, and inter-GPU networks. We bridge this
+gap with TileSight, a tile-centric performance-modeling
+tool that leverages the tile from a programming primitive to
+an analysis primitive. Within a single GPU core, TileSight
+models the overlap of compute and memory pipelines. Across
+cores on the same chip, TileSight models the cache hierar-
+chy. Across GPUs, it models inter-node communication. All
+three layers share the tile abstraction: 1) the intra-tile layer
+expresses each tile’s work as a resource vector spanning the
+network, memory, and compute pipelines; 2) the inter-tile
+layer schedules dependent and ordered tile actions to expose
+legal overlap and infers multi-level cache hit rates from a
+tile reuse distance; 3) the cross-device layer maps remote
+tensor accesses to placements and routes them through an
+𝛼–𝛽stage cost. Evaluated on A100, H200, B200, and B6000,
+TileSight matches measured single-GPU kernel latency
+to within a pooled 12.35% mean absolute percentage error
+(MAPE), beating state-of-the-art baselines and transferring
+better across the four architectures. Its L2 cache-hit-rate
+predictions land within roughly one percentage point of
+the measured rate on every GPU. Pushed up to 32-GPU
+deployments, TileSight reaches 16.18% weighted MAPE
+(wMAPE) on fused distributed kernels and 13.52% wMAPE on
+end-to-end vLLM serving. When driven into the optimization
+loop, TileSight picks tile configurations competitive with
+strong vendor and expert baselines on the case studies we
+report. TileSight will be open-sourced upon publication.
+1
+Introduction
+Large language model (LLM) scaling keeps pushing training
+and serving systems closer to hardware limits, making kernel
+efficiency central to both latency and cost. To extract this
+performance, developers increasingly fuse multiple LLM
+operations into large tile programs whose bottlenecks are
+determined by tiling, memory movement, pipeline over-
+lap, and wavefront scheduling. Accurate and fast white-box
+performance modeling is therefore needed to expose the
+performance boundary and guide optimization.
+To facilitate kernel optimization, the GPU programming
+community has converged on tile-centric programming as
+the common paradigm: Triton [44] pioneered tile-level loads,
+stores and dot products, which has become the de facto
+standard for custom kernels in PyTorch. TileLang [10] fur-
+ther decouples dataflow from scheduling at the tile level.
+NVIDIA’s CUDA Tile [33] (CUDA 13.1, 2025), described
+as the most significant CUDA advancement in roughly 20
+years [15], officially adopts tiles as the programming prim-
+itive, while CuteDSL [12] exposes CUTLASS’s tile abstrac-
+tions as a Python domain-specific language (DSL). As a result,
+tiles have emerged as a central abstraction in modern GPU
+programming. However, the performance analysis has
+not kept pace with this tile-centric abstraction: Triton
+relies on black-box autotuning over thousands of configu-
+rations [44], roofline models [48] cannot distinguish an L2
+cache miss from a shared memory bank conflict, and ML-
+based predictors [17, 25] require per-architecture training
+and are opaque. Profilers such as Nsight Compute (NCU) and
+profiling-based tools [18, 20] are post-hoc: they can perturb
+execution through instrumentation and clock changes, and
+their counter reports do not explain which tile, reuse pattern,
+or pipeline stage caused the observed bottleneck. Table 1
+summarizes this abstraction mismatch. As tile-centric pro-
+gramming becomes increasingly adopted, an accurate and
+efficient tile-centric performance model is urgently needed to
+predict how tile-configuration changes affect performance
+without running the kernel.
+The need for such a model becomes even more pressing
+when we consider what happens inside a tiled kernel’s main
+loop. Even for GEMM, performance depends on software-
+pipeline depth, resident tiles per streaming multiprocessor
+(SM), and load-compute overlap rather than only on FLOP
+and byte counts. The issue becomes sharper in fused kernels:
+as illustrated in Figure 1, FlashAttention-3 (FA-3) on H100
+involves over ten distinct operations, including two GEMMs
+on Tensor Cores, reductions and softmax on CUDA cores,
+and special functions on special function units (SFUs), with
+fine-grained data dependencies. These operations occupy
+different hardware resources and can potentially overlap,
+1
+arXiv:2607.22432v1  [cs.DC]  24 Jul 2026
+
+
+--- Page 2 ---
+Zhiwen Mo et al.
+but the degree of overlap depends critically on their sched-
+uling order and pipeline depth. Existing tools, including
+roofline, profilers, and autotuners, are largely blind to this
+intra-tile scheduling structure. Furthermore, these complex
+kernels are increasingly needed in distributed settings. For
+instance, Tensor parallelism (TP), expert parallelism (EP),
+and sequence parallelism (SP) partition workloads across
+multiple GPUs [41], introducing collective communication
+that needs to overlap with computation. The performance
+of a distributed kernel depends on how the global tile grid is
+partitioned, what communication primitives are used, and
+how compute and communication pipelines interleave. These
+decisions are currently made by intuition or expensive trial-
+and-error.
+To address these challenges, we observe that tiles provide
+a natural first-class abstraction for performance modeling of
+GPU systems. This stems from three properties: (1) Deter-
+ministic: given a tile configuration (shape, pipeline depth,
+memory layout), the resource usage of each tile is fully de-
+termined, enabling analytical modeling without simulation.
+(2) Composable: tile information composes hierarchically.
+Each tile carries its own per-pipeline resource decompo-
+sition (intra-tile), tiles are related through dependencies,
+concurrent issue, and execution order (inter-tile), and tile
+grids extend across devices through placement (cross-device).
+Each level can be modeled independently then composed.
+(3) Portable: the tile abstraction is adopted across various
+GPU architectures (in this paper we exercise NVIDIA A100,
+H100, H200, B200, RTX PRO 6000 Blackwell (B6000), and
+AMD MI210), since all modern GPUs execute tile-shaped
+workloads through similar hierarchical memory and com-
+pute structures.
+Building on these insights, we present TileSight, a unified
+tile-centric analytical execution engine. Unlike roofline models
+that attribute performance to a single bottleneck resource,
+TileSight analytically simulates how a tile execution plan
+unfolds across the hardware, capturing the prologue, steady-
+state overlap, and epilogue structure that determines real
+kernel performance. This simulation composes three hierar-
+chical levels with unified tile-based abstractions:
+• Intra-tile: each tile is characterized by an operation, an
+src/dst placement descriptor, and a footprint, which to-
+gether produce a per-tile resource vector that decomposes
+work into times on independently schedulable hardware
+pipelines spanning network, memory, and compute. The
+same placement descriptor unifies fusion (intermediates
+kept in registers or shared memory (SMEM)) and cross-
+device movement.
+• Inter-tile: tiles are related through producer–consumer
+dependencies, concurrent issue, and execution order. These
+together drive a topological-order search over the tile-
+action directed acyclic graph (DAG) that picks the best le-
+gal pipeline overlap inside a fused kernel body, and a multi-
+level tile reuse distance analysis with stochastic distance-
+based cache modeling (SDCM) that derives implicit cache
+hit rates from grid traversal.
+• Cross-device: cross-device execution is a placement case
+of the same intra-tile abstraction — a tile whose source
+or destination crosses devices simply gains a Net entry
+computed from the routed 𝛼–𝛽cost of the underlying
+remote tensor access, so the same envelope still applies.
+Crucially, these three levels are jointly designed with
+shared core abstractions: HardwareUsage as a per-pipeline
+time decomposition, the tile action as the composable sched-
+uling unit, and the TileGrid as the workload descriptor. In
+summary, we make the following contributions:
+(1) A unified tile-centric analytical execution engine
+that simulates how tile execution plans unfold across hard-
+ware pipelines, including per-tile resource decomposition
+(intra-tile), dependency-driven DAG ordering with tile reuse-
+distance cache modeling (inter-tile), and placement-based
+cross-device tile accesses, all under one framework with
+shared abstractions (§3).
+(2) Tile-pipeline overlap analysis that models both reg-
+ular software pipelined loops (e.g., GEMM load-compute
+overlap) and complex fused kernels (e.g., FlashAttention and
+multi-head latent attention (MLA) decode) as repeated tile
+pipelines over dependency-constrained tile-action DAGs. By
+combining pipeline depth, resident tile interleaving, and legal
+tile-action ordering, TileSight predicts the prologue, steady-
+state, and epilogue costs that simple roofline models miss
+(§3.4).
+(3) Tile reuse-distance cache modeling that makes cache
+behavior a natural consequence of the tile execution plan
+rather than a separate trace-simulation problem. By reason-
+ing about reuse at the same granularity as GPU schedules,
+TileSight enables fast, schedule-sensitive multi-level cache
+modeling inside an analytical performance model, while
+preserving accuracy through lightweight approximation and
+sampling techniques (§3.5).
+(4) Composable distributed extension via tile place-
+ment where cross-device execution is a placement case of
+the same tile abstraction: remote tensor accesses are inferred
+from producer–consumer placement and decomposed into
+ordered stages of logical exchanges, whose routed 𝛼–𝛽cost
+populates the network entry of the per-tile resource vector
+so cross-device movement composes with local compute
+through the same envelope (§3.6).
+2
+Background & Motivation
+2.1
+GPU Performance Modeling
+Existing GPU performance tools can be grouped into three
+categories. Learned and hybrid predictors [25, 54] fit
+2
+
+
+--- Page 3 ---
+K
+Qi
+Si,j 
+Kj
+Vj
+Oi
+Si,j'
+Pi,j
+Register
+L1/Shared
+Memory
+L2 Cache
+Global 
+Memory
+LD Qi
+LD Qi
+LD Qi
+GEMM0j
+Compute
+GEMM0j
+Pipe 1
+Pipe 0 
+Q
+K
+V
+GEMM0
+GEMM0
+Rescale
+Rescale
+Softmax
+Softmax
+GEMM1
+GEMM1
+O
+Q
+S
+V
+O
+LD Kj
+LD Kj
+LD Kj
+GEMM0j
+LD Kj+1
+LD Kj+1
+LD Kj+1
+Cuda Core
+SFU
+Tensor core
+(a)
+(b)
+(c)
+GEMM0j+1
+GEMM0j+1
+GEMM0j+1
+Rj+2
+Softmaxj
+LD Vj
+LD Vj
+LD Vj
+GEMM1j
+Rj+1
+Softmaxj+1
+GEMM1j+1
+LD Vj+1
+LD Vj+1
+LD Vj+1
+LD Kj+2
+LD Kj+2
+LD Kj+2
+LD Kj+3
+LD Kj+3
+LD Kj+3
+GEMM1j
+GEMM1j+1
+GEMM0j+2
+GEMM0j+2
+GEMM1j
+GEMM1j+1
+GEMM0j+2
+Rj
+Figure 1. FlashAttention-3 on H100: (a) the 10+ heteroge-
+neous operations spanning Tensor Cores, CUDA cores, and
+SFUs; (b) their data-dependency DAG; (c) how scheduling
+order determines compute-memory pipeline overlap.
+0
+50
+100
+150
+200
+250
+Data Size (MB)
+7500
+10000
+12500
+15000
+17500
+20000
+22500
+Effective Bandwidth (GB/s)
+L2 cliff: 83.12 MB
+L1.5 cliff
+B200
+L1.5 = 22465 GB/s
+L2 = 20549 GB/s
+DDR = 7407 GB/s
+0
+50
+100
+150
+200
+250
+Data Size (MB)
+2000
+3000
+4000
+5000
+6000
+7000
+L2 cliff: 130.62 MB
+B6000
+L2 = 7434 GB/s
+DDR = 1563 GB/s
+Figure 2. L2 bandwidth vs. working-set size on B200 and
+B6000, revealing the multi-level cache hierarchy. B200 (dual-
+die) exposes a level-1.5 (L1.5)/LRC tier at ∼22.5 TB/s and a
+smeared L2 cliff at ∼83 MB; B6000 (single-die) shows a sharp
+cliff at ∼130 MB. TileSight uses these sweeps to calibrate
+effective cache capacity per GPU.
+either end-to-end runtime or analytical-model residuals from
+per-architecture traces, arguing that pure analytical models
+cannot capture modern GPU interaction complexity; both
+nevertheless require retraining and provide limited inter-
+pretability. Analytical models [35, 48, 55] are portable
+and explainable, but typically collapse GPU execution into
+aggregate compute and bandwidth terms. Profiling and
+simulation tools [3, 18, 20, 46] expose measured behavior
+after execution, but do not forecast how a tile shape, pipeline
+depth, or swizzle change will perform before rerunning the
+kernel. As motivated in Section 1, the shared limitation is
+an abstraction mismatch: these tools do not model perfor-
+mance at the same tile granularity used by modern GPU
+programs. In particular, where hybrid predictors delegate
+this complexity to learned components, TileSight shows
+Table 1. Comparison with prior performance modeling tools.
+Feature
+Roof-
+line
+[48]
+Neu-
+Sight
+[25]
+Pipe-
+Weave
+[54]
+GenZ
+[6]
+Vidur
+[3]
+SimAI
+[46]
+Tile-
+Sight
+No kernel profiling/training1
+✓
+✗
+✗
+✓
+✗
+✗
+✓
+Pipeline-aware2
+✗
+✗
+#
+✗
+✗
+✗
+✓
+Cache-aware3
+✗
+✗
+✗
+✗
+✗
+✗
+✓
+Explicit fused program4
+✗
+✗
+#
+✗
+✗
+✗
+✓
+Distributed5
+✗
+#
+#
+#
+✓
+✓
+✓
+Compute-comm. overlap6
+✗
+✗
+✗
+✗
+✗
+#
+✓
+Interpretable7
+✓
+✗
+#
+✓
+✗
+✗
+✓
+✓Full support. # Partial. ✗Not supported.
+1No kernel profiling/training: no kernel execution traces or ML training are required;
+TileSight uses only one-time per-architecture microbenchmarks
+(bandwidth/throughput/latency sweeps, ∼minutes). 2Pipeline-aware: intra-tile DAG
+scheduling and compute-memory pipeline overlap. 3Cache-aware: predicts L2/L1.5 hit
+rates and schedule-dependent tile locality effects.
+4Explicit fused program: user-described arbitrary multi-op DAG kernels (e.g., FA-3,
+MLA), not limited to a fixed set of supported patterns. 5Distributed: multi-GPU
+collective communication modeling.
+6Compute-communication overlap: fused compute-communication kernels (e.g.,
+AllGather+GEMM). SimAI accepts user-specified overlap ratios but does not derive
+them analytically. 7Interpretable: white-box model supporting bottleneck diagnosis.
+that a first-principles tile-centric simulation can capture it
+while remaining fully white-box.
+2.2
+Modeling Gap for Tile-Centric Programs
+The missing abstraction appears at three levels. Intra-tile:
+each tile uses heterogeneous pipelines spanning compute,
+memory, and network, so a single bottleneck scalar misses
+the per-pipeline structure that determines overlap (Figure 1).
+Inter-tile: tile dependencies determine the legal action order-
+ings inside a fused body, and tile execution order across the
+grid determines cache reuse; a single flat bandwidth number
+is insufficient on modern GPUs (Figure 2). Cross-device:
+partitioned tile grids exchange data through communication
+pipelines that must overlap with compute rather than be
+added as standalone times. Table 1 summarizes how existing
+tools miss one or more of these levels.
+3
+Hierarchical Tile-Pipeline Model
+TileSight treats the tile as the first-class modeling unit
+and adopts a prologue–steady–epilogue pipeline envelope
+to recursively apply at every level of the program. A tile
+carries intra-tile information (operation, src/dst placement,
+footprint, and the resources it occupies on each indepen-
+dently schedulable hardware pipeline) and participates in
+inter-tile relationships (producer–consumer dependencies,
+concurrent issue, and execution order across loops, the tile
+grid, and waves). A tiled workload is therefore a tile execu-
+tion plan: a graph of tiles annotated with these two kinds
+of information. Distributed execution shares the same tile-
+based abstraction: a tile whose source or destination crosses
+3
+
+
+--- Page 4 ---
+Zhiwen Mo et al.
+Table 2. The tile execution plan groups its fields by what
+they describe: a single tile in isolation (intra) or relationships
+among tiles (inter).
+Field
+Side
+Role in the model
+Tensor
+accesses
+Intra
+Per-tile footprint and a placement descrip-
+tor recording where a tensor tile is produced
+and where it resides: register, architecture-
+specific tensor memory (TMEM), SMEM, local
+cache/DDR, or shard/replica on a GPU group.
+Reuse dimensions feed inter-tile cache model-
+ing.
+Operation
+type
+Intra
+The action a tile performs: load, store, tensor-
+core or CUDA-core matmul, reduction, expo-
+nential, rescaling, remote transfer, or fused
+composite.
+Resource
+vector
+Intra
+Per-tile time on independently schedulable re-
+sources (tensor cores (TC), CUDA cores, SFU,
+TMEM, SMEM, L1.5, L2, DDR, Net); derived
+from the operation, footprint, placement, and
+calibrated hardware rates.
+Tile grid
+Inter
+Spatial tile shape, launch order, swizzle, loop/re-
+duction depth, and distributed partition. Deter-
+mines tile execution order, waves, and local
+work per device.
+Producer–
+consumer
+DAG
+Inter
+Edges among tiles based on tensor production
+and consumption; together with placement,
+fixes the legal orderings within an iteration.
+Concurrency
+& depth
+Inter
+Software-pipeline stages, resident blocks per
+SM, and which tiles may issue together. Sets
+the effective pipeline depth.
+devices simply gains a Net entry in its resource vector, and
+the same envelope still applies.
+3.1
+From Workload to Tile Execution Plan
+The input to TileSight is a high-level workload, such as a
+tiled GEMM, a fused attention kernel, an all-gather followed
+by a GEMM, or Mixture-of-Experts (MoE) routing across
+GPUs; the workload fixes tensors and their placements but
+leaves the schedule unspecified. TileSight lifts it to a tile
+execution plan that exposes the schedule-relevant choices
+needed for performance modeling: tile shape, loop and reduc-
+tion order, block swizzle, software-pipeline depth, resident
+blocks per SM, distributed partitioning, and collective imple-
+mentation. Tile-centric DSLs such as Triton and TileLang
+expose most of this information directly; for hand-written
+kernels, the same fields are supplied manually from the
+kernel schedule.
+The plan deliberately avoids thread-level details. It keeps
+only the choices that tile programmers and distributed run-
+times actually change, and those choices change which tiles
+enter the pipeline, what resources they occupy, and how they
+depend on or run concurrently with each other. Cache traffic,
+wave effects, communication stages, and pipeline overlap
+are then derived rather than separately added.
+3.2
+Intra-Tile: A Tile and Its Resource Vector
+A tile is characterized by its operation (load, store, tensor-core
+or CUDA-core matmul, reduction, exponential, rescaling,
+remote transfer, or fused composite), its footprint (per-tile
+bytes and FLOPs), and its src/dst placement descriptors that
+record where its inputs are produced and where its output
+resides — a register, architecture-specific tensor memory
+(TMEM), the shared-memory scratchpad, the L1.5 or L2
+cache, DDR on the local device, or a shard or replica on
+a GPU group. Placement is the central abstraction that lets
+the same intra-tile representation describe both fusion and
+cross-device movement: marking an intermediate output as
+register-, TMEM-, or SMEM-scope removes a global-memory
+store (fusion), while marking a load source as a remote shard
+turns the load into a cross-device transfer (distribution).
+For each tile, TileSight converts these properties into
+a vector of times on independently schedulable hardware
+resources:
+u(𝑜) = ⟨𝑡TC,𝑡CUDA,𝑡SFU,𝑡TMEM,𝑡SMEM,𝑡L1.5,𝑡L2,𝑡DDR,𝑡Net⟩,
+(1)
+computed from the tile’s operation, footprint, src/dst place-
+ment, and one-shot microbenchmark-calibrated rates. A pure
+tensor-core matmul tile populates only the TC entry; a Black-
+well attention tile also charges explicit TMEM traffic for soft-
+max and correction loads/stores; a load tile from DDR pop-
+ulates DDR (and L1.5/L2 if the access hits cache); a remote-
+load tile populates Net. This vector is more expressive than
+a roofline scalar because tiles on different pipelines may
+overlap, while tiles contending for the same pipeline serialize,
+and remote movement composes with local compute through
+the same machinery. Two entries of u(𝑜) are not fixed by
+the tile in isolation: the L1.5/L2/DDR split for a memory tile
+depends on whether its access hits cache, derived from tile
+reuse distance in §3.5; the Net entry for a remote tile depends
+on the routed cost of the underlying communication stage,
+derived in §3.6. Algorithm 1 sketches how all components
+plug into the master loop; subsequent subsections detail each
+block.
+3.3
+Inter-Tile: Dependency, Concurrency and Order
+Tiles connect through three kinds of inter-tile information.
+1) Producer–consumer dependencies fix the legal orderings
+within an iteration: in FlashAttention, 𝑄/𝐾loads precede
+gemm1 (𝑄@𝐾), gemm1 precedes softmax, and softmax pre-
+cedes gemm2 (𝑃@𝑉). Together with placement and depen-
+dencies, it determines which intermediates stay in regis-
+ters/TMEM/SMEM and which spill to global memory. 2)
+Concurrent issue lets non-dependent tiles run together when
+their resource vectors do not contend, e.g., concurrently
+loading the next 𝐾-block of attention while computing on
+4
+
+
+--- Page 5 ---
+X0
+XN-1
+W0
+O0
+All Gather-GEMM
+O0=AG(X0,...XN-1)@W0
+L0-Mem
+L1-Mem
+L2-Mem
+L3-Mem
+L4-Mem
+Intra-Tile
+Module
+Net.
+HBM
+L2
+L1
+Reg
+Comp.
+TC/SFU/...
+SW.
+Pipeline 0
+SW.
+Pipeline 1
+Inter-Tile
+Module
+Tile Schedule
+DAG Analysis
+Concurrency
+Analysis
+RD Track
+Resource
+Vector
+Pipeline
+Envelope
+      Overall Perf.
+Latency: 1.79ms
+Tensor Core Util: 78%
+Smem Util: 75%
+L2 Cache hit: 56%
+Overlap rate: 85%  ....
+      AG Tile Stats.  
+Tile active: 38%
+Tile net. util%: 28%  ...
+      LD W Tile Stats.  
+Tile active: 65%
+Tile cache hit rate: 33%
+Tile L2 Util: 40%  ...
+(a) Operator
+Description
+(b) Tile 
+Schedule
+L4-Mem (E.g., NVSwitch)
+GPU 0
+L3-Mem (GPU HBM)
+L2-Mem (L2 Cache)
+L1
+L0
+L0
+C
+C
+SM 0
+L1
+L0
+L0
+C
+C
+SM N
+(c) HW
+Abstraction
+(d) Modeling
+Component
+(e) Modeling
+Visualization
+(f) TileSight Report
+AG
+LD X00 LD W00
+LD X00 LD W00
+LD X00 LD W00
+GEMM0
+LD X01 LD W01
+LD X01 LD W01
+LD W01
+GEMM0
+GEMM0
+GEMM1
+GEMM1
+GEMM1
+LD X02 LD W02
+LD X02 LD W02
+LD X02 LD W02
+LD X01
+Prologue
+Steady
+Epilogue
+ST O00
+ST O00
+ST O00
+ST O00
+Figure 3. TileSight design overview on all-gather–GEMM (AG-GEMM). (a) A workload is described by an operator and
+tensor placement only (𝑋column-sharded across 𝑁GPUs). (b) TileSight lifts it to a tile schedule whose DAG spans memory
+levels 𝐿0–𝐿4. (c) A single hardware abstraction exposes registers, SMEM, L2, HBM, and the inter-GPU fabric as a 5-level
+hierarchy. (d) Intra-tile resource vectors and inter-tile DAG/concurrency analysis feed a recursive prologue–steady–epilogue
+envelope. (e) The engine renders the envelope as a timeline: software-pipelined loads overlap with compute, and the AllGather
+is inferred from placement on the Net lane. (f) A per-tile performance report with latency, utilization, cache hit, and overlap
+rate.
+Algorithm 1: Hierarchical Tile-Pipeline Evaluation
+Input
+:tile execution plan 𝑃, hardware specification 𝐻, optional
+distributed mapping Π
+Output:predicted latency 𝑇and per-resource utilization
+1 𝐺←tile grid, launch order, and swizzle from 𝑃
+2 𝐴←tensor accesses, reuse dimensions, and placement descriptors from 𝑃
+3 𝐷←tile-action DAG from 𝑃
+4 𝑆←software-pipeline parameters from 𝑃
+5 if Π is not empty then
+6
+𝐺,𝐴, 𝐷←PartitionTilePlan(𝐺,𝐴, 𝐷, Π)
+// single device is
+the local-only case
+7
+O𝑛𝑒𝑡←InferRemoteTensorAccesses(𝐺,𝐴, 𝐷, Π)
+8
+N ←network topology and calibrated 𝛼, 𝛽parameters from 𝐻
+9
+foreach remote tensor access sequence 𝑐∈O𝑛𝑒𝑡do
+10
+K𝑐←DecomposeIntoStages(𝑐)
+// e.g., ring steps or
+tree levels
+11
+foreach stage 𝑘∈K𝑐do
+12
+E𝑘←LogicalExchanges(𝑘)
+// tuples
+(𝑠𝑟𝑐,𝑑𝑠𝑡,𝑏𝑦𝑡𝑒𝑠)
+13
+R𝑘←Route(E𝑘, N)
+14
+𝑇𝑘,𝑈𝑘←AlphaBetaStageTime(R𝑘, N)
+15
+Annotate the corresponding transfer tile in 𝐷with Í
+𝑘𝑇𝑘on Net
+16 𝐶←CacheTraffic(𝐺,𝐴, 𝐻)
+17 Annotate memory tiles in 𝐷with L1.5/L2/DDR entries from 𝐶
+18 𝑝←ResidentTilesPerSM(𝑃, 𝐻)
+19 𝑑←𝑆.stages × 𝑝−1
+20 E𝑡𝑖𝑙𝑒←PipelineEnvelope(𝐷,𝑑, 𝐻, active SMs)
+21 𝑇, 𝑈←WaveAggregate(𝐺, E𝑡𝑖𝑙𝑒, 𝐻)
+22 return 𝑇, 𝑈
+the current one, or issuing the A and B loads of a GEMM
+along the same 𝐾slice. The same set of tiles can be ordered
+in multiple legal ways that yield different overlap on shared
+pipelines. 3) Tile execution order across loop iterations and
+the tile grid determines which loads find their data already
+resident in cache: row-panel traversal preserves B-tile reuse
+for adjacent 𝑀-rows, block swizzle reorders the sequence,
+and persistent-block schedules pin tiles to SMs. These three
+pieces are exactly the input the pipeline envelope needs.
+3.4
+Pipeline Envelope: Prologue–Steady–Epilogue
+Given a set of tiles with resource vectors and inter-tile rela-
+tionships, TileSight evaluates execution as a pipeline. For a
+repeated unit with 𝑁logical iterations and effective depth 𝑑:
+𝑇= 𝑇pro + max(𝑁−𝑑, 0)𝑇steady +𝑇epi,
+(2)
+where 𝑇pro is the fill cost, 𝑇steady is the overlapped cost per
+repeated unit, and 𝑇epi is the drain cost. The same enve-
+lope applies recursively at every level of the tile execution
+plan: the steady-state body of an outer envelope (over tile-
+block waves) can itself be a pipeline (over a 𝐾-loop), whose
+steady body can in turn be a pipeline over the inner action
+sequence. The effective depth combines explicit software-
+pipeline stages with resident tile interleaving:
+𝑑= stages × resident_tiles_per_SM −1.
+(3)
+A two-block-per-SM schedule is therefore not a special case:
+it deepens the pipeline because an SM can issue work from
+one resident tile-block while another waits on memory.
+Steady-state overlap. The steady-state cost of a tile se-
+quence depends on which legal ordering is chosen, since tiles
+using the same hardware dimension in Eq. 1 accumulate on
+that dimension while independent dimensions overlap:
+𝑇steady(𝜎) = max
+𝑟
+∑︁
+𝑜∈𝜎
+𝑢𝑟(𝑜),
+(4)
+subject to all data-dependency edges in the DAG. The se-
+lected steady state is the best legal ordering:
+𝑇steady =
+min
+𝜎∈Topo(𝐷)𝑇steady(𝜎).
+(5)
+This is a small search in practice because real fused-kernel
+DAGs are heavily constrained. For MLA decode, 11 tile ac-
+tions reduce from 11! unconstrained permutations to 132
+legal topological orders. The search is not an autotuning run:
+it is an analytical scheduling step over the tile plan, so it
+remains cheap enough to run inside a cost model.
+Boundary costs. The prologue and epilogue are computed
+from the same resource vectors but with reduced overlap. For
+a load–compute pipeline, the prologue consists primarily of
+memory tiles that fill the pipeline, while the epilogue consists
+of remaining compute and final stores. Fused tile bodies add
+5
+
+
+--- Page 6 ---
+Zhiwen Mo et al.
+Algorithm 2: Recursive Pipeline-Envelope Evaluation
+1 Function OverlapAnalysis(𝑃, 𝐻):
+2
+𝑝←ResidentTilesPerSM(𝑃, 𝐻)
+3
+(𝑛full,𝑛tail) ←WaveDecompose(𝑃.grid, 𝐻.SMs, 𝑝)
+4
+(𝑇full,𝑈full) ←AnalyzeLoop(𝑃.root, 𝑝, 𝐻.SMs)
+5
+if 𝑛tail > 0 then
+6
+(𝑇tail,𝑈tail) ←AnalyzeLoop(𝑃.root, 𝑝,𝑛tail)
+7
+else
+8
+𝑇tail ←0, 𝑈tail ←∅
+9
+return 𝑛full𝑇full +𝑇tail, MergeMetrics(𝑈full,𝑈tail)
+10 Function AnalyzeLoop(𝑛𝑜𝑑𝑒,𝑠𝑡𝑎𝑔𝑒,𝑎𝑐𝑡𝑖𝑣𝑒_𝑆𝑀𝑠):
+11
+𝑔𝑟𝑜𝑢𝑝𝑠←GetSubNodes(𝑛𝑜𝑑𝑒)
+12
+if 𝑛𝑜𝑑𝑒is an inner loop then
+13
+𝑠←GetPipelineStage(𝑛𝑜𝑑𝑒)
+14
+𝑑←𝑠× 𝑠𝑡𝑎𝑔𝑒−1 // software stages × resident tiles
+15
+return ModelOverlap (𝑔𝑟𝑜𝑢𝑝𝑠,𝑑,𝑎𝑐𝑡𝑖𝑣𝑒_𝑆𝑀𝑠)
+16
+𝑚𝑒𝑡𝑟𝑖𝑐𝑠←[ ]
+17
+foreach 𝑔∈𝑔𝑟𝑜𝑢𝑝𝑠do
+18
+if 𝑔is a loop then
+19
+𝑚𝑒𝑡𝑟𝑖𝑐𝑠.append(AnalyzeLoop(𝑔,𝑠𝑡𝑎𝑔𝑒,𝑎𝑐𝑡𝑖𝑣𝑒_𝑆𝑀𝑠))
+20
+else
+21
+𝑚𝑒𝑡𝑟𝑖𝑐𝑠.append(ModelOverlap([𝑔],𝑠𝑡𝑎𝑔𝑒−
+1,𝑎𝑐𝑡𝑖𝑣𝑒_𝑆𝑀𝑠))
+22
+return MergeMetrics (𝑚𝑒𝑡𝑟𝑖𝑐𝑠)
+23 Function ModelOverlap(𝑔𝑟𝑜𝑢𝑝𝑠,𝑑,𝑎𝑐𝑡𝑖𝑣𝑒_𝑆𝑀𝑠):
+24
+𝑁←repeated-iteration count represented by 𝑔𝑟𝑜𝑢𝑝𝑠
+25
+𝑏𝑒𝑠𝑡←∞
+26
+foreach 𝜎∈Topo(𝑔𝑟𝑜𝑢𝑝𝑠) do
+27
+u𝜎←resource-vector accumulation under order 𝜎and
+𝑎𝑐𝑡𝑖𝑣𝑒_𝑆𝑀𝑠
+28
+𝑇pro,𝑇steady,𝑇epi ←boundary and steady costs from u𝜎
+29
+𝑇←𝑇pro + max(𝑁−𝑑, 0)𝑇steady +𝑇epi
+30
+if 𝑇< 𝑏𝑒𝑠𝑡then
+31
+𝑏𝑒𝑠𝑡←𝑇
+32
+return 𝑏𝑒𝑠𝑡and the corresponding utilization
+reductions or normalizations to one or both boundaries. This
+separation matters because two schedules with the same
+steady-state bottleneck can have different end-to-end time
+when the loop count is short or when only a few waves are
+launched.
+Resident tiles and waves. Occupancy changes overlap
+structure, not only utilization. If 𝑝tile-blocks reside on one
+SM, the model treats them as interleaved instances of the
+same tile pipeline; the resident count is bounded by shared
+memory, registers, warp limits, and architecture-specific
+maximum blocks per SM. The same wave decomposition
+handles tail effects: a tail wave may use only a subset of
+SMs, and those active SMs receive a larger share of shared
+L2/DDR bandwidth, so the envelope is recomputed for the
+tail using its active-SM count. Algorithm 2 expands this
+evaluation, recursively traversing the tile loop structure and
+enumerating dependency-valid orderings.
+3.5
+Cache Traffic via Tile Reuse Distance
+For a memory tile, the L1.5/L2/DDR split is not a property
+of the tile in isolation: the same load-tile coordinate can hit
+cache or fall through to DDR depending on swizzle, wave oc-
+cupancy, and which neighboring tiles share tensor data. Pre-
+serving B-tile reuse across GEMM 𝑀-axis tiles can cut DDR
+traffic by ∼4×, and block swizzling shifts L2 hit rate from
+A0
+C00
+A1
+B0
+B1
+C01
+C11
+C10
+RD Tracker
+A0.0   DT=∞ 
+B0.0   DT=∞
+........
+A0.0   DT=11
+........
+A0+B0
+C0
+K× Table Entries
+K× RD Sim.
+K2 Complexity
+A0
+A0
+C00
+B0
+A0
+RD Tracker
+A0   DT=∞ 
+B0   DT=∞
+Write C00
+A0   DT=2
+........
+1× Table Entries
+1× RD Sim.
+12 Complexity
+GEMM Tile Wave
+(a)Cache Line Reuse Distance
+(b)Tile Reuse Distance
+DT= 11
+DT= 2 
+Figure 4. Tile vs. cache-line reuse distance. Left: tradi-
+tional cache-line reuse distance tracks tens of thousands of
+line entries and evaluates exact SDCM at line granularity.
+Right: TileSight lifts reuse distance to tile-sized blocks,
+applies a Gaussian SDCM approximation, and samples along
+reduction axes, preserving schedule sensitivity while making
+cache modeling lightweight.
+35% to 72% in our motivating case; modern GPUs further add
+intermediate L1.5/LRC tiers (H200, B200), making a single
+flat bandwidth term insufficient. Reuse-distance analysis is
+well established for cache modeling [4, 5, 9, 24, 30, 31], but
+conventional formulations operate on cache-line traces and
+are too low-level to place inside analytical schedule search.
+TileSight instead lifts reuse distance to the tile execution
+plan, with the symbolic tile order as the analyzed sequence
+and tile-sized tensor blocks as the reuse universe — to our
+knowledge, the first analytical GPU performance model to
+make schedule-sensitive, multi-level cache modeling practi-
+cal through a tile-granular reuse-distance abstraction.
+3.5.1
+Tensor Access and Tile Reuse Distance. Tile-
+Sight introduces a tensor access for each tensor associated
+with the tile grid: per-tile footprint, placement descriptor,
+repeated-access count, and the grid dimensions along which
+the same data block is reused. The reuse dimensions reuse_dims
+make one rule cover diverse operators: a tensor’s reuse key is
+the tile coordinate projected onto the non-reuse dimensions.
+For a GEMM grid (𝑀𝑡, 𝑁𝑡), A tiles are reused across 𝑁𝑡and B
+tiles across 𝑀𝑡. For MLA decode, key–value (KV)-cache tiles
+are reused across attention heads of the same batch element.
+For convolution, weights and activations have different reuse
+dimensions over batch, output-channel, and spatial axes. This
+avoids operator-specific cache formulas while preserving the
+schedule information that determines reuse.
+The tile reuse distance 𝐷𝑇is the number of distinct tile-
+sized data blocks accessed between two consecutive accesses
+to the same tensor block. Traditional reuse distance asks how
+many cache lines or memory transactions intervene between
+two accesses, tile reuse distance asks the same question at
+the unit GPU kernel schedules expose. Modeling an 8 KB tile
+instead of 128-byte cache lines reduces tracked entries by
+64×, matches the granularity tile-centric schedules expose,
+makes block swizzles and traversal orders directly visible to
+the cache model, and avoids trace-level cache simulation.
+6
+
+
+--- Page 7 ---
+For a tensor with reuse_dims, TileSight computes a
+reuse key from the tile’s non-reuse coordinates:
+key(x, 𝑅) = Linearize 𝑥𝑑| 𝑑∉𝑅,
+(6)
+where x is the tile coordinate and 𝑅is the set of reuse di-
+mensions. For GEMM’s A matrix with 𝑅= {𝑁𝑡}, all tiles
+in the same M-row share the same A key. For B, all tiles in
+the same N-column share the same B key. The concrete tile
+execution order, including swizzles and row-panel traversal,
+determines the sequence in which these keys appear and
+therefore their reuse distances.
+3.5.2
+Hit Probability and Fast Evaluation. Given reuse
+distance 𝐷𝑇, associativity 𝐴, and cache capacity 𝐵𝑇measured
+in tile units, the stochastic distance cache model estimates
+the hit probability of a least-recently-used (LRU)-like cache.
+The exact SDCM hit probability can be expressed with a
+binomial form:
+𝑃(ℎ| 𝐷𝑇) =
+𝐴−1
+∑︁
+𝑎=0
+𝐷𝑇
+𝑎
+  𝐴
+𝐵𝑇
+𝑎𝐵𝑇−𝐴
+𝐵𝑇
+𝐷𝑇−𝑎
+,
+(7)
+where 𝐴is cache associativity and 𝐵𝑇is cache capacity
+measured in tiles. While accurate, this binomial form is
+expensive to compute for every tensor key in a large tile
+grid.
+TileSight therefore adopts a Gaussian approximation for
+efficient evaluation:
+𝑃(ℎ| 𝐷𝑇)approx = 1 −𝑄
+ |𝐴−1 −𝜇|
+√
+𝜎2
+
+,
+(8)
+where
+𝜇= 𝐷𝑇· 𝐴
+𝐵𝑇
+,
+𝜎2 = 𝐷𝑇· 𝐴
+𝐵𝑇
+·
+
+1 −𝐴
+𝐵𝑇
+
+.
+(9)
+𝑄(𝑥) denotes the complementary cumulative distribution
+function (CDF) of the standard normal distribution. To fur-
+ther reduce overhead, we apply the Zelen–Severo approxi-
+mation [1] for the CDF Φ(𝑥):
+Φ(𝑥) ≈1 − 𝑎1𝑡−𝑎2𝑡2 + 𝑎3𝑡3 𝑒−𝑥2/2
+√
+2𝜋
+,
+(10)
+where 𝑡= (1 + 0.33267𝑥)−1 and 𝑎1,𝑎2,𝑎3 are constants.
+Sampling along reduction axes. Tile execution plans
+expose reduction axes (e.g., the 𝐾axis in GEMM). TileSight
+samples reuse events at this granularity rather than replaying
+every inner-loop access (a GEMM with 𝐾=8192, tile𝐾=32
+reduces checks by 256× with negligible accuracy loss). To-
+gether with tile-level reuse distance and the Gaussian ap-
+proximation, this reduces cache-model evaluation by roughly
+five orders of magnitude, enabling cache modeling inside the
+analytical loop rather than as offline trace analysis.
+3.5.3
+Two-Level Cascade, Swizzle, and Waves. On GPUs
+with an intermediate L1.5/LRC tier, TileSight applies SDCM
+as a cascade — L1.5 within each physical SM group, L2 glob-
+ally, and DDR carrying the residual miss traffic; without this
+design, L1.5 hit probability is zero and the model collapses to
+a single L2 evaluation. A block swizzle, row-panel, Z-order,
+or persistent-block schedule is just a concrete sequence of tile
+coordinates fed to the reuse-distance simulation. Within a
+wave, TileSight perturbs 𝐷𝑇for hardware nondeterminism,
+sequential tensor loads, and cross-tensor cache aging, all
+derived from the tile execution plan and hardware grouping
+with no kernel-specific profiling. Tail waves use a subset of
+SMs and therefore receive a larger share of shared bandwidth,
+so the envelope is recomputed for the tail. The resulting
+L1.5/L2/DDR byte counts populate the corresponding entries
+of Eq. 1, so cache behavior changes the pipeline envelope
+itself, not only the final latency.
+3.6
+Cross-Device Tiles
+Cross-device execution is a placement extension of the same
+intra-tile abstraction: a tile’s source or destination can point
+to a shard or replica on another GPU, and its resource vector
+picks up a non-zero Net entry. A tensor-, expert-, sequence-
+or data-parallel mapping partitions both the tile grid and
+its tensor tiles, producing placement descriptors over GPU
+groups. After partitioning, a local tile wave may need a
+tensor tile produced by another device, a replicated acti-
+vation, or a partial result that must be reduced before later
+tiles can consume it. TileSight treats these as remote tensor
+accesses: the required collectives or point-to-point transfers
+are inferred directly from producer–consumer placement,
+and each becomes a tile with source/destination devices, byte
+volume, and Net resource usage.
+Logical exchanges and topology. For each inferred re-
+mote tensor access, TileSight decomposes the required
+tensor-tile movement into ordered stages. A stage is rep-
+resented by logical source–destination exchanges (𝑠,𝑑,𝑏),
+where 𝑠is the device that owns or produces the tensor
+tile, 𝑑denotes the device whose tile wave consumes it, and
+𝑏means the tile or shard byte volume derived from the
+tensor access. Collective algorithms simply provide differ-
+ent stage decompositions: a ring all-reduce uses reduce-
+scatter and all-gather steps, tree algorithms use reduction
+and broadcast levels, and irregular routing remains point-
+to-point. This representation is tile-level rather than packet-
+level. It preserves the tensor-placement information needed
+to reason about communication volume, while leaving the
+hardware topology to determine which physical network-
+on-chip (NoC) or interconnect links carry each exchange.
+Per-stage routed cost. After routing the exchanges in
+a stage, TileSight estimates the stage time with an 𝛼–𝛽
+communication model [43] that matches the decomposition
+7
+
+
+--- Page 8 ---
+Zhiwen Mo et al.
+Table 3. Hardware specifications: theoretical peak (spec) /
+microbenchmark-calibrated (meas.) for GPU architectures
+evaluated in this paper.
+GPU
+SMs
+VEC FP32 T
+TC FP16 T
+SFU T
+L2 TB/s
+DDR TB/s
+spec / meas.
+spec / meas.
+spec / meas.
+meas.
+spec / meas.
+A100
+108
+19.5 / 19.0
+312 / 299
+2.4 / 2.4
+3.2
+1.9 / 1.7
+H200*
+132
+61.8 / 49.5
+989 / 928
+3.9 / 4.1
+9.2
+4.8 / 4.2
+B6000
+188
+117 / 88.6
+468 / 433
+7.3 / 6.7
+7.6
+1.8 / 1.4
+B200
+148
+74.5 / 57.7
+2382 / 2185
+4.7 / 4.5
+20.5
+8.0 / 7.0
+MI210
+104
+45.3 / 34.4
+181 / 167
+2.8 / 1.1
+4.8
+1.6 / 1.4
+Note: TileSight’s hardware abstraction also includes cache hierarchy, architecture-
+specific TMEM bandwidth, SMEM/occupancy limits, and network hierarchy across
+GPU groups. Not listed here for simplicity. *H200 has a maximum clock of 1980 MHz
+and a default clock of 1830 MHz.
+into hop latency and bottleneck-link serialization:
+𝑇𝑘=
+max
+(𝑠,𝑑,𝑏)∈E𝑘
+∑︁
+𝑙∈P𝑠𝑑
+𝛼𝑙
+|               {z               }
+routed hop latency
++
+max
+𝑙∈L 𝛽𝑙𝐵𝑙,𝑘
+|      {z      }
+bottleneck-link serialization
+,
+(11)
+where E𝑘is the set of logical exchanges in stage 𝑘, P𝑠𝑑the
+physical route for (𝑠,𝑑,𝑏), 𝐵𝑙,𝑘the bytes routed through link
+𝑙, and 𝛼𝑙, 𝛽𝑙are the calibrated startup latency and inverse
+bandwidth of link 𝑙. The cost of an inferred communication
+sequence is the ordered sum over its stages, 𝑇𝑐= Í
+𝑘∈K𝑐𝑇𝑘.
+For algorithms with repeated identical stages such as ring
+collectives, TileSight evaluates one stage and multiplies
+by the stage count. The result enters the Net dimension of
+Eq. 1, so cross-device movement is represented as an intra-
+tile resource requirement and overlaps with local compute
+through the same steady-state machinery as everything else.
+3.7
+Putting It Together
+With the pieces in place, Algorithm 1 regains its full meaning:
+cache analysis (§3.5) populates the L1.5/L2/DDR entries of
+u(𝑜) from inter-tile execution order; remote tensor accesses
+(§3.6) populate the Net entry from routed 𝛼–𝛽stage cost; the
+envelope (§3.4) then consumes the completed resource vec-
+tors and the dependency/concurrency edges (§3.3), applied
+recursively across nested loops, waves, and network stages.
+None of these are post-hoc corrections — each piece either
+populates or consumes the same per-tile resource vector that
+flows through the envelope.
+3.8
+Portable Hardware Abstraction
+TileSight requires only the parameters that affect the tile
+execution plan and its placement descriptors. The abstraction
+mirrors the tensor-placement hierarchy: local placements
+map to register/TMEM/SMEM/cache/DDR resources, remote
+placements map to a calibrated network hierarchy across
+GPUs and nodes (Table 3). Values come from vendor spec-
+ifications and lightweight microbenchmarks for practical
+bandwidth, utilization caps, and network parameters.
+TileSight does not model warp-level instruction issue,
+compiler register allocation, hardware scheduling at instruc-
+tion granularity, or packet-level network effects. Instead, it
+models the schedule-visible effects that tile-level program-
+mers and distributed runtimes control: tile shape, tensor
+placement, reuse pattern, swizzle order, pipeline depth, res-
+ident blocks per SM, distributed partitioning, collective al-
+gorithm, and topology-aware routing. This is what makes
+the model both portable across GPU generations and fast
+enough to use inside schedule search.
+4
+Implementation
+TileSight is implemented in Python (∼6K lines) and sup-
+ports NVIDIA and AMD GPUs. Users describe kernels as
+tile-based programs, either extracted from Triton or TileLang
+code, or written by hand for non-DSL kernels, and TileSight
+produces a full performance breakdown without running
+the kernel.
+Describing arbitrary fused programs. To represent ar-
+bitrary kernels, TileSight describes the operations executed
+within each tile as a tile-action DAG (§3.1). Each tile action is
+annotated with the HardwareUsage resource vector (Sec. 3.1)
+and two additional attributes: (1) explicit data dependencies
+among actions, and (2) the scratchpad memory level at which
+intermediate results reside: the register file, shared memory, or
+architecture-specific tensor memory (TMEM) on Blackwell.
+The scratchpad annotation determines the bandwidth tier
+charged for each data movement between actions and how
+much on-chip capacity is consumed, which in turn constrains
+occupancy. Data dependencies are declared between tile-
+action nodes. TileSight automatically enumerates all valid
+topological orderings consistent with these dependencies
+and selects the schedule minimizing tile latency.
+Software pipeline and occupancy. For pipelined ker-
+nels, the user provides the pipeline depth, corresponding to
+num_stages in Triton or explicit stage counts in TileLang.
+Given kernel resource usage, such as shared memory per
+tile and register count, TileSight computes the number
+of resident tiles per SM as the resource-limited minimum.
+This determines the effective pipeline depth and per-SM
+bandwidth allocation. TileSight models head and tail waves
+separately: the tail wave has fewer active SMs, so each SM
+has a larger per-SM share of L2 and DDR bandwidth, which
+is reflected in the per-tile latency computation.
+Single GPU to cluster. At the single-GPU level, the entire
+tile grid is scheduled on one device. At the node level, a
+DistributedTileMap partitions the grid across GPUs and
+a NetworkHierarchy captures the intra-node interconnect,
+including NVLink or PCIe. TileSight selects collective algo-
+rithms, such as ring, recursive-doubling, Rabenseifner, based
+on message size and device count. For multi-node clusters,
+the same NetworkHierarchy is extended with inter-node
+links, such as InfiniBand or NVLink Bridge. Users can specify
+8
+
+
+--- Page 9 ---
+Table 4. FlashAttention-3 modeling compared with NCU on
+H100 (Qwen configuration: batch 1, 64 heads, head-dim 128).
+NCU is ground truth.
+Time (ms) L2 hit (%) L2 util. (%) SMEM (%) TC (%) SFU (%)
+NCU
+5.58
+96.50
+38.66
+51.14
+74.78
+38.58
+TileSight
+5.73
+95.26
+35.72
+43.13
+70.30
+35.42
+custom topologies by providing per-hop bandwidth and la-
+tency for any link. Given a DistributedTileMap, TileSight
+infers the required remote tensor accesses from producer–
+consumer placement of the partitioned tile grid, decomposes
+each into ordered stages of (𝑠,𝑑,𝑏) logical exchanges, and
+applies the 𝛼–𝛽stage cost over the NetworkHierarchy to
+produce a per-tile Net resource time that flows through the
+same pipeline envelope as local compute and memory.
+Composition and calibration. The modeling chain runs
+bottom-up: our cache model computes L1.5/L2/DDR traffic
+fractions based on tile schedule and reuse distances. These
+traffic data feed into the per-tile pipeline overlap model. The
+wave model aggregates per-tile results into per-device time,
+while the distributed model adds communication and com-
+putes overlap. Memory/TMEM bandwidth, per-unit compute
+throughput, and other hardware parameters are calibrated
+once per architecture with small microbenchmarks. This
+consists of bandwidth sweeps over working-set sizes, as in
+Figure 2, and short matrix-multiply probes that only take
+seconds.
+5
+Evaluation
+To demonstrate that a unified tile-level abstraction can model
+single-operator latency, cache behavior, distributed kernels,
+and end-to-end serving without per-target retraining or
+profiling, we evaluate TileSight from single-GPU kernels
+to multi-GPU LLM serving across A100, H200, B200, B6000,
+H200-NVL, and B200×32 systems.
+We first describe the experimental setup in §5.1, including
+the hardware and framework configuration, workloads, and
+baselines. We then validate the core tile-level model on single-
+GPU operators in §5.2, followed by a deeper analysis of L2
+cache prediction for persistent kernels in §5.3. §5.4 and §5.5
+extend the evaluation to distributed settings, covering both
+collective/fused compute-communication kernels and end-
+to-end vLLM serving. Finally, §5.6 shows how TileSight can
+be used for performance diagnosis and cost-model-guided
+schedule pruning.
+5.1
+Experimental Setup
+Hardware and framework. To ensure broad hardware cov-
+erage, we evaluate A100×1, H200-SXM×8, B200×8, an InfiniBand-
+connected B200×32 cluster, B6000×2, and H200-NVL×8 sys-
+tems, spanning SXM, PCIe, NVLink4/5, and multi-node set-
+tings. We use CUDA 12.9 on Hopper and Ampere machines
+and CUDA 13.1 on Blackwell machines. We additionally eval-
+uate AMD MI210 (CDNA2) on ROCm 6.2 for cross-vendor
+coverage. GEMM measurements use cutlass_profiler on
+NVIDIA GPUs and Composable Kernel (CK) on MI210; dis-
+tributed kernels use Parallel Kittens [40]; and end-to-end
+serving uses vLLM 0.19.0.
+Workloads. Kernel-level experiments cover BF16/FP16
+GEMMs, persistent-kernel cache sweeps, collectives, and
+fused compute-communication kernels. End-to-end vLLM
+experiments include dense and MoE models from the Qwen,
+Llama, and DeepSeek families, ranging from single-GPU
+serving to tensor-, expert-, and data-parallel serving on up
+to 32 GPUs. In total, we evaluate 703 GEMM shapes, 4,680
+persistent-kernel cases for cache modeling, and 166 vLLM
+decode configurations.
+Baselines. For single-operator prediction, we compare
+against Roofline [48], NeuSight [25]1, PipeWeave [54], and
+GenZ [6]. NeuSight is trained on BF16/FP16 GEMM data from
+six PipeWeave GPUs, including A100. The PipeWeave dataset
+covers A100 and Hopper-class machines, so PipeWeave is not
+a zero-shot baseline on those architectures. For distributed
+kernels and end-to-end serving, we compare against PipeWeave
+and GenZ. PipeWeave’s collective model is a per-GPU ran-
+dom forest with no configurable 𝛼–𝛽or topology parame-
+ters; among our targets, A100 and B6000 (RTX PRO 6000
+Blackwell) have native PipeWeave collective datasets, while
+H200-NVL and B200 are unsupported and we use its H800
+dataset as the closest available substitute. For end-to-end
+serving, we provide PipeWeave with the required vendor
+hardware specifications.
+5.2
+Single-Operator Prediction Accuracy
+Figure 5 evaluates 703 BF16/FP16 tensor-core GEMM shapes
+on A100, B200, B6000, and H200, using cutlass_profiler
+measurements as ground truth after filtering stream-K and
+single-instruction, multiple-thread (SIMT) fallback paths.
+TileSight achieves 12.35% pooled MAPE, compared with
+21.97% for PipeWeave, 32.95% for retrained NeuSight, 33.85%
+for Roofline, and 34.89% for GenZ. TileSight is best on
+the newer B200, B6000, and H200 targets. NeuSight nar-
+rowly leads on A100 because A100 appears in its training
+distribution, but this advantage does not transfer to newer
+GPUs, illustrating the overfitting risk of architecture-specific
+learned predictors. On MI210, because CK provides no ex-
+plicit rasterization (along-𝑀/along-𝑁) or swizzle control as
+cutlass_profiler does, TileSight runs in its default cache
+mode, yet still leads at 23.4% MAPE, ahead of PipeWeave
+(25.5%), NeuSight (26.4%), Roofline (38.8%), and GenZ (40.4%).
+Non-GEMM fused operators are evaluated in the distributed
+and end-to-end workloads below.
+1The original NeuSight is trained only on FP32 GEMMs; we retrain it with
+PipeWeave’s FP16 dataset for a fair comparison.
+9
+
+
+--- Page 10 ---
+Zhiwen Mo et al.
+101
+102
+103
+104
+105
+Measured latency ( s)
+101
+102
+103
+104
+105
+Predicted latency ( s)
+B6000
+TileSight    5.2%
+Pipeweave   31.7%
+Neusight    28.1%
+Roofline    33.7%
+GenZ        34.8%
+100
+101
+102
+103
+104
+Measured latency ( s)
+100
+101
+102
+103
+104
+B200
+TileSight   14.9%
+Pipeweave   16.5%
+Neusight    44.9%
+Roofline    33.4%
+GenZ        34.9%
+100
+101
+102
+103
+104
+Measured latency ( s)
+100
+101
+102
+103
+104
+H200
+TileSight   10.4%
+Pipeweave   14.3%
+Neusight    42.2%
+Roofline    21.3%
+GenZ        22.4%
+101
+102
+103
+104
+105
+Measured latency ( s)
+101
+102
+103
+104
+105
+A100
+TileSight   18.7%
+Pipeweave   24.5%
+Neusight    17.8%
+Roofline    45.7%
+GenZ        46.3%
+101
+102
+103
+104
+105
+Measured latency ( s)
+101
+102
+103
+104
+105
+MI210
+TileSight   23.4%
+Pipeweave   25.5%
+Neusight    26.4%
+Roofline    38.8%
+GenZ        40.4%
+Figure 5. GEMM latency prediction vs. measured latency across A100, B200, B6000, H200, and MI210. Each point is one
+BF16/FP16 tensor-core GEMM shape; the diagonal indicates exact prediction.
+0
+200
+400
+600
+800
+1000
+1200
+Config index (shape × tiling)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+L2 hit rate
+L2 hit-rate: TileSight vs NCU
+A100: MAE=1.46 pp, MAPE=2.33%
+H200: MAE=0.88 pp, MAPE=1.50%
+B200: MAE=1.05 pp, MAPE=1.52%
+B6000: MAE=0.78 pp, MAPE=1.09%
+NCU (truth)
+TileSight
+Figure 6. TileSight L2 hit-rate prediction vs. NCU ground
+truth across 4,680 GEMM persistent-kernel cases.
+Table 4 compares TileSight with NCU on a fused FA-3
+kernel. The final model predicts latency within 2.7% and
+tracks the major resource-utilization components, providing
+a compact sanity check for the tile-pipeline model on non-
+GEMM fused execution.
+5.3
+L2 Cache Prediction Accuracy
+Figure 6 evaluates tile reuse-distance cache modeling against
+NCU on 4,680 GEMM persistent-kernel cases. With effective
+cache capacity calibrated by the bandwidth sweep in Figure 2,
+mean absolute L2 hit-rate error stays near one percentage
+point on every GPU: 1.46 pp on A100, 0.88 pp on H200, 1.05 pp
+on B200, and 0.78 pp on B6000 . The results demonstrate the
+effectiveness of tile reuse-distance cache modeling.
+Effect of inter-SM execution skew. The reuse-distance
+model assumes tiles advance at a uniform rate, but SMs
+desynchronize and work on different 𝐾-slices at once, spread-
+ing the concurrently accessed tiles beyond L2; for deep-
+𝐾GEMMs this pushes the measured hit rate below Tile-
+Sight’s lockstep prediction (e.g., a GEMM with 𝑀=𝑁=8192,
+𝐾=28672 on H200: 82% predicted vs. 43% measured). Such
+configurations are rare, so aggregate error stays near one
+percentage point, but the model is systematically optimistic
+in this regime; we revisit it in §7.
+5.4
+Distributed Validation
+Figures 7 and 8 validate 304 distributed cases on H200×8
+and B200×8: 152 pure collectives and 152 fused compute-
+communication kernels. TileSight extracts logical source–
+destination exchanges, routes them over calibrated NVLink
+topologies, and evaluates each stage with the 𝛼-𝛽model
+from §3.6. On pure collectives, TileSight achieves 12.22%
+wMAPE, compared with 20.82% for GenZ and 65.72% for
+PipeWeave on supported rows. PipeWeave has no native
+configurable H200/B200 backend for these collectives and
+falls back to an H800 random-forest model, so it cannot
+reflect the NVLink4/5 bandwidth differences in our machines.
+For B200 Ulysses Attention, the local compute stage uses
+the source-aligned SM100 128×128 FA4 tile pipeline with
+TMEM traffic, packed grids, and the sectioned LPT mapping,
+composed with four all-to-all stages. On fused kernels, where
+both baselines are unsupported, TileSight achieves 14.83%
+wMAPE.
+5.5
+vLLM End-to-End Decode
+Figures 9 and 10 evaluate end-to-end vLLM decode through-
+put on 166 healthy configurations spanning dense, MoE,
+single-node, and multi-node serving. The evaluated systems
+range from A100×1 and B6000×2 to B200×32 and H200-
+NVL×8, exercising both local tile execution and routed dis-
+tributed stages. Overall, TileSight achieves 13.52% wMAPE,
+while PipeWeave with the B200 extension reaches 31.84%
+wMAPE on 114/117 dense configurations. PipeWeave does
+not support MoE. PipeWeave uses native collective datasets
+for A100 and B6000, but falls back to H800 for H200-NVL
+and B200. For B200, we extend PipeWeave by supplying B200
+hardware specifications while using its closest available H800
+samples for GEMM-configuration lookup and its Hopper
+calculator. The B200 extension produces valid predictions
+for 19/22 dense configurations. In the remaining three large-
+batch cases, the prefill RMSNorm sequence lengths exceed
+PipeWeave’s 131K-token MLP training maximum. Although
+PipeWeave bounds its learned utilization factor to [0, 1]
+10
+
+
+--- Page 11 ---
+10
+2
+10
+1
+100
+101
+10
+2
+10
+1
+100
+101
+H200x8
+pred (ms)
+AllGather
+TileSight  11.8%
+GenZ       27.9%
+PipeWeave  57.5%
+10
+1
+100
+101
+10
+1
+100
+101
+AllReduce
+TileSight   6.1%
+GenZ        7.9%
+PipeWeave  62.3%
+10
+1
+100
+101
+10
+1
+100
+101
+ReduceScatter
+TileSight  11.8%
+GenZ       29.6%
+PipeWeave  57.6%
+10
+1
+100
+10
+1
+100
+All-to-All
+TileSight   6.4%
+GenZ       29.7%
+10
+2
+10
+1
+100
+101
+Ground Truth (ms)
+10
+2
+10
+1
+100
+101
+B200x8
+pred (ms)
+TileSight  17.1%
+GenZ       31.5%
+PipeWeave  68.5%
+10
+2
+10
+1
+100
+101
+Ground Truth (ms)
+10
+2
+10
+1
+100
+101
+TileSight  19.5%
+GenZ        6.2%
+PipeWeave  88.8%
+10
+1
+100
+101
+Ground Truth (ms)
+10
+1
+100
+101
+TileSight  13.1%
+GenZ       30.1%
+PipeWeave  69.2%
+10
+2
+10
+1
+Ground Truth (ms)
+10
+2
+10
+1
+TileSight  29.9%
+GenZ       52.2%
+Figure 7. Pure-collective prediction on H200×8 and B200×8 across AllGather, AllReduce, ReduceScatter, and All-to-All.
+Table 5. Performance improvements in TileSight diagnosed kernels
+Kernel
+Framework
+Device
+Baseline
+Issue
+Solution
+Optimized
+Speedup
+ReLU
+Triton
+MI210
+1.40ms
+Indirect addr.
+Unroll addr.
+1.10ms
+1.27×
+Avg_Pool
+Triton
+MI210
+0.20ms
+Indirect addr. + Not Overlapped
+Unroll addr. + Small tile
+0.10ms
+2.00×
+Avg_Pool
+Torch
+MI210
+0.15ms
+Not Overlapped
+Small tile
+0.10ms
+1.50×
+GEMM(M128)
+CK
+MI210
+3.68ms
+Not Overlapped
+Multi Thread Block per SM
+2.68ms
+1.37×
+GEMM(K57344)
+CK
+MI210
+55.63ms
+Large K with L2 hit rate issue
+large tilek->1 TB per CU
+51.90ms
+1.07×
+RMS_Norm
+Torch.Compile
+H100
+0.21ms
+Not Overlapped
+Multi Thread Block per SM
+0.18ms
+1.17×
+MLA(kv8192
+b128 h128)
+Triton
+MI210
+66.38ms
+Tiling, Memory Alloc., SMEM
+Conflict
+Register alloc., larger Tile, Conflict
+Elim.
+7.40ms
+8.97×
+10−1
+100
+101
+10−1
+100
+101
+H200x8
+pred (ms)
+AllGather+GEMM
+TileSight  15.3%
+10−1
+100
+10−1
+100
+GEMM+ReduceScatter
+TileSight  12.2%
+100
+101
+100
+101
+Ulysses Attention
+TileSight  14.3%
+10−1
+100
+Ground Truth (ms)
+10−1
+100
+B200x8
+pred (ms)
+TileSight  14.0%
+10−1
+100
+Ground Truth (ms)
+10−1
+100
+TileSight  24.6%
+100
+101
+Ground Truth (ms)
+100
+101
+TileSight  14.8%
+Figure
+8.
+Fused
+compute-communication
+kernel
+prediction on H200×8 and B200×8 (AllGather+GEMM,
+GEMM+ReduceScatter, Ulysses Attention).
+with a sigmoid, these out-of-range inputs drive it to zero,
+triggering division by zero and preventing robust end-to-
+end prediction for these cases. This highlights a robustness
+limitation of ML-based predictors when extrapolating to
+unseen cases. TileSight achieves 7.5–18.0% per-machine
+wMAPE and 10.35% wMAPE on MoE configurations.
+5.6
+Key Applications: Diagnosis and Cost Model
+Due to its interpretable nature, TileSight can be used as a
+white-box optimization aid. Figure 11 shows that tile config-
+urations selected by TileSight can match or exceed strong
+vendor and expert baselines across attention, MLA, GEMM,
+and dequantized matmul kernels on H100 and MI210. Fig-
+ure 12 shows the same model used as a TileLang cost model:
+retaining the predicted top 5% schedules prunes 95% of candi-
+dates while reaching 99.66% of exhaustive-search best perfor-
+mance on average. This is especially useful on less-supported
+targets, where learned or vendor-tuned cost models provide
+weak guidance but the analytical model can still surface
+high-quality schedule candidates.
+The diagnosis cases fall into four recurring bottleneck
+classes: indirect addressing, insufficient pipeline overlap,
+poor L2 locality, and architecture-specific memory-layout is-
+sues. In each case, TileSight maps the bottleneck to concrete
+tile-level changes, such as address unrolling, tile-size adjust-
+ment, higher resident-block occupancy, or shared-memory/register-
+layout fixes. Table 5 summarizes diagnosis cases where Tile-
+Sight identifies indirect addressing, pipeline stalls, and L2
+locality bottlenecks, leading to 1.07–8.97× improvements.
+11
+
+
+--- Page 12 ---
+Zhiwen Mo et al.
+1
+4
+16
+64
+512
+102
+103
+decode throughput (tok/s)
+wMAPE: TileSight 9.3%  ·  PipeWeave 58.1%
+A100×1  ·  Qwen2.5-7B
+1
+2
+4
+8
+16
+32
+64
+128
+102
+103
+wMAPE: TileSight 7.7%  ·  PipeWeave 44.0%
+A100×1  ·  Qwen2.5-14B
+1
+2
+4
+8
+16
+102
+wMAPE: TileSight 9.7%  ·  PipeWeave 21.3%
+A100×1  ·  Qwen3-32B
+1
+2
+4
+8
+16
+32
+64
+128
+102
+103
+wMAPE: TileSight 16.4%  ·  PipeWeave 33.9%
+RTX 6000 Pro×2  ·  Qwen3-32B
+1
+2
+4
+8
+16
+32
+64
+101
+102
+103
+decode throughput (tok/s)
+wMAPE: TileSight 18.2%  ·  PipeWeave 26.3%
+RTX 6000 Pro×2  ·  Llama-3.3-70B (BF16)
+1
+4
+16
+64
+256
+2048
+102
+103
+104
+wMAPE: TileSight 15.9%  ·  PipeWeave 38.1%
+B200×8  ·  Llama-3.3-70B
+1
+4
+16
+64
+512
+102
+103
+104
+wMAPE: TileSight 19.2%  ·  PipeWeave 25.5%
+B200×8  ·  Llama-3.1-405B
+1
+4
+16
+64
+512
+102
+103
+104
+wMAPE: TileSight 22.3%  ·  PipeWeave 54.4%
+H200-NVL×4  ·  Qwen3-32B
+1
+4
+16
+64
+512
+batch size
+102
+103
+104
+decode throughput (tok/s)
+wMAPE: TileSight 15.2%  ·  PipeWeave 47.5%
+H200-NVL×4  ·  Qwen2.5-72B
+1
+4
+16
+64
+512
+batch size
+102
+103
+104
+wMAPE: TileSight 15.9%  ·  PipeWeave 47.6%
+H200-NVL×4  ·  Llama-3.3-70B
+1
+4
+16
+64
+512
+batch size
+102
+103
+104
+wMAPE: TileSight 17.6%  ·  PipeWeave 10.8%
+H200-NVL×8  ·  Llama-3.3-70B
+1
+2
+4
+8
+16
+32
+64
+128
+batch size
+102
+103
+wMAPE: TileSight 12.1%  ·  PipeWeave 7.5%
+H200-NVL×8  ·  Llama-3.1-405B
+1
+4
+16
+64
+512
+batch size
+102
+103
+104
+decode throughput (tok/s)
+wMAPE: TileSight 7.7%
+B200×8
+DeepSeek-V3 (MoE)
+1
+4
+16
+64
+512
+batch size
+103
+104
+wMAPE: TileSight 7.7%
+B200×8
+Qwen3-Coder-480B (MoE)
+2
+8
+32
+128
+1024
+batch size
+103
+104
+wMAPE: TileSight 7.5%
+B200×32 (4-node)
+DeepSeek-V3 (MoE, TP16+DP2)
+1
+2
+4
+8
+16
+32
+64
+128
+256
+batch size
+102
+103
+wMAPE: TileSight 16.6%
+H200-NVL×8
+DeepSeek-R1 (MoE)
+1
+4
+16
+64
+512
+batch size
+102
+103
+wMAPE: TileSight 11.1%
+H200-NVL×8
+Qwen3-235B (MoE)
+vLLM measurement
+TileSight (ours)
+PipeWeave
+Figure 9. vLLM decode throughput prediction across dense LLMs, MoE models, and multi-node configurations. Dense rows
+cover A100×1, B6000×2, B200×8, and H200-NVL. MoE rows cover B200×8, B200×32, and H200-NVL×8. Bars compare measured
+vLLM tokens per second with TileSight and PipeWeave where supported. PipeWeave does not support MoE.
+101
+102
+103
+104
+Measured decode throughput (tok/s)
+101
+102
+103
+104
+Predicted decode throughput (tok/s)
+modeling tool
+TileSight (ours)
+PipeWeave
+GPU platform
+A100×1
+RTX 6000 Pro×2
+B200×8
+B200×32 (4-node)
+H200-NVL×4
+H200-NVL×8
+y = x
+y = 2x / y = x/2
+Figure 10. Predicted vs. measured decode throughput across
+all healthy configurations. TileSight: 13.52% wMAPE over-
+all. PipeWeave: 31.84% wMAPE on supported dense rows.
+6
+Related Work
+Tile-Centric Programming Frameworks. Triton [44],
+TileLang [10], TileLink [56], CUTLASS/CUTE [11], CuteDSL [12],
+ThunderKittens [38], FractalTensor [28], and NVIDIA’s CUDA
+Tile [33] have driven GPU programming toward tile-centric
+abstractions. Yet none ships a tile-centric performance model:
+Triton relies on black-box autotuning, TileLang on heuristics,
+and tritonBLAS [42] on GEMM-specific analytical selection.
+TileSight fills this gap as a unified tile-centric cost model
+and diagnosis backend for these frameworks.
+Performance Modeling and Prediction. Roofline [48]
+and its variants (e.g., GenZ [6], [13, 29, 36, 52]) provide
+useful first-order bounds for LLM inference but cannot distin-
+guish kernels with different schedules at identical FLOP/byte
+counts, nor capture schedule-dependent effects such as L2
+reuse under different tile orders. Karami et al. [21] further
+show non-GEMM ops account for up to 74% of inference la-
+tency, challenging GEMM-centric assumptions. Dataflow ex-
+ploration frameworks [7, 16, 23, 35, 50, 55] model loop nests
+and data reuse for spatial accelerators but rely on simplified
+hardware assumptions that limit GPU applicability. Hybrid
+and ML-based approaches—PipeWeave [54], NeuSight [25],
+CDMPP [19], TAO [34], Omniwise [47], among others [17,
+26]—predict runtime via learned models (either end-to-end or
+as residuals on top of analytical estimates), often accurately
+but as black boxes without exposing why a kernel is slow.
+12
+
+
+--- Page 13 ---
+GQA0
+GQA1
+GQA2
+GQA3
+MHA0
+MHA1
+MHA2
+MHA3
+0
+1
+2
+Norm.
+MHA/GQA on H100
+GQA0
+GQA1
+GQA2
+GQA3
+MHA0
+MHA1
+MHA2
+MHA3
+0
+1
+2
+MHA/GQA on MI210
+MLA0
+MLA1
+MLA2
+MLA3
+MLA4
+MLA5
+MLA6
+MLA7
+0
+5
+10
+Norm.
+MLA on H100
+30
+40
+MLA on MI210
+MLA0
+MLA1
+MLA2
+MLA3
+MLA4
+MLA5
+MLA6
+MLA7
+0
+5
+10
+fail
+M0
+M1
+M2
+M3
+M4
+M5
+M6
+M7
+M8
+M9
+M10
+M11
+M12
+M13
+0
+1
+2
+3
+Norm.
+GEMM on H100
+M0
+M1
+M2
+M3
+M4
+M5
+M6
+M7
+M8
+M9
+M10
+M11
+M12
+M13
+0
+1
+2
+3
+GEMM on MI210
+10
+15
+Dequant GEMM on H100
+Q0
+Q1
+Q2
+Q3
+Q4
+Q5
+Q6
+Q7
+Q8
+Q9
+Q10
+Q11
+Q12
+Q13
+0
+1
+2
+Norm.
+Q0
+Q1
+Q2
+Q3
+Q4
+Q5
+Q6
+Q7
+Q8
+Q9
+Q10
+Q11
+Q12
+Q13
+0.0
+0.5
+1.0
+1.5
+Dequant GEMM on MI210
+Normalized latency vs. TileSight (lower is better)
+TileSight
+FlashMLA
+TileSight-Base
+cuBLAS
+FA-3
+rocBLAS
+Triton
+Figure 11. Kernel performance on H100 and MI210
+when TileSight guides tile configuration selection in
+Triton and TileLang, replacing exhaustive autotuning.
+Reference lines are FlashAttention-3 for multi-head
+attention/grouped-query attention (MHA/GQA), FlashMLA
+for MLA, cuBLAS/rocBLAS for matrix multiplication, and
+vendor libraries for dequantized matrix multiplication.
+TileSight differs by being fully first-principles with no
+learned component, yet matches or exceeds these predic-
+tors’ accuracy while offering schedule-aware, tile-granular
+diagnosis that decomposes performance into actionable com-
+ponents.
+GPU Profiling and Instrumentation. Vendor profilers
+(Nsight Compute [32], OmniPerf [2]) report metrics but
+little root-cause guidance. KPerfIR [18] and Neutrino [20]
+advance compiler- and probe-based GPU instrumentation,
+while binary-level tools [37, 53, 58, 59] provide low-level
+visibility. All are post-hoc, requiring execution and unable
+to predict unseen configurations. TileSight predicts perfor-
+mance before execution and maps bottlenecks to tile-level
+scheduling decisions.
+Distributed Multi-GPU Performance Modeling. Vidur
+[3], Lumos [27], SimAI [46], TokenSim [49], Maya [51], and
+Echo [14] simulate distributed training or inference at scale
+90
+92
+94
+96
+98
+100
+Performance (% of best)
+2048x12288x49152
+4096x1024x7168
+8192x8192x28672
+8192x28672x8192
+512x1024x8192
+4096x14336x14336
+512x12288x12288
+4096x28672x8192
+512x28672x8192
+16384x1024x7168
+100.0%
+100.0%
+100.0%
+100.0%
+100.0%
+100.0%
+99.9%
+99.6%
+98.7%
+98.4%
+mean 99.66%
+Figure 12. TileSight as cost model in TileLang: pruning
+95% of candidate schedules and retaining the predicted top
+5% reaches 99.66% of exhaustive-search best performance on
+average across 10 LLaMA-derived GEMM-FP16 workloads.
+using profiling-based kernel estimators, while DistServe [57],
+CrossPipe[8], Sailor [39], Metis [45], and RAPID-LLM [22]
+optimize parallel strategies with various communication and
+scheduling models. All treat single-GPU kernel execution as
+a black box. TileSight operates at the complementary intra-
+kernel level, providing white-box tile-level cost estimation
+that can plug into these distributed simulators, while its own
+distributed extension composes tile-level predictions with
+communication models under a unified tile abstraction.
+7
+Limitations and Future Work
+TileSight targets regular, tile-structured programs whose
+runtime is dominated by resource utilization. It does not
+model data-dependent control flow, highly irregular memory
+access, instruction-level compiler decisions, undocumented
+warp/cooperative thread array (CTA) scheduling, or closed-
+source runtime behavior. The hardware abstraction focuses
+on throughput. Latency-bound cases such as small-batch
+decode attention, and multi-die effects such as B200 SM-to-
+HBM affinity, require finer-grained latency and topology pa-
+rameters. TileSight also assumes tiles execute at a uniform
+rate across SMs; in reality SMs desynchronize, which makes
+L2 hit-rate prediction mildly optimistic for large-𝐾GEMMs
+(§5.3). Finally, although TileSight has been validated as a
+TileLang cost model on selected GEMM workloads, broader
+compiler integration and non-GEMM schedule search remain
+future work.
+8
+Conclusion
+TileSight shows that the tile, already a universal GPU
+programming unit across Triton, TileLang, CUDA Tile, and
+CuteDSL, can also unify performance reasoning. With tile-
+level modeling of resource use, dependencies, cache reuse,
+and cross-device placement, TileSight accurately predicts
+13
+
+
+--- Page 14 ---
+Zhiwen Mo et al.
+performance from single kernels to multi-node clusters with-
+out per-architecture training or profiling. The broader les-
+son is a first-principles one: begin with a compact set of
+physically grounded mechanisms, and let their composition
+explain complex execution. For regular tile-structured work-
+loads, this approach can yield accurate and interpretable
+predictions that transfer across architectures.
+14
+
+
+--- Page 15 ---
+References
+[1] Milton Abramowitz and Irene A Stegun. 1965. Handbook of mathemat-
+ical functions: with formulas, graphs, and mathematical tables. Vol. 55.
+Courier Corporation.
+[2] Advanced Micro Devices, Inc. 2025.
+Omniperf Documenta-
+tion. https://rocm.docs.amd.com/projects/omniperf/en/docs-6.2.1/
+what-is-omniperf.html Accessed: 2025-04-15.
+[3] Amey Agrawal, Nitin Kedia, Jayashree Mohan, Ashish Panwar, Nipun
+Kwatra, Bhargav S Gulavani, Ramachandran Ramjee, and Alexey
+Tumanov. 2024. Vidur: A large-scale simulation framework for llm
+inference. Proceedings of Machine Learning and Systems 6 (2024), 351–
+366.
+[4] Yehia Arafa, Abdel-Hameed Badawy, Gopinath Chennupati, Atanu
+Barai, Nandakishore Santhi, and Stephan Eidenbenz. 2020.
+Fast,
+accurate, and scalable memory modeling of GPGPUs using reuse
+profiles. In Proceedings of the 34th ACM International Conference on
+supercomputing. 1–12.
+[5] Yehia Arafa, Gopinath Chennupati, Atanu Barai, Abdel-Hameed A
+Badawy, Nandakishore Santhi, and Stephan Eidenbenz. 2019. Gpus
+cache performance estimation using reuse distance analysis. In 2019
+IEEE 38th International Performance Computing and Communications
+Conference (IPCCC). IEEE, 1–8.
+[6] Abhimanyu Bambhaniya, Ritik Raj, Geonhwa Jeong, Souvik Kundu,
+Sudarshan Srinivasan, Suvinay Subramanian, Midhilesh Elavazhagan,
+Madhu Kumar, and Tushar Krishna. 2024. Demystifying AI Platform
+Design for Distributed Inference of Next-Generation LLM models.
+arXiv preprint arXiv:2406.01698 (2024).
+[7] Jingwei Cai, Yuchen Wei, Zuotong Wu, Sen Peng, and Kaisheng Ma.
+2023. Inter-layer scheduling space definition and exploration for tiled
+accelerators. In Proceedings of the 50th Annual International Symposium
+on Computer Architecture. 1–17.
+[8] Tiancheng Chen, Aleš Kubíček, Langwen Huang, and Torsten Hoefler.
+2025.
+CrossPipe: Towards Optimal Pipeline Schedules for Cross-
+Datacenter Training. In USENIX Annual Technical Conference. https:
+//api.semanticscholar.org/CorpusID:280049543
+[9] Thomas M. Conte, Mary Ann Hirsch, and W-MW Hwu. 1998. Com-
+bining trace sampling with single pass methods for efficient cache
+simulation. IEEE Trans. Comput. 47, 6 (1998), 714–720.
+[10] Tile-AI Contributors. 2025. TileLang: A Domain-Specific Language
+for High-Performance GPU/CPU Kernels. https://github.com/tile-
+ai/tilelang.
+[11] NVIDIA Corporation. 2024. CUTLASS: CUDA Templates for Linear
+Algebra Subroutines. https://github.com/NVIDIA/cutlass.
+[12] CUTLASS acce. NVIDIA CUTLASS.
+https://github.com/NVIDIA/
+cutlass.
+[13] Michael Davies, Neal Crago, Karthikeyan Sankaralingam, and Christos
+Kozyrakis. 2025. LIMINAL: Exploring The Frontiers of LLM Decode
+Performance. arXiv preprint arXiv:2507.14397 (2025).
+[14] Yicheng Feng, Yuetao Chen, Kaiwen Chen, Jingzong Li, Tianyuan Wu,
+Peng Cheng, Chuan Wu, Wei Wang, Tsung-Yi Ho, and Hong Xu. 2024.
+Echo: Simulating Distributed Training At Scale. ArXiv abs/2412.12487
+(2024). https://api.semanticscholar.org/CorpusID:274789139
+[15] Futu News. 2026.
+NVIDIA launches CUDA 13.1 and CUDA
+Tile; Jensen Huang calls it the most significant advancement
+since CUDA’s introduction ∼20 years ago.
+Online news
+brief. https://news.futunn.com/en/post/65885271/futu-morning-brief-
+the-most-critical-week-of-the-year Accessed: 2026-05-19.
+[16] Mingyu Gao, Xuan Yang, Jing Pu, Mark Horowitz, and Christos
+Kozyrakis. 2019. Tangram: Optimized coarse-grained dataflow for
+scalable nn accelerators. In Proceedings of the Twenty-Fourth Interna-
+tional Conference on Architectural Support for Programming Languages
+and Operating Systems. 807–820.
+[17] X Yu Geoffrey, Yubo Gao, Pavel Golikov, and Gennady Pekhimenko.
+2021.
+Habitat: A {Runtime-Based} computational performance
+predictor for deep neural network training. In 2021 USENIX Annual
+Technical Conference (USENIX ATC 21). 503–521.
+[18] Yue Guan, Yuanwei Fang, Keren Zhou, Corbin Robeck, Manman Ren,
+Zhongkai Yu, Yufei Ding, and Adnan Aziz. 2025. KPerfIR: Towards an
+Open and Compiler-centric Ecosystem for GPU Kernel Performance
+Tooling on Modern AI Workloads. arXiv preprint arXiv:2505.21661
+(2025).
+[19] Hanpeng Hu, Junwei Su, Juntao Zhao, Yanghua Peng, Yibo Zhu,
+Haibin Lin, and Chuan Wu. 2024. CDMPP: A device-model agnostic
+framework for latency prediction of tensor programs. In Proceedings of
+the Nineteenth European Conference on Computer Systems. 1054–1074.
+[20] Songlin Huang and Chenshu Wu. 2025.
+Neutrino: Fine-grained
+{GPU} Kernel Profiling via Programmable Probing. In 19th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI
+25). 331–355.
+[21] Rachid Karami, Sheng-Chun Kao, and Hyoukjun Kwon. 2025. Un-
+derstanding the Performance Horizon of the Latest ML Workloads
+with NonGEMM Workloads. In 2025 IEEE International Symposium on
+Performance Analysis of Systems and Software (ISPASS). IEEE, 1–14.
+[22] George Karfakis, Faraz Tahmasebi, Bin Chen, Lime Yao, Saptarshi
+Mitra, Tian Pan, Hyoukjun Kwon, and Puneet Gupta. 2025. RAPID-
+LLM: Resilience-Aware Performance analysis of Infrastructure for
+Distributed LLM Training and Inference. ArXiv abs/2512.19606 (2025).
+https://api.semanticscholar.org/CorpusID:284077588
+[23] Hyoukjun Kwon, Prasanth Chatarasi, Vivek Sarkar, Tushar Krishna,
+Michael Pellauer, and Angshuman Parashar. 2020. Maestro: A data-
+centric approach to understand reuse, performance, and hardware
+cost of dnn mappings. IEEE micro 40, 3 (2020), 20–29.
+[24] Monica D Lam, Edward E Rothberg, and Michael E Wolf. 1991. The
+cache performance and optimizations of blocked algorithms. ACM
+SIGOPS Operating Systems Review 25, Special Issue (1991), 63–74.
+[25] Seonho Lee, Amar Phanishayee, and Divya Mahajan. 2025. Forecasting
+GPU Performance for Deep Learning Training and Inference. In
+Proceedings of the 30th ACM International Conference on Architectural
+Support for Programming Languages and Operating Systems, Volume 1.
+493–508.
+[26] Ying Li, Yifan Sun, and Adwait Jog. 2023. Path Forward Beyond Simu-
+lators: Fast and Accurate GPU Execution Time Prediction for DNN
+Workloads. In Proceedings of the 56th Annual IEEE/ACM International
+Symposium on Microarchitecture. 380–394.
+[27] Mingyu Liang, Hiwot Tadese Kassa, Wenyin Fu, Brian Coutinho, Louis
+Feng, and Christina Delimitrou. 2025. Lumos: Efficient Performance
+Modeling and Estimation for Large-scale LLM Training.
+ArXiv
+abs/2504.09307 (2025).
+https://api.semanticscholar.org/CorpusID:
+277781663
+[28] Siran Liu, Chengxiang Qi, Ying Cao, Chao Yang, Weifang Hu, Xuanhua
+Shi, Fan Yang, and Mao Yang. 2024. Uncovering nested data parallelism
+and data reuse in dnn computation with fractaltensor. In Proceedings
+of the ACM SIGOPS 30th Symposium on Operating Systems Principles.
+160–177.
+[29] José Morgado, Leonel Sousa, and Aleksandar Ilic. 2024. CARM tool:
+cache-aware roofline model automatic benchmarking and application
+analysis. In 2024 IEEE International Symposium on Workload Charac-
+terization (IISWC). IEEE, 68–81.
+[30] Qingpeng Niu, James Dinan, Qingda Lu, and Ponnuswamy Sadayap-
+pan. 2012. PARDA: A fast parallel reuse distance analysis algorithm.
+In 2012 IEEE 26th International Parallel and Distributed Processing
+Symposium. IEEE, 1284–1294.
+[31] Cedric Nugteren, Gert-Jan Van den Braak, Henk Corporaal, and Henri
+Bal. 2014.
+A detailed GPU cache model based on reuse distance
+theory. In 2014 IEEE 20th International Symposium on High Performance
+Computer Architecture (HPCA). IEEE, 37–48.
+[32] NVIDIA Corporation. 2025.
+NVIDIA Nsight Compute.
+https:
+//developer.nvidia.com/nsight-compute Accessed: 2025-04-15.
+15
+
+
+--- Page 16 ---
+Zhiwen Mo et al.
+[33] NVIDIA Corporation. 2026. CUDA Tile | NVIDIA Developer. https:
+//developer.nvidia.com/cuda/tile Accessed: 2026-04-13.
+[34] Santosh Pandey, Amir Yazdanbakhsh, and Hang Liu. 2024. Tao: re-
+thinking DL-based microarchitecture simulation. Proceedings of the
+ACM on Measurement and Analysis of Computing Systems 8, 2 (2024),
+1–25.
+[35] Angshuman Parashar, Priyanka Raina, Yakun Sophia Shao, Yu-Hsin
+Chen, Victor A Ying, Anurag Mukkara, Rangharajan Venkatesan,
+Brucek Khailany, Stephen W Keckler, and Joel Emer. 2019. Timeloop:
+A systematic approach to dnn accelerator evaluation. In 2019 IEEE
+international symposium on performance analysis of systems and
+software (ISPASS). IEEE, 304–315.
+[36] Rajeev Patwari, Ashish Sirasao, and Devleena Das. 2025. Forecasting
+LLM inference performance via hardware-agnostic analytical model-
+ing. arXiv preprint arXiv:2508.00904 (2025).
+[37] Du Shen, Shuaiwen Leon Song, Ang Li, and Xu Liu. 2018. Cudaadvisor:
+Llvm-based runtime profiling for modern gpus. In Proceedings of the
+2018 International Symposium on Code Generation and Optimization.
+214–227.
+[38] Benjamin F Spector, Simran Arora, Aaryan Singhal, Daniel Y Fu, and
+Christopher Ré. 2024. ThunderKittens: Simple, Fast, and Adorable AI
+Kernels. arXiv preprint arXiv:2410.20399 (2024).
+[39] Foteini Strati, Zhendong Zhang, George Manos, Ixeia Sánchez Périz,
+Qinghao Hu, Tiancheng Chen, Berk Buzcu, Song Han, Pamela Delgado,
+and Ana Klimovic. 2025. Sailor: Automating distributed training over
+dynamic, heterogeneous, and geo-distributed clusters. In Proceedings
+of the ACM SIGOPS 31st Symposium on Operating Systems Principles.
+204–220.
+[40] Stuart H Sul, Simran Arora, Benjamin F Spector, and Christopher
+Ré. 2025. ParallelKittens: Systematic and Practical Simplification of
+Multi-GPU AI Kernels. arXiv preprint arXiv:2511.13940 (2025).
+[41] Jonas Svedas, Hannah Watson, Nathan Laubeuf, Diksha Moolchandani,
+Abubakr Nada, Arjun Singh, Dwaipayan Biswas, James Myers, and
+Debjyoti Bhattacharjee. 2025. A survey of end-to-end modeling for
+distributed DNN training: Workloads, simulators, and TCO. arXiv
+preprint arXiv:2506.09275 (2025).
+[42] Ryan Swann, Muhammad Osama, Xiaohu Guo, Bryant Nelson, Lixun
+Zhang, Alex Brown, Yen Ong, Ali Yazdani, Sean Siddens, Ganesh
+Dasika, et al. 2025. tritonBLAS: Triton-based Analytical Approach for
+GEMM Kernel Parameter Selection. arXiv preprint arXiv:2512.04226
+(2025).
+[43] Rajeev Thakur, Rolf Rabenseifner, and William Gropp. 2005. Opti-
+mization of collective communication operations in MPICH. The
+International Journal of High Performance Computing Applications 19,
+1 (2005), 49–66.
+[44] Philippe Tillet, Hsiang-Tsung Kung, and David Cox. 2019. Triton:
+an intermediate language and compiler for tiled neural network
+computations. In Proceedings of the 3rd ACM SIGPLAN International
+Workshop on Machine Learning and Programming Languages. 10–19.
+[45] Taegeon Um, Byungsoo Oh, Minyoung Kang, Woo-Yeon Lee, Goeun
+Kim, Dongseob Kim, Youngtaek Kim, Mohd Muzzammil, and Myeong-
+jae Jeon. 2024. Metis: Fast automatic distributed training on heteroge-
+neous {GPUs}. In 2024 USENIX Annual Technical Conference (USENIX
+ATC 24). 563–578.
+[46] Xizheng Wang, Qingxu Li, Yichi Xu, Gang Lu, Dan Li, Li Chen, Heyang
+Zhou, Linkang Zheng, Sen Zhang, Yikai Zhu, Yang Liu, Pengcheng
+Zhang, Kun Qian, Kunling He, Jiaqi Gao, Ennan Zhai, Dennis Cai,
+and Binzhang Fu. 2025. SimAI: Unifying Architecture Design and
+Performance Tuning for Large-Scale Large Language Model Training
+with Scalability and Precision. In Symposium on Networked Systems
+Design and Implementation. https://api.semanticscholar.org/CorpusID:
+278205358
+[47] Zixian Wang, Cole Ramos, Muhammad A Awad, and Keith Lowery.
+2025. Omniwise: Predicting GPU Kernels Performance with LLMs.
+arXiv preprint arXiv:2506.20886 (2025).
+[48] Samuel Williams, Andrew Waterman, and David Patterson. 2009.
+Roofline: an insightful visual performance model for multicore ar-
+chitectures. Commun. ACM 52, 4 (2009), 65–76.
+[49] Feiyang Wu, Zhuohang Bian, Guoyang Duan, Tianle Xu, Junchi Wu,
+Teng Ma, Yongqiang Yao, Ruihao Gong, and Youwei Zhuo. 2025.
+TokenSim: Enabling Hardware and Software Exploration for Large
+Language Model Inference Systems. In Advanced Parallel Programming
+Technologies. https://api.semanticscholar.org/CorpusID:276928157
+[50] Yannan Nellie Wu, Po-An Tsai, Angshuman Parashar, Vivienne Sze,
+and Joel S Emer. 2022. Sparseloop: An analytical approach to sparse
+tensor accelerator modeling. In 2022 55th IEEE/ACM International
+Symposium on Microarchitecture (MICRO). IEEE, 1377–1395.
+[51] Srihas Yarlagadda, Amey Agrawal, Elton Pinto, Hakesh Darapaneni,
+Mitali Meratwal, Shivam Mittal, Pranavi Bajjuri, Srinivas Sridharan,
+and Alexey Tumanov. 2025.
+Maya: Optimizing Deep Learning
+Training Workloads using GPU Runtime Emulation. arXiv preprint
+arXiv:2503.20191 (2025).
+[52] Zhihang Yuan, Yuzhang Shang, Yang Zhou, Zhen Dong, Zhe Zhou,
+Chenhao Xue, Bingzhe Wu, Zhikai Li, Qingyi Gu, Yong Jae Lee, et al.
+2024. Llm inference unveiled: Survey and roofline model insights.
+arXiv preprint arXiv:2402.16363 (2024).
+[53] Alberto Zeni, Emanuele Del Sozzo, Eleonora D’Arnese, Davide Confic-
+coni, and Marco D Santambrogio. 2024. Starlight: A kernel optimizer
+for GPU processing. J. Parallel and Distrib. Comput. 187 (2024), 104832.
+[54] Kaixuan Zhang, Yunfan Cui, Shuhao Zhang, Chutong Ding, Shiyou
+Qian, Luping Wang, Jian Cao, Guangtao Xue, Cheng Huang, Guodong
+Yang, and Liping Zhang. 2026. PipeWeave: Synergizing Analytical
+and Learning Models for Unified GPU Performance Prediction. arXiv
+preprint (2026). https://arxiv.org/abs/2601.14910
+[55] Size Zheng, Siyuan Chen, Siyuan Gao, Liancheng Jia, Guangyu Sun,
+Runsheng Wang, and Yun Liang. 2023. TileFlow: A Framework for
+Modeling Fusion Dataflow via Tree-based Analysis. In Proceedings of
+the 56th Annual IEEE/ACM International Symposium on Microarchitec-
+ture. 1271–1288.
+[56] Size Zheng, Jin Fang, Xuegui Zheng, Qi Hou, Wenlei Bao, Ningxin
+Zheng, Ziheng Jiang, Dongyang Wang, Jianxi Ye, Haibin Lin, et al. 2025.
+Tilelink: Generating efficient compute-communication overlapping
+kernels using tile-centric primitives. arXiv preprint arXiv:2503.20313
+(2025).
+[57] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-
+anzhe Liu, Xin Jin, and Hao Zhang. 2024. {DistServe}: Disaggregating
+prefill and decoding for goodput-optimized large language model
+serving. In 18th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 24). 193–210.
+[58] Keren Zhou, Xiaozhu Meng, Ryuichi Sai, Dejan Grubisic, and John
+Mellor-Crummey. 2021. An automated tool for analysis and tuning of
+gpu-accelerated code in hpc applications. IEEE Transactions on Parallel
+and Distributed Systems 33, 4 (2021), 854–865.
+[59] Keren Zhou, Xiaozhu Meng, Ryuichi Sai, and John Mellor-Crummey.
+2021. GPA: A GPU Performance Advisor Based on Instruction Sam-
+pling. In 2021 IEEE/ACM International Symposium on Code Generation
+and Optimization (CGO). 115–125.
+16

@@ -1,0 +1,2230 @@
+--- Page 1 ---
+Libra: Taming Attention Workload Skew in Long-Context LLM
+Training with Bounded Sequence Pool
+Yan Wang1,*, Xiulong Yuan2, Kaiming Yang3, Jiaxuan Peng2, Pengju Lu1, Mingzhen Li1, Zhipeng
+Zhang4, Chang Si2, Zhixiang Ruan2, Hongqing Chen2, Linlang Jiang2, Siyu Wang2, Langshi Chen2,
+Rui Men2, Man Yuan2, Guangming Tan1, Yong Li4, Weile Jia1, and Jingren Zhou2
+1University of Chinese Academy of Sciences; 2Alibaba Group; 3National University of Singapore; 4Unaffiliated
+Abstract
+Long-context LLM training suffers from a load-balancing
+problem that sequence packing does not solve. Packing sam-
+ples into fixed-token sequences balances memory and linear-
+cost operators, but the dominant attention cost scales with
+the sum of squared sequence lengths. Consequently, equally
+sized packed sequences drawn from a long-tailed corpus
+can carry substantially different attention workloads, creat-
+ing data-parallel stragglers and pipeline bubbles. Existing
+cross-group approaches either balance at the granularity
+of sequences or microbatches, where an outlier can domi-
+nate an assignment, or disaggregate attention over a global
+worker pool whose communication domain grows with the
+data-parallel (DP) degree.
+We present Libra, which operationalizes the law of large
+numbers (LLN) as a scaling principle for load balancing
+in long-context LLM training. The key implication is that
+the attention-balancing pool need not grow with the data-
+parallel degree. Libra groups packed sequences and the CP
+groups processing them into fixed-size sequence pools. As
+DP scales out, Libra increases the number of sequence pools
+rather than the size of each pool, thereby bounding the scope
+of every attention exchange. LLN explains why a moderate
+pool can smooth workload variation; Variance-Reduced Se-
+quence Placement makes this design effective for finite, long-
+tailed workloads by assigning packed sequences with com-
+plementary attention workloads to reduce residual inter-pool
+skew. Within each pool, Tiled Attention Pooling dispatches
+sequence–head SH-Tiles across GPUs to balance computa-
+tion, while a pipelined runtime overlaps tile exchange with
+attention computation.
+Libra exposes a drop-in context-parallel attention operator
+and a pluggable data sampler, requiring no changes to model
+layers, optimizers, or pipeline schedules. On Qwen3-Turbo
+training with 256K- and 1M-token production workloads,
+Libra improves end-to-end throughput by up to 2.54× over
+Ulysses, and attention microbenchmarks show up to 3.14×
+worst-step straggler-attention speedup. Libra has accumu-
+lated hundreds of thousands of GPU-hours in production on
+jobs spanning 32K to 1M tokens while preserving training
+semantics.
+*Work done during an internship at Alibaba Group. Corresponding authors:
+Weile Jia <jiaweile@ict.ac.cn>, Mingzhen Li <limingzhen@ict.ac.cn>.
+DP 1
+DP 2
+DP 4
+DP 8
+16
+12
+8
+4
+0
+1x
+2x
+4x
+8x
+1.00x
+1.75x
+2.86x
+Normalized Cluster Throughput
+Ideal Linear Scaling
+Actual Throughput
+16x
+4.66x
+7.63x
+Figure 1. Normalized cluster throughput of Qwen3-Turbo
+training with 1M-token packed sequences and CP= 16, as
+DP scales from 1 to 16.
+1
+Introduction
+Long contexts are increasingly important to LLM applica-
+tions such as coding, reasoning, and data analysis [1, 9, 28].
+Training on long contexts, however, exposes an acute load-
+balancing problem. Sequence lengths in production corpora
+are highly skewed: our long-context corpus has a median
+sequence length of only 644 tokens but includes sequences
+approaching one million tokens, a pattern also observed
+in public long-context corpora [2, 4, 25]. Because dense at-
+tention cost grows quadratically with sequence length, this
+length skew translates into much larger variation in atten-
+tion FLOPs.
+Sequence packing does not eliminate this variation. Pack-
+ing multiple samples into fixed-token sequences balances
+activation memory and the linear-cost operators, but the
+attention cost of a packed sample is proportional to the sum
+of its constituent sequences’ squared lengths. Holding the
+rest of a sample fixed, one 40K-token sequence contributes
+roughly 10× the attention FLOPs of ten 4K-token sequences
+despite occupying the same number of tokens. Equal token
+counts can therefore conceal substantially different attention
+workloads.
+This imbalance becomes a cluster-wide performance prob-
+lem. A slow data-parallel (DP) replica delays the entire syn-
+chronization group, while latency variation across micro-
+batches enlarges pipeline-parallel (PP) bubbles. In our Qwen3-
+Turbo workload with 1M-token packed sequences and con-
+text parallel degree CP= 16, when increasing DP from 1 to 16
+and scaling from 16 to 256 GPUs, the cluster throughput is
+improved by only 4.42×, rather than the ideal 16× (Figure 1).
+1
+arXiv:2607.23250v1  [cs.DC]  25 Jul 2026
+
+
+--- Page 2 ---
+Conference’17, July 2017, Washington, DC, USA
+Yan Wang, Xiulong Yuan
+The resulting scaling efficiency is only 27.6%: attention skew
+at a few workers leaves resources idle throughout the job.
+Existing approaches to cross-CP-group imbalance largely
+operate at two extremes. 1) Data schedulers and adaptive
+parallelization schemes balance the sequences, the packed
+samples, or the microbatches [2, 8, 15, 23, 24, 26, 29]. At these
+granularities, an outlier can still dominate the workload as-
+signed to one CP group; compensating for it through variable-
+length packing can also increase the token and activation-
+memory budgets. 2) At the other extreme, DistCA [33] disag-
+gregates attention over a global worker pool. A global pool
+maximizes task-placement scope, but its communication do-
+main grows with the cluster and can span low-bandwidth
+inter-supernode links. These limitations expose the central
+design question of this work: over what scope should attention
+be balanced?
+Our key insight is to use the law of large numbers (LLN)
+as a scaling principle for load balancing in long-context LLM
+training: the attention-balancing pool need not grow with the
+data-parallel degree. We define a sequence pool as a fixed-size
+group of packed sequences, together with the CP groups pro-
+cessing them, over which attention work may be exchanged.
+Aggregating multiple sequences causes a pool’s average at-
+tention workload to concentrate around the dataset mean.
+Consequently, the required pool size is primarily determined
+by the workload distribution and the target imbalance, rather
+than scaling proportionally with the DP degree. As DP scales
+out, Libra increases the number of fixed-size sequence pools
+instead of the size of each pool. This LLN-guided design
+bounds the scope of every attention exchange, naturally sup-
+ports DP weak scaling, and enables the cluster scheduler to
+place each pool within a bounded locality domain.
+Under bare LLN, classical concentration alone, however,
+is insufficient at the moderate pool sizes required for com-
+munication efficiency. Production training operates on finite
+windows drawn from long-tailed corpora, where random
+pool construction can leave substantial residual skew. Libra
+therefore introduces Variance-Reduced Sequence Placement
+(VRSP), which assigns packed samples with complementary
+attention FLOPs to different sequence pools. VRSP makes
+LLN-guided pooling effective at practical pool sizes by ex-
+plicitly reducing finite-window inter-pool variance.
+Even if all sequence pools receive the same total workload,
+GPUs within a pool can still be imbalanced. Libra therefore
+introduces Tiled Attention Pooling (TAP), which decomposes
+attention along both the sequence and head dimensions. Each
+resulting SH-Tile covers a sequence range and a head range
+and becomes an independently schedulable attention task.
+The head dimension adds scheduling units without forcing
+smaller sequence blocks, allowing TAP to reduce efficient
+FlashAttention performance variation while enlarging the
+placement space. A FLOPs-aware placer assigns SH-Tiles
+across the pool to equalize per-GPU computation. Because
+tile exchange introduces QKV-dispatch and output-return
+communication, the TAP Pipeliner further divides the ex-
+change into chunks and overlaps it with FlashAttention com-
+putation. Thus, VRSP balances across pools, TAP balances
+within a pool, and the Pipeliner mitigates the communication
+introduced by tile migration.
+Libra exposes a drop-in context-parallel attention opera-
+tor and a pluggable data sampler, requiring no changes to
+model layers, optimizers, gradient accumulation, checkpoint-
+ing, or pipeline schedules. An asynchronous CPU planner
+prepares upcoming tile-placement plans while GPU train-
+ing proceeds. On Qwen3-30B-A3B training with 256K- and
+1M-token production workloads, Libra improves end-to-end
+throughput by up to 2.54× over Ulysses and raises DP= 16
+per-GPU scaling efficiency from 27.6% to 70.3%. Attention
+microbenchmarks show up to 3.14× worst-step straggler-
+attention speedup. Libra has also been deployed in Qwen-
+series jobs spanning 32K to 1M tokens and thousands of
+GPUs, accumulating hundreds of thousands of GPU-hours
+while preserving training semantics.
+This paper makes the following contributions:
+• We introduce LLN-guided sequence pooling, a scaling
+principle in which scaling-out DP increases the num-
+ber of fixed-size sequence pools rather than the size of
+each pool, bounding the attention-exchange domain.
+• We design VRSP to make LLN-guided pooling effective
+for finite, long-tailed workloads by explicitly reducing
+inter-pool FLOPs variance.
+• We design TAP with sequence × head tiling for intra-
+pool balance, together with a pipelined runtime that
+overlaps tile exchange and attention computation.
+• We implement Libra as a drop-in context-parallel at-
+tention operator with a pluggable data sampler and
+demonstrate up to 2.54× end-to-end throughput and
+3.14× worst-step straggler-attention speedup on pro-
+duction Qwen3 workloads.
+2
+Background
+2.1
+Parallelism for Long-Context LLM Training
+Data Parallel (DP). We use a DP replica to denote a logi-
+cal execution lane on the attention path: each replica pro-
+cesses a disjoint portion of the global batch, and replicas
+synchronize gradients at optimizer boundaries via AllRe-
+duce or ReduceScatter [18, 31]. The slowest rank stalls the
+entire group at each synchronization. In real deployments,
+the DP dimension may span supernodes.
+Pipeline Parallel (PP). PP partitions model layers into
+sequential stages [6, 12, 14, 16, 17] fed by microbatches; un-
+equal per-microbatch workloads introduce pipeline bubbles
+that idle the remaining stages. In real deployments, PP stages
+may also span supernodes.
+Context Parallel (CP). CP distributes the computation
+and activation state of a single packed sequence across a
+group of workers, enabling long sequences that would be
+2
+
+
+--- Page 3 ---
+Libra
+Conference’17, July 2017, Washington, DC, USA
+impractical to process on one GPU [10]. Existing schemes
+partition attention along the sequence axis (e.g., Ring Atten-
+tion [13]) or the head axis (e.g., Ulysses [7]). Workload-aware
+dispatchers such as MagiAttention [30] and FCP [32] can
+rebalance attention tasks among workers within a CP group.
+Because this paper focuses specifically on core attention, we
+use CP hereafter as a paper-specific abstraction for the work-
+ers that jointly executes the core attention of one packed
+sequence; this abstraction also subsumes the tensor-parallel
+degree used on the attention path. Because these CP col-
+lectives lie on the critical path of each attention call, CP
+groups are commonly mapped to high-bandwidth intercon-
+nect domains. Across CP groups, however, each group still
+processes one packed sequence whose total FLOPs can differ
+from another by orders of magnitude, leaving a per-worker
+attention FLOPs imbalance across CP groups that motivates
+this paper (quantified in §3.1).
+Notation. We denote the parallelism dimensions as DP,
+PP, and CP, with total workers 𝑁= DP × PP × CP, and the
+global batch size and microbatch size as GBS and mbs, respec-
+tively1. We assume mbs=1 throughout the system; all of our
+production deployments use this configuration. Thus, GBS,
+mbs, and the gradient-accumulation factor GA count packed
+sequences, and each DP replica processes GA = GBS/DP
+packed sequences between optimizer updates. For a fixed
+gradient-accumulation index 𝑖, the packed sequences as-
+signed to that index across all DP replicas form a microbatch
+group.
+2.2
+Attention Mechanism
+This paper focuses on dense causal self-attention within each
+sample; balancing sparse or linear attention variants is left
+to future work.
+Multi-head self-attention (MHA) [21] consists of QKV pro-
+jection, core attention, and output projection. QKV and out-
+put projections are linear layers with O(𝑙) cost in sequence
+length𝑙and are negligible in the long-context regime; core at-
+tention computes pairwise token interactions and dominates
+with O(𝑙2) cost. For one head,
+CoreAttn(Q, K, V; M) = softmax
+QK𝑇
+√𝑑ℎ
++ M
+
+V
+(1)
+where Q, K, V ∈R𝑙×𝑑ℎare the query, key, and value matrices,
+and M ∈R𝑙×𝑙is the causal attention mask.
+Core attention is a parameter-free operator: once the up-
+stream projection has produced Q/K/V, its output is deter-
+mined by these tensors, the mask, and the associated exe-
+cution metadata. Consequently, any compatible worker can
+1Tensor parallelism on the attention path is included in CP. In our MoE
+deployments, expert parallelism is overlaid on the DP × CP device mesh
+rather than introduced as an additional multiplicative dimension. Accord-
+ingly, a DP replica denotes a logical attention-path replica and does not
+imply that every expert parameter is fully replicated.
+execute a core-attention task given these inputs, enabling
+the cross-worker workload migration used by Libra (§4.3).
+2.3
+Sequence Packing
+Sequence packing [11, 22] concatenates multiple training
+samples into a packed sequence and applies a block-diagonal
+causal mask to prevent information flow across sample bound-
+aries.
+Fixed-token packing constructs every packed sequence
+with the same total token count 𝐿. This ensures uniform
+activation memory and balanced non-attention workloads
+(linear layers, normalization) across DP replicas. However,
+attention FLOPs remain imbalanced: core attention cost is
+quadratic in per-sample length, so a packed sequence con-
+taining one long sample incurs far more attention FLOPs
+than one containing many short samples of the same total to-
+ken count. Formally, if a packed sequence 𝑆contains samples
+with lengths {ℓ𝑗}, we use
+𝑤(𝑆) ∝
+∑︁
+𝑗
+ℓ2
+𝑗
+(2)
+as its attention-workload proxy, absorbing the causal factor,
+number of heads, and head dimension into the proportional-
+ity constant. Equal 𝐿therefore does not imply equal 𝑤(𝑆).
+Workload-aware variable-token packing [24] relaxes
+the equal-token constraint and allows packed sequences
+to have different token counts so as to equalize attention
+workloads across sequences. This trades memory balance for
+FLOPs balance, since variable-length sequences consume dif-
+ferent activation memory; more importantly, a single outlier
+sample may itself exceed the target workload for an entire
+packed sequence, so no arrangement of the remaining sam-
+ples can remove this lower bound. WLB-LLM [24] mitigates
+this by delaying outlier samples to later batches, but doing so
+changes the sample multiset contributing to an optimizer up-
+date and therefore violates the step-equivalence requirement
+adopted in this paper.
+This paper therefore defaults to fixed-token packing and
+addresses the residual attention FLOPs imbalance through
+attention-workload scheduling in §4, an approach orthogo-
+nal to data repacking and composable with it.
+3
+Motivation
+3.1
+Attention FLOPs Imbalance under Long-Tailed
+Distributions
+Long-context training datasets exhibit strongly long-tailed
+sample-length distributions: most raw samples before pack-
+ing are short, while the tail extends to tens of thousands of
+tokens (Fig. 2). Under fixed-token packing, however, equal
+token counts do not imply equal attention workload. For
+a packed sequence 𝑆containing samples with lengths {ℓ𝑗},
+3
+
+
+--- Page 4 ---
+Conference’17, July 2017, Washington, DC, USA
+Yan Wang, Xiulong Yuan
+5 10
+100
+1,000
+10,000
+100,000
+Sequence Length
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Count
+1e7
+256k Dataset
+p50 
+ 607 tokens
+p75 
+ 1,313 tokens
+p99 
+ 33,330 tokens
+5 10
+100
+1,000
+10,000 100,000
+Sequence Length
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+1e6
+1M Dataset
+p50 
+ 644 tokens
+p75 
+ 1,432 tokens
+p99 
+ 71,006 tokens
+Figure 2. Sample-length distributions before packing on the
+256K and 1M production datasets.
+the workload proxy from §2.3 is 𝑤(𝑆) ∝Í
+𝑗ℓ2
+𝑗. The sample-
+length tail therefore induces substantial attention-workload
+skew among packed sequences and, in turn, among workers.
+Cross-group imbalance. Existing intra-CP dispatchers
+can handle imbalance within a CP group (§2.1), but they do
+not remove workload skew across CP groups. Along DP, that
+skew makes lighter replicas wait for stragglers at synchro-
+nization points. Figure 1 shows one scaling symptom on the
+1M workload: when CP= 32, increasing DP from 1 to 8 yields
+only a 3.51× throughput gain. This measurement alone does
+not attribute the entire scaling gap to attention; the recovery
+of most of the lost DP scaling by Libra in §6 provides comple-
+mentary, indirect evidence for that relationship. Along PP,
+different microbatches in the same gradient-accumulation
+window can carry different attention workloads. Their un-
+equal compute times delay dependent pipeline stages and
+create compute-induced bubbles, even when the pipeline
+schedule itself is unchanged. We quantify this effect in §6.
+Our objective is therefore to reduce cross-CP-group, per-
+worker attention skew and the resulting DP waiting and PP
+bubbles, rather than force every GPU in every microbatch
+to match the global mean exactly.
+3.2
+Bounded Attention-Workload Redistribution via
+the Law of Large Numbers
+Core attention is a parameter-free operator (§2.2), so a com-
+patible worker can execute a task given its Q/K/V tensors,
+mask, and execution metadata. This property permits atten-
+tion workloads to be redistributed across CP groups, but
+leaves a central question: over what scope should that redis-
+tribution occur?
+We define a sequence pool at a fixed PP stage and gradient-
+accumulation (GA) index. It contains the packed sequences
+and corresponding CP groups of 𝑃DP replicas and is exe-
+cuted by 𝑃· CP workers, where 𝑃| DP. A pool is a spatial
+redistribution domain: different GA indices may reuse the
+same workers over time, but their runtime tasks do not be-
+long to the same pool.
+Local scope (𝑃=1). Without cross-group redistribution,
+balance must instead come from data placement, repacking,
+or adaptive parallelism. Examples include WLB-LLM [24]
+0
+100
+200
+300
+400
+500
+Step
+0.90
+0.95
+1.00
+1.05
+1.10
+Normalized kernel time  (time / mean)
+mean (=1.0)
+Figure 3. Runtime variation across 256 identical GPUs ex-
+ecuting the same 32K causal-attention input for 500 steps.
+At each step we discard one fastest and one slowest outlier,
+then report (slowest −fastest)/fastest over the remaining
+workers.
+and FlexSP [23]. All such approaches face an indivisible-
+outlier lower bound: rearranging other samples cannot make
+a single outlier cheaper. Methods that defer an outlier to a
+later optimizer step also change that step’s sample multiset,
+violating the step-equivalence requirement. This semantic
+criticism applies only when deferral crosses optimizer-step
+boundaries, not to adaptive parallelism in general.
+Large-scope extreme (𝑃=DP). Within the sequence-pool
+abstraction, the largest redistribution scope at a fixed PP
+stage contains all DP replicas. Cluster-wide core-attention
+disaggregation can extend beyond this in-model extreme. For
+example, DistCA [33] sends core-attention tasks from DP/PP
+workers to a dedicated attention-server pool. This broad
+scope improves workload aggregation but incurs three costs.
+First and most importantly, its attention communication do-
+main grows with the cluster and can cross low-bandwidth
+inter-supernode links. Second, a larger pool averages more
+data-workload variation but includes more sources of device-
+runtime variation, so an assignment balanced in FLOPs need
+not be balanced in time. Third, DistCA-style cross-PP dis-
+aggregation requires dedicated ping-pong execution and
+runtime co-design; it is not a pipeline-schedule-transparent
+local replacement.
+Figure 3 illustrates the second cost. Under the stated pro-
+tocol, the per-step spread averages 7.01% and reaches 15.07%.
+This result is supporting evidence that large pools expose
+scheduling to more runtime-variance sources. Thus, enlarg-
+ing a pool trades better workload aggregation for a wider
+communication domain and greater runtime-variability ex-
+posure, suggesting a finite effective scope rather than un-
+bounded expansion.
+Concentration in fixed-size pools. Let 𝑋= 𝑤(𝑆) be the
+workload of one packed sequence, with mean 𝜇, standard de-
+viation 𝜎, and CV = 𝜎/𝜇. Within a GBS window, let 𝐷= GBS
+be the number of packed sequences, 𝑃the number assigned
+to each pool, 𝐾= 𝐷/𝑃the number of pools, and 𝐿𝑘the ag-
+gregate workload of pool 𝑘. We measure the cluster-wide
+maximum normalized load as 𝑅= max𝑘𝐿𝑘/(𝑃𝜇); perfect
+balance is 𝑅= 1 and residual imbalance is 𝑅−1.
+4
+
+
+--- Page 5 ---
+Libra
+Conference’17, July 2017, Washington, DC, USA
+1
+2
+4
+8
+16
+Pool Size
+2
+4
+6
+8
+Imbalance ratio
+256k Dataset
+Empirical mean
+Theory: 1 + CV
+P
+2ln(D/P)
+Perfect balance
+1
+2
+4
+8
+16
+Pool Size
+1M  Dataset
+Empirical mean
+Theory: 1 + CV
+P
+2ln(D/P)
+Perfect balance
+Figure 4. Residual inter-pool imbalance versus pool size for
+the 256K (left) and 1M (right) datasets at GBS= 128. Distribu-
+tions are obtained by empirical random grouping; markers
+show their means, and the analytical curve follows Eq. 3.
+Under the analytical approximation that packed-sequence
+workloads are grouped randomly and are independent and
+identically distributed (IID) with finite variance, the Central
+Limit Theorem (CLT) makes each pool sum 𝐿𝑘approximately
+Gaussian, with mean 𝑃𝜇and standard deviation
+√
+𝑃𝜎. After
+normalization by 𝑃𝜇, the standard deviation becomes CV/
+√
+𝑃.
+Approximating the expected maximum of the 𝐾normalized
+Gaussian pool sums then gives
+E[𝑅] ≈1 + CV
+√
+𝑃
+√
+2 ln𝐾= 1 + CV
+√
+𝑃
+√︁
+2 ln(𝐷/𝑃).
+(3)
+This CLT-plus-Gaussian-maximum expression is an analyti-
+cal approximation, not a claim that production samples are
+strictly IID.
+Figure 4 evaluates practical sizes 𝑃≤16. At 𝑃= 8, random
+grouping still leaves 𝑅−1 ≈1.08 on 256K and 𝑅−1 ≈0.90
+on 1M. The LLN explains why the concentration of any
+one fixed-size pool is determined by 𝑃and the workload
+distribution, rather than directly by the number of pools. Yet
+the cluster-wide maximum retains the
+√
+ln𝐾term, so bare
+LLN converges too slowly at practical 𝑃. A finite-window
+placement mechanism is therefore needed to suppress the
+residual global skew and make fixed 𝑃viable across GBS and
+DP scales.
+Scaling principle: fixed-size, DP-only pools. The re-
+sulting scaling principle is that the attention-balancing pool
+need not grow with the DP degree: the pool size required for
+a target level of concentration is governed primarily by the
+workload distribution and target imbalance. Pools should
+therefore remain fixed in size and expand only along DP.
+DP scale-out then increases the number of pools rather than
+the size of an individual pool, bounding the scope of every
+attention-workload redistribution. The LLN concentrates
+the workload of each fixed-size pool, but adding more pools
+can still increase the workload of the worst-loaded pool
+through the
+√
+ln𝐾effect. Finite-window inter-pool place-
+ment is therefore needed to control this cluster-wide residual,
+512
+1024
+2048
+4096
+8192
+16384
+32768
+65536 131072
+Sequence length per FA call (tokens)
+128
+64
+32
+16
+8
+4
+Heads per FA call
+0.78
+0.89
+0.96
+0.98
+0.99
+0.99
+1.00
+1.00
+1.00
+0.61
+0.85
+0.92
+0.98
+0.99
+0.99
+1.00
+1.00
+1.00
+0.25
+0.74
+0.90
+0.94
+0.99
+0.99
+1.00
+1.00
+1.00
+0.14
+0.53
+0.78
+0.92
+0.95
+0.99
+0.99
+1.00
+1.00
+0.07
+0.25
+0.75
+0.81
+0.93
+0.95
+0.99
+1.00
+1.00
+0.04
+0.13
+0.52
+0.79
+0.82
+0.93
+0.96
+0.99
+1.00
+0.2
+0.4
+0.6
+0.8
+1.0
+Relative value
+Figure 5. Measured FlashAttention throughput as a function
+of per-call sequence-block length (horizontal axis) and head
+count (vertical axis), normalized to the peak throughput in
+this configuration.
+while intra-pool worker balancing addresses skew within
+each pool.
+3.3
+Head-Axis Splitting for Communication Overlap
+Attention-workload redistribution transfers Q/K/V tensors
+and attention outputs within a pool, introducing commu-
+nication. To avoid eroding the gains from load balancing,
+this communication must be overlapped with attention com-
+putation. Such overlap is most effective when chunks are
+balanced in both compute and communication.
+For the standard dense causal attention considered here,
+equal head-axis chunks have the same query–key interac-
+tions, Q/K/V/output byte volume, and execution structure.
+The conventional sequence-axis alternatives considered here
+do not provide both properties: fixed-token chunks become
+more expensive later in the causal order, whereas fixed-
+FLOPs chunks contain different numbers of query tokens and
+therefore different communication volumes. Among the se-
+quence and head axes considered in this work, the head axis
+is consequently the only one that provides uniform compute
+and communication chunks.
+Head-axis splitting also preserves kernel efficiency better
+in our measured configuration. Figure 5 shows that normal-
+ized FlashAttention throughput is less sensitive to reducing
+the number of heads per call, whereas shortening sequence
+blocks loses efficiency more quickly.
+4
+Design
+4.1
+Overview
+Libra adopts a two-level load-balancing design. Its central ab-
+straction is the sequence pool: at a fixed PP stage and gradient-
+accumulation (GA) index, a pool contains the packed se-
+quences of 𝑃DP replicas and their CP groups, comprising
+𝑊= 𝑃· CP workers. We require 𝑃| DP and keep pool mem-
+bership fixed during training. Pools span only DP; different
+GA indices reuse the same worker groups over time but form
+distinct logical pools.
+5
+
+
+--- Page 6 ---
+Conference’17, July 2017, Washington, DC, USA
+Yan Wang, Xiulong Yuan
+Before (input order)
+After (reordered)
+GA
+Variance-Reduce Seq Placement
+Tiled Attention Pool
+GA
+GA
+SH-Tile
+Q-Tile
+KV-Tile
+Move
+Copy
+Communication
+DP0
+DP1
+MLP
+Pooling Plan
+MLP
+CPU
+GPU
+Placement
+Executor
+Pool1
+Pool0
+Attention FLOPS
+Low
+High
+1
+3
+5
+7
+9
+DP0
+DP1
+MLP
+MLP
+MLP
+MLP
+MLP
+MLP
+Tile Placer
+Tile Exchange Planner
+Q
+K V
+DP0
+DP1
+DP0
+DP1
+Head Shard 0
+Head Shard 1
+Comp
+Stream
+Comm
+Attention
+Attention
+Attention
+Comm
+Comm
+Comm
+Comm
+Idle
+Idle
+Comm
+Stream
+Comp
+Stream
+Comm
+Attention
+Attention
+Attention
+Comm
+Comm
+Comm
+Comm
+Idle
+Idle
+Comm
+Stream
+Tile Pipeliner
+Pool0
+Pool1
+Figure 6. Design overview of Libra.
+REORDER
+GA 0
+Worker Group 0
+GA 1
+GA 0
+GA 1
+Worker Group 1
+Worker Group 2
+Worker Group 3
+Worker Group 0
+Worker Group 1
+Worker Group 2
+Worker Group 3
+Pool
+Worker Group
+GA
+Figure 7. GA-index/pool layout (GBS=16, DP=8, 𝑃=2). At
+each GA index, four pools occupy disjoint groups of two
+DP ranks; the next GA index reuses the same four worker
+groups.
+Libra uses three components to address two levels of
+skew. Variance-Reduced Sequence Placement (VRSP; §4.2) bal-
+ances aggregate attention FLOPs across sequence pools. Tiled
+Attention Pooling (TAP; §4.3) decomposes each packed se-
+quence along the sequence and head axes. Each resulting
+SH-Tile pairs one sequence block with one head shard and
+serves as an independently placeable core-attention task.
+TAP assigns these SH-Tiles across the 𝑊workers in a pool
+to balance estimated FLOPs. The TAP Pipeliner (§4.4) further
+overlaps intra-worker-group tensor transfers with attention
+computation. These components reduce estimated attention-
+workload skew.
+Figure 6 shows the workflow. VRSP runs in the data path
+and emits the reordered packed sequences. A CPU plan-
+ner derives a per-tile assignment and its communication
+schedule from sequence-length metadata. The assignment
+is reused across Transformer layers with the same layout,
+while each layer transfers its own Q/K/V and output tensors.
+Consequently, no placement decision is made on the GPU
+critical path. Figure 7 illustrates the layout of the pools. With
+GBS=16, DP=8, and mbs=1, the GA window has two indices.
+At each index, DP/𝑃= 4 pools execute concurrently; across
+the optimizer-step window, VRSP constructs GBS/𝑃= 8
+logical pools. Pools are emitted in GA-major, pool-minor
+order.
+4.2
+Variance-Reduced Sequence Placement
+VRSP balances the aggregate workload of all sequence-pool
+instances in one optimizer-step window. Its scheduling unit
+is a complete packed sequence: VRSP neither splits a packed
+sequence nor changes its internal packing. For packed se-
+quence 𝑆𝑖with constituent raw-sample lengths {ℓ𝑖𝑗}, it uses
+𝐹𝑖= 𝑤(𝑆𝑖) ∝
+∑︁
+𝑗
+ℓ2
+𝑖𝑗.
+(4)
+Given GBS packed sequences and pool size 𝑃, VRSP forms
+𝐾= GBS/𝑃sequence-pool instances, each containing ex-
+actly 𝑃packed sequences. It may reorder packed sequences
+across GA indices, DP replicas, and pools, but preserves the
+raw-sample multiset of the entire optimizer step.
+Natural concentration is insufficient at bounded pool
+sizes. The LLN-guided analysis in §3.2 explains why increas-
+ing 𝑃concentrates a randomly constructed pool’s aggregate
+workload. Yet production training presents a finite GBS win-
+dow, and its packed-sequence workloads remain long-tailed.
+Consequently, random grouping leaves a large cluster-wide
+maximum at the moderate 𝑃required to bound communi-
+cation. At GBS=128 and 𝑃=8, its residual inter-pool imbal-
+ance 𝑅−1 is 1.08 on our 256K dataset and 0.90 on our 1M
+dataset. Even at 𝑃=64, the residual remains 0.09 and 0.08,
+respectively. Relying on natural concentration alone would
+therefore require nearly collapsing the GBS window into one
+communication pool.
+Heavy–light grouping balances the realized pool
+workloads. VRSP uses the placement freedom within one
+optimizer step instead of enlarging the communication do-
+main. The GBS packed sequences in that step form 𝐾pool
+instances, whose aggregate workloads can differ substan-
+tially under random grouping. Because VRSP cannot reduce
+an outlier’s cost, it places heavy packed sequences together
+6
+
+
+--- Page 7 ---
+Libra
+Conference’17, July 2017, Washington, DC, USA
+with lighter ones so that each pool’s aggregate workload
+approaches the mean across these 𝐾pools. The raw samples
+and their packing remain unchanged; VRSP modifies only
+the mapping of complete packed sequences to GA indices,
+DP replicas, and pools.
+Exact-cardinality greedy placement. VRSP must jointly
+satisfy two requirements: balance aggregate FLOPs and as-
+sign exactly 𝑃packed sequences to every pool. As shown
+in algorithm 1, VRSP adapts the longest-processing-time-first
+(LPT) heuristic, which processes tasks from heaviest to light-
+est and assigns each task to the currently least-loaded desti-
+nation. VRSP adds an exact-cardinality constraint: it consid-
+ers only pools that contain fewer than 𝑃packed sequences.
+Specifically, it sorts packed sequences by decreasing 𝐹𝑖and
+repeatedly assigns the next sequence to the least-loaded non-
+full pool. A pool is removed from the candidate heap after re-
+ceiving 𝑃sequences. This heaviest-first order places difficult
+outliers while all pools remain available and lets later, lighter
+sequences fill the residual gaps. Equal-workload sequences
+are ordered by their original indices; equal-load pools are
+ordered by pool index, making the procedure deterministic.
+Algorithm 1 Variance-Reduced Sequence Placement
+1: Input: packed sequences {𝑆𝑖}GBS−1
+𝑖=0
+; pool size 𝑃
+2: Output: reordered sequence list 𝑆′
+3: 𝐹𝑖←Í
+𝑗ℓ2
+𝑖𝑗for every 𝑆𝑖
+4: 𝐾←GBS/𝑃; initialize 𝐾empty pools
+5: order ←sort (𝐹𝑖,𝑖) by decreasing 𝐹𝑖, then increasing 𝑖
+6: H ←min-heap of (load𝑘,𝑘) over non-full pools
+7: for 𝑖in order do
+8:
+(load𝑘,𝑘) ←pop(H)
+9:
+append 𝑆𝑖to pool 𝑘; load𝑘+= 𝐹𝑖
+10:
+if pool 𝑘contains fewer than 𝑃sequences then
+11:
+push (load𝑘,𝑘) into H
+12:
+end if
+13: end for
+14: 𝑆′ ←concatenate pools in GA-major, pool-minor order
+15: return 𝑆′
+Writing 𝐷= GBS, the procedure sorts the 𝐷packed se-
+quences and performs one heap operation per sequence,
+taking 𝑂(𝐷log 𝐷+ 𝐷log𝐾) = 𝑂(𝐷log 𝐷) time and 𝑂(𝐾)
+pool-state space. We use it as a practical exact-cardinality
+heuristic and do not apply the approximation guarantee of
+unconstrained classical LPT. It runs at data-loading time on
+CPU and changes neither TAP nor the model execution path.
+Figure 8 shows the resulting reduction. At 𝑃=8, VRSP
+lowers 𝑅−1 below 0.7% on both datasets, compared with
+90% and 108% under random grouping. It also consistently
+outperforms Zigzag and Zigzag-with-swap across the evalu-
+ated pool sizes. Thus, VRSP supplies the per-step placement
+mechanism that bare LLN lacks: LLN motivates keeping each
+pool bounded, while workload-aware placement balances
+the actual pool instances formed from the current GBS. §6.5
+evaluates this behavior across GBS and pool sizes.
+2
+4
+8
+16
+32
+64
+Pool size
+0
+1
+2
+3
+Imbalance Ratio
+256k Dataset
+Constrained LPT ( =4.27)
+Random ( =0.78)
+Zigzag ( =1.50)
+Zigzag+Swap ( =2.21)
+Perfect Balance
+2
+4
+8
+16
+32
+64
+Pool Size
+1M Dataset
+Constrained LPT ( =3.62)
+Random ( =0.73)
+Zigzag ( =1.33)
+Zigzag+Swap ( =2.10)
+Perfect Balance
+Figure 8. Inter-pool imbalance versus pool size 𝑃on the
+1M and 256K datasets (GBS=128). VRSP denotes the exact-
+cardinality greedy placement in Algorithm 1.
+4.3
+Tiled Attention Pooling
+Even after VRSP balances aggregate pool workloads, workers
+within a pool can remain imbalanced. TAP decomposes core
+attention into SH-Tiles, estimates their FLOPs, and assigns
+them across the pool while accounting for the communica-
+tion induced by migration.
+4.3.1
+SH-Tiles and KV Groups. TAP divides each packed
+sequence at global token positions into blocks of at most 𝐵
+tokens; it does not introduce additional cuts at raw-sample
+boundaries. Thus, a block may intersect multiple samples,
+and the final block may contain fewer than 𝐵tokens. TAP
+also splits the ℎ𝑞query heads into 𝐻equal-width shards,
+where 𝐻| ℎ𝑞. 𝐻is fixed across pools, layers, and packed
+sequences in one training configuration. We use the SH-Tile
+as the smallest independently placeable unit.
+SH-Tile 𝑡= (sequence_block 𝑏, head_shard ℎ)
+(5)
+A SH-Tile remains intact even when block 𝑏crosses sam-
+ple boundaries: one variable-length attention call processes
+its sample fragments under the block-diagonal causal mask.
+Let block𝑏cover sample-local query positions 𝑎𝑏𝑗, . . . ,𝑒𝑏𝑗−1
+in every intersected raw sample 𝑗. TAP estimates the tile’s
+attention FLOPs as Equation 6.
+𝑓𝑏,ℎ∝ℎ𝑞
+𝐻
+∑︁
+𝑗:𝑏∩𝑗≠∅
+𝑒𝑏𝑗−1
+∑︁
+𝑞=𝑎𝑏𝑗
+(𝑞+ 1)
+(6)
+The estimate counts actual causal query–key pairs, so it
+handles cross-sample blocks and short final blocks without
+charging internal padding. The placer balances this analytical
+FLOPs proxy. Because it depends only on sequence meta-
+data and the fixed tile configuration, the CPU planner can
+compute it cheaply and deterministically before execution,
+without online profiling, and reuse the resulting assignment
+across attention layers. Different head shards of the same
+block have equal 𝑓𝑏,ℎbut no KV affinity.
+KV reuse instead follows raw-sample and head-shard iden-
+tity. A KV group is 𝑔= (𝑗,ℎ): the complete K/V tensors of
+raw sample 𝑗on head shard ℎ. Multiple query blocks of the
+same sample and head shard share this KV group. Even when
+7
+
+
+--- Page 8 ---
+Conference’17, July 2017, Washington, DC, USA
+Yan Wang, Xiulong Yuan
+a query block needs only a causal prefix, the runtime fetches
+the complete group and applies the causal mask during at-
+tention. A cross-sample SH-Tile therefore references the set
+in Equation 7.
+K(𝑡) = {(𝑗,ℎ) | 𝑗intersects tile 𝑡= (𝑏,ℎ)}
+(7)
+KV groups therefore serve only as reuse information during
+placement. The placer still assigns each complete SH-Tile
+exactly once, to one worker.
+4.3.2
+Communication-Aware Tile Placement. Each SH-
+Tile 𝑡has one Q-home worker 𝑞(𝑡), which supplies its Q
+tensor and receives its output. The KV groups referenced
+by 𝑡have independent source mappings and may be assem-
+bled from fragments held by multiple workers. The Q-home
+therefore need not hold the tile’s complete K/V.
+The placer tracks, for every destination worker 𝑟, its esti-
+mated load 𝐿𝑟and the set C𝑟of KV groups already selected for
+that destination. Because a fetched group remains resident
+until the current layer’s pool execution completes, another
+tile at the same destination reuses it without a second trans-
+fer. Placing tile 𝑡at 𝑟adds the communication volume as
+Equation 8.
+Δcomm(𝑡,𝑟) =
+∑︁
+𝑔∈K (𝑡)\C𝑟
+𝑉𝑔+1[𝑟≠𝑞(𝑡)] 𝑉𝑄(𝑡) +𝑉𝑂(𝑡) (8)
+where 𝑉𝑔, 𝑉𝑄(𝑡), and 𝑉𝑂(𝑡) are the actual KV, Q, and output
+byte volumes. Selecting the Q-home avoids both Q dispatch
+and output return; selecting a destination that already holds
+a referenced KV group avoids that group’s KV transfer.
+Algorithm 2 Communication-Aware SH-Tile Placement
+1: Input: tiles T; workers W; 𝜏= 0.03
+2: Output: assignment 𝜎
+3: 𝐶←(1 + 𝜏) (Í
+𝑡∈T 𝑓𝑡)/|W|
+4: order ←sort tiles by decreasing 𝑓𝑡, then tile ID
+5: for 𝑡in order do
+6:
+F ←{𝑟∈W : 𝐿𝑟+ 𝑓𝑡≤𝐶}
+7:
+if F ≠∅then
+8:
+𝑟∗←arg min𝑟∈F (Δcomm(𝑡,𝑟), 𝐿𝑟,𝑟)
+9:
+else
+10:
+𝑟∗←arg min𝑟∈W (𝐿𝑟, Δcomm(𝑡,𝑟),𝑟)
+11:
+end if
+12:
+𝜎(𝑡) ←𝑟∗; 𝐿𝑟∗+= 𝑓𝑡
+13:
+C𝑟∗←C𝑟∗∪K (𝑡)
+14: end for
+15: return 𝜎
+As shown in Algorithm 2, we design a load-target-guided,
+communication-aware greedy placer. It first limits estimated
+FLOPs skew and then favors destinations that require less
+tensor movement. For each SH-Tile, it considers destina-
+tions that remain below the soft load target 𝐶. Within this
+feasible set it minimizes incremental communication, then
+current load, then worker ID. If no worker can accept a tile
+below 𝐶, it chooses a least-loaded worker, breaking load
+DP 0
+DP 1
+16k
+DP 0
+DP 1
+Head Split 0
+Head Split 1
+1
+3
+5
+7
+9
+11
+1
+3
+SH-Tile
+12k
+4k
+4k
+4k
+4k
+4k
+DP 0  CP 1
+DP 0  CP 0
+DP 1  CP 0
+DP 1  CP 1
+Tiled Placer
+FLOPS
+Balance
+FLOPS
+Imbalance
+Figure 9. SH-Tile construction and communication-aware
+placement (𝐵=2048, 𝐻=2, 𝑃=2, CP=2). The placer balances
+its FLOPs while favoring destinations that avoid Q/output
+migration or reuse resident KV groups.
+ties by communication and worker ID. This fallback guar-
+antees a complete assignment for every input. 𝐶guides the
+balance–communication trade-off rather than providing a
+worst-case load guarantee; in particular, a tile can be individ-
+ually larger than the remaining headroom of every worker.
+We fix 𝜏= 0.03 in all configurations. Tile ordering and desti-
+nation scoring run asynchronously on CPU.
+4.3.3
+Tile Exchange Planning. The planner converts 𝜎
+into tensor transfers. A migrated tile receives Q from its
+Q-home and returns its output there. KV transfer is dedupli-
+cated for each sample, head shard, and destination worker:
+all tiles at one destination that reference the same KV group
+share one complete fetch, while two destinations fetch sepa-
+rate copies. Multiple KV-source workers may jointly supply
+fragments of that fetch. Local Q/output paths and already-
+resident KV groups require no transfer.
+The planner builds the assignment from metadata and
+reuses it across attention layers with the same layout. Each
+layer nevertheless instantiates its own transfers and retains
+fetched KV groups only until that layer’s current sequence-
+pool execution finishes.
+4.4
+TAP Pipeliner
+TAP’s tensor movement can offset the gain from balanc-
+ing unless it overlaps attention computation. The Pipeliner
+exploits the head axis to create chunks that contain propor-
+tional pieces of every tile assigned to a worker.
+Equal-head chunk construction. Every assigned SH-
+Tile has width ℎ𝑞/𝐻heads. The executor first concatenates
+the worker’s SH-Tiles along the sequence/variable-length
+batch dimension, producing an aggregate workload whose
+head width remains ℎ𝑞/𝐻. It then divides this head dimen-
+sion into 𝑀equal pieces, with 𝑀| (ℎ𝑞/𝐻). Chunk 𝑚there-
+fore contains the 𝑚-th head piece of every assigned tile. Al-
+though the tiles can have heterogeneous sequence workloads,
+every chunk contains the same fraction of each tile and hence
+the same estimated FLOPs, Q/output bytes, KV bytes, and
+execution structure. The logical KV fetch of each group is
+8
+
+
+--- Page 9 ---
+Libra
+Conference’17, July 2017, Washington, DC, USA
+Comm
+Stream
+SH-Tiles After Tile Placer
+Chunk Split
+Chunk Form
+0
+1
+2
+3
+Chunk Construction
+Chunk-Level Computation-Communication Overlap
+Comp
+Stream
+QKV-0
+O-3
+Attention-0
+Attention-1
+Attention-2
+Attention-3
+QKV-1
+QKV-2 + O-0
+QKV-3 + O-1
+O-2
+Idle
+Idle
+Figure 10. TAP Pipeliner with 𝑀=4. Nonblocking dispatch
+and return operations overlap the computation of adjacent
+equal-head chunks; the first dispatch and final return remain
+exposed.
+correspondingly transferred in 𝑀head pieces. We use the
+configurable default 𝑀= 4 in all experiments.
+Asynchronous overlap. The runtime issues nonblock-
+ing communication and delays synchronization until the
+transferred tensors are consumed. It first dispatches chunk 0.
+While computing an arrived chunk 𝑖, it initiates chunk 𝑖+1’s
+Q/K/V dispatch and chunk 𝑖−1’s output return. It waits for
+an input handle only before computing the corresponding
+chunk and waits for outstanding return handles only be-
+fore assembling the final output. Thus, chunk 0’s dispatch
+and chunk 𝑀−1’s return form the two exposed boundaries;
+the intermediate transfers can overlap compute. When each
+chunk’s attention time covers the concurrent transfer time,
+up to (𝑀−1)/𝑀of communication can be hidden.
+5
+Implementation
+We implement Libra as a Python/PyTorch package on top
+of an unmodified FlashAttention variable-length kernel. SH-
+Tile slicing, variable-length packing, head chunking, and
+mask metadata construction all occur in Python/PyTorch;
+Libra requires no custom attention kernel. Inter-rank tensor
+movement uses torch.all_to_all. The total implementa-
+tion comprises 9k lines of Python code.
+Configuration simulator. Before training, a CPU-side
+simulator reads cumulative sequence-length metadata for
+the complete corpus and replays VRSP and TAP over GBS
+windows. For each candidate (𝑃, 𝐻, 𝐵), it reports three quan-
+tities: VRSP’s inter-pool imbalance, the placer’s intra-pool
+imbalance, and the exchange plan’s communication volume.
+Both imbalance metrics use estimated attention FLOPs. Byte
+accounting matches the runtime planner: it includes mi-
+grated Q and output tensors and KV transfers deduplicated
+by sample, head shard, and destination worker. The simula-
+tor guides configuration selection by exposing the balance–
+communication trade-off and checking that a candidate pro-
+vides sufficient tile granularity; it does not claim to solve a
+fixed optimization objective. Applied with each workload’s
+actual GBS, it selects 𝑃=8 for both our 256K and 1M con-
+figurations. The selected 𝑃, 𝐻, and 𝐵remain fixed during a
+training run, while 𝜏= 0.03 and 𝑀= 4 use the fixed defaults
+from §4.
+Data and planning path. At every optimizer step, a
+global sampler collects the metadata of its GBS packed se-
+quences, runs VRSP once, and emits reordered indices in
+GA-major, pool-minor order. Each DP replica then loads its
+assigned packed sequence. At training initialization, Libra
+creates the sequence-pool communication groups at every PP
+stage. Each group contains the CP workers of 𝑃contiguous
+DP replicas and remains fixed across GA indices, iterations,
+and layers.
+During each iteration, a designated coordinator in every
+sequence pool constructs the TAP plan on a dedicated CPU
+thread alongside data loading and broadcasts the completed
+plan metadata to the pool workers. The plan records SH-
+Tile destinations, Q homes and KV sources, per-destination
+KV deduplication, tensor exchanges, and the 𝑀= 4 chunk
+schedule. It is constructed once per pool instance and reused
+by all compatible attention layers in that iteration; each layer
+binds the plan to its own Q/K/V and output tensors.
+Plan-driven executor. Integration replaces the existing
+CP core-attention call with the libra_attention API. The
+executor makes no placement decision on the GPU path: it
+prepares the planned variable-length FlashAttention inputs,
+issues the planned Q/K/V dispatches and output returns asyn-
+chronously, waits for tensors only before they are consumed,
+and invokes the unmodified FlashAttention kernel for each
+head chunk. A fetched KV group remains available to all
+referencing SH-Tiles at that destination until the current
+layer’s pool execution completes, but is not retained across
+layers. Transformer-layer definitions, the optimizer, gradient
+accumulation, pipeline schedules, and checkpointing require
+no changes. In particular, Libra stores no plan or runtime
+state in checkpoints; pool groups are reconstructed from
+the training configuration and plans are regenerated after
+restart.
+Production deployment. Libra has been deployed in
+Qwen-series training with packed-sequence lengths from
+32K to 1M, including jobs at thousands-of-GPU scale, and
+has accumulated hundreds of thousands of GPU-hours with-
+out correctness incidents. VRSP preserves the raw-sample
+multiset of each optimizer step, while TAP executes the same
+block-diagonal masked core-attention tasks under a poten-
+tially different floating-point operation order. We do not
+claim bitwise-equivalent gradients, optimizer states, or train-
+ing trajectories; the deployed training runs converge nor-
+mally. Quantitative end-to-end results appear in §6.
+6
+Evaluation
+6.1
+Experimental Setup
+We evaluate Libra on an NVIDIA GPU cluster with NVLink
+intra-node interconnect and RoCE inter-node networking.
+9
+
+
+--- Page 10 ---
+Conference’17, July 2017, Washington, DC, USA
+Yan Wang, Xiulong Yuan
+Unless otherwise specified, all experiments use identical
+hardware and software configuration.
+Workloads. We evaluate Libra in two settings. (1) End-
+to-end training on real production workloads, with Libra
+integrated into our internal Megatron-LM-style [19] train-
+ing framework, using Qwen3-Turbo (Qwen3-30B-A3B) [27].
+(2) Microbenchmarks that measure the core-attention layer in
+isolation, capturing both its computation and cross-worker
+communication. Here we use a synthetic attention head con-
+figuration (ℎ𝑞=128, ℎ𝑘𝑣=16, 𝑑=256 for 256K; ℎ𝑞=128, ℎ𝑘𝑣=4,
+𝑑=256 for 1M) while drawing sequence lengths from the
+production datasets described below.
+Datasets. We use two production datasets with packed se-
+quence lengths of 256K and 1M tokens. As shown in Figure 2,
+both datasets exhibit long-tailed sample-length distributions
+(raw samples before packing), where a small fraction of long
+samples contributes disproportionally to attention FLOPs.
+Baselines. We compare against three external baselines
+and three cumulative variants of Libra:
+• Ulysses [7]: a widely adopted context-parallelism scheme
+that balances attention FLOPs within each CP group
+but leaves cross-CP-group imbalance unaddressed. It
+is our primary end-to-end baseline.
+• WLB-LLM [24]: balances workload across CP groups
+via workload-aware variable-token packing. Lacking
+an open-source release, we reimplement from the pa-
+per, keeping Ulysses within each CP group. Our re-
+production excludes the outlier-deferral mechanism,
+which would alter the sample multiset of an optimizer
+step and violate the step-equivalence requirement (§2.3);
+outliers therefore remain indivisible single-sample packed
+sequences, weakening worst-step balancing.
+• DistCA [33]: disaggregates core attention across a cluster-
+wide dedicated attention-server pool. We do not run
+its public implementation; instead, we emulate its bal-
+ancing scope in our own harness as a cluster-wide
+pool (𝑃=DP), reusing Libra’s SH-Tile granularity and
+Pipeliner overlap; VRSP placement is not applicable
+here, as a single cluster-wide pool has no inter-pool
+placement to optimize, so the comparison isolates the
+balancing scope (𝑃=8 vs. 𝑃=DP). DistCA’s token-level
+dispatch, dedicated attention-server pool, and ping-
+pong execution are not covered.
+• Libra variants: to attribute gains to individual compo-
+nents, Libra (TAP) enables only Tiled Attention Pool-
+ing, Libra (TAP+VRSP) adds Variance-Reduced Sequence
+Placement, and Libra (full) further enables the Pipeliner’s
+communication overlap.
+We compare against both only in the microbenchmarks, not
+end-to-end: applying them end-to-end would require inva-
+sive modifications to the training framework’s execution
+scheduling, in particular the pipeline schedule, which our
+production framework cannot readily accommodate.
+DP 1
+DP 2
+DP 4
+DP 8
+DP 16
+1x
+2x
+4x
+8x
+16x
+1.00x
+1.75x
+2.86x
+4.66x
+1.00x
+1.90x
+3.69x
+7.04x
+7.63x
+13.66x
+2
+0
+4
+6
+8
+10
+12
+14
+16
+Normalized Throughput
+Ideal Linear
+Baseline
+Libra
+DP 1
+DP 2
+DP 4
+DP 8
+DP 16
+1x
+2x
+4x
+8x
+16x
+1.00x
+1.09x
+1.49x
+2.39x
+1.00x
+1.92x
+3.65x
+6.75x
+4.42x
+11.25x
+2
+0
+4
+6
+8
+10
+12
+14
+16
+Normalized Throughput
+Ideal Linear
+Baseline
+Libra
+256K
+1M
+Figure 11. Throughput scaling vs. DP size (relative to DP=1;
+ideal is linear) on the 256K and 1M datasets.
+Metrics. For end-to-end training, we report throughput
+in tokens per GPU per second as the primary efficiency met-
+ric. For standalone microbenchmarks, we report the core-
+attention latency, including both computation and commu-
+nication, measured on the slowest worker in the step, where
+a step is the execution of one gradient-accumulation (GA)
+index’s microbatch group. This straggler latency determines
+the effective step time under bulk-synchronous execution.
+We report the mean and max of this per-step straggler metric
+across the steps of one GBS window. Unless otherwise noted,
+all results are normalized to Ulysses.
+6.2
+End-to-end Performance
+We now evaluate Libra in real end-to-end training, where
+attention-FLOPs imbalance manifests as per-worker load
+skew across the whole cluster and stalls training at synchro-
+nization boundaries. We analyze this along the two dimen-
+sions where the skew surfaces: the data-parallel (DP) dimen-
+sion, where unequal per-DP-rank attention work throttles
+throughput scaling, and the pipeline-parallel (PP) dimen-
+sion, where unequal per-microbatch work inflates pipeline
+bubbles.
+DP Imbalance. We hold the global batch size fixed and
+expand only the DP dimension (PP=1), measuring training
+throughput. With no inter-DP imbalance, throughput should
+grow linearly with DP size; in practice, the heaviest DP rank
+stalls the all-reduce boundary, and this straggler penalty
+worsens as larger DP shrinks the per-rank sample count
+and amplifies the long tail. TAP balances attention FLOPs
+across CP groups so every rank carries near-mean work. Fig-
+ure 11 shows the DP-scaling results on the 256K (GBS=128,
+10
+
+
+--- Page 11 ---
+Libra
+Conference’17, July 2017, Washington, DC, USA
+CP=8, 8–128 GPUs) and 1M (GBS=32, CP=16, 16–256 GPUs)
+datasets for DP ∈{1, 2, 4, 8, 16}, reported as throughput scal-
+ing relative to DP=1 (ideal linear scaling is DP-fold); we use
+Libra (full) throughout this subsection, with 𝑃=min(8, DP).
+Each curve is normalized to its own DP=1 throughput. This
+is a common reference point: at DP=1 there is no cross-DP
+imbalance to remove, Libra reduces to 𝑃=1, and Ulysses al-
+ready balances within the single CP group, so both methods
+attain the same DP=1 throughput. The baseline scales far
+below linear: at DP=16 it reaches only 7.63× on 256K and
+4.42× on 1M against an ideal of 16×, i.e., 47.7% and 27.6%
+scaling efficiency. Libra restores near-linear scaling, reaching
+13.66× (85.4%) on 256K and 11.25× (70.3%) on 1M at the same
+DP=16, an end-to-end speedup of 1.79× and 2.54× over the
+baseline, respectively. The advantage widens with scale and
+is larger on 1M, whose longer sequences produce a heavier
+FLOPs tail and thus more severe inter-rank imbalance for
+TAP to absorb.
+0
+1
+2
+3
+4
+5
+6
+7
+0
+100
+200
+300
+400
+500
+Number of microbatches
+256K
+Libra
+baseline
+mean
+0
+5
+10
+15
+20
+Normalized per-microbatch forward time (Libra = 1)
+0
+50
+100
+150
+200
+250
+300
+Number of microbatches
+1M
+Libra
+baseline
+mean
+Figure 12. Distribution of per-microbatch forward time on
+the 256K and 1M datasets, for the baseline and Libra , nor-
+malized by Libra’s per-iteration mean; dashed lines mark the
+mean.
+PP Imbalance. We run pipeline-parallel training (256K:
+DP=4, PP=2, CP=8, GBS=128; 1M: DP=4, PP=2, CP=16, GBS=32)
+and measure the distribution of per-microbatch forward time,
+aggregated over all ranks across 15 training iterations and
+normalized by Libra’s mean forward time in the same itera-
+tion (so Libra’s mean sits at 1). Ideally every microbatch in
+a window carries equal work, leaving no compute-induced
+pipeline bubble; in practice, per-microbatch attention FLOPs
+vary widely under the long-tailed distribution, so the heav-
+iest microbatch stalls the pipeline and inflates the bubble.
+Libra equalizes global per-worker work by combining VRSP
+across the GBS window with TAP within each pool, flatten-
+ing the per-microbatch time distribution. Figure 12 shows
+this distribution on the 256K and 1M datasets; since no
+pipeline trace is collected, the compression of the forward-
+time distribution serves as a proxy (indirect evidence) for
+the reduction of compute-induced pipeline bubbles. On 1M,
+the baseline’s per-microbatch forward time is extremely dis-
+persed, spanning 0.02–23.1 with a mean of 4.14, whereas
+Libra compresses the range to 0.52–1.57. Since the pipeline
+bubble is set by the slowest microbatch in the window, this
+compression is what matters: Libra cuts the worst-case micro-
+batch from 23.1 to 1.57, a 14.7× reduction. The 256K dataset
+shows the same pattern at a smaller scale, with the worst-
+case microbatch falling from 6.98 to 2.63 (2.6×).
+6.3
+Microbenchmarks of Libra
+1.13
+1.13
+1
+0.42
+0.38
+0.36
+1
+0.41
+0.74
+0.36
+0.36
+0.34
+0
+0.2
+0.4
+0.6
+0.8
+1
+1.2
+Ulysses
+WLB-LLM
+DistCA
+Libra(TAP)
+Libra(TAP+VRSP)
+Libra(Full)
+Normalized Time
+Max
+Mean
+Ulysses Mean Time = 1.0
+Ulysses Mean Time = 1.0
+1.16
+1.16
+0.43
+0.67
+0.49
+0.4
+1
+0.67
+0.42
+0.54
+0.48
+0.38
+0
+0.2
+0.4
+0.6
+0.8
+1
+1.2
+1.4
+Ulysses
+WLB-LLM
+DistCA
+Libra(TAP)
+Libra(TAP+VRSP)
+Libra(Full)
+Normalize Time
+Max
+Mean
+256K
+1M
+Figure 13. Per-step core-attention latency of Libra and all
+baselines on the 256K and 1M datasets.
+We compare Libra against all baselines (Ulysses, WLB-
+LLM, DistCA) on the 256K and 1M datasets, isolating the
+core-attention layer. We take each step’s straggler latency
+(the slowest worker) as its time, and report the mean and max
+across steps in a GBS window: the mean reflects throughput
+without PP, while the max proxies the PP bottleneck (no PP
+is run here). Figure 13 shows Libra (full) attains the lowest
+latency on both datasets and both metrics.
+256K Dataset. We use DP=32, CP=8, GBS=128 over 4 GA
+indices, with Libra at 𝑃=8, 𝐻=1, 𝐵=4096. Libra (full) lowers
+the mean latency by 15.9% over WLB-LLM and 53.7% over
+DistCA, and the max by 68.4% and 64.2%; against Ulysses
+the reductions reach 65.6% (mean) and 68.3% (max). WLB-
+LLM balances the mean but its max stays within 0.2% of
+Ulysses, as indivisible outlier packed sequences still bottle-
+neck its slowest step. DistCA, emulated as a cluster-wide
+pool (𝑃=DP=32), balances globally, yet trails on the mean
+because a cluster-wide pool exchanges tiles across all 256
+GPUs, which inflates communication. VRSP trims the max
+by 9.6% over TAP, and overlap a further 5.1%.
+1M Dataset. We use DP=16, CP=16, GBS=32 (matching
+256K tokens) over 2 GA indices, with Libra at 𝑃=8, 𝐻=1,
+11
+
+
+--- Page 12 ---
+Conference’17, July 2017, Washington, DC, USA
+Yan Wang, Xiulong Yuan
+𝐵=8192. Libra (full) again leads, cutting latency by 42.1%
+(mean) and 65.6% (max) over WLB-LLM, whose max again
+matches Ulysses within 0.3%; VRSP contributes 26.2% of the
+max reduction over TAP and overlap 19.2% more. DistCA,
+emulated as 𝑃=DP=16, is closer here, with Libra (full) still
+7.7% (mean) and 7.9% (max) faster; at larger DP the cluster-
+wide pool’s communication is expected to grow further (§6.4),
+whereas Libra keeps 𝑃=8 fixed.
+In summary, Libra is fastest on both: WLB-LLM cannot
+cut the max because indivisible outlier packed sequences
+still dominate its slowest step, and DistCA pays the commu-
+nication cost of a cluster-wide pool. By bounding the pool to
+𝑃=8 and rebalancing within it, Libra avoids both, attaining
+a mean-straggler speedup of 2.91× (256K) / 2.57× (1M) and
+a worst-step straggler speedup of 3.14× (256K) / 2.90× (1M)
+over Ulysses.
+6.4
+Pool Size Sweeping and Breakdown
+4
+8
+16
+32
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Normalized time
+Ulysses baseline = 1.0
+0.33
+0.34
+0.48
+0.74
+0.34
+0.36
+0.69
+0.96
+0.42
+0.36
+0.71
+0.94
+256K
+2
+4
+8
+16
+Pool size
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Normalized time
+Ulysses baseline = 1.0
+0.57
+0.37
+0.39
+0.42
+0.57
+0.37
+0.48
+0.56
+0.70
+0.54
+0.53
+0.56
+1M
+Libra(Full)
+Libra(TAP+VRSP)
+Libra(TAP)
+Computation
+Communication
+Figure 14. Per-step core-attention latency vs. pool size (256K,
+1M), normalized to the Ulysses mean.
+We sweep the pool size 𝑃under the same parallelism
+layout (CP, DP, GBS) as §6.3, comparing all three variants.
+We report the executor time of the slowest pool, averaged
+across steps and normalized to the Ulysses mean executor
+time (530.6 ms on 256K, 3955.0 ms on 1M). For Libra (TAP)
+and Libra (TAP+VRSP) we split each step’s latency into core-
+attention computation and communication— an estimate by
+profiler item name: FlashAttention kernels count as com-
+putation, and all remaining items (tile dispatch, KV fetch,
+gather/scatter, output return) as communication; Libra (full)
+overlaps the two into one bar (Figure 14).
+Communication scales with pool size. As the pool grows,
+tile exchange spans more workers and its cost rises steeply.
+In normalized time, 256K communication climbs from 0.07
+at 𝑃=4 to 0.17 (𝑃=8), 0.47 (𝑃=16), and 0.77 (𝑃=32); on 1M
+it holds near 0.03 at 𝑃=2 and 𝑃=4, then rises to 0.17 (𝑃=8)
+and 0.26 (𝑃=16). Bounding the pool is thus essential: a global
+pool would pay this cost every step.
+VRSP lowers computation by improving inter-pool balance.
+Better balance leaves the straggler pool with less excess
+work, shrinking the computation term. Comparing the Libra
+(TAP) and Libra (TAP+VRSP) bars, VRSP cuts computation
+from a normalized 0.25 to 0.19 at 𝑃=8 on 256K (23.5%), and
+from 0.51 to 0.33 at 𝑃=4 on 1M (34.1%); on 256K at 𝑃=8 the
+communication term rises instead (0.11 →0.17), so the no-
+overlap total is nearly unchanged (0.36) and the net benefit
+there materializes only once overlap is enabled.
+Overlap cannot fully hide communication. The Pipeliner
+overlaps the middle chunks’ transfers with compute, but
+the two pipeline ends are always exposed: the first chunk’s
+dispatch has no preceding compute (and, as the executor’s
+first synchronization point, absorbs waits inherited from im-
+balance outside core attention), and the last chunk’s output
+return has no following compute. The hidden share therefore
+grows with the communication volume: on 1M at 𝑃≤4, where
+communication is near zero (0.03), overlap brings essentially
+no gain; at 𝑃=8 it hides only about 10% of communication on
+256K (0.34 total versus a 0.19 computation floor) but 54% on
+1M, and the absolute saving keeps growing at larger pools
+(0.20 normalized, 43% of communication, at 𝑃=16 on 256K).
+Still, the unhidden leftover grows with pool size: on 256K
+at 𝑃=32 computation is as balanced as at 𝑃=8 (0.19), yet the
+unhidden leftover reaches 0.56. Overlap thus mitigates but
+cannot eliminate the communication a larger pool adds.
+Finally, Libra (full) at 𝑃=4 slightly edges out 𝑃=8 on both
+datasets (0.33 vs. 0.34 on 256K; 0.37 vs. 0.39 on 1M); we
+nevertheless use 𝑃=8 throughout, as the offline simulator
+selects it on the estimated balance–communication trade-off
+rather than by a measured-latency sweep.
+6.5
+Inter-Pool Imbalance Analysis of VRSP
+Table 1 reports inter-pool FLOPs imbalance, the fractional
+overshoot of the heaviest pool above the mean (0 is perfect
+balance), before and after VRSP, swept over pool size, GBS,
+and both datasets; “before” groups packed sequences con-
+tiguously in production sampler order, and each cell averages
+over the GBS windows of the entire dataset.
+VRSP sharply reduces inter-pool imbalance in every con-
+figuration. At 𝑃=8 it drives the imbalance to 0.005 on 256K
+(GBS=128) and 0.007 on 1M (GBS=32), down from 1.08 and
+0.52 in production sampler order, because exact-cardinality
+LPT placement directly reduces the spread of realized pool
+sums rather than relying on statistical averaging. Across
+the evaluated GBS scales, doubling GBS leaves the 𝑃=8 im-
+balance essentially unchanged, whereas production-order
+grouping needs a far larger pool to approach the same bal-
+ance; after VRSP, 𝑃=8 keeps the residual below 0.7% in all
+evaluated configurations. Keeping the pool small also bounds
+its machine domain, cutting cross-node traffic and exposure
+to hardware-throughput variance.
+12
+
+
+--- Page 13 ---
+Libra
+Conference’17, July 2017, Washington, DC, USA
+Table 1. Inter-pool FLOPs imbalance before/after VRSP
+across GBS and pool sizes on 256K and 1M. “Before” groups
+packed sequences contiguously in production sampler order;
+“After” applies VRSP to the same windows. Each cell averages
+over the GBS windows of the entire dataset.
+256K
+1M
+𝐺𝐵𝑆=128
+𝐺𝐵𝑆=256
+𝐺𝐵𝑆=32
+𝐺𝐵𝑆=64
+P
+Before
+After
+Before
+After
+Before
+After
+Before
+After
+2
+3.4617
+2.3059
+3.9431
+2.3012
+1.8732
+1.0069
+2.1719
+0.9853
+4
+1.9776
+0.6635
+2.2960
+0.6610
+1.0476
+0.1078
+1.3098
+0.0650
+8
+1.0770
+0.0050
+1.2895
+0.0042
+0.5247
+0.0066
+0.7294
+0.0055
+16
+0.5616
+0.0006
+0.7059
+0.0006
+0.2000
+0.0009
+0.3641
+0.0008
+32
+0.2548
+0.0002
+0.3534
+0.0001
+0.0000
+0.0000
+0.1301
+0.0001
+6.6
+Intra-Pool Grid Searching of TAP
+The two granularity knobs of TAP, block size 𝐵and head split
+𝐻, both raise the number of schedulable SH-Tiles and thus
+improve intra-pool balance, but they differ sharply in com-
+munication cost. To characterize their effect, we grid-search
+𝐵and 𝐻on both datasets: 256K (CP=8, DP=8, 𝑃=8, GBS=128)
+over 𝐵∈{2048, 4096, 8192, 16384}, and 1M (CP=16, DP=4,
+𝑃=4, GBS=32) over 𝐵∈{4096, 8192, 16384, 32768}, each with
+𝐻∈{1, 2, 4, 8}, using the communication-aware Tile Placer
+with VRSP enabled and Pipeliner overlap disabled. Figure 15
+reports the mean-straggler core-attention speedup over the
+same-layout Ulysses.
+At an equal total tile count, splitting along heads out-
+performs splitting along the sequence on 256K. On 256K,
+𝐻=1, 𝐵=2048 and 𝐻=4, 𝐵=8192 produce the same number
+of tiles(128), yet the head-split configuration reaches 1.89×
+versus 1.76× for the sequence-only split; the same ordering
+holds on the smaller diagonals (e.g., 1.43× vs. 1.28× at 32
+tiles). The gap comes from communication. As shown in the
+Tile Placer (§4.3.2), all query tiles in a KV-group share one
+KV-Tile, so the larger block of the head-split configuration
+lets each KV group be referenced by fewer query tiles while
+amortizing each KV fetch over more query work. Since the
+estimated FLOPs balance is comparable at an equal tile count,
+the benefit scales with the KV communication volume: it
+is pronounced on 256K (ℎ𝑘𝑣=16) but small on 1M (ℎ𝑘𝑣=4),
+whose equal-tile-count diagonals are nearly flat (e.g., 1.62×–
+1.63× at 256 tiles). Head splitting adds tiles with no extra KV
+bytes as long as 𝐻≤ℎ𝑘𝑣, where each head shard fetches a
+disjoint K/V slice; beyond that (𝐻>ℎ𝑘𝑣) head shards share
+expanded kv heads and KV traffic rises, consistent with the
+slight drop at 𝐻=8 on 1M (1.58× vs. 1.62×). Splitting the se-
+quence instead shrinks the block, fragmenting KV reuse and
+inflating the fetch count. Head splitting is thus the preferred
+way to add scheduling granularity, provided the total tile
+count remains sufficient: at 𝐻=1 the 256K speedup collapses
+from 1.75× (128 tiles) to 0.81× (16 tiles).
+2048
+4096
+8192
+16384
+256K - Block Size
+1
+2
+4
+8
+Num Head Split
+1.75x
+1.79x
+1.28x
+0.81x
+1.86x
+1.86x
+1.43x
+1.89x
+1.84x
+1.84x
+4096
+8192
+16384
+32768
+1M - Block Size
+1
+2
+4
+8
+1.62x
+1.62x
+1.40x
+0.86x
+1.63x
+1.61x
+1.40x
+1.62x
+1.60x
+1.58x
+Speedup (x)
+0.9
+1.0
+1.1
+1.2
+1.3
+1.4
+1.5
+1.6
+Figure 15. Core-attention speedup over Ulysses across
+num_head_split (𝐻) and block size (𝐵) on 256K and 1M.
+7
+Related Work
+Attention within a CP group. Most systems divide one
+packed sequence within a context-parallel (CP) group. Ring
+schemes include Ring Attention [13], Zigzag-Ring [10],
+and Striped Attention [3]; they circulate KV blocks and
+arrange sequence shards to reduce causal imbalance. Burst-
+Engine [20] overlaps ring communication with attention
+compute for million-token sequences. Ulysses [7] exchanges
+tensors along the head axis, while LoongTrain [5] combines
+head and sequence parallelism. Workload-aware dispatchers
+such as MagiAttention [30] and FCP [32] place attention
+tasks within a CP group for heterogeneous masks or work-
+loads. These systems improve memory scalability, execution,
+and load balance within one CP group. Libra instead ad-
+dresses workload skew across CP groups processing different
+packed sequences, while remaining compatible with an intra-
+group attention implementation.
+Input organization and adaptive parallelism. A com-
+plementary line of work adapts the input layout, data as-
+signment, or parallelism configuration to heterogeneous se-
+quence lengths. LongAlign [2] uses length-aware batching;
+WLB-LLM [24] combines workload-aware variable-token
+packing with fine-grained sharding; and ChunkFlow [29]
+merges or splits inputs into uniform chunks and schedules
+them with memory state in mind. Skrull [26] jointly opti-
+mizes global data scheduling and context parallelism for
+long-context fine-tuning. FlexSP [23] adapts sequence paral-
+lelism to each training step’s length mix. DCP [8] partitions
+data and computation into blocks and plans their placement
+for each input batch, while Dynamic-CP [15] varies the CP
+degree across iterations and microbatches.
+These approaches and Libra act at different interfaces.
+Repacking and data scheduling reshape or remap training
+inputs; adaptive-parallelism systems make the execution
+configuration follow each workload. Methods that keep an
+outlier sample indivisible retain the outlier lower bound dis-
+cussed in §3.2, whereas fine-grained block-placement meth-
+ods can split work at the cost of input-dependent planning
+and communication. Libra retains fixed-token packing and
+13
+
+
+--- Page 14 ---
+Conference’17, July 2017, Washington, DC, USA
+Yan Wang, Xiulong Yuan
+fixed pool membership. It instead redistributes parameter-
+free core-attention tasks within a bounded group of CP
+groups, preserving the optimizer-step raw-sample multiset
+while leaving the model’s surrounding parallel schedule un-
+changed.
+Core-attention disaggregation. DistCA [33] takes the
+broad-scope alternative: it separates core attention from the
+model workers, dispatches token-level attention tasks to a
+dedicated attention-server pool, and dynamically rebatches
+them for balance. Its ping-pong execution co-design over-
+laps task movement with computation across model stages.
+This cluster-wide service maximizes the available schedul-
+ing scope, but its communication domain and exposure to
+runtime variability grow with the deployment, and cross-
+PP disaggregation requires coordinated pipeline execution
+(§3.2). In contrast, a Libra sequence pool stays within one PP
+stage and contains a fixed number 𝑃of DP replicas. Scaling
+DP adds more fixed-size pools rather than enlarging each
+attention redistribution domain.
+The distinguishing idea of Libra is consequently not a
+new global scheduler or another intra-CP attention algo-
+rithm, but a bounded balancing scope. The law of large num-
+bers motivates decoupling sequence-pool size from DP scale;
+VRSP balances the pool instances realized in each optimizer-
+step window; TAP places sequence–head tiles within each
+pool while accounting for tensor movement; and the TAP
+Pipeliner overlaps that movement with attention computa-
+tion.
+8
+Conclusion
+Through Libra, we demonstrate the effectiveness of apply-
+ing the law of large numbers to attention load balancing
+in long-tailed, long-context LLM training. Specifically, Li-
+bra presents three innovations to address attention FLOPs
+imbalance: 1) using the law of large numbers as a scaling
+principle so that the sequence-pool size need not grow with
+the DP degree, 2) introducing Variance-Reduced Sequence
+Placement to balance the sequence-pool instances formed
+in each optimizer-step window, and 3) developing Tiled At-
+tention Pooling to balance sequence × head SH-Tiles within
+each pool, together with the TAP Pipeliner to overlap the re-
+sulting tensor movement with attention computation. Libra
+integrates through a pluggable data sampler and a drop-in
+context-parallel attention API, and delivers up to 2.54× end-
+to-end throughput and 3.14× worst-step straggler-attention
+throughput over Ulysses on Qwen3 training. It has accumu-
+lated hundreds of thousands of GPU-hours in production at
+context lengths from 32K to 1M while preserving the raw-
+sample multiset of every optimizer step. Going forward, we
+hope Libra draws attention to bounded, pool-level statistical
+balancing as a practical approach to long-tailed workloads
+in distributed training.
+References
+[1] Shengnan An, Zexiong Ma, Zeqi Lin, Nanning Zheng, Jian-Guang
+Lou, and Weizhu Chen. 2024. Make your llm fully utilize the context.
+Advances in Neural Information Processing Systems 37 (2024), 62160–
+62188.
+[2] Yushi Bai, Xin Lv, Jiajie Zhang, Yuze He, Ji Qi, Lei Hou, Jie Tang, Yuxiao
+Dong, and Juanzi Li. 2024. LongAlign: A Recipe for Long Context
+Alignment of Large Language Models. In Findings of the Association
+for Computational Linguistics: EMNLP 2024, Yaser Al-Onaizan, Mohit
+Bansal, and Yun-Nung Chen (Eds.). Association for Computational
+Linguistics, Miami, Florida, USA, 1376–1395. doi:10.18653/v1/2024.
+findings-emnlp.74
+[3] William Brandon, Aniruddha Nrusimha, Kevin Qian, Zachary
+Ankner, Tian Jin, Zhiye Song, and Jonathan Ragan-Kelley. 2023.
+Striped Attention: Faster Ring Attention for Causal Transformers.
+arXiv:2311.09431 [cs.LG] https://arxiv.org/abs/2311.09431
+[4] Yukang Chen, Shengju Qian, Haotian Tang, Xin Lai, Zhijian Liu,
+Song Han, and Jiaya Jia. 2024.
+LongLoRA: Efficient Fine-tuning
+of Long-Context Large Language Models. In International Con-
+ference on Learning Representations, B. Kim, Y. Yue, S. Chaud-
+huri, K. Fragkiadaki, M. Khan, and Y. Sun (Eds.), Vol. 2024.
+8220–8238.
+https://proceedings.iclr.cc/paper_files/paper/2024/file/
+211ab571cc9f3802afa6ffff52ae3e5b-Paper-Conference.pdf
+[5] Diandian Gu, Peng Sun, Qinghao Hu, Ting Huang, Xun Chen, Ying-
+tong Xiong, Guoteng Wang, Qiaoling Chen, Shangchun Feng, Jie Fang,
+Yuhui Wang, Yong Li, Cong Wang, Wei Wei, Zhangsong Yang, Yunhai
+Tong, Yonggang Wen, Tianwei Zhang, and Yang You. 2024. Loong-
+Train: Efficient Training of Long-Sequence LLMs with Head-Context
+Parallelism. arXiv:2406.18485 [cs.DC] https://arxiv.org/abs/2406.18485
+[6] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao
+Chen, Mia Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V. Le, Yonghui
+Wu, and Zhifeng Chen. 2019. GPipe: Efficient training of giant neural
+networks using pipeline parallelism. In Advances in Neural Information
+Processing Systems (NeurIPS).
+[7] Sam Ade Jacobs, Masahiro Tanaka, Chengming Zhang, Minjia Zhang,
+Shuaiwen Leon Song, Samyam Rajbhandari, and Yuxiong He. 2023.
+DeepSpeed Ulysses: System Optimizations for Enabling Training of
+Extreme Long Sequence Transformer Models. arXiv:2309.14509 [cs.LG]
+https://arxiv.org/abs/2309.14509
+[8] Chenyu Jiang, Zhenkun Cai, Ye Tian, Zhen Jia, Yida Wang, and Chuan
+Wu. 2025. DCP: Addressing Input Dynamism In Long-Context Train-
+ing via Dynamic Context Parallelism. In Proceedings of the ACM SIGOPS
+31st Symposium on Operating Systems Principles (Lotte Hotel World,
+Seoul, Republic of Korea) (SOSP ’25). Association for Computing Ma-
+chinery, New York, NY, USA, 221–236. doi:10.1145/3731569.3764849
+[9] Hongye Jin, Xiaotian Han, Jingfeng Yang, Zhimeng Jiang, Zirui Liu,
+Chia-Yuan Chang, Huiyuan Chen, and Xia Hu. 2024. Llm maybe
+longlm: Self-extend llm context window without tuning. arXiv preprint
+arXiv:2401.01325 (2024).
+[10] Vijay Anand Korthikanti, Jared Casper, Sangkug Lym, Lawrence
+McAfee, Michael Andersch, Mohammad Shoeybi, and Bryan Catan-
+zaro. 2023. Reducing Activation Recomputation in Large Transformer
+Models. In Proceedings of Machine Learning and Systems (MLSys).
+[11] Mario Michael Krell, Matej Kosec, Sergio P. Perez, and Andrew Fitzgib-
+bon. 2021. Efficient Sequence Packing without Cross-contamination:
+Accelerating Large Language Models without Impacting Performance.
+arXiv:2107.02027 [cs.LG] https://arxiv.org/abs/2107.02027
+[12] Zhouyang Li, Yuliang Liu, Wei Zhang, Tailing Yuan, Bin Chen, and
+Chengru Song. 2025. SlimPipe: Memory-Thrifty and Efficient Pipeline
+Parallelism for Long-Context LLM Training. In Proceedings of the In-
+ternational Conference for High Performance Computing, Networking,
+Storage and Analysis. 1409–1428.
+[13] Hao Liu, Matei Zaharia, and Pieter Abbeel. 2024. RingAttention with
+Blockwise Transformers for Near-Infinite Context. In The Twelfth
+14
+
+
+--- Page 15 ---
+Libra
+Conference’17, July 2017, Washington, DC, USA
+International Conference on Learning Representations (ICLR).
+https:
+//openreview.net/forum?id=WsRHpHH4s0
+[14] Weijian Liu, Mingzhen Li, Guangming Tan, and Weile Jia. 2025. Mario:
+Near zero-cost activation checkpointing in pipeline parallelism. In
+Proceedings of the 30th ACM SIGPLAN Annual Symposium on Principles
+and Practice of Parallel Programming. 197–211.
+[15] Parth Mannan, Kunlun Li, Tailai Ma, Sophia Yang, Guohao Wu,
+and Chenyu Wang. 2026.
+Speeding Up Variable-Length Training
+with Dynamic Context Parallelism and NVIDIA Megatron Core.
+NVIDIA Technical Blog. https://developer.nvidia.cn/blog/speeding-
+up-variable-length-training-with-dynamic-context-parallelism-
+and-nvidia-megatron-core/ Accessed: 2026-06-05.
+[16] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri,
+Nikhil R. Devanur, Gregory R. Ganger, Phillip B. Gibbons, and Matei
+Zaharia. 2019. PipeDream: Generalized Pipeline Parallelism for DNN
+Training. In Proceedings of the 27th ACM Symposium on Operating
+Systems Principles (SOSP). 1–15. doi:10.1145/3341301.3359646
+[17] Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGres-
+ley, Mostofa Patwary, Vijay Korthikanti, Dmitri Vainbrand, Prethvi
+Kashinkunti, Julie Bernauer, Bryan Catanzaro, Amar Phanishayee, and
+Matei Zaharia. 2021. Efficient large-scale language model training on
+GPU clusters using Megatron-LM. In Proceedings of the International
+Conference for High Performance Computing, Networking, Storage and
+Analysis (SC).
+[18] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He.
+2020. ZeRO: memory optimizations toward training trillion parameter
+models. In Proceedings of the International Conference for High Perfor-
+mance Computing, Networking, Storage and Analysis (Atlanta, Georgia)
+(SC ’20). IEEE Press, Article 20, 16 pages.
+[19] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley,
+Jared Casper, and Bryan Catanzaro. 2019. Megatron-lm: Training multi-
+billion parameter language models using model parallelism. arXiv
+preprint arXiv:1909.08053 (2019).
+[20] Ao Sun, Weilin Zhao, Xu Han, Cheng Yang, Zhiyuan Liu, Chuan Shi,
+and Maosong Sun. 2025. BurstEngine: An efficient distributed frame-
+work for training transformers On extremely Long sequences of over
+1M tokens. In Proceedings of the International Conference for High
+Performance Computing, Networking, Storage and Analysis (SC ’25). As-
+sociation for Computing Machinery, New York, NY, USA, 1429–1445.
+doi:10.1145/3712285.3759802
+[21] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion
+Jones, Aidan N. Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017.
+Attention is all you need. In Proceedings of the 31st International Con-
+ference on Neural Information Processing Systems (Long Beach, Cali-
+fornia, USA) (NIPS’17). Curran Associates Inc., Red Hook, NY, USA,
+6000–6010.
+[22] Shuhe Wang, Guoyin Wang, Yizhong Wang, Jiwei Li, Eduard Hovy,
+and Chen Guo. 2025. Packing Analysis: Packing Is More Appropriate
+for Large Models or Datasets in Supervised Fine-tuning. In Findings of
+the Association for Computational Linguistics: ACL 2025, Wanxiang Che,
+Joyce Nabende, Ekaterina Shutova, and Mohammad Taher Pilehvar
+(Eds.). Association for Computational Linguistics, Vienna, Austria,
+4953–4967. doi:10.18653/v1/2025.findings-acl.256
+[23] Yujie Wang, Shiju Wang, Shenhan Zhu, Fangcheng Fu, Xinyi Liu,
+Xuefeng Xiao, Huixia Li, Jiashi Li, Faming Wu, and Bin Cui. 2025.
+FlexSP: Accelerating Large Language Model Training via Flexible
+Sequence Parallelism. In Proceedings of the 30th ACM International
+Conference on Architectural Support for Programming Languages and
+Operating Systems, Volume 2 (Rotterdam, Netherlands) (ASPLOS ’25).
+Association for Computing Machinery, New York, NY, USA, 421–436.
+doi:10.1145/3676641.3715998
+[24] Zheng Wang, Anna Cai, Xinfeng Xie, Zaifeng Pan, Yue Guan, Weiwei
+Chu, Jie Wang, Shikai Li, Jianyu Huang, Chris Cai, Yuchen Hao, and
+Yufei Ding. 2025. WLB-LLM: workload-balanced 4D parallelism for
+large language model training. In Proceedings of the 19th USENIX Con-
+ference on Operating Systems Design and Implementation (Boston, MA,
+USA) (OSDI ’25). USENIX Association, USA, Article 43, 17 pages.
+[25] Maurice Weber, Daniel Fu, Quentin Anthony, Yonatan Oren, Shane
+Adams, Anton Alexandrov, Xiaozhong Lyu, Huu Nguyen, Xiaozhe
+Yao, Virginia Adams, Ben Athiwaratkun, Rahul Chalamala, Kezhen
+Chen, Max Ryabinin, Tri Dao, Percy Liang, Christopher Ré, Irina
+Rish, and Ce Zhang. 2024. RedPajama: an Open Dataset for Train-
+ing Large Language Models. In Advances in Neural Information Pro-
+cessing Systems (NeurIPS), Datasets and Benchmarks Track.
+https:
+//arxiv.org/abs/2411.12372
+[26] Hongtao Xu, Wenting Shen, Yuanxin Wei, Ang Wang, Guo Run-
+fan, Tianxing Wang, Yong Li, Mingzhen Li, and Weile Jia. 2026.
+Skrull: Towards Efficient Long Context Fine-tuning through Dynamic
+Data Scheduling. In The Thirty-ninth Annual Conference on Neural
+Information Processing Systems.
+https://openreview.net/forum?id=
+WBEknRZBpT
+[27] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo
+Zheng, Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, et al. 2025.
+Qwen3 technical report. arXiv preprint arXiv:2505.09388 (2025).
+[28] Hongli Yu, Tinghong Chen, Jiangtao Feng, Jiangjie Chen, Weinan Dai,
+Qiying Yu, Ya-Qin Zhang, Wei-Ying Ma, Jingjing Liu, Mingxuan Wang,
+et al. 2025. Memagent: Reshaping long-context llm with multi-conv
+rl-based memory agent. arXiv preprint arXiv:2507.02259 (2025).
+[29] Xiulong Yuan, Hongtao Xu, Wenting Shen, Ang Wang, Xiafei Qiu,
+Jie Zhang, Yuqiong Liu, Bowen Yu, Junyang Lin, Mingzhen Li, Weile
+Jia, Yong Li, and Wei Lin. 2025. Efficient Long Context Fine-tuning
+with Chunk Flow. In Forty-second International Conference on Machine
+Learning. https://openreview.net/forum?id=rzn2OgflOK
+[30] Tao Zewei and Huang Yunpeng. 2025.
+MagiAttention: A Dis-
+tributed Attention Towards Linear Scalability for Ultra-Long Con-
+text, Heterogeneous Mask Training.
+https://github.com/SandAI-
+org/MagiAttention/.
+[31] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang,
+Min Xu, Less Wright, Hamid Shojanazeri, Myle Ott, Sam Shleifer, Alban
+Desmaison, Can Balioglu, Pritam Damania, Bernard Nguyen, Geeta
+Chauhan, Yuchen Hao, Ajit Mathews, and Shen Li. 2023. PyTorch
+FSDP: Experiences on Scaling Fully Sharded Data Parallel. Proceedings
+of the VLDB Endowment (PVLDB) 16, 12 (2023), 3848–3860. doi:10.
+14778/3611540.3611569
+[32] Yilong Zhao, Xiaonan Nie, Kan Zhu, Shuang Ma, Zhichao Lai, Hongxi-
+ang Hao, Yang Zhou, Baris Kasikci, and Ion Stoica. 2026. Unleashing
+Scalable Context Parallelism for Foundation Models Pre-Training via
+FCP. In Ninth Conference on Machine Learning and Systems.
+https:
+//openreview.net/forum?id=MPVycRsIn6
+[33] Yonghao Zhuang, Junda Chen, Bo Pang, Yi Gu, Yibo Zhu, Yimin Jiang,
+Ion Stoica, Hao Zhang, and Eric P. Xing. 2026. Efficient Long-Context
+Language Model Training by Core Attention Disaggregation. In Ninth
+Conference on Machine Learning and Systems. https://openreview.net/
+forum?id=oIonqkc8hM
+15
