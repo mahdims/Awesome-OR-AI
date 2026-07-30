@@ -1,10 +1,69 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-07-28
+**Last Updated:** 2026-07-30
 
 ---
 
 ## Recent Papers
+
+#### 2026-07-30 (7 papers)
+
+### [SpecAHD: Localize to Specialize for Automated Heuristic Design in Large-Scale Routing Problems](https://arxiv.org/abs/2607.23676)
+
+**2026-07-26** | Guangdong University of Technology | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Coupled bilevel AHD framework using LLM-guided evolutionary search to co-evolve region exposure policies and repair heuristics, with submodular repertoire selection and a response archive for region-conditioned routing. | *LLM role:* evolutionary_search
+
+> SpecAHD introduces a bilevel LLM evolutionary search framework that co-evolves an upper-level program to expose local repair regions and a lower-level repertoire of specialized constructive heuristics to repair them. The results are rigorously backed by extensive empirical evidence, showing cost reductions of up to 57.7% against state-of-the-art AHD baselines (like EoH and ReEvo) on large-scale routing benchmarks including CVRP and VRPTW up to 10,000 nodes. The key insight is the 'Repair Response Archive'—a memory mechanism that logs heuristic performance on specific local structures during training, allowing a k-NN router to dynamically select the best specialized heuristic for new regions at inference time. This is highly relevant for our work in LLM evolutionary search and large-scale routing, as it provides a concrete, scalable architecture for within-instance specialization and memory-augmented heuristic selection.
+
+### [Teaching LLMs to Self-Evolve: Cultivating Core Meta-Skills with Reinforcement Learning](https://arxiv.org/abs/2607.21971)
+
+**2026-07-24** | University of Illinois Urbana-Champaign | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Reinforcement Learning with Group Relative Policy Optimization (GRPO) on synthesized evolution trajectories | *LLM role:* evolutionary_search
+
+> Wu et al. introduce METAEVOLVE, a framework that uses reinforcement learning (GRPO) to explicitly train LLMs to perform iterative self-evolution and refinement. The results are rigorously backed by execution-based metrics, showing a 24% absolute improvement over AlphaEvolve on out-of-distribution coding tasks and a 46% relative speedup on open-ended algorithm optimization benchmarks. The key insight is that instead of relying on zero-shot prompting in an evolutionary loop, researchers can synthesize evolution trajectories (current code, fitness, history) from static datasets and use execution feedback as a verifiable reward to fine-tune the mutator LLM. This is a highly significant paper for our work in LLM evolutionary search, as it provides an actionable, scalable blueprint for RL-infused evolution that directly improves sample efficiency and search quality.
+
+### [Budget-Aware LLM Discovery via Cost-Calibrated Frontier Utility](https://arxiv.org/abs/2607.26828)
+
+**2026-07-29** | Mohamed bin Zayed University of Artificial Intelligence (MBZUAI), City University of Hong Kong, International Digital Economy Academy (IDEA) | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Cost-calibrated adaptive controller (CostAda) using cost-calibrated frontier utility with remaining-budget conditioning | *LLM role:* heuristic_generator
+
+> This paper introduces CostAda, an adaptive controller for LLM evolutionary search that allocates compute across search frontiers based on cost-calibrated utility (progress divided by realized token cost) and remaining budget. The results are rigorously backed by empirical evaluations across 8 benchmarks using GLM-5 and GPT-5.4, demonstrating that CostAda reaches the full-budget quality of state-of-the-art baselines (AdaEvolve, EvoX) using only half the token budget. The key insight is that progress-only credit is fundamentally flawed when search actions (e.g., short refinements vs. long-context guidance) have vastly different token costs; dividing fitness gains by the log of realized cost and shifting weight from local to global progress as the budget drains drastically improves search efficiency. This is highly relevant to our focus on sample efficiency and scalability in LLM evolutionary search, providing a concrete, implementable utility formulation to optimize massively parallel evolution runs and reduce compute costs.
+
+### [EvoPINN: Agentic Discovery of Executable Algorithms for Physics-Informed Neural Networks](https://arxiv.org/abs/2607.26490)
+
+**2026-07-29** | Institute of Automation, Chinese Academy of Sciences, University of Chinese Academy of Sciences | M=8 P=7 I=8 **MUST-READ** *discuss*
+
+*Method:* LLM-guided evolutionary search with module-wise evolution, UCB-style adaptive scheduling, and diagnosis-guided program generation | *LLM role:* evolutionary_search
+
+> EvoPINN is an LLM-driven evolutionary framework that autonomously discovers novel neural architectures and training programs for Physics-Informed Neural Networks (PINNs). Backed by rigorous empirical results, the framework evaluated only 56 candidates to discover algorithms that outperformed expert-designed baselines by up to 35% on complex PDE benchmarks. The key insight is its decoupled, module-wise evolution strategy: it uses a UCB scheduler to dynamically allocate LLM mutation budget between different algorithm components, combined with AST-based structural verification to filter out cosmetic LLM edits before triggering expensive evaluations. This is highly relevant for LLM evolutionary search research, as the telemetry-guided generation and modular credit assignment directly address the sample efficiency and sparse reward challenges inherent in automated heuristic discovery.
+
+### [VPR-Evolve: Multi-Agent-Driven Algorithm Evolution for FPGA Place and Route](https://arxiv.org/abs/2607.24998)
+
+**2026-07-27** | Arizona State University | M=8 P=4 I=8 **MUST-READ** *discuss*
+
+*Method:* Multi-agent LLM-driven algorithm evolution for VPR source code | *LLM role:* heuristic_generator, code_writer, evaluator
+
+> Wu et al. introduce VPR-Evolve, a multi-agent LLM framework that specializes FPGA place-and-route algorithms by directly evolving the tool's source code for specific hardware designs. The results are backed by rigorous empirical evaluation on VTR-9 benchmarks, showing up to a 9.8% reduction in critical-path delay and outperforming Bayesian hyperparameter tuning with significantly fewer evaluations. The key insight is the framework's architecture, which uses staged evolution to optimize different algorithmic components sequentially and employs an 'Inspiration Collector' agent that injects new literature-based ideas specifically when the search plateaus. This is highly relevant for our research in LLM evolutionary search, as the multi-agent memory and plateau-recovery mechanisms can be directly adapted to improve search efficiency in our automated heuristic design pipelines.
+
+### [A Control System, a Dataset, and a Recipe for Making Frozen LLM Agents Learn a Domain](https://arxiv.org/abs/2607.25415)
+
+**2026-07-28** |  | M=6 P=7 I=7 *changes-thinking* *discuss*
+
+*Method:* Sample-efficient reinforcement learning (ϵ-greedy contextual bandit and REINFORCE) | *LLM role:* agent_executor
+
+> This paper formulates LLM agent harness optimization (prompts, tools, memory, planning) as a discrete control problem and evaluates online RL (bandits, REINFORCE) against a static DSPy-optimized baseline. Backed by rigorous empirical results across multiple domains and models, the authors find that online RL consistently underperforms the static DSPy baseline within practical episode budgets (e.g., 62% vs 96% success on tool-use). The key insight is that starting online controllers from a uniform prior over a discrete harness space is severely sample-inefficient; dynamic harness optimization must be bootstrapped from a metric-guided static optimizer to be viable. This is highly relevant for our work in LLM evolutionary search and agent optimization, as it provides concrete evidence on the sample efficiency bottlenecks of dynamic harness tuning and offers a practical deployment recipe.
+
+### [NeurGO: Learning to Generate Elite Candidates for Meta-Black-Box Expensive Optimization](https://arxiv.org/abs/2607.23408)
+
+**2026-07-26** | China University of Geosciences | M=6 P=6 I=7 *discuss*
+
+*Method:* Generative Meta-Black-Box Optimization (MetaBBO) framework using an attention-based Transformer encoder (PCE) and an MLP-based Elite Synthesis Decoder (ESD) trained with a Quality–Diversity (QD) loss | *LLM role:* none
+
+> NeurGO is a generative meta-black-box optimization framework that uses a Transformer encoder to capture population search trends and an MLP decoder to directly synthesize a small set of elite candidates for expensive optimization tasks. The method is backed by strong empirical results on CEC 2008 and COCO BBOB benchmarks (D=10), demonstrating faster convergence and better final performance than Bayesian Optimization and other MetaBBO baselines under a strict 300-evaluation budget. The key insight is that instead of generating raw candidate coordinates, the decoder outputs contribution weights used to recombine the existing population's representations, ensuring generated candidates remain anchored to known promising regions and avoiding out-of-distribution proposals. This architectural design is highly relevant for continuous latent-space optimization and could be directly adapted to improve sample efficiency when optimizing continuous representations of algorithms or heuristics.
+
 
 #### 2026-07-28 (3 papers)
 

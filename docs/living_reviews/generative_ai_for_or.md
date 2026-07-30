@@ -1,10 +1,29 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-07-28
+**Last Updated:** 2026-07-30
 
 ---
 
 ## Recent Papers
+
+#### 2026-07-30 (2 papers)
+
+### [Large Language Model for Operations Research Formulation Selection in Multi-Warehouse Inventory Allocation](https://arxiv.org/abs/2607.25956)
+
+**2026-07-28** | JD.com | M=7 P=6 I=7 *discuss*
+
+*Method:* Solver-guided Large Language Model (LLM) framework for OR formulation selection, progressively post-trained with Supervised Fine-Tuning (SFT), Identity Preference Optimization (IPO), and Group Relative Policy Optimization (GRPO) | *LLM role:* selector
+
+> Xu et al. propose an LLM-based selector trained via SFT, IPO, and GRPO to route multi-warehouse inventory allocation instances to the most suitable mixed-integer programming (MIP) formulation. Backed by real-world data from JD.com, the GRPO-trained selector improves top-1 expert selection accuracy by 29 percentage points over an SFT+IPO baseline, translating to a 12.5% allocation accuracy gain over the incumbent system. The key insight is the offline GRPO metadata construction: pre-computing and caching solver evaluations (scores, rankings, best expert) for historical instances to serve as fast, reliable reward signals during iterative RL post-training, which avoids expensive solver calls in the RL loop. This is highly relevant for our work in RL-infused algorithm and operator selection, providing a concrete blueprint for using solver-guided RL to train LLM routing policies efficiently.
+
+### [Search Hardness-Aware LLM-Based Problem Formulation for Expensive Simulation-Driven Design](https://arxiv.org/abs/2607.21220)
+
+**2026-07-23** | Xidian University, Victoria University of Wellington | M=7 P=6 I=7 *discuss*
+
+*Method:* LLM-based problem formulation with search hardness-aware evolutionary refinement | *LLM role:* formulation_generator, formulation_repairer, state_judge, evolutionary_operator
+
+> This paper proposes an LLM-based evolutionary framework to automatically generate and refine optimization problem formulations (objectives and constraints) for expensive simulation-driven design. The authors empirically demonstrate on a hydrology task and five antenna design benchmarks that their evolved formulations require significantly fewer expensive simulator evaluations to reach feasible designs compared to expert-designed or zero-shot LLM formulations. The key insight is using initial random simulation data to identify 'hard but promising' (rare and non-dominated) states, and then using a candidate formulation's ability to prioritize these anchor states as the fitness signal for the evolutionary search. This is highly relevant for research in LLM evolutionary search and automated OR modeling, as it provides a concrete method for constructing proxy rewards that improve sample efficiency when evaluating generated code is computationally expensive.
+
 
 #### 2026-07-28 (1 papers)
 
