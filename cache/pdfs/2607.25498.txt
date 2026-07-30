@@ -1,0 +1,3628 @@
+--- Page 1 ---
+1
+Beyond Prefill-Decode Disaggregation: Dissecting LLM Inference for
+Heterogeneous Platforms via Dynamic Operator Scheduling
+Jiaqi Yang , Jiayi Li , Yihan Fu , Hongxiao Zhao , Zhan Chen , Qiuping Wu , Yuchao Yang , Bonan Yan
+Peking University, Beijing 100871, China
+jiaqiyang25@stu.pku.edu.cn, bonanyan@pku.edu.cn
+Abstract
+Prefill–decode disaggregation (PD) and roofline-based op-
+erator placement are common strategies for partitioning
+Large Language Model (LLM) inference across heteroge-
+neous systems, but they are often insufficient in practice.
+End-to-end latency also depends on workload shape, run-
+time device contention, and persistent weight layout. We
+present DOPS (dynamic operator scheduling), a hardware-
+aware, closed-loop framework that jointly optimizes oper-
+ator scheduling and blockwise weight layouts. DOPS con-
+structs a stage-aware directed acyclic graph (DAG) and inte-
+grates two components: the Bifocal scheduler for dynamic
+operator-to-device placement and the Weight Layout Arbiter
+(WLA) for selecting hardware-efficient weight layouts under
+strict memory constraints. Across representative heteroge-
+neous systems combining neural processing units (NPUs)
+and processing-in-memory (PIM) devices, Bifocal achieves
+geometric-mean speedups of 1.20× to 2.23× over the PD
+baseline.
+WLA provides an additional geometric-mean
+speedup of 1.28× to 1.33× over Bifocal/Linear. DOPS
+also supports systematic analysis of workload sensitivity
+and hardware scalability for LLM serving. The source code
+is available at https://github.com/YIAI-02/TriForm, and
+the visualization tool is demonstrated at https://youtu.
+be/Ya_oMCyYno0.
+Keywords: large language model inference, heterogeneous
+systems, processing-in-memory, scheduling, weight layout
+1 Introduction
+Large Language Models (LLMs) have emerged as a cor-
+nerstone in artificial intelligence, rapidly evolving into ver-
+satile interfaces for conversational assistance, code gener-
+ation, and information retrieval [1–3]. However, the serv-
+ing cost and latency of LLM inference remain major barriers
+to broader deployment under tight service-level objectives
+(SLOs) and memory budgets [4–9]. This challenge is partic-
+ularly acute on edge platforms constrained by limited power
+and area budgets [10–18].
+This paper has been accepted for publication at the 59th IEEE/ACM
+International Symposium on Microarchitecture (MICRO). © IEEE. Per-
+sonal use of this material is permitted. Permission from IEEE must be ob-
+tained for all other uses, in any current or future media, including reprint-
+ing/republishing this material for advertising or promotional purposes,
+creating new collective works, for resale or redistribution to servers or
+lists, or reuse of any copyrighted component of this work in other works.
+NPU+ 32 GB PIM
+Qwen-14b
+(a)
+(b)
+prefill length
+decode length
+batch size
+PD
+AF
+PD+Linear
+PD+FFN
+PD+Attn
+Decode1
+LLM 
+Inference
+Decode0
+Prefill
+Lin
+Lout
+NPUs
+Compute-centric
+Dense Matrix Ops
+PIMs
+Memory-centric
+High Internal BW.
+Coordinated
+Execution
+Main Memory (Model Weights)
+Static Operator-device 
+mapping policy is sensitive
+Weight Duplication 
+or Re-Layout 
+Figure 1: (a) Challenges for LLM inference on NPU–PIM systems.
+(b) The best static mapping policy for minimizing latency varies
+across workload configurations, parameterized by {prefill length
+(x), decode length (y), and batch size (z)}. PD, AF, PD+Linear,
+PD+FFN, and PD+Attn are different policies. See Table 1 for de-
+tails.
+An LLM request consists of two stages with distinct execu-
+tion profiles. Prefill stage processes the full prompt with high
+arithmetic intensity, whereas decode generates one token
+at a time while repeatedly streaming weights and the grow-
+ing KV cache [7, 19, 20]. Naturally, recent systems decou-
+ple these stages, since one compute-and-memory alloca-
+tion rarely serves both efficiently [5, 21, 22]. This paradigm
+is known as prefill–decode disaggregation (PD).
+This asymmetry makes heterogeneous architectures attrac-
+tive.
+For edge deployment, NPU–PIM systems combine
+compute-centric neural processing units (NPUs), memory-
+centric processing-in-memory (PIM) devices, and persistent
+weight storage in main memory, as shown in Figure 1(a).
+NPUs excel at dense linear algebra through parallel multiply-
+accumulate arrays, but their efficiency depends on blocked
+execution aligned with hardware tile shapes [23, 24]. On de-
+code-dominant workloads, even modern NPUs can become
+bandwidth-limited and underutilized [19, 25]. PIM devices
+complement NPUs by moving simple computation closer to
+memory and exploiting high internal bandwidth and bank-
+level parallelism for data-movement-heavy kernels [26–28].
+However, process and power constraints make PIM less suit-
+able for compute-intensive kernels [29–33].
+Prefill–decode disaggregation remains too coarse-grained
+for NPU–PIM execution.
+Prior work has explored finer-
+grained mappings, including attention-centric PIM offload-
+ing and static operator partitioning across NPUs and
+PIMs [25, 34, 35]. To organize this design space, we clas-
+sify operator-to-device schedulers along two axes: static
+versus dynamic placement, and online versus offline deci-
+sion timing. Static placement uses fixed rules, whereas dy-
+arXiv:2607.25498v1  [cs.AR]  28 Jul 2026
+
+
+--- Page 2 ---
+2
+Norm_1
+Add_1
+Norm_2
+Add_2
+Act
+Q generation
+K generation
+V generation
+FFN_1
+FFN_2
+FFN_3
+[B, Tq, D]
+[B, Tq, D]
+[B, Tq, D]
+[B, Tq, Dq]
+WQ
+[D, Dq]
+WK
+[D, Dkv]
+WV
+[D, Dkv]
+KV Cache
+[B, Hq, 
+Tq, Tkv]
+WO
+[Dq, D]
+WFFN1
+[D，Hf]
+WFFN3
+[D, Hf]
+WFFN2
+[Hf, D]
+Memory
+Layer n-1
+[B, Hq, Tq, Tkv]
+[B, Hq, Tq, Dh]
+[B, Tq, D]
+[B, Tq, D]
+[B, Tq, Hf]
+[B, Tq, Hf]
+[B, Tq, D]
+Layer 0
+MHA Block
+FFN Block
+embed
+output
+token
+input token
+decoder 
+0 
+decoder 
+n-1 
+LM
+Head
+(a)
+[B, Tq, D]
+[B, Tq, D]
+Softmax
+Context (SV)
+Projection
+Score (QKT)
+[B, Tq, Hf]
+Cube
+Partial Sums
+Activations
+Buffer
+MAC Array
+Interface
+Vector
+Engine
+CXL Switch
+Host
+GDDR PIM
+Banks
+Control
+Vector Unit
+Banks
+GDDR PIM
+GDDR PIM
+GDDR PIM
+Systolic Array
+DaVinci Core
+Control Unit
+(b2) GDDR PIM
+(b1) Representative NPU 
+HBM-PIM
+Die
+Buffer Die
+TSVs
+Periph.
+PCU
+Bank
+Bank
+(b4) HBM-PIM
+(b3) HB-PIM
+Logic Die
+HB Ctrl.
+PE
+HB Ctrl.
+PE
+Buffer
+DRAM Bank
+Cu-Cu Pillar
+Ascend 
+NPU
+Figure 2: (a) Decoder-only transformer structure and operator-level dataflow within one layer. (b1) Representative NPU architecture.
+(b2)–(b4) Representative PIM architectures, including GDDR-based PIM (GDDR-PIM), hybrid-bonded PIM (HB-PIM), and HBM-based PIM
+(HBM-PIM).
+namic placement adapts to the workload and hardware. On-
+line schedulers make decisions during serving, whereas of-
+fline schedulers make these decisions before deployment.
+Under diverse workloads and evolving NPU–PIM hardware,
+a fixed rule is unlikely to remain optimal.
+As illustrated
+in Figure 1(b), no single static policy dominates the work-
+load space, even for a fixed model on a fixed hardware plat-
+form. The best operator-to-device mapping shifts with pre-
+fill length, decode length, and batch size. Policies that of-
+fload attention, linear, or FFN operators each dominate only
+part of the space, and the decision boundaries are irregu-
+lar rather than monotonic. This variability makes universal
+mapping policies fundamentally unreliable.
+Unlocking the full potential of heterogeneous computing
+platforms, therefore, requires answering fundamental ques-
+tions: Q1: When is an NPU–PIM design genuinely beneficial
+for a target workload? Q2: How should operators be sched-
+uled to achieve optimal performance under varying work-
+load configurations?
+Additionally, heterogeneous execution must consider how
+persistent weights are stored and accessed. In practice, the
+same weight block used by both NPU and PIM needs differ-
+ent physical data tiling organizations in memory. NPUs fa-
+vor blocked layouts that efficiently feed tensor engines [23,
+24], whereas PIM favors bank- or channel-aware layouts
+that align data placement with its internal parallelism [11].
+Maintaining a single device-agnostic copy forces repeated
+runtime relayout or repacking.
+Maintaining both device-
+specific copies in main memory eliminates that overhead,
+but quickly inflates the persistent memory footprint and can
+violate edge memory budgets [11, 35]. This raises another
+key question: Q3: How can persistent weight layouts be cho-
+sen to reduce relayout overhead without incurring the full
+memory cost of duplication?
+To answer these questions, we present DOPS, a hardware-
+aware framework for dissecting LLM inference for heteroge-
+neous NPU–PIM systems. Our contributions include:
+⋄We formalize LLM inference on NPU–PIM as a coupled
+scheduling and data-storage optimization problem. We
+introduce DOPS to jointly navigate this design space and
+maximize performance or efficiency.
+⋄We propose Bifocal, a dynamic scheduler that determines
+effective operator placement by combining rigorous finish-
+time estimation with downstream lookahead and reuse-
+aware biases. We further develop a Weight Layout Arbiter
+(WLA) that uses a two-stage block-coordinate search to
+select blockwise weight layouts in main memory.
+⋄We build a closed-loop workflow from user inputs through
+simulation, deployment, and validation.
+DOPS achieves
+substantial speedups on representative NPU–PIM config-
+urations. Beyond performance optimization, the workflow
+exposes system bottlenecks and supports hardware ex-
+ploration across NPU-to-PIM ratios. We release the frame-
+work as open source to support further development and
+research.
+We evaluate DOPS on representative hardware configurations
+that combine a Huawei Ascend 910B NPU with SK Hynix
+AiM-based GDDR6-PIM devices. Our experiments show that
+the Bifocal scheduler achieves geometric mean speedups
+ranging from 1.20× to 2.23× over PD across different mod-
+els. The proposed Weight Layout Arbiter (WLA) delivers an
+additional geometric mean speedup of 1.28× to 1.33× over
+Bifocal.
+2 Preliminaries
+2.1 Transformer-based Large Language Models
+Figure 2(a) illustrates a representative decoder-only trans-
+former architecture, which alternates multi-head attention
+(MHA) and feedforward network (FFN) blocks throughout
+the decoder stack.
+Input tokens are mapped to embed-
+dings and processed by N decoder layers [36].
+Each
+decoder layer contains multi-head self-attention and an
+FFN, together with normalization and residual connec-
+tions.
+Grouped-query attention (GQA) and mixture-of-
+experts (MoE) designs further diversify the operator mix
+and memory traffic presented to the hardware [17, 37, 38].
+During both the prefill and decode stages, computation
+proceeds through all LLM layers.
+The prefill stage pro-
+cesses a prompt of length Lin and generates the initial KV
+cache. The decode stage generates Lout tokens autoregres-
+sively [19, 39]. Here, Tq denotes the number of query posi-
+tions processed by the current attention operation, and Tkv
+denotes the number of cached key-value positions visible
+to that operation. Each decode step usually has Tq = 1,
+while attention reads an ever-growing cache of length Tkv.
+
+
+--- Page 3 ---
+3
+The difference between the query and cache lengths pro-
+duces distinct kernel regimes. Prefill is dominated by higher-
+intensity general matrix–matrix multiplication (GEMM). De-
+code is dominated by general matrix–vector multiplication
+(GEMV), KV-cache reads, and short kernels whose perfor-
+mance is sensitive to bandwidth and launch overhead [40].
+Let B denote the batch size, D the model dimension, Dq
+the query-projection width, HKV the number of key/value
+heads, Dh the head dimension, and Hf the FFN hidden
+size. During decode, typical activation shapes include the
+query tensor Q ∈[B, Tq, Dq], cached key and value tensors
+K/V ∈[B, Tkv, HKV, Dh], and intermediate FFN activations
+of shape [B, Tq, Hf], where [·] denotes a tensor shape.
+2.2 LLM Inference on NPU–PIM Hardware
+This paper focuses on NPU–PIM systems for edge LLM infer-
+ence [41, 42], where request shapes impose diverse com-
+pute and memory-access demands. NPUs and PIM devices
+provide complementary hardware substrates for these work-
+loads. As depicted in Figure 2(b1), a typical NPU combines a
+multiply-accumulate (MAC) array, vector units, and on-chip
+buffers for dense GEMM-style operators [43, 44]. This orga-
+nization is effective for dense GEMM kernels. However, op-
+erators with low arithmetic intensity can underutilize large
+matrix engines, making performance sensitive to on-chip
+buffer capacity and off-chip memory bandwidth [25, 44]. As
+illustrated in Figure 2(b2)–(b4), PIM places lightweight com-
+pute logic close to or inside DRAM banks, reducing the cost
+of moving activations and KV-cache data across the mem-
+ory interface [10, 45]. Research prototypes and commer-
+cial systems have been demonstrated using GDDR-, HBM-
+, and LPDDR-based designs [10, 27, 46–49]. More recent
+2.5D and 3D integrations place compute logic under or near
+stacked memory and exploit through-silicon vias (TSVs), hy-
+brid bonding, or monolithic 3D stacking to provide denser in-
+terconnects and higher effective bandwidth [50–53]. In the
+systems we target, NPUs and PIM devices access the same
+host-visible main-memory space. Persistent model weights
+are stored there and fetched through device-specific mem-
+ory paths [11, 35, 45]. This shared address space simpli-
+fies data sharing but does not eliminate layout mismatch
+because the devices prefer different physical tilings of the
+same weights.
+2.3 Weight Layout Mismatch for NPUs & PIMs
+Linear denotes the default software-visible tensor organi-
+zation, typically using row-major or column-major order,
+which preserves contiguous addressing and compatibility
+with host-side GEMM libraries [11]. NPU_OPT denotes an
+accelerator-friendly packed or fractal organization aligned
+with the target NPU’s native compute granularity. On the
+Huawei Ascend NPU, low-level matrix multiplication uses
+operand-dependent fractal layouts such as ZZ, NZ, and ZN.
+PIM_OPT denotes a bank-, channel-, and row-aware physical
+placement that aligns chunks or tiles with near-bank execu-
+NPU1
+PIM1
+...
+...
+NPU0
+PIM0
+Host CPU
+Main
+Memory
+Bus
+Arithmetic Intensity (FLOPs/Byte)
+Performance (TFLOPs/s)
+Peak Performance
+Roofline model is 
+overly optimistic
+Ascend910B
+DRAM Peak Bandwidth
+20.1%
+81.9%
+Utilization (%)
+QKT
+QKV 
+Gen.
+Softmax
+Proj.
+Others
+FFN
+SV
+Ascend910B
+128GB GDDR6 PIM
+Lack of consideration
+device utilization
+0.00
+0.10
+0.20
+20
+40
+60
+80
+(a)
+(b)
+(c)
+101
+101
+102
+102
+103
+0 1 2 3
+4 5 6 7 
+[0 1 2 3 4 5 6 7 ] 
+Linear
+[ 0 1 4 5 2 3 6 7 ] 
+NPU_OPT
+[ 0 2 1 3 4 6 5 7] 
+PIM_OPT
+Bank Group
+0 4
+2 6 
+1 5
+3 7 
+Bank1
+Bank0
+Bank Group
+0 1
+4 5 
+2 3
+6 7 
+Bank1
+Bank0
+Bank Group
+0 2
+4 6 
+1 3
+5 7 
+Bank1
+Bank0
+Original
+Matrix
+Linearized Address Order
+In Memory
+0 1 2 3
+4 5 6 7 
+0 1 2 3
+4 5 6 7 
+0 1 2 3
+4 5 6 7 
+NPU-PIM Hardware
+Latency(ms)
+Figure 3: (a) Example of how Linear, NPU_OPT, and PIM_OPT lay-
+outs map the same logical matrix to bank groups of main mem-
+ory. (b) The performance and bandwidth assumptions used in the
+roofline model are overly optimistic. (c) Roofline-model-based op-
+erator partitioning ignores device utilization.
+tion. This organization improves all-bank parallelism, bank-
+local computation, and row-buffer locality for GEMV [35].
+Consequently, heterogeneous NPU–PIM systems may re-
+quire relayout, duplication, or flexible address mapping for
+efficient data sharing across devices. Figure 3(a) illustrates
+how the three layouts map the same logical matrix to differ-
+ent memory locations.
+3 Motivation: Observations & Problem Analysis
+Target problem: solve the operator placement problem for
+LLM inference on heterogeneous NPU–PIM systems, i.e.,
+decide which device should execute each LLM operator to
+maximize performance or efficiency.
+Observations. The roofline model is insufficient for operator
+placement. Roofline-based heuristics overlook dynamic fac-
+tors that are essential for accurate performance modeling.
+First, memory bandwidth is not a device-local constant. The
+effective bandwidth depends on inter-device transfers, het-
+erogeneous memory paths and cache residency. Second,
+peak compute throughput often overestimates attainable
+performance, especially for nonlinear operators and short
+decode kernels [40, 44, 54–56].
+Figure 3(b) shows that,
+on the Huawei Ascend 910B NPU, the roofline “sweet spot”
+shifts with workload size. When the workload is too small
+to saturate either the compute engine or the available mem-
+ory bandwidth, the static roofline model becomes overly
+optimistic.
+These results indicate that classifying opera-
+tors as compute-bound or memory-bound is incomplete;
+in practice, the effective roofline is inherently dynamic and
+workload-dependent.
+A static placement rule lacks the time dimension of
+execution. End-to-end computing latency depends on re-
+source contention, queuing, overlap, and data residency,
+not only on the standalone latency of each operator [8, 57–
+59]. A policy that always chooses the locally faster device
+can send many ready operators to the same device, cre-
+ate a backlog on the critical path, and leave the other de-
+
+
+--- Page 4 ---
+4
+Heterogeneous System (NPU-PIM)
+BUS
+  Profiling
+Satisfy?
+Compare?
+Verify & Deploy
+LLM Model Card 
+w/ Optimization
+Op. Placement
+& Scheduling
+Optimized
+Weight Layout
+Simulated
+Performance
+Hardware
+Abstraction
+Workload
+Configuration
+Computation Graph Builder
+Real-World E2E Performance
+Communication Topology
+Performance Model
+BIFOCAL Scheduler
+Weight Layout Arbiter
+Sec. 5.1
+Sec. 5.2
+Token-Level
+Iteration-Level
+DOPS
+Framework
+inputs
+outputs
+Performance Eval Methods
+Roofline Model
+Operator Model
+Program-Snippet
+E2E Measurement
+...
+NPU1
+NPU0
+...
+PIM1
+PIM0
+Host CPU
+Main Memory
+estimative
+realistic
+Figure 4: Overall workflow of DOPS for dissecting LLM inference
+on a heterogeneous NPU–PIM system. E2E: end-to-end.
+vice underutilized, as shown in Figure 3(c) on the simulated
+heterogeneous Ascend910B-GDDR6 PIM platforms. In this
+setting, offloading operators to a device with slightly worse
+standalone latency can still shorten overall latency by reduc-
+ing waiting time or avoiding a costly transfer on the queuing
+critical path. This issue is especially important in the LLM
+decode stage, where token dependencies limit parallelism
+and make communication cost and device availability top
+priorities when assigning operators.
+Weight tiling layout in main memory is coupled with operator
+placement.
+Weight layout choice depends on whether a
+device can load data directly, whether relayout effort is re-
+quired, and what effective load bandwidth is exposed to
+the runtime. An NPU_OPT layout can improve tensor exe-
+cution on the NPUs but increase the access cost for PIMs.
+A PIM_OPT layout can improve bank-level parallelism in
+memory but introduce extra conversion before NPU execu-
+tion [11, 35]. From a system perspective, once a weight
+block is reused across multiple layers or decode steps, its
+stored format changes both the effective load cost on each
+device and the likelihood that the block remains resident in
+a useful form. Therefore, the cost of a layout decision is
+history-dependent: it depends on which device consumed
+the block previously and which device is likely to consume
+it next. This temporal dependence is one of the main rea-
+sons why weight layout cannot be optimized independently
+from scheduling. Alternatively, duplicating multiple weight
+copies on each device (NPU and PIM) increases memory us-
+age and violates edge memory budgets.
+Motivation. A quantitative framework is necessary to pre-
+dict whether the heterogeneity of NPU–PIM systems is ben-
+eficial for a target LLM model, workload configuration, and
+hardware platforms. It should move beyond static roofline-
+model ceilings, search for a dynamic operator placement
+that is aware of communication and utilization, and jointly
+determine a weight layout that improves latency in both pre-
+fill and decode under memory constraints.
+4 DOPS Framework
+To address the coupled scheduling and weight-layout prob-
+lem identified in Section 3, we develop DOPS, which orga-
+nizes model, hardware, and workload information into a
+closed optimization loop. As shown in Figure 4, DOPS takes
+three classes of inputs: LLM model card with optimiza-
+tion (e.g. quantization, sparsification), hardware abstrac-
+tion for the target NPU–PIM system, and workload configura-
+tion. From these inputs, DOPS builds the computation graph,
+instantiates the performance model and communication
+topology, and produces three outputs: operator placement
+with the resulting execution schedule, optimized weight lay-
+outs in memory, and simulated end-to-end latency. The gen-
+erated operator schedule and the optimized weight layouts
+are then deployed on the target NPU–PIM system, where
+measured execution is used to determine whether the tar-
+get objectives are satisfied and to compare practical latency
+against simulated performance predictions. Detailed expla-
+nations are given as follows.
+4.1 Inputs
+LLM Model Card with Optimization.
+An LLM model card
+defines the target architecture and operator shapes, includ-
+ing variants that alter dependencies or tensor dimensions.
+DOPS models quantization and sparsification because both
+affect bytes per operation, memory footprint, and communi-
+cation traffic. Quantization specifies weight and activation
+precision, boundary casts, and per-channel or per-group
+scaling. Sparsification covers weight, activation, and atten-
+tion sparsity, and activation sparsity may differ between pre-
+fill and decode. These abstractions cover representative in-
+ference schemes [60–63].
+Hardware Abstraction.
+A hardware abstraction describes
+the target NPU–PIM system, including available device
+types, device counts, memory resources, and the intercon-
+nect. DOPS derives hardware-performance inputs from four
+abstraction levels: roofline models, operator-level measure-
+ments, program snippets, and end-to-end measurements
+(see the bottom-left “performance eval methods” block in
+Figure 4).
+Among these, the roofline and operator mod-
+els are directly consumed by DOPS as scheduling inputs.
+To address the limitations discussed in Section 3, we ap-
+ply device-specific corrections for utilization loss and short
+decode kernels. The measurement-based operator model
+stores profiled per-operator latency for each device.
+For
+multi-device configurations, the hardware model also spec-
+ifies inter-device communication bandwidth and the net-
+work topology. These properties determine transfer paths,
+shared-link contention, and how much communication can
+overlap with computation.
+Workload Configuration.
+A workload configuration de-
+scribes how the target LLM is served and how broadly DOPS
+explores the optimization space. On the serving side, it in-
+cludes prefill length Lin, decode length Lout, batch size B,
+the optimization objective, and optional service-level con-
+straints such as time to first token (TTFT), time per out-
+put token (TPOT), end-to-end latency, and memory capac-
+
+
+--- Page 5 ---
+5
+ity. On the optimization side, it specifies the search scope
+over layers, operators, devices, and formats, a candidate-
+evaluation budget, how far the scheduler looks ahead, and
+the termination criteria for exploration.
+4.2 Functional Components
+Computation Graph Builder.
+Using the inputs defined
+above, the Computation Graph Builder constructs a directed
+acyclic graph (DAG) that represents the target inference
+workload.
+The DAG is stage-aware and instantiates the
+operator sequence for both prefill and decode under the
+specified sequence lengths and batch sizes.
+Each DAG
+vertex represents a schedulable task.
+The graph granu-
+larity is backend-defined.
+In the simplest case, one log-
+ical operator becomes one DAG vertex.
+When the back-
+end exposes a fused kernel such as online softmax, kernel-
+level optimizations can be folded into one calibrated atten-
+tion vertex.
+When sharding is enabled, a logical opera-
+tor can be expanded into multiple shard vertices plus any
+required communication or reduction vertices. Each task
+vertex records the information needed by later stages, in-
+cluding tensor shape, precision, sparsity state, and arith-
+metic work. Directed edges encode both data dependen-
+cies and data movement, including activation transfers, KV-
+cache updates, weight loads from main memory, and any
+required relayout operation. This representation makes the
+coupling between operator placement and weight layout ex-
+plicit within one DAG.
+Performance Model.
+The performance model converts the
+annotated DAG into latency primitives used by the built-in op-
+timization engines (Section 4.3). For each operator–device
+pair, it estimates compute time1, memory-service time1,
+and additional costs for weight loading, relayout, and cache-
+miss handling under the selected caching policy.
+Communication Topology.
+The communication topology
+specifies the interconnect structure and bandwidth con-
+straints. DOPS currently supports two interconnect patterns:
+(i) a fully connected topology, where any pair of devices
+can communicate through a direct logical link; and (ii) a
+star topology, where device-to-device communication is
+routed through the host, while devices may also access
+host-side shared memory.
+For either topology, DOPS re-
+solves each route and estimates the transfer latency of DAG
+data-movement edges using a link model consistent with
+AHEAD [64] and LogGP [65].
+To model runtime contention, each resolved route is
+mapped to shared communication pipelines with availabil-
+ity times. A transfer starts only after its source data and
+required pipeline are ready.
+Concurrent transfers on the
+same pipeline are therefore serialized or delayed, whereas
+transfers on disjoint pipelines may overlap with one another
+1In this paper, we use the variable τ to represent time.
+a
+DAG G = (V,E)
+qu,v(k,l,du,v) 
+pu(k) 
+b
+Device Set K
+PIM
+NPU
+Memory Pool
+KV Cache & Weights
+treload（k，c）
+(b)
+a
+b1
+(d)
+b0
+c1
+c0
+d1
+d0
+e1
+e0
+f0
+c
+d
+f1
+g0
+g1
+reduce
+h1
+h0
+c
+EFT (c，PIM)
+(i) transfer from a
+(ii) avail time of PIMs
+(iii) pc(PIM)
+(iv) reload weightc  
+c
+Cnear (c, PIM)  vs. Cnear (c, NPU) 
+EFT (c，NPU)
+e
+f
+g
+h
+TH (c，PIM)
+f
+g
+Greedily assign 
+successor f and g
+TH (c，NPU)
+Phase-Reuse Bias
+Token-Amortization Bias
+c
+c’
+c’’
+c’’’
+Ri
+()
+α()
+
+c Bphase(c,PIM0) 
+< 0 
+Mem of PIM0
+cache weightc
+match
+θ
+Cfar (c, PIM)  vs. Cfar (c, NPU) 
+Row-wise
+sharding
+Column-wise
+sharding
+(c)
+(a)
+Figure 5: Overview of Bifocal scheduler. (a) A task DAG in DOPS.
+(b) Example of Near-focus term EFT(v, k) and bTH(v, k). (c) Ex-
+ample of Far-focus bias Btoken(v, k) and Bphase(v, k). (d) Operator
+sharding and inserted communication tasks.
+and with computation. Tensor-parallel collectives, including
+scatter, reduce, and all-reduce, are inserted as communica-
+tion vertices and evaluated with the same cost primitive.
+4.3 Built-in Optimization Engines
+The optimization loop is driven by two engines: Bifocal
+scheduler and Weight Layout Arbiter (WLA). More details are
+in Section 5.
+Bifocal scheduler is a list scheduler that operates on the
+generated execution DAG to determine operator placement
+across the heterogeneous NPU–PIM system. Inspired by the
+Heterogeneous Earliest Finish Time (HEFT) algorithm [66–
+69], we introduce an additional guidance metric, termed the
+“bifocal score,” to account for the coupled execution over-
+head between NPU and PIM. The bifocal score comprises
+a near-focus score, which estimates the completion time of
+a ready operator given current device availability, and a far-
+focus score, which captures downstream effects such as de-
+vice contention and cross-step reuse.
+WLA assigns storage formats to all weight blocks in main
+memory to minimize the predicted end-to-end latency. Each
+iteration evaluates a candidate layout by invoking Bifocal to
+estimate the makespan of the full inference DAG and to ex-
+tract schedule-derived load statistics under that layout. It
+then alternates between one outer dominance-assignment
+update and several inner targeted-refinement updates to fur-
+ther reduce the predicted makespan.
+4.4 Outputs, Deployment, and Verification
+Operator Placement & Scheduling.
+This specifies a con-
+crete mapping from operators to devices (NPU0, NPU1, . . . ,
+PIM0, PIM1, . . . ) along with start time and completion time
+for every compute and communication event. It also records
+explicit communication events for dependency edges and
+models their potential pipelining with computation.
+
+
+--- Page 6 ---
+6
+Optimized Weight Layout.
+The optimized weight layout is a
+blockwise storage plan for persistent weights in main mem-
+ory. For each weight block, it records the selected layout
+format (Linear, NPU_OPT, PIM_OPT, etc.) and any remain-
+ing required conversion operations (e.g., TransDataTo5HD
+in the Huawei CANN framework [70–72] or tf.transpose()
+in TensorFlow [73]) before execution on a given device.
+Simulated Performance.
+DOPS reports predicted perfor-
+mance for each candidate strategy under the same work-
+load configuration and hardware settings. Because all can-
+didates are evaluated under a common input specification,
+DOPS can conveniently compare alternative scheduling poli-
+cies, weight-layout strategies, and hardware configurations
+on an equal basis.
+Verify & Deploy Loop.
+This loop moves the DAG schedules
+and the optimized weight layouts onto the target NPU–PIM
+system and measures real execution latency. Depending
+on the available hardware access and model fidelity, verifi-
+cation can be performed with program snippets or with full
+end-to-end latency. The measured results are used to check
+whether the target objectives are satisfied and to compare
+empirical latency against simulated predictions, which pro-
+vides a direct assessment of model fidelity and optimization
+effectiveness.
+5 Optimization Algorithms
+This section explains the algorithms of the proposed two op-
+timization engines. For each, we first formalize the underly-
+ing optimization problem, and then describe the methods
+adopted in DOPS.
+5.1 Bifocal Scheduler
+5.1.1 Problem Formulation
+As shown in Figure 5(a), let G = (V, E) be the execution
+DAG instantiated by the Computation Graph Builder, with
+a unique source (starting) vertex and a unique sink (end)
+vertex. A logical operator may be decomposed into multi-
+ple shard vertices v ∈V , which may be placed on differ-
+ent devices. Each edge (u, v) ∈E (from vertex u to v) en-
+forces precedence and carries a data payload duv > 0. Let
+K = {1, . . . , K} be the device set (e.g., {NPU0, NPU1, . . . ,
+PIM0, PIM1, . . . }), and let Kv ⊆K denote the legal devices
+for vertex v. For a vertex v and legal device k ∈Kv, the
+performance model returns an estimated device-dependent
+execution latency pv(k). For an edge (u, v) ∈E and de-
+vice pair (k, ℓ), the performance model returns an estimated
+data-transfer latency quv(k, ℓ, duv).
+For a weight-bearing
+operator, let weightv denote its dominant reusable weight
+block. For a non-weight-bearing vertex, let weightv = ∅
+and define treload(∅, k, c) = 0.
+Algorithm 1 Bifocal Optimizer
+(code is in https://github.com/YIAI-02/TriForm)
+Input: DAG G = (V, E); legal-device sets {Kv}v∈V ; weight
+format ϕ; initial system state s0.
+Output: σ : V →K; τ = {(τvs, τvc)}v∈V ; updated system
+state s.
+1: Initialize σ(v) ←⊥, τvs(v) ←⊥, and τvc(v) ←⊥for all v ∈V
+2: Initialize s ←s0
+3: Initialize ready set R ←{v ∈V | Pred(v) = ∅}
+4: while R̸ = ∅do
+5:
+min-heap Q ←∅
+6:
+for all v ∈R do
+7:
+bestScore ←+∞; kv ←⊥; b
+Hv ←∅
+8:
+for all k ∈Kv do
+9:
+(score, b
+Hv,k) ←Evaluate(v, k, s, ϕ)
+10:
+if score < bestScore then
+11:
+bestScore ←score; kv ←k; b
+Hv ←b
+Hv,k
+12:
+end if
+13:
+end for
+14:
+Push (bestScore, v, kv, b
+Hv) into min-heap Q
+15:
+end for
+16:
+(σ, τ, s) ←Commit(v⋆, k⋆, b
+H⋆, ϕ, σ, τ, s)
+17:
+Commit(v⋆, k⋆, ϕ, σ, τ, avail, c); UpdateSystemState
+18:
+Remove v⋆from R and insert any newly ready tasks into
+R
+19: end while
+ϕ denotes the weight-format map. Evaluate returns the score in
+Equation 2 and its associated tentative hint map. The superscript
+⋆marks the minimum-key candidate popped from Q.
+During optimization, Bifocal maintains system state s, which
+includes ready tasks, device availability, cache state c, near-
+future hints H, and cross-step weight-device hints θ. H :
+V ⇀K stores tentative placements within the current looka-
+head window; after each commit, stale entries are dropped
+and remaining hints are refreshed. A schedule maps σ :
+V →K with σ(v) ∈Kv and start/completion times (τvs, τvc).
+A feasible schedule satisfies the following precedence and
+resource constraints:
+τvs ≥τuc + quv
+ σ(u), σ(v), duv
+
+,
+∀(u, v) ∈E,
+τvs ≥aσ(v)(v),
+∀v ∈V,
+τvc = τvs + pv
+ σ(v)
++ treload
+ weightv, σ(v), cv
+
+,
+∀v ∈V.
+(1)
+where ak(v) is the value of avail(k) when v is evaluated, and
+cv is the cache state immediately before v starts. The first
+line enforces data dependencies, the second enforces de-
+vice availability, and the third defines completion time as
+the start time plus device execution time and any cache-
+induced weight-reload penalty.
+The overall objective is to minimize the makespan T = τtc (t
+is the sink vertex) by finding an operator-to-device mapping
+σ.
+
+
+--- Page 7 ---
+7
+5.1.2 Bifocal Optimizer
+Bifocal is a list scheduler that incrementally constructs an
+operator placement and execution timeline for an LLM infer-
+ence DAG. Representative scheduling steps are illustrated
+in Figure 5(b–c). In the simplified example in Figure 5(b–c),
+each LLM operator (e.g., QK⊤) corresponds to one task and
+is the minimum allocation unit. Algorithm 1 summarizes the
+main control flow. We call a vertex a “ready task” if all its pre-
+decessor vertices have been committed to the current par-
+tial schedule. At each iteration, the scheduler re-evaluates
+every ready task under the current partial schedule, identi-
+fies its best legal device, and pushes the resulting candidate
+into a min-heap keyed by the bifocal score. It then commits
+the ready task whose best legal placement has the minimum
+score, updates the partial timeline and cache state, and re-
+freshes both hint maps.
+We define
+Score(v, k) = Cnear(v, k) + Cfar(v, k),
+Cnear(v, k) = (1 −γ) EFT(v, k) + γ bTH(v, k),
+Cfar(v, k) = Bphase(v, k) + Btoken(v, k).
+(2)
+where γ ∈[0, 1] is a fixed scheduler hyperparameter and
+smaller scores are preferred. The individual terms are de-
+fined as follows:
+Near-focus earliest finish time. The term EFT(v, k) is the lo-
+cal completion-time estimate if v is placed on device k un-
+der the current partial schedule, and EST(v, k) is the cor-
+responding earliest start time. Let Pred(v) denote the set
+of predecessor vertices of v. It is computed from (i) the
+maximum predecessor-arrival time, where each arrival com-
+bines predecessor completion and the corresponding trans-
+fer latency quv(·), (ii) the earliest availability time of device k,
+(iii) the device-dependent execution time pv(k), and (iv) the
+weight-reload penalty induced by the current cache state c.
+Concretely, we use
+EST(v, k) = max
+
+avail(k),
+max
+u∈Pred(v)
+
+τuc + quv
+ σ(u), k, duv
+
+,
+EFT(v, k) = EST(v, k) + pv(k) + treload
+ weightv, k, c
+.
+(3)
+For a source vertex, we use the convention max ∅= −∞, so
+its earliest start time is avail(k). All terms have units of time,
+and lower values are preferred.
+Near-focus DAG-window term ( bTH(v, k)) approximates the
+downstream impact of committing (v, k) by exploring a
+short successor chain containing at most H vertices. The
+window is formed by recursively following the outgoing de-
+pendency with the largest payload until it reaches H ver-
+tices or no successor remains. The Bifocal scheduler per-
+forms a lightweight lookahead simulation over this window.
+It fixes the root placement of v on k, uses entries from H
+as consistency hints for overlapping vertices, enumerates
+legal NPU/PIM device-type assignments for the remaining
+window vertices, and selects the assignment with the small-
+est simulated completion time. The routine returns bTH(v, k)
+and a tentative window mapping; after the selected task is
+committed, this mapping is saved in H only as reusable near-
+future hints.
+Far-focus
+phase-reuse
+bias
+(Bphase(v, k))
+captures
+schedule-local
+weight–device
+consistency
+and
+prefill
+residency potential. In addition to near-future vertex place-
+ments, the Bifocal scheduler maintains the weight–device
+hint map θ defined above.
+A candidate whose device
+type differs from θ(weightv) incurs a positive penalty
+proportional to the estimated reload overhead; a match-
+ing candidate incurs no such penalty.
+During prefill, we
+additionally give a negative bias to a device class whose
+aggregate capacity can retain the model’s full weight set,
+scaled by the estimated reload time.
+Far-focus token-amortization bias (Btoken(v, k)) captures the
+autoregressive nature of decoding. During decode, let Ri =
+Lout −i+1 denote the effective remaining decode horizon at
+step i. We compare the current-token cost of choosing de-
+vice k with the estimated average per-token cost if the same
+placement is reused for the remaining decode tokens:
+Btoken(v, k) = α  b
+Cavg(v, k; i, Lout, c) −b
+Ccur(v, k, c)
+,
+(4)
+where α ≥0 is the token-amortization scaling coefficient,
+bCcur is the current-token cost under the present cache state,
+and bCavg is the corresponding average per-token cost after
+spreading any one-time migration or reload overhead across
+the remaining horizon. Thus, when many decode tokens
+remain, the Bifocal scheduler may accept a higher current-
+token cost if the placement is expected to reduce the aver-
+age cost of later steps.
+Once the best assignment has been determined, the sched-
+uler commits the vertex and updates the scheduling state,
+device availability, the cache state c, the near-future hint
+map H, and the schedule-local weight–device hint map θ.
+5.1.3 A Representative Example
+Figure 5(b–c) illustrates how Bifocal selects a placement
+for one vertex. For a vertex c, which reuses weightc, we
+compare running it on NPU versus PIM0. We first compute
+the near-focus scores Cnear(c, PIM0) and Cnear(c, NPU) to de-
+termine the preferable short-term placement under the cur-
+rent partial schedule (Figure 5(b)). This comparison com-
+bines the immediate earliest-finish estimate EFT(c, k) with
+the short DAG-window lookahead bTH(c, k), so it reflects
+not only when c itself would finish, but also how commit-
+ting c to device k perturbs a short successor chain.
+We
+then evaluate the far-focus score (Figure 5(c)). For exam-
+ple, matching θ(weightc) avoids the device-change penalty
+in Bphase(c, PIM0); during prefill, this term can also be nega-
+tive when the aggregate PIM capacity can retain the model’s
+full weight set. Then, during a decode step with a long re-
+maining horizon Ri, the scheduler can deliberately choose
+PIM0 and accept a higher current migration cost to achieve
+a lower average cost bCavg for future decode tokens. The
+
+
+--- Page 8 ---
+8
+Initialize all Wb as Linear (φini)
+  Evaluate φini to get T(φini) and  (lw,c)  
+Initialize (φbest,  Tbest(φ) as (φini,T(φini))
+iteration i < Imax
+Output: best map φbest  and 
+best makespan Tbest(φbest) with scheduling
+Yes
+Outer stage: Dominance Assignment
+Any changes ?
+ Evaluate after outerstage and update
+No
+Inner stage: Targeted Refinement
+Tbest,i-1(φ) > Tbest,i(φ) 
+Update i, (φbest,i,  Tbest,i(φ))
+Yes
+Ιnput: DAG G = (V, E);  Device Set K;
+Weight Format F;  Weight blocks Wb
+No
+Step1: Compute normalized reload pressure
+            (lw,c)  in the previous Tbest(φ)
+Step2: Aggregate reload pressure by 
+            weight blocks to get lb,c
+Step3: Assign the format of block 
+           according to:
+lb,npu > (1 + ∆) lb,pim
+lb,pim > (1 + ∆) lb,npu
+Otherwise
+, Fblock= NPU_OPT
+, Fblock= PIM_OPT
+, Fblock = Linear.
+∆ = max{∆min, ∆0βi-1}
+Yes
+Step1: Prepare “flip candidates”， which 
+           are blocks stored as NPU_OPT 
+           but loaded to PIM or vice versa.
+Step2: For each candidate, evaluate other 
+           two formats to search for better 
+           makespan T(φ).
+Step3: A trial update is accepted when 
+           the predicted makespan T(φ) 
+           decreases by ε.
+No
+Outer stage
+Inner stage
+Figure 6: Two-stage block-coordinate search for optimizing the
+blockwise weight-format map. The left panel summarizes initial-
+ization; the upper-right and lower-right panels specify the outer-
+and inner-stage update rules, respectively.
+token-amortization bias Btoken captures this effect. These
+far-focus terms can outweigh another device’s near-focus
+advantage, causing the scheduler to prefer a placement
+with lower long-term cost even when its immediate Cnear is
+higher.
+Figure 5(d) illustrates two forms of operator sharding. Row-
+wise sharding creates mutually independent shards, so
+the scheduler may interleave shard execution with other
+ready tasks and establish new DAG edges directly from
+each shard. Column-wise sharding, in contrast, requires
+explicit synchronization and reduction; therefore, commu-
+nication tasks such as reduce, all-reduce, gather, or
+scatter are inserted into the DAG and scheduled explicitly.
+The graph-construction interface is extensible: additional
+serving-parallelism modes can be represented by insert-
+ing the corresponding vertices and dependency constraints.
+For MoE models, we insert router vertices to model token-to-
+expert routing explicitly, including the selection of the top-
+k experts (FFN blocks) for each token. The resulting dis-
+patch and combine dependencies are materialized as ordi-
+nary DAG edges or communication vertices. Task partition-
+ing, KV-write pinning, router insertion, and communication-
+vertex insertion are all completed during DAG preprocess-
+ing.
+5.2 Weight Layout Arbiter
+5.2.1 Problem Formulation
+The WLA optimizes the blockwise assignment of weight-
+storage formats for a fixed workload and hardware config-
+uration. It shares the same DAG G = (V, E), device set K,
+and cost primitives as the Bifocal scheduler.
+Let W be the set of weight identifiers referenced by G.
+Weights are partitioned into stable blocks B, where each
+block b ∈B corresponds to a subset Wb ⊆W. Let F be the
+supported storage format set, including Linear, NPU_OPT,
+and PIM_OPT as described in Section 2. A blockwise as-
+signment is a map ϕ : B →F, inducing a per-weight map
+φ(w) = ϕ(b) for all w ∈Wb. For any map ϕ, let T(ϕ) denote
+the makespan predicted by Bifocal for the schedule induced
+by ϕ. The optimization problem is minϕ:B→F T(ϕ).
+5.2.2 Method: Two-Stage Block Coordinate Search Strat-
+egy
+We solve the above problem using a two-stage block-
+coordinate search strategy that is tailored to the implemen-
+tation cost of repeated schedule evaluation. The search still
+operates over the discrete Cartesian product F |B|, but in-
+stead of performing a full exact coordinate sweep, it alter-
+nates between an outer dominance assignment stage and
+an inner targeted refinement stage.
+Figure 6 summarizes the overall loop on the left and the two
+update stages on the right. We initialize ϕini by assigning
+Linear to all blocks, and evaluate the schedule once using
+Bifocal to obtain T(ϕini) together with schedule-derived per-
+weight load statistics. Specifically, for each weight identifier
+w ∈W and device class c, let ℓw,c denote the load pres-
+sure induced by the most recently evaluated schedule of w
+on device class c. WLA aggregates these per-weight statis-
+tics to block granularity. The resulting block-level quantities
+are then normalized to obtain ˜ℓb,NPU and ˜ℓb,PIM, which guide
+the dominance decision in the outer stage.
+Outer Stage:
+Dominance Assignment.
+This stage per-
+forms a coarse blockwise reassignment based on the block-
+level reload pressure observed in the previous schedule. For
+each block b, the dominance relation between ˜ℓb,NPU and
+˜ℓb,PIM is then used to determine a promising format for b, as
+illustrated in Figure 6.
+Inner Stage: Targeted Refinement.
+This stage refines the
+coarse map through focused local coordinate search. It first
+builds a candidate set containing the blocks whose current
+format still disagrees with the observed loading behavior in
+the refreshed schedule.
+For each candidate block b, the
+method holds all other block assignments fixed, explicitly
+evaluates the neighboring maps ϕ(b←f) for f ∈F \ {ϕ(b)},
+and accepts a flip only when the predicted makespan de-
+creases by more than ϵ, as illustrated in the lower-right panel
+of Figure 6. Each accepted flip therefore improves the cur-
+rent solution within the one-block neighborhood explored at
+that step. After each accepted flip, the arbiter invokes Bifo-
+cal again before processing the next candidate.
+The procedure ends when the outer stage does not pro-
+duce further format changes, when the iteration budget is
+reached, or when the tolerance criterion of early-stop ϵ is
+
+
+--- Page 9 ---
+9
+Table 1: Operator-placement policies evaluated on heterogeneous computing platforms
+Method
+Category
+prefill placement
+decode placement
+PD
+Static, prefill–decode
+disaggregation
+All operators on
+NPU.
+All operators on PIM.
+AF
+Static, attention-FFN
+disaggregation
+Attention-related operators on PIM in both stages. Remaining operators on NPU.
+PD+Linear
+FACIL-inspired static rule [11]
+All operators on
+NPU.
+Linear operators compiled to GEMV on PIM. Other
+operators on NPU.
+PD+Attn
+AttAcc-inspired static rule [34]
+All operators on
+NPU.
+Attention-related operators on PIM. Other operators on
+NPU.
+PD+FFN
+IANUS-inspired static rule [35]
+All operators on
+NPU.
+Fully connected (FC) operators on PIM during decode.
+Remaining operators on NPU.
+Bifocal
+Dynamic (this work)
+Prefill–decode joint optimization. A dynamic Bifocal scheduler with a bifocal
+score.
+Table 2: Hardware settings and performance models
+Type
+NPU
+PIM
+Device
+Huawei Ascend
+910B
+SK Hynix AiM
+device
+Peak compute
+throughput
+280 TFLOPS @
+FP16
+16 TFLOPS @
+FP16
+Memory
+16 GB
+16 GB/device
+Peak memory bw.
+0.8 TB/s
+16 TB/s/device
+Scheduling input
+Calibrated roofline
+model
+Operator model
+Verification model
+Program snippets
+Program
+snippets with
+the AiM
+simulator [26]
+activated. The final output is the best blockwise map ϕbest
+and its predicted makespan Tbest.
+6 Experiments
+6.1 Setup
+Benchmarks and workloads. We evaluate DOPS on a rep-
+resentative set of models, including Llama-7B, Llama-13B,
+Llama-70B, Qwen-1.8B, Qwen-7B, Qwen-14B, and Mixtral-
+8×7B, covering dense architectures, GQA, and MoE mod-
+els. For Mixtral-8×7B, the graph builder instantiates 8 local
+experts with deterministic top-2 routing. For the schedul-
+ing experiments in Sections 6.2 and 6.4, we sweep prefill
+lengths over {128, 512, 1024, 2048}, decode lengths over
+{128, 256, 512, 1024}, and batch sizes over {1, 4, 8, 16}.
+For the weight-layout study in Section 6.5, we sweep prefill
+and decode lengths over {8, 32, 64, 128, 1024}, while em-
+phasizing the shorter settings because relayout overhead is
+amortized more effectively over long sequences [11]. To
+prevent the evaluation from being dominated by repeated
+weight swapping over the NoC, each target hardware con-
+figuration is chosen so that it can accommodate the full
+model weights under the evaluated workload settings. Ac-
+cordingly, Llama-70B and Mixtral-8×7B use INT8 quantiza-
+tion [74, 75], while the remaining models use FP16. We re-
+port end-to-end latency together with its prefill and decode
+components. Due to space constraints, we present only rep-
+resentative cases in the paper; the full sweep is available in
+our https://github.com/YIAI-02/TriForm.
+Hardware settings. We use a Huawei Ascend 910B NPU and
+SK Hynix AiM devices based on GDDR6-PIM [26]. We con-
+struct four hybrid-platform variants by pairing the NPU with
+0, 2, 4, and 8 AiM devices, denoted as HP0, HP32, HP64, and
+HP128, respectively, where the suffix denotes the total PIM
+capacity in GB. The interconnect is a fully connected PCIe
+Gen4 x16 fabric. Both the NPU and the PIM devices fetch
+weight blocks from main memory. When the stored layout
+of a weight block does not match the target device, load-
+ing is followed by a format conversion. We include this over-
+head in the reported end-to-end latency. By default, the KV
+cache is stored in PIM at head granularity. Loaded weight
+blocks remain resident while capacity permits; otherwise,
+they are evicted according to an LRU policy. We assume
+maximal overlap between computation and weight loading.
+Table 2 summarizes the hardware parameters together with
+the models used for scheduling and verification.
+For the NPU scheduling input, we use a calibrated roofline
+model. For each NPU sub-kernel s with FLOPs fs and mem-
+ory traffic ms, DOPS estimates its latency as
+τs = max
+
+fs
+Pe(s) · max(u(fs), ϵu), ms
+Be(s)
+
++ τkernel,e(s),
+where e(s) ∈{Cube, Vector} denotes the Ascend execution
+engine, Pe(s) and Be(s) are engine throughput and memory
+bandwidth, u(fs) is a fitted saturated logistic function, ϵu
+stabilizes utilization, and τkernel,e(s) is CANN-profiled launch
+overhead.
+In addition, DOPS supports LLMCompass [44] and our in-
+house Ascend 910B simulator; the latter supports config-
+urable operator splitting and hybrid execution. For weight-
+relayout modeling, we follow the methodology in [11] and
+estimate the memory-side relayout cost using Ramula-
+tor2 [76]; NPU-side format-conversion latency is estimated
+using Huawei CANN conversion kernels [77].
+Baselines. For Section 6.2, we compare Bifocal with the
+static policies summarized in Table 1: the PD and AF base-
+lines and the prior-work-inspired PD+Attn, PD+FFN, and
+
+
+--- Page 10 ---
+10
+0
+50
+100
+1.00×
+0.81×
+1.12×
+1.26×
+1.14×
+1.50×
+1.00×
+0.76×
+1.06×
+1.15×
+1.10×
+1.38×
+1.00×
+0.94×
+0.96×
+1.27×
+1.07×
+1.10×
+1.00×
+0.92×
+0.96×
+1.23×
+1.07×
+1.10×
+1.00×
+0.97×
+0.82×
+1.26×
+1.06×
+1.50×
+1.00×
+0.96×
+0.82×
+1.24×
+1.06×
+1.49×
+1.00×
+0.27×
+0.71×
+1.22×
+1.13×
+1.37×
+1.00×
+0.26×
+0.67×
+1.13×
+1.09×
+1.30×
+1.00×
+0.58×
+0.62×
+1.23×
+1.07×
+1.46×
+1.00×
+0.57×
+0.62×
+1.20×
+1.07×
+1.44×
+1.00×
+0.73×
+0.57×
+1.22×
+1.06×
+1.48×
+1.00×
+0.73×
+0.57×
+1.20×
+1.06×
+1.47×
+10
+20
+30
+1.00×
+0.63×
+1.20×
+1.12×
+0.89×
+1.88×
+1.00×
+0.60×
+1.18×
+1.05×
+0.87×
+1.89×
+1.00×
+0.76×
+1.23×
+1.10×
+0.85×
+2.05×
+1.00×
+0.76×
+1.28×
+1.08×
+0.86×
+2.04×
+1.00×
+0.81×
+1.27×
+1.09×
+0.86×
+2.16×
+1.00×
+0.81×
+1.34×
+1.08×
+0.87×
+2.13×
+1.00×
+0.21×
+1.32×
+1.07×
+0.93×
+2.27×
+1.00×
+0.20×
+1.31×
+1.03×
+0.92×
+2.29×
+1.00×
+0.48×
+1.32×
+1.06×
+0.90×
+2.34×
+1.00×
+0.48×
+1.36×
+1.05×
+0.91×
+2.31×
+1.00×
+0.64×
+1.35×
+1.05×
+0.90×
+2.43×
+1.00×
+0.64×
+1.39×
+1.05×
+0.91×
+2.41×
+0
+Latency (s)
+PD
+AF
+PD+FFN
+PD+Linear
+PD+Attn
+BIFOCAL
+Latency (s)
+(Qwen, 128, 128)
+(Qwen, 128, 512)
+(Qwen, 128, 1024)
+(Qwen, 1024, 128)
+(Qwen, 1024, 512)
+(Qwen, 1024, 1024)
+ (Llama, 128, 128)
+ (Llama, 128, 512)
+ (Llama, 128, 1024)
+ (Llama, 1024, 128)
+ (Llama, 1024, 512)
+ (Llama, 1024, 1024)
+Operator Placement Strategies
+PD
+AF
+PD+FFN
+PD+Linear
+PD+Attn
+BIFOCAL
+PD
+AF
+PD+FFN
+PD+Linear
+PD+Attn
+BIFOCAL
+PD
+AF
+PD+FFN
+PD+Linear
+PD+Attn
+BIFOCAL
+PD
+AF
+PD+FFN
+PD+Linear
+PD+Attn
+BIFOCAL
+PD
+AF
+PD+FFN
+PD+Linear
+PD+Attn
+BIFOCAL
+Simulated prefill latency
+Simulated decode latency
+Verified prefill latency 
+Verified decode latency
+upper-right corner label:
+(Model, prefill length, decode length)
+Bars (lower is better):
+Numbers in each group: Black: prefill:decode latency ratio.   left/green: simulated speedup vs PD; right/blue: verified speedup vs PD (higher is better)
+1:20.9
+1:19.7
+1:2.31
+1:2.23
+1:18.5
+1:18.5
+1:16.3
+1:17
+1:18.2
+1:17.9
+1:13.6
+1:14
+1:79.4
+1:78
+1:9.45
+1:9.13
+1:82.5
+1:81.1
+1:62.4
+1:63.1
+1:74.1
+1:73
+1:72
+1:71
+1:163
+1:161
+1:19.6
+1:18.9
+1:199
+1:196
+1:129
+1:130
+1:153
+1:151
+1:108
+1:107
+1:14.6
+1:13.9
+1:0.31
+1:0.31
+1:21.1
+1:21.1
+1:11.8
+1:12.2
+1:12.8
+1:12.6
+1:6.39
+1:6.42
+1:55.4
+1:54.5
+1:1.24
+1:1.24
+1:89.6
+1:88.7
+1:45
+1:45.4
+1:51.8
+1:51.1
+1:24.1
+1:24
+1:113
+1:112
+1:2.56
+1:2.54
+1:120
+1:198
+1:92.1
+1:92.6
+1:107
+1:105
+1:48.9
+1:48.7
+1:23.6
+1:23.3
+1:2.2
+1:2.15
+1:19.5
+1:19.5
+1:20.9
+1:22.2
+1:26.6
+1:26.9
+1:12.1
+1:11.9
+1:96.3
+1:98.7
+1:9.41
+1:9.21
+1:78
+1:76.6
+1:87.1
+1:91.1
+1:114
+1:115
+1:46.3
+1:47.8
+1:221
+1:228
+1:21.3
+1:20.8
+1:173
+1:170
+1:203
+1:212
+1:258
+1:262
+1:102
+1:106
+1:25.3
+1:25.2
+1:0.28
+1:0.28
+1:18.9
+1:18.9
+1:23.6
+1:24.5
+1:27.1
+1:27.3
+1:10.6
+1:10.4
+1:100
+1:102
+1:1.15
+1:1.13
+1:75.8
+1:74.8
+1:94.5
+1:97.1
+1:111
+1:112
+1:42.3
+1:43.4
+1:214
+1:219
+1:2.45
+1:2.42
+1:159
+1:157
+1:203
+1:209
+1:237
+1:240
+1:87.5
+1:90.1
+Figure 7: Verification of DOPS on HP32 for representative workloads.
+Negative Gap
+Positive Gap
+Qwen-1.8B
+Llama-7B
+Count
+Signed Gap(%)
+Signed Gap(%)
+Figure 8: Distribution of the signed percentage gap between sim-
+ulated and verified end-to-end speedup for Llama-7B and Qwen-
+1.8B.
+PD+Linear rules. For a fair comparison, we reimplement
+only each method’s operator-to-device placement rule on
+a common NPU–PIM target. We do not import hardware-
+specific datapaths, memory-system modifications, or run-
+time mechanisms from the original systems.
+For Section 6.5,
+we compare five layout strategies:
+PD/Linear,
+PD/Dual,
+Bifocal/Linear,
+Bifocal/WLA,
+and Bifocal/Dual.
+The Dual variants maintain separate
+NPU_OPT and PIM_OPT copies. Neither device incurs runtime
+format-conversion overhead, but persistent storage dou-
+bles. We use Bifocal/Dual as a reference upper bound
+under idealized dual-format access, where each device
+reads weights in its preferred physical layout. Bifocal/WLA
+combines the Bifocal scheduler in Section 5.1 with the WLA
+mechanism in Section 5.2.
+For Sections 6.2–6.4, all placement policies use the same
+all-Linear persistent layout and incur conversion or relay-
+out costs.
+WLA is enabled only in Section 6.5.
+Sched-
+uler hyperparameters, modeling overheads, and overhead-
+sensitive settings are documented in the public experiment-
+hyperparameter documentation and DOPS README.
+6.2 Verification of Scheduling Benefits and Speedup Analy-
+sis
+Figure 7 presents representative verification results for two
+model families on HP32. For clarity, we show batch size 16
+for Llama-7B and batch size 8 for Qwen-1.8B. Each model
+covers prefill lengths of 128 and 1024 and decode lengths
+of 128, 512, and 1024. For each workload, we report both
+absolute latency and end-to-end speedup over PD. Each
+stacked bar is annotated with a prefill-to-decode latency ra-
+tio normalized as Tprefill : Tdecode = 1 : r. In this experiment,
+all weight blocks are stored in the Linear layout so that the
+Latency (s)
+b1
+b4
+b8
+b16
+Speedup vs PD
+ (Llama, 1024, 128)
+ (Llama, 1024, 512)
+ (Llama, 1024, 1024)
+ (Qwen, 1024, 128)
+ (Qwen, 1024, 512)
+ (Qwen, 1024, 1024)
+baseline
+baseline
+baseline
+baseline
+baseline
+baseline
+0
+50
+0.24
+0.26
+0.27
+0.27
+0.34
+0.51
+0.60
+0.71
+0.58
+0.85
+1.04
+1.22
+0.23
+0.44
+0.71
+1.13
+1.02
+1.02
+1.14
+1.39
+0
+50
+0.19
+0.21
+0.21
+0.21
+0.60
+1.16
+1.32
+1.48
+0.68
+0.96
+1.07
+1.12
+0.36
+0.71
+0.93
+1.13
+1.58
+1.98
+2.28
+3.29
+0
+50
+0.15
+0.33
+0.46
+0.58
+0.21
+0.43
+0.53
+0.62
+0.38
+0.77
+1.01
+1.23
+0.12
+0.34
+0.62
+1.07
+1.05
+1.09
+1.17
+1.47
+0
+50
+0.23
+0.41
+0.48
+0.53
+0.55
+1.22
+1.32
+1.47
+0.58
+0.94
+1.06
+1.12
+0.27
+0.66
+0.90
+1.11
+1.91
+2.24
+2.34
+3.30
+0
+50
+0.13
+0.36
+0.54
+0.73
+0.18
+0.39
+0.49
+0.57
+0.34
+0.76
+1.01
+1.22
+0.10
+0.33
+0.61
+1.06
+1.06
+1.10
+1.18
+1.48
+0
+50
+0.26
+0.52
+0.64
+0.72
+0.57
+1.26
+1.35
+1.49
+0.58
+0.94
+1.05
+1.11
+0.27
+0.67
+0.90
+1.10
+2.10
+2.36
+2.43
+3.28
+PD
+AF
+PD+FFN
+PD+Linear
+PD+Attn
+Bifocal
+PD
+AF
+PD+FFN
+PD+Linear
+PD+Attn
+Bifocal
+Figure 9: Speedup over PD across batch sizes 1, 4, 8, and 16 for
+Llama-7B and Qwen-1.8B.
+PIM
+NPU
+1.5
+PD
+AF
+PD+FFN
+PD+Linear
+PD+Attn
+BIFOCAL
+High Speedup
+High Co-util
+Speedup (x)
+Util. (%)
+Co-util. (%)
+baseline
+1.0
+0.5
+80
+60
+40
+20
+45
+30
+15
+Figure 10: Distributions of speedup, average device utilization,
+and co-utilization on Llama-7B.
+comparison isolates the effect of scheduling.
+For Llama-7B, the simulated DOPS speedup over PD ranges
+from 1.10× to 1.48×; for Qwen-1.8B, it ranges from 1.89×
+to 2.43×. Validation using NPU hardware snippets and the
+PIM simulator produces speedups of up to 1.47× and 2.41×,
+respectively. Gains are observed in all 6 evaluated configu-
+rations for both model families, whereas several static base-
+lines remain sensitive to workload shape and sometimes un-
+derperform PD.
+We further evaluate a 4 × 4 × 4 sweep (64 workloads per
+model) over prefill lengths {128, 512, 1024, 2048}, decode
+lengths {128, 256, 512, 1024}, and batch sizes {1, 4, 8,
+16}. Bifocal achieves geometric-mean speedups of 2.23×,
+1.36×, and 1.44× on Qwen-1.8B, Qwen-7B, and Qwen-
+14B with HP32; 1.20× and 1.25× on Llama-7B and Llama-
+13B with HP64; and 1.72× and 1.20× on Mixtral-8×7B and
+Llama-70B with HP128. Each platform accommodates the
+
+
+--- Page 11 ---
+11
+N
+Decode-Token96-Layer0
+Q
+K
+V
+QKT
+SV
+Softmax
+Proj.
+N
+FFN1
+FFN3
+N
+FFN2
+N
+(a)
+NPU
+PIM
+Non-Linear Op.
+PIM0
+PIM1
+NPU
+0
+5
+10
+15
+20
+Time(ms)
+FFN
+Attention
+QKV Gen.
+Others
+(b)
+Visualization Tool for 
+  the Scheduling DAG
+Cumulative saved Time
+Control
+Panel
+(c)
+Figure 11: A case study of dynamic operator placement. (a) The
+operator-to-device mapping at token 96. (b) Timeline of device us-
+age. (c) Our visualization tool for replaying the simulated sched-
+ule.
+model weights and peak KV cache; detailed results are
+available at https://github.com/YIAI-02/TriForm/tree/
+micro26_pieak_final.
+Figure 8 analyzes the signed gap ∆between simulated and
+verified end-to-end speedups for the validated program snip-
+pets.
+We define ∆=
+Ssimulation−Sverification
+Sverification
+× 100%, where
+Ssimulation and Sverification denote the simulated and verified
+speedups over PD, respectively. Across the two model fami-
+lies, the signed gap ranges from approximately −4% to +6%.
+Because Bifocal relies on calibrated operator-level primi-
+tives, inaccurate performance models can degrade schedul-
+ing quality. For the validated snippets, the observed gap
+suggests sufficient fidelity for the scheduling decisions stud-
+ied here.
+Figure 9 compares speedup over PD across batch sizes 1, 4,
+8, and 16 on Llama-7B and Qwen-1.8B at prefill=1024 and
+three decode lengths, including the low-batch regime em-
+phasized by recent edge-deployment studies [11, 50, 78–
+80]. At batch size 1, high modeled PIM bandwidth makes
+PD a strong baseline, yet Bifocal improves all six configura-
+tions. Its advantage grows with batch size as static stage
+separation becomes less effective.
+Figure 10 reports speedup over PD, average device uti-
+lization, and co-utilization.
+Bifocal has the highest me-
+dian and upper-tail speedup in Figure 10(a). The instanta-
+neous utilizations in Figure 10(b) are UtilPIM(t) =
+BusyPIM(t)
+NumPIM ,
+UtilNPU(t) = BusyNPU(t)
+NumNPU . Here, Busyd(t) and Numd are the busy
+and total device counts of type d.
+In Figure 10(c), we show the co-utilization defined as
+CoUtil = 1
+T
+Z T
+0
+min(UtilPIM(t), UtilNPU(t)) dt
+(5)
+where T denotes the makespan of the phase under con-
+sideration.
+This metric captures the time-averaged over-
+lap between normalized PIM and NPU utilization. By defi-
+nition, CoUtil is upper-bounded by the smaller of the two
+standalone average utilizations; in practice, inter-operator
+dependencies together with synchronization and communi-
+cation overheads in heterogeneous execution can make the
+gap substantial.
+0
+50
+100
+Latency 
+0
+5
+10
+0
+50
+100
+150
+0
+50
+100
+0
+5
+10
+0
+50
+100
+150
+(s)
+(ms)
+(s)
+(s)
+(ms)
+(s)
+P50-TTFT
+P50-TBT
+P50-E2E
+P90-TTFT
+P90-TBT
+P90-E2E
+PD
+AF
+PD+FFN
+PD+Linear
+PD+Attn
+Bifocal
+1.00x
+0.01x
+0.63x
+0.24x
+0.03x
+3.77x
+1.00x
+0.45x
+0.79x
+0.67x
+0.44x
+3.38x
+1.00x
+0.02x
+0.70x
+0.39x
+0.09x
+2.67x
+1.00x
+0.10x
+0.96x
+0.64x
+0.40x
+2.52x
+1.00x
+0.61x
+0.99x
+0.79x
+0.60x
+1.63x
+1.00x
+0.11x
+0.95x
+0.66x
+0.42x
+2.26x
+Figure 12: Trace-driven BurstGPT serving on HP32.
+Variant
+Near-focus
+Far-focus
+EFT
+bTH
+Bphase
+Btoken
+EFT-only
+✓
+–
+–
+–
+Bifocal w/o LA
+✓
+–
+✓
+✓
+Bifocal w/o Phase
+✓
+✓
+–
+✓
+Bifocal w/o Token
+✓
+✓
+✓
+–
+Bifocal
+✓
+✓
+✓
+✓
+✓: enabled; Note: LA = DAG-window
+lookahead term.
+EFT
+w/o LA
+w/o Phase
+w/o Token
+Full
+1.5
+2.0
+2.5
+Speedup over PD
+[128,512]
+[128,1024]
+[1024,512]
+[128,1024]
+[1024,1024]
+Qwen 1.8B
+Llama 7B
+Figure 13: Bifocal scheduler component ablation on selected rep-
+resentative workloads.
+Across 64 Llama-7B cases, DOPS does not always maxi-
+mize NPU or PIM utilization in isolation, yet it consistently
+achieves the highest co-utilization. Dynamic assignment is
+effective because it selects the device that best matches the
+current global schedule, rather than simply the device with
+the shortest standalone execution time. Some static poli-
+cies keep one device busy, yet still deliver limited speedup
+because the overlap between devices remains poor.
+Figure 11 presents an example for Llama-7B with prefill=128,
+decode=512, and batch size 16.
+Figure 11(a) visualizes
+the mapping at layer 0 of token 96, where DOPS already
+moves the KV-cache-intensive portion of the attention path
+to PIM and offloads part of the FFN to increase overlap with-
+out creating an excessively long critical path. Figure 11(b)
+shows the PIM and NPU execution timeline for the decod-
+ing step that generates token 96 across the full set of layers,
+illustrating the high co-utilization between the two devices.
+Figure 11(c) shows a screenshot of our DAG-visualization
+tool. Additional prefill and selected decode-token traces are
+provided in https://github.com/YIAI-02/TriForm; video
+of https://youtu.be/Ya_oMCyYno0 shows a representative
+schedule replay with per-operator assignments and commu-
+nication events.
+To test realistic request dynamics, we replay 500 sampled
+BurstGPT requests with Qwen-1.8B on HP32, scaling arrival
+timestamps to create serving backpressure. The requests
+have mean input/output lengths of 708/286 tokens.
+In
+this experiment, Btoken is disabled because realized output
+length is unknown at admission time. Requests are served
+in first-come-first-served (FCFS) order with a maximum serv-
+ing batch size of 4 and a 10 ms batch timeout. Compared
+with the same static baselines, Bifocal improves median
+and tail TTFT, time-between-token (TBT), and end-to-end la-
+tency in Figure 12, confirming that DOPS’s dynamic schedul-
+ing benefits persist beyond fixed synthetic workloads.
+6.3 Ablation Study of DOPS Scheduling
+
+
+--- Page 12 ---
+12
+128
+256
+512
+1024
+2.00
+4.00
+6.00
+8.00
+10.00
+Speedup vs. HP0 
+HP32
+HP64
+HP128
+Llama_7B
+HP32
+HP64
+HP128
+Llama_13B
+HP32
+HP64
+HP128
+Llama_70B
+Batch=16     Batch=8     Batch=4      Batch=1
+decode length
+prefill length
+128
+256
+512
+1024
+128
+256
+512
+1024
+128
+256
+512
+1024
+128
+256
+512
+1024
+128
+256
+512
+1024
+128
+256
+512
+1024
+128
+256
+512
+1024
+128
+256
+512
+1024
+128
+512
+1024
+2048
+128
+512
+1024
+2048
+128
+512
+1024
+2048
+128
+512
+1024
+2048
+12.00
+Figure 14: Speedup of HP32, HP64, and HP128 compared to HP0
+across Llama-7B, Llama-13B, and Llama-70B.
+To isolate Bifocal’s gains, we ablate its score components
+on HP32 using five Qwen-1.8B and Llama-7B representative
+workloads. Figure 13 lists the enabled components in the
+left panel and reports speedup over PD in the right panel.
+EFT-only captures much of the gain because it accounts for
+predecessor completion time, communication latency, de-
+vice availability, device execution time, and cache-induced
+weight reload. The phase-reuse term consistently matters:
+removing it increases latency by 7.0%–10.0% by weaken-
+ing weight-device affinity across the prefill-decode bound-
+ary and successive decode steps. The token-amortization
+term is critical for long decode; removing it causes 16.0%–
+25.6% loss because one-time migration or reload costs can
+be amortized over future tokens. The DAG-window looka-
+head term especially helps Qwen-1.8B: removing it adds
+6.4%–11.8% latency, showing that successor awareness
+avoids downstream contention.
+6.4 Hardware Scaling & Marginal Returns
+To evaluate how additional PIM capacity affects perfor-
+mance on the NPU–PIM platform for a given workload, we
+scale the hardware budget from HP0 to HP32, HP64, and
+HP128, and report speedup over HP0. In this experiment, all
+configurations use the Bifocal scheduler, and weight blocks
+are stored in the linear layout.
+Figure 14 shows the re-
+sulting speedups for Llama-7B, Llama-13B, and Llama-70B
+across 64 combinations of batch size, prefill length, and
+decode length, where the color encodes the magnitude of
+the speedup relative to HP0. Additional PIM increases band-
+width and capacity but may also add communication/syn-
+chronization pressure, so observed benefits depend on Bi-
+focal’s ability to distribute work across the NPU and PIM de-
+vices. Within each 4 × 4 block, corresponding to one batch
+size, the same PIM-capacity configuration generally yields
+larger speedup as the decode length increases, moving right
+along the x-axis, and as the prefill length increases, moving
+up along the y-axis. The main exceptions appear in several
+blocks with prefill length 2048. In this regime, the KV cache
+occupies a substantial fraction of the PIM capacity, which
+weakens the benefit of accelerating weight-intensive opera-
+tors.
+decode 128
+decode 256
+160
+120
+80
+40
+0
+HP0
+HP32
+HP64
+HP128
+Speedup 
+vs HP0
+0
+20
+40
+60
+80
+prefill 128
+prefill 512
+prefill 1024
+prefill 2048
+baseline
+0
+20
+40
+60
+HP0
+HP32
+HP64
+HP128
+decode 512
+decode 1024
+HP0
+HP32
+HP64
+HP128
+batch 1
+batch=4
+batch 8
+batch=16
+(a) Llama-13B, batch size 16, decode length 1024
+(b) Llama-13B, batch size 4, prefill length 2048
+(c) Llama-13B, prefill length 2048, 
+decode length 1024
+HP0
+HP32
+HP64
+HP128
+0
+10
+20
+30
+Speedup 
+vs HP0
+Speedup 
+vs HP0
+Speedup 
+vs HP0
+(d) batch size 8, prefill length 2048, 
+decode length 512
+Llama-7b
+Llama-13B
+Llama-70B
++60.61x
++11.89x
++17.54x
+baseline
++74.47x
+baseline
++8.45x
+baseline
++11.26x
++15.88x
++21.44x
++26.88x
++38.54x
++38.54x
++24.57x
++60.61x
++13.94x
++21.34x
+Figure 15: Marginal returns with hardware scaling.
+Figure 15 further explains the marginal return of each addi-
+tional PIM budget. The bars represent speedup relative to
+HP0, while the starred point marks the configuration with the
+highest marginal payoff, namely, the capacity point whose
+incremental speedup over the previous smaller PIM configu-
+ration is the largest (not the highest absolute speedup). Al-
+though the overall trend is consistent, i.e., adding PIM is
+generally beneficial, the marginal gain is not universal. It
+is jointly determined by prefill length, decode length, batch
+size, and model size. Figure 15(a–d) presents 4 representa-
+tive cases, where three factors are fixed while the remaining
+one varies to study its effect on the marginal return.
+Insight 1: Longer prefill lengths shift the highest-payoff PIM
+point toward larger capacities. As illustrated in Figure 15(a),
+under Llama-13B with batch size 16 and a fixed decode
+length of 1024, increasing the prefill length from 128 to 2048
+shifts the strongest marginal gain from the HP0→HP32 incre-
+ment to the HP64→HP128 increment. Correspondingly, the
+largest incremental gain increases from 11.89× to 60.61×.
+This trend is expected because a longer prefill enlarges the
+context seen by subsequent decode steps, thereby increas-
+ing both KV-cache traffic and the memory cost of attention.
+Insight 2: Longer decode lengths induce the same rightward
+shift. As illustrated in Figure 15(b), using Llama-13B with
+batch size 4 and a fixed prefill length of 2048, extending the
+decode length from 128 to 1024 shifts the largest marginal
+benefit from HP0→HP32 increment to HP32→HP64 increment,
+while the corresponding largest incremental gain increases
+from 17.54× to 38.54×. Because KV-cache accesses and
+attention-related memory traffic are repeated over more gen-
+eration steps, a larger PIM budget can amortize its cost
+more effectively.
+Insight 3:
+A larger batch size can delay the payoff of
+increasing PIM capacity. As illustrated in Figure 15(c), for
+Llama-13B with prefill length fixed at 2048 and decode
+length fixed at 1024, increasing the batch size from 1 to 4
+shifts the largest marginal gain from HP0→HP32 increment
+to the HP64→HP128 increment. Intuitively, a larger batch im-
+proves NPU utilization in the HP0 baseline, so the benefit of
+provisioning more PIM capacity emerges later.
+Insight 4:
+Increasing model size pushes the optimal
+marginal-return point toward larger PIM capacities.
+As
+
+
+--- Page 13 ---
+13
+Table 3: Scheduler functionality comparison for PIM-accelerated LLM inference systems. Only scheduler-side functions are compared.
+Method
+AttAcc [34]
+IANUS [35]
+FACIL [11]
+PAISE [81]
+PAPI [82]
+PIMoE [83]
+DOPS
+Scheduler type(1)
+Static; offline
+Static; offline
+Static; offline
+Dynamic; offline
+Dynamic; online
+Dynamic; online
+Dynamic; offline
+Target stages and
+operators
+decode:
+Attn
+prefill+decode:
+Linear + Attn
+decode:
+Linear
+decode:
+Linear + Attn
+decode:
+Linear
+decode:
+MoE FFN
+prefill+decode:
+all ops + comm.
+Allocation basis(2) Fixed-rule
+Local-cost
+Fixed-rule
+Local-cost
+Local-cost
+Local-cost
+Global-timeline
+Workload(3)
+Dense
+Dense
+Dense
+Dense
+Dense
+MoE
+Dense + MoE
+Extensibility(4)
+Low
+Medium
+Low
+Medium
+Medium
+Medium
+High workload/hw.
+modular
+Notes. (1) Following the terminology introduced in Section 1. (2) Fixed-rule = pre-defined operator-to-device mapping; Local-cost = consider only the metric of the current operator on a
+given device; Global-timeline = ready-DAG-task scoring with global horizon. (3) dense = no sparse expert routing. (4) Low = tied to a specific workload/hardware; Medium = reusable only
+within a restricted space; High = modular abstractions that can incorporate new operators or devices.
+0.0
+0.3
+0.6
+0.9
+1.00x
+1.45x
+1.19x
+1.99x
+2.31x
+1.00x
+1.45x
+1.19x
+1.93x
+2.31x
+1.00x
+1.27x
+1.04x
+1.18x
+1.45x
+1.00x
+1.40x
+1.56x
+2.46x
+2.85x
+1.00x
+1.40x
+1.55x
+2.53x
+2.75x
+1.00x
+1.12x
+1.01x
+1.11x
+1.25x
+1.0
+2.0
+Latency(s)
+Weight Copy Rate
+Linear
+NPU_OPT
+PIM_OPT
+Steps
+outer0
+init
+outer1
+inner1
+outer1
+inner3
+outer1
+inner5
+outer2
+inner1
+outer2
+inner3
+outer2
+inner5
+outer2
+inner7
+outer2
+inner9
+outer2
+inner11
+outer3
+inner0
+outer3
+inner2
+outer3
+inner4
+outer3
+inner6
+0.76
+0.80
+0.84
+0.88
+Total
+time (s)
+(b)
+ upper-right corner label: 
+(batch, prefill length, decode length)
+(a)
+PD/Linear
+Bifocal/Linear
+PD/Dual
+Bifocal/WLA
+Bifocal/Dual
+Color of bar:
+Color of pie:
+Linear
+NPU_OPT
+PIM_OPT
+(1, 128, 128)
+(1, 32, 8)
+(1, 8, 8)
+(4, 128, 128)
+(4, 32, 8)
+(4, 8, 8)
+Figure 16: (a) Latency and speedup of Bifocal/WLA on Llama-7B.
+Bars report latency, annotations report speedup over PD/Linear,
+and pie charts show layout composition. The weight-copy rate
+is the normalized number of stored weight copies. (b) WLA opti-
+mization trace for a representative case.
+illustrated in Figure 15(d),
+with batch size 8,
+prefill
+length 2048, and decode length 512 fixed, moving from
+Llama-7B to Llama-13B and then to Llama-70B shifts the
+strongest marginal gain from the HP0→HP32 increment to
+the HP64→HP128 increment.
+Larger models carry more
+weights, so an undersized PIM is more likely to trigger
+repeated LRU replacement and additional communication,
+making larger-capacity PIM configurations increasingly valu-
+able.
+6.5 Effectiveness of WLA
+In this experiment, we use HP32 and evaluate the models
+that can be accommodated on this platform under the target
+workload settings: Llama-7B, Qwen-1.8B, Qwen-7B, and
+Qwen-14B. Their weights are partitioned into 56, 49, 49,
+and 70 blocks, respectively. We sweep prefill and decode
+lengths over {8, 32, 64, 128, 1024}, and batch sizes over {1,
+4, 8}. Compared to Bifocal/Linear, Bifocal/WLA reduces
+latency by 8.3%–40.4%, with greater benefits at shorter se-
+quence lengths where layout overhead dominates.
+Across the full sweep available at https://github.com/
+YIAI-02/TriForm, Bifocal/WLA achieves geometric-mean
+speedups of 2.12× over PD/Linear and 1.32× over
+Bifocal/Linear on Qwen-1.8B, with consistent gains on
+larger models. These results show that WLA nearly matches
+the dual-copy baseline without doubling persistent weight
+storage.
+The sweep also reveals format preferences: at low batch
+sizes and short decode lengths, PIM_OPT blocks dominate
+to avoid high one-time conversion costs. As batch size and
+sequence length grow, NPU_OPT becomes preferred to avoid
+repeated NPU-side transformations.
+Only near-balanced
+cases retain a few Linear blocks.
+Figure 16(b) shows
+rapid convergence over iterations: from an all-Linear start,
+coarse blockwise moves are made toward the load-favored
+format, followed by limited refinement. Although latency is
+not strictly monotonic, a lower-latency mixed layout is typi-
+cally reached within three outer iterations.
+7 Related Work
+Scheduling on heterogeneous platforms.
+Recent LLM-
+oriented PIM systems cover different operator–device place-
+ment points, as summarized in Table 3. These policies are
+useful but restricted, while DOPS searches a broader space
+to select a workload- and hardware-aware plan.
+DOPS is orthogonal and complementary to two lines of prior
+work. First, DOPS is complementary to hardware-specific
+mechanisms or data-layout transformations, such as near-
+memory data condenser to bridge sparse data layouts be-
+tween NPU and PIM in PIMoE [83]. DOPS can consume such
+optimized substrates through its hardware abstraction and
+performance model. Second, DOPS is complementary to run-
+time schedulers. Online mechanisms can adapt to instan-
+taneous serving states [82, 83]. However, it must remain
+lightweight. In contrast, DOPS performs optimization at de-
+ployment time and can afford a broader search over the full
+inference DAG.
+As shown in Figure 17, when the PAPI- and PAISE-inspired of-
+floading rules are transplanted into our common evaluation
+framework, their runtime thresholds reduce to determinis-
+tic placement policies for each fixed workload and hardware
+configuration. We instantiate them as the closest static pol-
+icy classes in Table 1. Nevertheless, their policies remain
+valuable when the actual serving state deviates from the pro-
+filed configuration.
+Hardware simulators. Existing hardware modeling and sim-
+ulation tools typically target a specific abstraction level or
+accelerator substrate [44, 76, 84–86]. Detailed simulators
+improve the fidelity of performance model estimates for a
+given hardware design, whereas DOPS optimizes how a full
+LLM inference DAG should be mapped to heterogeneous
+devices under such estimates. In practice, these simula-
+tors can serve as offline calibration backends for our per-
+
+
+--- Page 14 ---
+14
+(128, 128)
+(128, 512)
+(128, 1024)
+(1024, 128)
+(1024, 512)
+(1024, 1024)
+0.0
+0.5
+1.0
+1.5
+2.0
+Normalized latency
+(PD = 1.0)
+1.26×
+1.27×
+1.26×
+1.22×
+1.23×
+1.22×
+1.12×
+0.96×
+0.82×
+0.71×
+0.62×
+0.57×
+1.50×
+1.10×
+1.50×
+1.37×
+1.46×
+1.48×
+(128, 128)
+(128, 512)
+(128, 1024)
+(1024, 128)
+(1024, 512)
+(1024, 1024)
+1.12×
+1.10×
+1.09×
+1.07×
+1.06×
+1.05×
+1.20×
+1.23×
+1.27×
+1.32×
+1.32×
+1.35×
+1.88×
+2.05×
+2.16×
+2.27×
+2.34×
+2.43×
+PD+Linear
+PD+FFN
+Bifocal
+Llama-7B
+Qwen-1.8B
+Figure 17: Prior-scheduler-inspired baselines on HP32 for repre-
+sentative Llama-7B and Qwen-1.8B workloads.
+formance model, replacing or refining roofline-based and
+profile-based operator costs.
+Conversely, DOPS provides
+a system-level optimization layer above them and extends
+their utility from isolated hardware evaluation to end-to-end
+scheduling for NPU–PIM LLM inference.
+8 Conclusion
+We develop DOPS and formulate LLM inference on hetero-
+geneous NPU–PIM systems as a coupled scheduling-and-
+layout problem covering operator placement, device con-
+tention, and persistent weight format.
+Across the stud-
+ied model–platform pairings, Bifocal achieves 1.20×–2.23×
+geometric-mean speedup over PD, while WLA adds 1.28×–
+1.33× over Bifocal/Linear. On these edge-oriented sys-
+tems, the results show the value of moving beyond coarse
+prefill–decode disaggregation and static roofline rules and
+support future hardware–software co-design.
+References
+[1] OpenAI.
+Gpt-4 technical report.
+arXiv preprint
+arXiv:2303.08774, 2023.
+[2] Arghavan Moradi Dakhel, Vahid Majdinasab, Amin
+Nikanjam, Foutse Khomh, Michel C. Desmarais, and
+Zhen Ming (Jack) Jiang.
+Github copilot ai pair pro-
+grammer: Asset or liability?
+Journal of Systems and
+Software, 203:111734, 2023.
+[3] ChengXiang Zhai. Large language models and future
+of information retrieval: Opportunities and challenges.
+In Proceedings of the 47th International ACM SIGIR
+Conference on Research and Development in Infor-
+mation Retrieval (SIGIR 2024), pages 481–490. ACM,
+2024.
+[4] Ruihao Gong, Shihao Bai, Siyu Wu, Yunqian Fan, Zai-
+jun Wang, Xiuhong Li, Hailong Yang, and Xianglong Liu.
+Past-future scheduler for LLM serving under SLA guar-
+antees. In Proceedings of the 30th ACM International
+Conference on Architectural Support for Programming
+Languages and Operating Systems, Volume 2 (ASP-
+LOS 2025), pages 798–813. ACM, 2025.
+[5] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo
+Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao Zhang.
+DistServe:
+Disaggregating prefill and decoding for
+goodput-optimized large language model serving. In
+Proceedings of the 18th USENIX Symposium on Oper-
+ating Systems Design and Implementation (OSDI 24),
+pages 193–210. USENIX Association, July 2024. ISBN
+978-1-939133-40-3.
+[6] Hyungjun Oh, Kihong Kim, Jaemin Kim, Sungkyun Kim,
+Junyeol Lee, Du seong Chang, and Jiwon Seo. ExeGPT:
+Constraint-aware resource scheduling for LLM infer-
+ence. In Proceedings of the 29th ACM International
+Conference on Architectural Support for Programming
+Languages and Operating Systems, Volume 2 (ASP-
+LOS 2024), pages 369–384. ACM, 2024.
+[7] Minsu Kim, Seongmin Hong, RyeoWook Ko, Soongyu
+Choi, Hunjong Lee, Junsoo Kim, Joo-Young Kim, and
+Jongse Park. Oaken: Fast and efficient LLM serving
+with online-offline hybrid KV cache quantization.
+In
+Proceedings of the 52nd Annual International Sympo-
+sium on Computer Architecture (ISCA 2025), pages
+482–497. ACM, 2025.
+[8] Jovan Stojkovic, Chaojie Zhang, Íñigo Goiri, Josep Tor-
+rellas, and Esha Choukse.
+DynamoLLM: Designing
+LLM inference clusters for performance and energy ef-
+ficiency. In Proceedings of the IEEE International Sym-
+posium on High-Performance Computer Architecture
+(HPCA 2025), pages 1348–1362. IEEE, 2025.
+[9] Bin Wang, Bojun Wang, Changyi Wan, Guanzhe Huang,
+Hanpeng Hu, Haonan Jia, Hao Nie, Mingliang Li, Nuo
+Chen, Siyu Chen, Song Yuan, Wuxun Xie, Xiaoniu Song,
+Xing Chen, Xingping Yang, Xuelin Zhang, Yanbo Yu,
+Yaoyu Wang, Yibo Zhu, Yimin Jiang, Yu Zhou, Yuan-
+wei Lu, Houyi Li, Jingcheng Hu, Ka Man Lo, Ailin
+Huang, Binxing Jiao, Bo Li, Boyu Chen, Changxin
+Miao, Chao Lou, Chen Hu, Chen Xu, Chenfeng Yu,
+Chengyuan Yao, Daokuan Lv, Dapeng Shi, Deshan
+Sun, Ding Huang, Dingyuan Hu, Dongqing Pang, Enle
+Liu, Fajie Zhang, Fanqi Wan, Gulin Yan, Han Zhang,
+Han Zhou, Hanghao Wu, Hangyu Guo, Hanqi Chen,
+Hanshan Zhang, Hao Wu, Haocheng Zhang, Haolong
+Yan, Haoran Lv, Haoran Wei, Hebin Zhou, Heng Wang,
+Heng Wang, Hongxin Li, Hongyu Zhou, Hongyuan
+Wang, Huiyong Guo, Jia Wang, Jiahao Gong, Jial-
+ing Xie, Jian Zhou, Jianjian Sun, Jiaoren Wu, Jiaran
+Zhang, Jiayu Liu, Jie Cheng, Jie Luo, Jie Yan, Jie Yang,
+Jieyi Hou, Jinguang Zhang, Jinlan Cao, Jisheng Yin,
+Junfeng Liu, Junhao Huang, Junzhe Lin, Kaijun Tan,
+Kaixiang Li, Kang An, Kangheng Lin, Kenkun Liu, Lei
+Yang, Liang Zhao, Liangyu Chen, Lieyu Shi, Liguo Tan,
+Lin Lin, Lin Zhang, Lina Chen, Liwen Huang, Liying
+Shi, Longlong Gu, Mei Chen, Mengqiang Ren, Ming
+Li, Mingzhe Chen, Na Wang, Nan Wu, Qi Han, Qian
+Zhao, Qiang Zhang, Qianni Liu, Qiaohui Chen, Qiling
+Wu, Qinglin He, Qinyuan Tan, Qiufeng Wang, Qiuping
+Wu, Qiuyan Liang, Quan Sun, Rui Li, Ruihang Miao,
+Ruosi Wan, Ruyan Guo, Shangwu Zhong, Shaoliang
+Pang, Shengjie Fan, Shijie Shang, Shilei Jiang, Shiliang
+Yang, Shiming Hao, Shuli Gao, Siming Huang, Siqi
+Liu, Tiancheng Cao, Tianhao Cheng, Tianhao Peng,
+
+
+--- Page 15 ---
+15
+Wang You, Wei Ji, Wen Sun, Wenjin Deng, Wenqing
+He, Wenzhen Zheng, Xi Chen, Xiangwen Kong, Xi-
+anzhen Luo, Xiaobo Yang, Xiaojia Liu, Xiaoxiao Ren,
+Xin Han, Xin Li, Xin Wu, Xu Zhao, Yanan Wei, Yang
+Li, Yangguang Li, Yangshijie Xu, Yanming Xu, Yaqiang
+Shi, Yeqing Shen, Yi Yang, Yifei Yang, Yifeng Gong, Yi-
+han Chen, Yijing Yang, Yinmin Zhang, Yizhuang Zhou,
+Yuanhao Ding, Yuantao Fan, Yuanzhen Yang, Yuchu
+Luo, Yue Peng, Yufan Lu, Yuhang Deng, Yuhe Yin,
+Yujie Liu, Yukun Chen, Yuling Zhao, Yun Mou, Yun-
+long Li, Yunzhou Ju, Yusheng Li, Yuxiang Yang, Yuxi-
+ang Zhang, Yuyang Chen, Zejia Weng, Zhe Xie, Zheng
+Ge, Zheng Gong, Zhenyi Lu, Zhewei Huang, Zhichao
+Chang, Zhiguo Huang, Zhirui Wang, Zidong Yang, Zili
+Wang, Ziqi Wang, Zixin Zhang, Daxin Jiang, Heung-
+Yeung Shum, and Xiangyu Zhang. Step-3 is large yet
+affordable: Model-system co-design for cost-effective
+decoding. CoRR, abs/2507.19427, 2025.
+[10] Sang-Soo Park, KyungSoo Kim, Jinin So, Jin Jung,
+Jonggeon
+Lee,
+Kyoungwan
+Woo,
+Nayeon
+Kim,
+Younghyun Lee, Hyungyo Kim, Yongsuk Kwon, Jin-
+hyun Kim, Jieun Lee, YeonGon Cho, Yongmin Tai,
+Jeonghyeon Cho, Hoyoung Song, Jung Ho Ahn, and
+Nam Sung Kim. An LPDDR-based CXL-PNM platform
+for TCO-efficient inference of transformer-based large
+language models.
+In Proceedings of the IEEE Inter-
+national Symposium on High-Performance Computer
+Architecture (HPCA 2024), pages 970–982. IEEE,
+2024.
+[11] Seong Hoon Seo, Junghoon Kim, Donghyun Lee,
+Seonah Yoo, Seokwon Moon, Yeonhong Park, and
+Jae W. Lee.
+Facil:
+Flexible dram address map-
+ping for soc-pim cooperative on-device llm inference.
+In Proceedings of the IEEE International Symposium
+on High-Performance Computer Architecture (HPCA
+2025), pages 1720–1733. IEEE, March 2025.
+[12] Tianhua Xia and Sai Qian Zhang. Kelle: Co-design KV
+caching and eDRAM for efficient LLM serving in edge
+computing. In Proceedings of the 58th IEEE/ACM In-
+ternational Symposium on Microarchitecture (MICRO
+2025), pages 18–33. ACM, 2025.
+[13] Zhongkai Yu, Shengwen Liang, Tianyun Ma, Yunke Cai,
+Ziyuan Nan, Di Huang, Xinkai Song, Yifan Hao, Jie
+Zhang, Tian Zhi, Yongwei Zhao, Zidong Du, Xing Hu,
+Qi Guo, and Tianshi Chen. Cambricon-LLM: A chiplet-
+based hybrid architecture for on-device inference of
+70b LLM. In Proceedings of the 57th IEEE/ACM Interna-
+tional Symposium on Microarchitecture (MICRO 2024),
+pages 1474–1488. IEEE, 2024.
+[14] Weiyi Sun, Mingyu Gao, Zhaoshi Li, Aoyang Zhang,
+Iris Ying Chou, Jianfeng Zhu, Shaojun Wei, and Leibo
+Liu.
+Lincoln: Real-time 50–100b LLM inference on
+consumer devices with LPDDR-interfaced, compute-
+enabled flash memory.
+In Proceedings of the IEEE
+International Symposium on High-Performance Com-
+puter Architecture (HPCA 2025), pages 1734–1750.
+IEEE, 2025.
+[15] Lian Liu, Shixin Zhao, Bing Li, Haimeng Ren, Zhao-
+hui Xu, Mengdi Wang, Xiaowei Li, Yinhe Han, and
+Ying Wang.
+Make LLM inference affordable to ev-
+eryone: Augmenting GPU memory with NDP-DIMM.
+In Proceedings of the IEEE International Symposium
+on High-Performance Computer Architecture (HPCA
+2025), pages 1751–1765. IEEE, 2025.
+[16] Hyungyo Kim, Nachuan Wang, Qirong Xia, Jinghan
+Huang, Amir Yazdanbakhsh, and Nam Sung Kim. LIA:
+A single-GPU LLM inference acceleration with coop-
+erative AMX-enabled CPU-GPU computation and CXL
+offloading. In Proceedings of the 52nd Annual Inter-
+national Symposium on Computer Architecture (ISCA
+2025), pages 544–558. ACM, 2025.
+[17] Sungmin Yun, Kwanhee Kyung, Juhwan Cho, Jaewan
+Choi, Jongmin Kim, Byeongho Kim, Sukhan Lee, Ky-
+omin Sohn, and Jung Ho Ahn.
+Duplex: A device
+for large language models with mixture of experts,
+grouped query attention, and continuous batching. In
+Proceedings of the 57th IEEE/ACM International Sym-
+posium on Microarchitecture (MICRO 2024), pages
+1429–1443. IEEE, 2024.
+[18] Seonjin Na, Geonhwa Jeong, Byung Hoon Ahn, Aaron
+Jezghani,
+Jeffrey Young,
+Christopher J. Hughes,
+Tushar Krishna, and Hyesoon Kim. Flexinfer: Flexible
+LLM inference with CPU computations. In Proceedings
+of Machine Learning and Systems (MLSys 2025), vol-
+ume 7, 2025.
+[19] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gon-
+zalez, Hao Zhang, and Ion Stoica. Efficient memory
+management for large language model serving with
+PagedAttention. In Proceedings of the 29th ACM Sym-
+posium on Operating Systems Principles (SOSP 2023),
+pages 611–626. ACM, 2023.
+[20] Zixuan Zhou, Xuefei Ning, Ke Hong, Tianyu Fu, Jiaming
+Xu, Shiyao Li, Yuming Lou, Luning Wang, Zhihang
+Yuan, Xiuhong Li, Shengen Yan, Guohao Dai, Xiao-
+Ping Zhang, Yuhan Dong, and Yu Wang. A survey on
+efficient inference for large language models.
+arXiv
+preprint arXiv:2404.14294, 2024.
+[21] Pratyush
+Patel,
+Esha
+Choukse,
+Chaojie
+Zhang,
+Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ricardo
+Bianchini.
+Splitwise: Efficient generative LLM infer-
+ence using phase splitting.
+In Proceedings of the
+51st Annual International Symposium on Computer
+Architecture (ISCA 2024), pages 118–132. IEEE, 2024.
+
+
+--- Page 16 ---
+16
+[22] Jingqi Feng, Yukai Huang, Rui Zhang, Sicheng Liang,
+Ming Yan, and Jie Wu.
+Windserve: Efficient phase-
+disaggregated LLM serving with stream-based dy-
+namic scheduling.
+In Proceedings of the 52nd An-
+nual International Symposium on Computer Architec-
+ture (ISCA 2025), pages 1283–1295. ACM, 2025.
+[23] Heng Liao, Jiajin Tu, Jing Xia, Hu Liu, Xiping Zhou,
+Honghui Yuan, and Yuxing Hu. Ascend: a scalable and
+unified architecture for ubiquitous deep neural network
+computing: Industry track paper. In Proceedings of the
+IEEE International Symposium on High-Performance
+Computer Architecture (HPCA 2021), pages 789–801,
+2021.
+[24] Norman P. Jouppi, George Kurian, Sheng Li, Peter Ma,
+Rahul Nagarajan, Lifeng Nai, Nishant Patil, Suvinay
+Subramanian, Andy Swing, Brian Towles, Cliff Young,
+Xiang Zhou, Zongwei Zhou, and David Patterson. Tpu
+v4: An optically reconfigurable supercomputer for ma-
+chine learning with hardware support for embeddings.
+In Proceedings of the 50th Annual International Sym-
+posium on Computer Architecture (ISCA 2023), 2023.
+[25] Guseul Heo, Sangyeop Lee, Jaehong Cho, Hyunmin
+Choi, Sanghyeon Lee, Hyungkyu Ham, Gwangsun Kim,
+Divya Mahajan, and Jongse Park. Neupims: Npu-pim
+heterogeneous acceleration for batched llm inferenc-
+ing. In Proceedings of the 29th ACM International Con-
+ference on Architectural Support for Programming Lan-
+guages and Operating Systems, Volume 3 (ASPLOS
+2024), pages 722–737, 2024.
+[26] Yufeng Gu, Alireza Khadem, Sumanth Umesh, Ning
+Liang, Xavier Servot, Onur Mutlu, Ravi Iyer, and Reetu-
+parna Das. PIM is all you need: A CXL-enabled GPU-
+free system for large language model inference.
+In
+Proceedings of the 30th ACM International Conference
+on Architectural Support for Programming Languages
+and Operating Systems, Volume 2 (ASPLOS 2025),
+pages 862–881. ACM, 2025.
+[27] Seongju Lee, Kyuyoung Kim, Sanghoon Oh, Joonhong
+Park, Gimoon Hong, Dongyoon Ka, Kyudong Hwang,
+Jeongje Park, Kyeongpil Kang, Jungyeon Kim, Jun-
+yeol Jeon, Nahsung Kim, Yongkee Kwon, Vladimir
+Kornijcuk, Woojae Shin, Jongsoon Won, Minkyu Lee,
+Hyunha Joo, Haerang Choi, Jaewook Lee, Donguc Ko,
+Younggun Jun, Keewon Cho, Ilwoong Kim, Choungki
+Song, Chunseok Jeong, Daehan Kwon, Jieun Jang,
+Il Park, Junhyun Chun, and Joohwan Cho.
+A 1ynm
+1.25V 8Gb, 16Gb/s/pin GDDR6-based accelerator-in-
+memory supporting 1TFLOPS MAC operation and vari-
+ous activation functions for deep-learning applications.
+In Proceedings of the IEEE International Solid-State Cir-
+cuits Conference (ISSCC 2022), volume 65, pages 1–3.
+IEEE, 2022.
+[28] Alexandar Devic, Siddhartha Balakrishna Rai, Anand
+Sivasubramaniam, Ameen Akel, Sean Eilert, and Justin
+Eno. To pim or not for emerging general purpose pro-
+cessing in ddr memory systems. In Proceedings of the
+49th Annual International Symposium on Computer Ar-
+chitecture (ISCA 2022), pages 231–244, 2022.
+[29] Derrick Quinn, E. Ezgi Yücel, Jinkwon Kim, José F.
+Martínez,
+and
+Mohammad
+Alian.
+Longsight:
+Compute-enabled
+memory
+to
+accelerate
+large-
+context LLMs via sparse attention.
+In Proceedings
+of the 58th IEEE/ACM International Symposium on
+Microarchitecture (MICRO 2025), pages 34–48, 2025.
+[30] Rohan Mahapatra, Harsha Santhanam, Christopher
+Priebe, Hanyang Xu, and Hadi Esmaeilzadeh.
+In-
+storage acceleration of retrieval augmented genera-
+tion as a service.
+In Proceedings of the 52nd An-
+nual International Symposium on Computer Architec-
+ture (ISCA 2025), pages 450–466, 2025.
+[31] Chaoqiang Liu, Haifeng Liu, Dan Chen, Yu Huang,
+Yi Zhang, Wenjing Xiao, Xiaofei Liao, and Hai Jin. Het-
+erRAG: Heterogeneous processing-in-memory accel-
+eration for retrieval-augmented generation.
+In Pro-
+ceedings of the 52nd Annual International Symposium
+on Computer Architecture (ISCA 2025), pages 884–
+898, 2025.
+[32] Yoonho Jang, Hyeongjun Cho, Yesin Ryu, Jungrae Kim,
+and Seokin Hong. PIMPAL: Accelerating LLM inference
+on edge devices via in-DRAM arithmetic lookup.
+In
+Proceedings of the 62nd ACM/IEEE Design Automation
+Conference (DAC 2025), pages 1–7, 2025.
+[33] Sanghyeok Han, Byungkuk Yoon, Gyeonghwan Park,
+Choungki Song, Dongkyun Kim, and Jae-Joon Kim.
+Near-memory LLM inference processor based on 3d
+DRAM-to-logic hybrid bonding. In Proceedings of the
+62nd ACM/IEEE Design Automation Conference (DAC
+2025), pages 1–7, 2025.
+[34] Jaehyun
+Park,
+Jaewan
+Choi,
+Kwanhee
+Kyung,
+Michael Jaemin Kim, Yongsuk Kwon, Nam Sung
+Kim, and Jung Ho Ahn. Attacc! unleashing the power
+of pim for batched transformer-based generative
+model inference.
+In Proceedings of the 29th ACM
+International Conference on Architectural Support
+for Programming Languages and Operating Systems,
+Volume 2 (ASPLOS 2024), pages 103–119. ACM, April
+2024.
+[35] Minseok Seo, Xuan Truong Nguyen, Seok Joong
+Hwang, Yongkee Kwon, Guhyun Kim, Chanwook Park,
+Ilkon Kim, Jaehan Park, Jeongbin Kim, Woojae Shin,
+Jongsoon Won, Haerang Choi, Kyuyoung Kim, Dae-
+han Kwon, Chunseok Jeong, Sangheon Lee, Yongseok
+Choi, Wooseok Byun, Seungcheol Baek, Hyuk-Jae Lee,
+and John Kim.
+Ianus: Integrated accelerator based
+
+
+--- Page 17 ---
+17
+on npu-pim unified memory system. In Proceedings
+of the 29th ACM International Conference on Architec-
+tural Support for Programming Languages and Oper-
+ating Systems, Volume 3 (ASPLOS 2024), pages 545–
+560. ACM, April 2024.
+[36] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+Uszkoreit, Llion Jones, Aidan N. Gomez, Łukasz
+Kaiser, and Illia Polosukhin. Attention is all you need.
+Advances in Neural Information Processing Systems,
+30:5998–6008, 2017.
+[37] Joshua Ainslie, James Lee-Thorp, Michiel de Jong,
+Yury Zemlyanskiy, Federico Lebron, and Sumit Sang-
+hai.
+Gqa:
+Training generalized multi-query trans-
+former models from multi-head checkpoints. In Pro-
+ceedings of the 2023 Conference on Empirical Meth-
+ods in Natural Language Processing (EMNLP 2023),
+pages 4895–4901. Association for Computational Lin-
+guistics, 2023.
+[38] William Fedus, Barret Zoph, and Noam Shazeer.
+Switch transformers: Scaling to trillion parameter mod-
+els with simple and efficient sparsity. Journal of Ma-
+chine Learning Research, 23(120):1–39, 2022.
+[39] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan
+Li, Max Ryabinin, Beidi Chen, Percy Liang, Christo-
+pher Ré, Ion Stoica, and Ce Zhang.
+Flexgen: High-
+throughput generative inference of large language
+models with a single GPU. In Andreas Krause, Emma
+Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan
+Sabato, and Jonathan Scarlett, editors, Proceedings of
+the 40th International Conference on Machine Learn-
+ing (ICML 2023), volume 202, pages 31094–31116.
+PMLR, 2023.
+[40] Seonjin Na, Geonhwa Jeong, Byung Hoon Ahn, Jef-
+frey Young, Tushar Krishna, and Hyesoon Kim. Under-
+standing performance implications of LLM inference
+on CPUs. In Proceedings of the IEEE International Sym-
+posium on Workload Characterization (IISWC 2024),
+pages 169–180. IEEE, 2024.
+[41] Daliang Xu, Hao Zhang, Liming Yang, Ruiqi Liu, Gang
+Huang, Mengwei Xu, and Xuanzhe Liu. Fast on-device
+LLM inference with NPUs. In Proceedings of the 30th
+ACM International Conference on Architectural Sup-
+port for Programming Languages and Operating Sys-
+tems, Volume 1 (ASPLOS 2025), pages 445–462. ACM,
+2025.
+[42] Jaeyong Lee, Hyeunjoo Kim, Sanghun Oh, Myoungjun
+Chun, Myungsuk Kim, and Jihong Kim. AiF: Accelerat-
+ing on-device LLM inference using in-flash processing.
+In Proceedings of the 52nd Annual International Sym-
+posium on Computer Architecture (ISCA 2025), pages
+529–543. ACM, 2025.
+[43] Yuhang Zhou, Zhibin Wang, Guyue Liu, Shipeng Li,
+Xi Lin, Zibo Wang, Yongzhong Wang, Fuchun Wei,
+Jingyi Zhang, Zhiheng Hu, Yanlin Liu, Chunsheng Li,
+Ziyang Zhang, Yaoyuan Wang, Bin Zhou, Wanchun
+Dou, Guihai Chen, and Chen Tian. Squeezing opera-
+tor performance potential for the Ascend architecture.
+In Proceedings of the 30th ACM International Confer-
+ence on Architectural Support for Programming Lan-
+guages and Operating Systems, Volume 2 (ASPLOS
+2025), pages 1156–1171, 2025.
+[44] Hengrui Zhang, August Ning, Rohan Baskar Prabhakar,
+and David Wentzlaff. Llmcompass: Enabling efficient
+hardware design for large language model inference.
+In Proceedings of the 51st Annual International Sym-
+posium on Computer Architecture (ISCA 2024), pages
+1080–1096. IEEE, 2024.
+[45] Yilong Zhao, Mingyu Gao, Fangxin Liu, Yiwei Hu,
+Zongwu Wang, Han Lin, Ji Li, Xian He, Hanlin Dong,
+Tao Yang, Naifeng Jing, Xiaoyao Liang, and Li Jiang.
+UM-PIM: DRAM-based PIM with uniform & shared
+memory space.
+In Proceedings of the 51st Annual
+International Symposium on Computer Architecture
+(ISCA 2024), pages 644–659, 2024.
+[46] Jin Hyun Kim, Shin Haeng Kang, Sukhan Lee, Hyeonsu
+Kim, Woongjae Song, Yuhwan Ro, Seungwon Lee,
+David Wang, Hyunsung Shin, Bengseng Phuah, Jihyun
+Choi, Jinin So, Yeongon Cho, Joonho Song, Jangseok
+Choi, Jeonghyeon Cho, Kyomin Sohn, Youngsoo Sohn,
+Kwangil Park, and Nam Sung Kim. Aquabolt-xl: Sam-
+sung hbm2-pim with in-memory processing for ma-
+chine learning accelerators and beyond. In Proceed-
+ings of the IEEE Hot Chips 33 Symposium (HCS 2021).
+IEEE, 2021.
+[47] Young-Cheon Kwon, Suk-Han Lee, Jaehoon Lee, Sang-
+Hyuk Kwon, Je-Min Ryu, Jong-Pil Son, Seongil O, Hak
+soo Yu, Haesuk Lee, Soo Young Kim, Youngmin Cho,
+Jin Guk Kim, Jongyoon Choi, Hyunsung Shin, Jin Kim,
+BengSeng Phuah, HyoungMin Kim, Myeong Jun Song,
+Ahn Choi, Daeho Kim, Sooyoung Kim, Eun-Bong Kim,
+David Wang, Shinhaeng Kang, Yuhwan Ro, Seungwoo
+Seo, Joon Ho Song, Jaeyoun Youn, Kyomin Sohn, and
+Nam Sung Kim. 25.4 a 20nm 6gb function-in-memory
+dram, based on hbm2 with a 1.2tflops programmable
+computing unit using bank-level parallelism, for ma-
+chine learning applications.
+In Proceedings of the
+2021 IEEE International Solid-State Circuits Confer-
+ence (ISSCC 2021), pages 350–352, 2021.
+[48] Mingxuan He, Choungki Song, Ilkon Kim, Chun-
+seok Jeong, Seho Kim, Il Park, Mithuna Thottethodi,
+and T. N. Vijaykumar.
+Newton:
+A dram-maker’s
+accelerator-in-memory (aim) architecture for machine
+learning. In Proceedings of the 53rd IEEE/ACM Interna-
+tional Symposium on Microarchitecture (MICRO 2020),
+pages 372–385, 2020.
+
+
+--- Page 18 ---
+18
+[49] Sukhan Lee, Shinhaeng Kang, Jaehoon Lee, Hyeonsu
+Kim, Eojin Lee, Seungwoo Seo, Hosang Yoon, Seung-
+won Lee, Kyounghwan Lim, Hyunsung Shin, Jinhyun
+Kim, Seongil O, Anand Iyer, David Wang, Kyomin Sohn,
+and Nam Sung Kim. Hardware architecture and soft-
+ware stack for pim based on commercial dram technol-
+ogy: Industrial product. In Proceedings of the 48th An-
+nual International Symposium on Computer Architec-
+ture (ISCA 2021), pages 43–56, 2021.
+[50] Cong Li, Yihan Yin, Xintong Wu, Jingchen Zhu,
+Zhutianya Gao, Dimin Niu, Qiang Wu, Xin Si, Yuan
+Xie, Chen Zhang, and Guangyu Sun.
+H2-LLM:
+Hardware-dataflow co-exploration for heterogeneous
+hybrid-bonding-based low-batch LLM inference.
+In
+Proceedings of the 52nd Annual International Sympo-
+sium on Computer Architecture (ISCA 2025), pages
+194–210, 2025.
+[51] Yue Pan, Zihan Xia, Po-Kai Hsu, Lanxiang Hu, Hyungyo
+Kim, Janak Sharda, Minxuan Zhou, Nam Sung Kim,
+Shimeng Yu, Tajana Rosing, and Mingu Kang. Stratum:
+System-hardware co-design with tiered monolithic 3D-
+stackable DRAM for efficient MoE serving. In Proceed-
+ings of the 58th IEEE/ACM International Symposium on
+Microarchitecture (MICRO 2025), pages 1–17, 2025.
+[52] Chen Bai, Xin Fan, Zhenhua Zhu, Wei Zhang, and
+Yuan Xie.
+Accelstack: A cost-driven analysis of 3d-
+stacked LLM accelerators.
+In Proceedings of the
+44th IEEE/ACM International Conference on Computer-
+Aided Design (ICCAD 2025), pages 1–9. IEEE, 2025.
+[53] Zizhuo Fu, Xiaotian Guo, Wenxuan Zeng, Shuzhang
+Zhong, Yadong Zhang, Peiyu Chen, Runsheng Wang,
+Le Ye, and Meng Li.
+H2EAL: Hybrid-bonding ar-
+chitecture with hybrid sparse attention for efficient
+long-context LLM inference.
+In Proceedings of the
+44th IEEE/ACM International Conference on Computer-
+Aided Design (ICCAD 2025), pages 1–9. IEEE, 2025.
+[54] Tianqi Chen, Thierry Moreau, Ziheng Jiang, Lianmin
+Zheng, Eddie Yan, Haichen Shen, Meghan Cowan,
+Leyuan Wang, Yuwei Hu, Luis Ceze, Carlos Guestrin,
+and Arvind Krishnamurthy. TVM: An automated End-to-
+End optimizing compiler for deep learning. In Proceed-
+ings of the 13th USENIX Symposium on Operating Sys-
+tems Design and Implementation (OSDI 2018), pages
+578–594. USENIX Association, October 2018.
+ISBN
+978-1-939133-08-3.
+[55] Size Zheng, Yun Liang, Shuo Wang, Renze Chen, and
+Kaiwen Sheng. Flextensor: An automatic schedule ex-
+ploration and optimization framework for tensor com-
+putation on heterogeneous system.
+In Proceedings
+of the 25th ACM International Conference on Architec-
+tural Support for Programming Languages and Operat-
+ing Systems (ASPLOS 2020), pages 859–873, 2020.
+[56] Soroush Ghodrati, Sean Kinzer, Hanyang Xu, Ro-
+han Mahapatra, Yoonsung Kim, Byung Hoon Ahn,
+Dong Kai Wang, Lavanya Karthikeyan, Amir Yazdan-
+bakhsh, Jongse Park, Nam Sung Kim, and Hadi Es-
+maeilzadeh.
+Tandem processor:
+Grappling with
+emerging operators in neural networks. In Proceedings
+of the 29th ACM International Conference on Architec-
+tural Support for Programming Languages and Operat-
+ing Systems, Volume 2 (ASPLOS 2024), pages 1165–
+1182. Association for Computing Machinery, 2024.
+[57] Nikoleta Iliakopoulou, Jovan Stojkovic, Chloe Alverti,
+Tianyin Xu, Hubertus Franke, and Josep Torrellas.
+Chameleon:
+Adaptive caching and scheduling for
+many-adapter LLM inference environments.
+In Pro-
+ceedings of the 58th IEEE/ACM International Sympo-
+sium on Microarchitecture (MICRO 2025), pages 217–
+231. ACM, 2025.
+[58] Wenqi Jiang,
+Suvinay Subramanian,
+Cat Graves,
+Gustavo Alonso, Amir Yazdanbakhsh, and Vidushi
+Dadu. RAGO: Systematic performance optimization for
+retrieval-augmented generation serving.
+In Proceed-
+ings of the 52nd Annual International Symposium on
+Computer Architecture (ISCA 2025), pages 974–989.
+ACM, 2025.
+[59] Jovan Stojkovic, Chaojie Zhang, Íñigo Goiri, Esha
+Choukse, Haoran Qiu, Rodrigo Fonseca, Josep Tor-
+rellas, and Ricardo Bianchini.
+TAPAS: Thermal- and
+power-aware scheduling for LLM inference in cloud
+platforms.
+In Proceedings of the 30th ACM Inter-
+national Conference on Architectural Support for Pro-
+gramming Languages and Operating Systems, Volume
+2 (ASPLOS 2025), pages 1266–1281. Association for
+Computing Machinery, 2025.
+[60] Jungi Lee, Wonbeom Lee, and Jaewoong Sim. Tender:
+Accelerating large language models via tensor decom-
+position and runtime requantization. In Proceedings of
+the 51st Annual International Symposium on Computer
+Architecture (ISCA 2024), pages 1048–1062, 2024.
+[61] Akshat Ramachandran, Souvik Kundu, and Tushar Kr-
+ishna. MicroScopiQ: Accelerating foundational mod-
+els through outlier-aware microscaling quantization.
+In Proceedings of the 52nd Annual International Sym-
+posium on Computer Architecture (ISCA 2025), pages
+1193–1209, 2025.
+[62] Jiho Shin, Hoeseok Yang, and Youngmin Yi.
+Grasp:
+Group-based prediction of activation sparsity for fast
+LLM inference.
+In Proceedings of the 62nd Annual
+ACM/IEEE Design Automation Conference (DAC 2025),
+pages 1–7, 2025.
+[63] Youpeng Zhao, Di Wu, and Jun Wang. ALISA: Accel-
+erating large language model inference via sparsity-
+aware KV caching.
+In Proceedings of the 51st An-
+
+
+--- Page 19 ---
+19
+nual International Symposium on Computer Architec-
+ture (ISCA 2024), pages 1005–1017. IEEE, 2024.
+[64] Hazem A. Abdelhafez, Christopher Zimmer, Sudhar-
+shan S. Vazhkudai, and Matei Ripeanu.
+Ahead: A
+tool for projecting next-generation hardware enhance-
+ments on gpu-accelerated systems. In Proceedings of
+the IEEE International Parallel and Distributed Process-
+ing Symposium Workshops (IPDPSW 2019), pages
+583–592. IEEE, May 2019.
+[65] Albert D. Alexandrov, Mihai F. Ionescu, Klaus E.
+Schauser, and Chris J. Scheiman.
+Loggp: Incorpo-
+rating long messages into the logp model—one step
+closer towards a realistic model for parallel compu-
+tation.
+In Proceedings of the Seventh Annual ACM
+Symposium on Parallel Algorithms and Architectures
+(SPAA 1995), pages 95–105. Association for Comput-
+ing Machinery, 1995.
+[66] Haluk Topcuoglu, Salim Hariri, and Min-You Wu.
+Performance-effective
+and
+low-complexity
+task
+scheduling for heterogeneous computing. IEEE Trans-
+actions on Parallel and Distributed Systems, 13(3):
+260–274, 2002.
+[67] Hamid Arabnejad and Jorge G. Barbosa. List schedul-
+ing algorithm for heterogeneous systems by an opti-
+mistic cost table. IEEE Transactions on Parallel and
+Distributed Systems, 25(3):682–694, 2014.
+[68] Minhaj Ahmad Khan. Scheduling for heterogeneous
+systems using constrained critical paths. Parallel Com-
+puting, 38(4–5):175–193, 2012.
+[69] Thomas McSweeney,
+Neil Walton,
+and Mawussi
+Zounon. An efficient new static scheduling heuristic for
+accelerated architectures. In Computational Science
+– ICCS 2020: 20th International Conference, Amster-
+dam, The Netherlands, June 3–5, 2020, Proceedings,
+Part I, volume 12137 of Lecture Notes in Computer Sci-
+ence, pages 3–16. Springer, 2020.
+[70] Huawei Technologies Co., Ltd. aclFormat – ascendcl
+api (python), 2026.
+URL https://www.hiascend.
+com/document/detail/zh/canncommercial/80RC22/
+apiref/appdevgapi/aclpythondevg_01_0914.html.
+Accessed: 2026-03-25.
+[71] Huawei Technologies Co., Ltd.
+Data Layout For-
+mat – ascend c operator development, 2026.
+URL
+https://www.hiascend.com/document/detail/
+zh/CANNCommunityEdition/850alpha001/opdevg/
+Ascendcopdevg/atlas_ascendc_10_0099.html.
+Accessed: 2026-03-25.
+[72] Huawei Technologies Co., Ltd.
+TransDataTo5HD
+– ascend c operator development api, 2026.
+URL
+https://www.hiascend.com/document/detail/
+zh/canncommercial/800/apiref/ascendcopapi/
+atlasascendc_api_07_0200.html. Accessed: 2026-
+03-25.
+[73] TensorFlow Authors.
+tf.transpose | TensorFlow
+v2.16.1, 2024.
+URL https://www.tensorflow.org/
+api_docs/python/tf/transpose. Last updated 2024-
+04-26; accessed 2026-03-25.
+[74] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke
+Zettlemoyer. Gpt3. int8 (): 8-bit matrix multiplication
+for transformers at scale. 35:30318–30332, 2022.
+[75] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu,
+Julien Demouth, and Song Han.
+SmoothQuant: Ac-
+curate and efficient post-training quantization for large
+language models. In Proceedings of the 40th Interna-
+tional Conference on Machine Learning (ICML 2023),
+volume 202 of Proceedings of Machine Learning Re-
+search, pages 38087–38099, 2023.
+[76] Haocong Luo, Yahya Can Tuğrul, F. Nisa Bostancı,
+Ataberk Olgun, Abdullah Giray Yağlıkçı, and Onur
+Mutlu.
+Ramulator 2.0: A modern, modular, and ex-
+tensible DRAM simulator. IEEE Computer Architecture
+Letters, 23(1):112–116, 2024.
+[77] Huawei
+Ascend.
+ND2NZ
+format
+conversion
+on
+AIV
+cores:
+A
+matmul
+performance
+tun-
+ing case,
+ascend c best practices,
+cann com-
+munity
+edition
+8.5.0.alpha001,
+2026.
+URL
+https://www.hiascend.com/document/detail/
+zh/canncommercial/850/opdevg/Ascendcopdevg/
+atlas_ascendc_best_practices_10_10014.html.
+Official documentation in Chinese, accessed 2026-03-
+16.
+[78] Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc V.
+Le, Ed H. Chi, Sharan Narang, Aakanksha Chowdhery,
+and Denny Zhou. Self-consistency improves chain of
+thought reasoning in language models. In Proceedings
+of the International Conference on Learning Represen-
+tations (ICLR 2023), 2023.
+[79] Yiwei Li, Jiayi Shi, Shaoxiong Feng, Peiwen Yuan,
+Xinglin Wang, Yueqi Zhang, Ji Zhang, Chuyi Tan,
+Boyuan Pan, Yao Hu, and Kan Li. Speculative decod-
+ing for multi-sample inference. In Proceedings of Find-
+ings of the Association for Computational Linguistics:
+EMNLP 2025 (Findings of ACL: EMNLP 2025), pages
+12523–12533, 2025.
+[80] Yaniv Leviathan, Matan Kalman, and Yossi Matias.
+Fast inference from transformers via speculative de-
+coding. In Proceedings of the 40th International Con-
+ference on Machine Learning (ICML 2023), volume
+202 of Proceedings of Machine Learning Research,
+pages 19274–19286, 2023.
+[81] Hyojung Lee, Daehyeon Baek, Jimyoung Son, Jieun
+Choi, Kihyo Moon, and Minsung Jang.
+Paise:
+
+
+--- Page 20 ---
+20
+Pim-accelerated
+inference
+scheduling
+engine
+for
+transformer-based llm.
+In Proceedings of the IEEE
+International Symposium on High-Performance Com-
+puter Architecture (HPCA 2025), pages 1707–1719.
+IEEE, 2025.
+[82] Yintao He, Haiyu Mao, Christina Giannoula, Moham-
+mad Sadrosadati, Juan Gómez-Luna, Huawei Li, Xi-
+aowei Li, Ying Wang, and Onur Mutlu. PAPI: Exploiting
+dynamic parallelism in large language model decod-
+ing with a processing-in-memory-enabled computing
+system. In Proceedings of the 30th ACM International
+Conference on Architectural Support for Programming
+Languages and Operating Systems, Volume 2 (ASP-
+LOS 2025), pages 766–782. ACM, 2025.
+[83] Lizhou Wu, Haozhe Zhu, Siqi He, Xuanda Lin, Xi-
+aoyang Zeng, and Chixiao Chen. PIMoE: Towards ef-
+ficient moe transformer deployment on NPU-PIM sys-
+tem through throttle-aware task offloading. In 2025
+62nd ACM/IEEE Design Automation Conference (DAC),
+pages 1–7. IEEE, 2025.
+[84] Hyungkyu Ham, Wonhyuk Yang, Yunseon Shin, Okkyun
+Woo, Guseul Heo, Sangyeop Lee, Jongse Park, and
+Gwangsun Kim.
+ONNXim: A fast, cycle-level multi-
+core NPU simulator. IEEE Computer Architecture Let-
+ters, 23(2):219–222, 2024.
+[85] Sheng Xu, Xiaoming Chen, Ying Wang, Yinhe Han, Xue-
+hai Qian, and Xiaowei Li.
+PIMSim: A flexible and
+detailed processing-in-memory simulator. IEEE Com-
+puter Architecture Letters, 18(1):6–9, 2019.
+[86] Bruno E. Forlin, Paulo C. Santos, Augusto E. Becker,
+Marco A. Z. Alves, and Luigi Carro. Sim2PIM: A com-
+plete simulation framework for processing-in-memory.
+Journal of Systems Architecture, 128:102528, 2022.
