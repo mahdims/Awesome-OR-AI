@@ -1,0 +1,2299 @@
+--- Page 1 ---
+OnlineCache: Learning Dynamic Caching Policies
+with Error Correction for Efficient Diffusion Inference
+Zhikang Xie1∗, Xichen Ye1∗, Yifan Wu1, Haoshen Yu1, Li Chenan1,
+Peizhu Gong1, Weizhong Zhang2, Cheng Jin1,3†
+1College of Computer Science and Artificial Intelligence, Fudan University
+2School of Data Science, Fudan University
+3Shanghai Key Laboratory of Intelligent Information Processing
+Abstract
+Diffusion models have revolutionized generative tasks but incur high latency due
+to iterative denoising. While cache-based strategies accelerate inference by reusing
+intermediate features, they largely rely on static, sample-agnostic schedules. We
+argue that this rigidity overlooks two facts empirically validated in this paper: (i)
+generation difficulty varies across prompts, requiring adaptive resource alloca-
+tion—complex inputs demand more computation while simpler ones require less;
+(ii) error sensitivity fluctuates across timesteps, where static policies may cache
+high-error steps or waste computation on low-error ones. We therefore propose
+OnlineCache, a dynamic caching framework that jointly learns when to cache
+and how to correct approximation errors. We leverage policy gradient to train
+a lightweight network for adaptive speed-quality trade-offs, and incorporate a
+learnable corrector to mitigate caching-induced errors. Both modules are jointly
+optimized under a bilevel optimization framework, with the policy targeting global
+generation quality and the corrector minimizing local errors. Our method auto-
+matically allocates computational resources across both samples and timesteps,
+improving overall generation quality. Extensive experiments demonstrate clear
+superiority. On FLUX.1-dev model, OnlineCache achieves nearly 3× speedup
+while preserving generation fidelity. On DiT and CogVideoX, it similarly delivers
+competitive acceleration without compromising quality; across all scenarios, it
+consistently outperforms existing cache-based acceleration baselines.
+1
+Introduction
+In recent years, diffusion models (Sohl-Dickstein et al., 2015; Song and Ermon, 2019; Ho et al.,
+2020; Dhariwal and Nichol, 2021) have emerged as a dominant paradigm in generative AI, delivering
+unparalleled synthesis quality across a wide range of modalities, including images (Rombach et al.,
+2022), videos (Blattmann et al., 2023), audio (Kong et al., 2021), and 3D content (Poole et al.,
+2023). This success is largely attributed to the adoption of highly scalable transformer-based
+backbones (Peebles and Xie, 2023). However, such performance gains come at the cost of substantial
+computational overhead. As these models become increasingly complex and large-scale, they exhibit
+slow inference and high deployment costs, posing serious challenges for real-time applications.
+To mitigate these computational bottlenecks, various acceleration techniques have been explored in
+recent years. Most existing approaches rely on modifying the underlying model, such as network
+pruning (Fang et al., 2023), low-bit quantization (Shang et al., 2023), and knowledge distillation (Luh-
+man and Luhman, 2021), all of which reduce inference cost by altering model structure or parameter
+∗Equal contribution.
+†Corresponding author.
+Preprint.
+arXiv:2607.29398v1  [cs.LG]  31 Jul 2026
+
+
+--- Page 2 ---
+(a) Sample-level heterogeneity. OnlineCache dynamically
+allocates computation across prompts of varying difficulty.
+(b) Timestep-level heterogeneity. OnlineCache adaptively
+identifies timesteps that are suitable for caching.
+Figure 1: Comparison of static strategy (ERTACache) and ours (OnlineCache) in different senarios of diffusion acceleration.
+(a) Under different prompt complexities, ERTACache adopts a uniform caching strategy, whereas OnlineCache dynamically
+adapts (e.g., 70.00% vs. 53.33% cache ratio), achieving improved generation quality under a comparable average speedup. (b)
+Under the same 66.67% caching ratio, ERTACache’s "one-policy-fits-all" strategy is suboptimal. In contrast, OnlineCache
+identifies critical timesteps and achieves a 37.48% reduction in L1 error, along with substantially improved perceptual quality.
+representation. In contrast, an emerging line of work focuses on cache-based acceleration, which
+exploits the temporal redundancy across diffusion steps by reusing intermediate representations (Ma
+et al., 2024a,b; Chen et al., 2024). Owing to its model-agnostic nature and minimal architectural
+intervention, cache-based methods offer a complementary and increasingly attractive alternative.
+However, most existing cache-based methods rely on static or heuristic-driven rules to determine
+intermediate feature reuse, which fundamentally constrains their flexibility and performance. Static
+strategies such as ERTACache (Peng et al., 2025) adopt a fixed caching schedule—applying the
+same set of cached steps to all samples regardless of input complexity. More adaptive methods like
+TeaCache (Liu et al., 2025a), which utilize heuristic threshold, still remain suboptimal due to their
+greedy, local decisions that lack global quality awareness. Through an empirical analysis of diffusion
+trajectories (as evidenced in Figure 1), we argue that such rigid, rule-based policies are insufficient to
+handle the intrinsic heterogeneity of the denoising process, which manifests at two levels:
+▷Sample-level heterogeneity: Figure 1a demonstrates generation difficulty varies significantly
+across prompts. While static method allocates computation uniformly, our dynamic policy adap-
+tively allocates resources across samples, assigning more computation to difficult cases and less to
+easy ones, thereby achieving better performance under a comparable average speedup.
+▷Timestep-level heterogeneity: Figure 1b shows that error sensitivity fluctuates along the denoising
+trajectory. Static method inevitably caches sensitive steps while wasting computation on redundant
+ones, resulting in suboptimal quality. In contrast, OnlineCache identifies critical timesteps and
+significantly reduces overall errors (37.48% L1 reduction; LPIPS improves from 0.3920 to 0.2179).
+These observations reveal a fundamental mismatch between rigid scheduling and complex denoising.
+We argue that effective acceleration should move beyond fixed rules and adopt a dynamic, instance-
+aware policy. To this end, we propose OnlineCache, a framework that formulates the caching
+schedule as a sequential decision-making problem. Instead of relying on heuristics, we employ a
+lightweight policy network to evaluate latent states at each denoising timestep and decide whether
+to reuse cached representations or perform full computation. The policy is optimized via policy
+gradient (Sutton et al., 1999) to maximize a trajectory-level reward, endowing the model with a global
+perspective for efficient allocation of computational budgets. Specifically, we introduce two variants
+of OnlineCache: (i) a vanilla variant that trains a standalone policy network to learn adaptive caching
+decisions, and (ii) a bilevel optimization (BLO) variant that jointly trains the policy while optimizing
+an error corrector to compensate for caching-induced trajectory deviations.
+In the BLO variant, policy optimization is formulated as the outer objective to effectively balance the
+trade-off between acceleration and generation quality, while the error corrector is optimized as the
+inner objective to minimize local error. This bilevel coupling ensures that the policy learns to skip
+computation strictly conditional on the corrector’s capacity to repair the induced error, leading to a
+2
+
+
+--- Page 3 ---
+Numerical Integration:
+Next Timestep  
+(until 
+)
+Current Noisy
+Sample 
+Timestep 
+State 
+ Preparation
+Statistical Feature Extraction
+, 
+, 
+Concatenate
+Classifier
+Reuse 
+  Corrector 
+(Cache)
+Corrected Residual:
+Diffusion Model
+(Compute)    Update Cache
+    
+Compute Residual:
+Output:
+Figure 2: Overall inference pipeline of OnlineCache, where the policy network dynamically determines caching decisions
+and the corrector compensates for cache-induced approximation errors.
+superior Pareto frontier between efficiency and quality. Moreover, both the policy and the corrector
+are designed as lightweight MLPs, introducing negligible inference-time latency in practice.
+Our core contributions can be summarized as follows:
+▷We propose OnlineCache, a dynamic, instance-aware cache-based acceleration framework, with
+two variants: a policy-only vanilla model and a bilevel optimization model that jointly trains policy
+with an error corrector, enabling a globally effective speed-quality trade-off.
+▷We develop a practical training pipeline for OnlineCache, incorporating multiple optimization
+strategies and engineering techniques to ensure robust convergence, stable joint training, and
+efficient plug-and-play inference, without any architectural modifications to the backbone. Code
+and trained policy networks for several mainstream diffusion models will be released.
+▷We conduct extensive experiments and ablation studies to validate the effectiveness of our approach.
+OnlineCache accelerates 1.88× on DIT-XL/2 while maintaining competitive FID relative to full-
+step inference. On FLUX.1-DEV, it attains nearly 3× speedup with consistently high generation
+quality, surpassing prior cache-based methods. It also extends seamlessly to video generation.
+2
+Related Works
+Cache-based Acceleration.
+Cache-based acceleration leverages temporal redundancy across diffu-
+sion steps to reduce inference cost without modifying the backbone model. Early methods mostly
+adopt fixed caching schedules or architecture-specific reuse, such as periodic feature reuse in Deep-
+Cache (Ma et al., 2024a) and FORA (Selvaraju et al., 2024). To improve robustness, later methods
+introduce calibration or correction mechanisms, including Block Caching (Wimbauer et al., 2024),
+∆-DiT (Chen et al., 2024), and ERTACache (Peng et al., 2025). More recent work moves toward
+dynamic and learning-based policies, exemplified by TeaCache (Liu et al., 2025a), DiCache (Bu et al.,
+2025), and router-based or compensation-based approaches (Ma et al., 2024b; Liu et al., 2025b). Our
+method, OnlineCache, also belongs to this learning-based cache-acceleration family.
+Beyond caching, diffusion acceleration has also been explored through pruning, quantization, distilla-
+tion, and improved samplers. We refer readers to Appendix B for a more comprehensive discussion.
+3
+Methodology
+In this section, we detail OnlineCache, a dynamic caching framework for diffusion acceleration.
+We formulate the caching decision as a sequential decision-making problem and solve it via Policy
+Gradient (Sutton et al., 1999). Specifically, we introduce two versions: (i) a vanilla variant trains a
+separate policy network and (ii) a bilevel optimization variant that jointly trains the policy while
+tuning an error corrector for caching-induced deviations.
+3.1
+Problem Formulation
+We consider a diffusion-based generative process that progressively denoises a latent variable from
+xN to x0 over a sequence of timesteps {tN, . . . , t1}. During inference, a diffusion model Mdiff takes
+3
+
+
+--- Page 4 ---
+the current noisy sample xt at timestep t and predicts the next-step intermediate state. Here, we
+take the v-prediction parameterization as an example, while the x- and ϵ-prediction variants follow
+analogously. Specifically, the model output can be formulated in a residual form as:
+vt = Mdiff(xt, t) = xt + rt,
+(1)
+where rt = vt −xt denotes the residual at timestep t. The sample at the next timestep xt−1 is
+then obtained by applying a numerical integration step: xt−1 = xt −vt · ∆t, where ∆t denotes the
+integration step size. Previous works, such as ERTACache (Peng et al., 2025), have consistently shown
+that in diffusion process, the residual feature rt often evolves smoothly across adjacent timesteps.
+This temporal redundancy suggests that rt can be well approximated by a previously computed and
+cached residual from a recent timestep, denoted as rcached.
+We introduce a binary variable at ∈{0, 1} per timestep: at = 1 signifies caching (skip the heavy
+computation and reuse rcached), and at = 0 signifies computing. The update rule is defined as:
+vt = xt + ˆrt,
+where ˆrt =
+rcached,
+if at = 1,
+Mdiff(xt, t) −xt,
+if at = 0.
+(2)
+When at = 0, we update the cache with the exact residual: ˆrt →rcached. This mechanism allows us
+to skip the expensive computation of Mdiff entirely when the cached residual is deemed sufficient.
+3.2
+Policy Network Architecture and Design
+The decision to reuse residuals is non-trivial: aggressive caching may cause error accumulation and
+quality degradation, while conservative reuse diminishes efficiency gains. To balance these factors,
+we formulate caching as a Markov Decision Process (MDP) and train a lightweight policy πθ to
+maximize a reward signal balancing quality and speedup. Crucially, the effectiveness of the policy
+depends on a well-designed state representation input, guided by the following two key observations:
+▷Statistical Sufficiency. Latent features during diffusion often exhibit Gaussian-like behavior,
+making the channel-wise mean µ(·) and standard deviation σ(·) informative global summaries.
+This is theoretically grounded in Latent Diffusion Models, where the VAE imposes a KL constraint
+that regularizes the latent space toward N(0, I); combined with the Gaussian initialization at xT ,
+intermediate states naturally retain Gaussian-like properties. Empirically, as shown in Figure 3,
+analysis of hidden states from the FLUX.1-DEV (Labs et al., 2025) model across early, middle,
+and final timesteps confirms this behavior. Accordingly, we extract µ(·) and σ(·) from both the
+current latent xt and the cached residual rcached. In addition, we include max(|rcached|) to capture
+salient localized updates that may be obscured by average statistics.
+▷Temporal Awareness. Diffusion dynamics are non-stationary, evolving from coarse structural
+formation to fine-grained refinement. The time embedding embtime(t) supplies phase information,
+enabling the policy to adapt its caching behavior across different denoising stages.
+Figure 3: Statistical feature design for pol-
+icy input. We extract (µ(·), σ(·)) to char-
+acterize the latent distribution, motivated
+by the approximately Gaussian behavior of
+latent representations in diffusion models.
+Based on the above analysis, let D be the channel dimension
+of the latent space. The state st provided to the policy network
+πθ(at|st) is a concatenated vector in R6×D:
+st = Concat
+
+
+µ(xt), σ(xt),
+µ(rcached), σ(rcached), max(|rcached|),
+embtime(t)
+
+.
+(3)
+The policy πθ is parameterized by a lightweight Multilayer Per-
+ceptron(MLP). The architecture consists of: (i) An input pro-
+jection layer compressing the feature dimension from 6 × D
+to 2 × Nhidden, followed by LayerNorm and ReLU. (ii) A bot-
+tleneck layer reducing dimensions to Nhidden/2, followed by
+ReLU. (iii) A final projection to a scalar probability pt via a
+Sigmoid activation. The action is then sampled stochastically
+with at ∼Bernoulli(pt). To assess the validity of these de-
+sign choices, we perform a controlled ablation over the state
+components, as analyzed in Section 4.4.1.
+4
+
+
+--- Page 5 ---
+3.3
+Reward Design and Policy Optimization
+We design a composite reward function R(τ) evaluated over the full generation trajectory τ. The
+reward encourages high visual fidelity while enforcing a specific acceleration rate.
+▷Quality Reward (Rq): We measure the perceptual similarity between the image generated by our
+dynamic policy, Ipred, and the ground-truth image generated with full compute, Igt. We utilize the
+combination of LPIPS (Zhang et al., 2018) and SSIM (Wang et al., 2004):
+Rq = λq (1 −LLPIPS(Igt, Ipred) + LSSIM(Igt, Ipred)) .
+(4)
+▷Acceleration Constraint (Ra): To enforce a target compute budget, we penalize deviations from a
+target cache ratio ρtarget (e.g., 0.5, aiming for the policy to converge to caching roughly 50%):
+Ra = −λa
+
+1
+T
+T
+X
+t=1
+at −ρtarget
+ .
+(5)
+▷Stability Penalty (Rs): To prevent error explosion from consecutive caching, we apply a penalty if
+the number of consecutive skips kt exceeds a tolerance threshold ktol:
+Rs = −λs
+ T
+X
+t=1
+1(kt>ktol) · (kt −ktol)
+!
+.
+(6)
+The total reward for trajectory τ is the sum: R(τ) = Rq + Ra + Rs. Since Ra and Rs are always
+negative, they serve as penalty terms. We optimize the policy parameters θ using the REINFORCE
+algorithm (Monte Carlo Policy Gradient). To bridge the gap between raw rewards and stable gradient
+updates, we transform the total reward into a normalized advantage score and incorporate entropy
+regularization. For a detailed derivation of the reverse gradient flow, please refer to Appendix A.
+However, the raw reward signals R(τ) can vary significantly in magnitude, leading to high variance in
+gradient estimation. In practice, we follow a standard approach and compute a normalized advantage
+score for each trajectory relative to the current batch B. Let R(τi) be the cumulative reward for the
+i-th trajectory in a batch of size B. The advantage A(τi) for trajectory i is then standardized:
+A(τi) =
+R(τi) −1
+B
+PB
+j=1 R(τj)
+r
+1
+B
+PB
+j=1
+
+R(τj) −1
+B
+PB
+k=1 R(τk)
+2
++ ϵ
+,
+(7)
+where ϵ is a small constant for numerical stability. This normalization assigns positive rewards to
+above-average trajectories and penalizes below-average ones.
+To encourage exploration and prevent the policy from collapsing to a deterministic behavior early in
+training, we introduce an entropy bonus. Since our policy πθ(st) outputs a scalar probability pt for
+the Bernoulli distribution, the entropy at timestep t can be defined as:
+H(pt) = −[pt log pt + (1 −pt) log(1 −pt)] .
+(8)
+Finally, the total loss L(θ) combines the policy gradient and entropy terms. We introduce λe to
+control the exploration-exploitation trade-off, for a batch of trajectories, the objective is:
+L(θ) = 1
+B
+B
+X
+i=1
+"
+−
+ T
+X
+t=1
+log πθ(ai,t | si,t)
+!
+· A(τi) −λe
+1
+T
+T
+X
+t=1
+H(πθ(si,t))
+#
+.
+(9)
+3.4
+Bilevel Optimization Framework
+To further improve performance, we introduce an error corrector implemented as a lightweight MLP,
+which compensates for the drift induced by cache reuse. We formulate the joint training as a bilevel
+optimization problem. The framework consists of an outer-loop objective that optimizes the policy
+and a inner-loop objective that minimizes the local error. Formally, let θ and ϕ denote the parameters
+of the policy πθ and corrector Cϕ, respectively. The optimization problem can be defined as:
+min
+θ
+Louter(θ, ϕ∗(θ)) = −Eτ∼πθ[R(τ)]
+s.t.,
+ϕ∗(θ) ∈arg min
+ϕ Linner(θ, ϕ),
+(10)
+where R(τ) is the cumulative reward defined in Section 3.3.
+5
+
+
+--- Page 6 ---
+3.4.1
+Outer-loop: Policy Optimization
+In the outer loop, we optimize the policy parameters θ while keeping the error corrector ϕ fixed,
+which represents the optimal solution ϕ∗under the current policy. The policy network learns to
+make binary caching decisions at based on observed latent statistics. The optimization objective is to
+minimize the negative expected reward via the policy gradient defined in Equation 9, where A(τi)
+denotes the normalized advantage of the trajectory generated through the interaction between the
+current policy and the corrector. The update of θ can be expressed as:
+dLouter
+dθ
+=
+∂Louter
+∂θ
+| {z }
+Direct Gradient
++ ∂Louter
+∂ϕ∗
+· dϕ∗(θ)
+dθ
+|
+{z
+}
+Implicit Gradient
+.
+(11)
+The direct gradient term characterizes how variations in the policy θ directly influence the reward
+R(τ). In contrast, the implicit gradient reflects the fact that changing θ induces a shift in the inner-
+level optimum ϕ∗, since the corrector is trained conditional on the current caching decisions. This
+variation in ϕ∗in turn influences the outer-level reward.
+3.4.2
+Inner-loop: Corrector Training
+The inner loop aims to find the optimal corrector ϕ∗that compensates for the numerical errors
+introduced when the policy network chooses to skip the transformer computation (at = 1). When
+a step is cached, the accelerated output is calculated as ˆvt(ϕ) = vt + Cϕ(xt, rcached, embtime(t)),
+where vt is computed according to Equation 2 under the condition at = 1. Given the pre-computed
+ground-truth intermediate states vgt
+t (Appendix C.2.1 reports an ablation on the choice of corrector
+training target), the inner objective Linner is defined as the Mean Squared Error over the cached steps:
+Linner(θ, ϕ) =
+X
+t : at=1
+ˆvt(ϕ) −vgt
+t
+2
+2 .
+(12)
+3.4.3
+Practical BLO Implementation
+Computing the exact implicit gradient dϕ∗(θ)
+dθ
+in Equation 11 is intractable in our setting for two
+reasons: (i) The dependency of the inner objective Linner on the policy parameters θ is mediated by
+the discrete sampling of actions at ∼πθ. This non-differentiable sampling operation prevents the
+flow of gradients from the inner-loop loss back to the policy parameters via standard backpropagation.
+(ii) Even with continuous relaxation tricks (e.g., Gumbel-Softmax), calculating the exact implicit
+gradient typically involves computing Hessian-vector products, which imposes a prohibitive memory
+and computational burden given the high-dimensional context of diffusion models.
+Therefore, we adopt a First-Order Approximation of the BLO objective. Specifically, we simplify
+the optimization by alternating between the two levels: (i) Policy update (Outer-loop): We update
+θ using the policy gradient, assuming the current corrector ϕ is a localized constant approximation
+of the optimal ϕ∗(θ). (ii) Corrector training (Inner-loop): We update ϕ via supervised fine-tuning
+based on the trajectories generated by the new policy πθ. This alternating scheme can be viewed as a
+coordinate descent approach to the BLO problem. By iteratively updating the policy and adapting the
+corrector to shifts in the action distribution, the framework converges to a joint equilibrium, enabling
+our OnlineCache to deliver substantial speedups while preserving generation quality.
+4
+Experiments
+We design three sets of main experiments to evaluate our proposed OnlineCache:
+▷FLUX.1-DEV (Targeting SOTA Caching Methods 4.1): For image generation, we primarily
+compare against the SOTA caching methods and further provide a thorough generalization analysis.
+▷DIT-XL/2 (Targeting Learning-Based Methods 4.2): OnlineCache introduces an extra training
+phase. We therefore compare with representative learning-based cache methods (FastCache, L2C),
+demonstrating that our approach achieves superior performance even within trainable frameworks.
+▷COGVIDEOX-2B (Targeting Cross-Modality Generalization 4.3): For video generation, our goal
+is to validate the modality-agnostic nature of OnlineCache. Comparing with the strong baseline
+TeaCache is sufficient to show effective generalization beyond image diffusion models.
+6
+
+
+--- Page 7 ---
+4.1
+FLUX.1-DEV Experiment
+Table 1: Quantitative comparison on FLUX. We evaluate FLUX-series models on diverse datasets to demonstrate the strong
+performance and generalization capability of OnlineCache. Lat and CR denote Latency and Cache Ratio, respectively. Rows
+with the same background color denote comparable settings, and bold indicates the best result within each group.
+Method
+Efficiency
+Visual Quality
+CR
+Speed ↑
+Lat ↓
+LPIPS ↓
+SSIM ↑
+PSNR ↑
+Block1: FLUX.1-dev, MSCOCO, 512×512, 800 samples
+FLUX(30 steps)
+1.00×
+5.099
+–
+–
+–
+0.00%
+ERTACache
+2.68×
+1.900
+0.252
+0.739
+19.852
+66.67%
+TeaCache
+2.60×
+1.960
+0.329
+0.669
+17.006
+-
+OC-BLO(Ours)
+2.96×
+1.725
+0.245
+0.739
+21.442
+72.22%
+TeaCache
+1.40×
+3.646
+0.142
+0.831
+22.453
+-
+OC-BLO(Ours)
+2.07×
+2.463
+0.125
+0.850
+24.768
+56.32%
+Block2: FLUX.1-dev, MSCOCO, 1024×1024, 500 samples
+FLUX(30 steps)
+1.00×
+15.470
+–
+–
+–
+0.00%
+FLUX(12 steps)
+2.46×
+6.291
+0.390
+0.679
+16.619
+60.00%
+OC-BLO(Ours)
+3.25×
+4.758
+0.374
+0.694
+20.265
+74.81%
+ERTACache
+2.62×
+5.912
+0.281
+0.755
+20.382
+66.67%
+OC-BLO(Ours)
+2.75×
+5.631
+0.275
+0.762
+21.343
+68.38%
+Block3: FLUX.1-schnell, Parti-Prompts, 512×512, 1632 samples
+FLUX(4 steps)
+1.00×
+0.884
+–
+–
+–
+0.00%
+OC-BLO(Ours)
+1.31×
+0.674
+0.070
+0.844
+23.261
+34.40%
+OC-BLO(Ours)
+1.66×
+0.534
+0.131
+0.671
+22.649
+57.72%
+FLUX(6 steps)
+1.00×
+1.212
+–
+–
+–
+0.00%
+OC-BLO(Ours)
+2.31×
+0.525
+0.197
+0.574
+20.232
+74.59%
+Method
+Efficiency
+Visual Quality
+CR
+Speed ↑
+Lat ↓
+LPIPS ↓
+SSIM ↑
+PSNR ↑
+Block4: FLUX.1-dev, Parti-Prompts, 512×512, 1632 samples
+FLUX(30 steps)
+1.00×
+5.090
+–
+–
+–
+0.00%
+FLUX(12 steps)
+2.31×
+2.199
+0.425
+0.587
+13.958
+60.00%
+TaylorSeer(N=6,O=1)
+3.18×
+1.599
+0.405
+0.578
+15.033
+76.68%
+TaylorSeer(N=6,O=2)
+2.97×
+1.714
+0.383
+0.593
+16.009
+76.68%
+TaylorSeer(N=5,O=1)
+2.81×
+1.812
+0.341
+0.636
+17.795
+73.33%
+TaylorSeer(N=5,O=2)
+2.67×
+1.904
+0.338
+0.638
+18.370
+73.33%
+OC-BLO(Ours)
+3.18×
+1.601
+0.316
+0.668
+19.928
+73.39%
+ERTACache
+2.68×
+1.896
+0.251
+0.746
+20.319
+66.67%
+TaylorSeer(N=4,O=1)
+2.45×
+2.077
+0.274
+0.689
+19.195
+70.00%
+TaylorSeer(N=4,O=2)
+2.38×
+2.142
+0.267
+0.693
+19.690
+70.00%
+OC-BLO(Ours)
+2.93×
+1.739
+0.248
+0.740
+21.286
+70.92%
+Block5: FLUX.1-dev, Parti-Prompts, 512×512, 1632 samples
+FLUX(30 steps)
+1.00×
+5.090
+–
+–
+–
+0.00%
+OC-BLO(Ours)
+3.84×
+1.327
+0.372
+0.618
+18.810
+79.67%
+OC-BLO(Ours)
+4.04×
+1.261
+0.388
+0.603
+18.505
+81.05%
+OC-BLO(Ours)
+4.26×
+1.195
+0.410
+0.586
+18.057
+82.37%
+OC-BLO(Ours)
+4.50×
+1.130
+0.418
+0.578
+17.673
+83.84%
+OC-BLO(Ours)
+4.78×
+1.065
+0.443
+0.554
+16.908
+85.28%
+OC-BLO(Ours)
+5.25×
+0.969
+0.478
+0.524
+16.104
+87.27%
+4.1.1
+Quantitative Results on FLUX.1-DEV
+We evaluate OnlineCache with Bilevel Optimization (i.e., OC-BLO) on MSCOCO (Lin et al., 2014),
+generating 800 images at a 512 × 512 resolution. Quantitative results are presented in Table 1 ,
+Block1. Using FLUX.1-DEV as the baseline without caching, we compare our method against widely
+adopted cache-based approaches, including TeaCache and ERTACache. Under identical settings,
+OnlineCache demonstrates consistent performance improvements in synthesis quality and efficiency.
+4.1.2
+Generalization Analysis
+To assess the robustness and applicability of our proposed OnlineCache, we conduct comprehensive
+generalization experiments across four dimensions:
+▷Cross-Resolution Generalization (Block2): We evaluate the policy and corrector trained at
+512 × 512 directly on 1024 × 1024 generation without retraining. OnlineCache achieves a 3.25×
+speedup, outperforming a 12-step reduction baseline (2.46×) across all metrics. Compared to
+ERTACache, our method also attains a higher speedup while maintaining superior fidelity. This
+scalability is largely attributed to the policy design (Section 3.2), which utilizes global statistics
+(channel-wise mean and standard deviation) rather than raw spatial tensors. Since sequence length
+L varies with image resolution, adopting such resolution-agnostic statistics avoids coupling the
+policy to specific sequence lengths, thereby improving generalization across different resolution.
+▷Cross-Model Generalization (Block3): While direct cross-model transfer is generally constrained
+by architectural disparities (e.g., varying latent spaces, channel dimensions, and prediction targets),
+training a model-specific policy remains highly practical. The policy introduces negligible overhead
+(76.6MB for 24GB FLUX.1-DEV) and trains efficiently (see Table 4). Furthermore, the learned
+policy exhibits zero-shot transferability when underlying architectures are closely aligned. For
+instance, applying the FLUX.1-DEV policy to its distilled variant, FLUX.1-SCHNELL (sharing
+the same 3072-dimensional hidden state space), achieves a 2.31× speedup with LPIPS < 0.2.
+▷Cross-Dataset Generalization (Block4): We directly evaluate the MSCOCO-trained OnlineCache
+on the Parti-Prompts (Yu et al., 2022) dataset. The policy maintains strong performance, indicating
+that it captures fundamental denoising trajectory dynamics rather than dataset-specific artifacts,
+rendering domain-specific retraining unnecessary. Comparisons with the state-of-the-art TaylorSeer
+further validate the sustained efficacy of our approach under data distribution shifts.
+▷Acceleration Ratio Generalization (Block5): During training with the acceleration constraint
+(Equation 5), cache ratio converges to ∼0.43, yielding a 1.65× speedup. At inference, the overall
+acceleration ratio can be flexibly controlled via arithmetic modifications to the policy’s final output
+logits. Even under extreme acceleration (scaling from 3.84× to 5.25×), performance degrades
+gracefully rather than collapsing. Specifically, LPIPS increases monotonically from 0.372 to 0.478,
+indicating robust and reliable instance-aware decisions under tight computational budgets.
+7
+
+
+--- Page 8 ---
+4.2
+DIT-XL/2 Experiment
+Table 2: Quantitative comparison on DiT-XL/2. We compare OnlineCache against other learning-based acceleration
+approaches under diverse sampling configurations. The "FastCache baselines” are reused from the official FastCache paper (Liu
+et al., 2025b) (Tables 10 and Table 12). IS and Prec denote Inception Score and Precision, respectively. Note that sFID, IS,
+Prec, and Recall are not reported for FastCache Baselines, as they were not evaluated in the official paper.
+Method
+FID ↓
+sFID ↓
+IS ↑
+Prec ↑
+Recall ↑
+Speed ↑
+FastCache Baselines
+Baseline
+4.45
+-
+-
+-
+-
+1.00×
+TeaCache
+5.09
+-
+-
+-
+-
+1.84×
+AdaCache
+4.64
+-
+-
+-
+-
+1.26×
+L2C
+6.88
+-
+-
+-
+-
+1.69×
+FBCache
+4.48
+-
+-
+-
+-
+1.63×
+FastCache
+4.46
+-
+-
+-
+-
+1.74×
+OnlineCache with BLO (DDIM, 30 steps, CFG 1.7)
+Baseline
+4.44
+8.53
+304.46
+0.85
+0.50
+1.00×
+OC-BLO
+4.41
+8.61
+284.57
+0.84
+0.50
+1.54×
+OC-BLO
+4.43
+8.74
+271.91
+0.84
+0.50
+1.70×
+Method
+FID ↓
+sFID ↓
+IS ↑
+Prec ↑
+Recall ↑
+Speed ↑
+More OnlineCache Configurations
+DPM++, 50 steps, CFG 1.5
+Baseline
+3.47
+9.20
+268.44
+0.82
+0.57
+1.00×
+OC-BLO
+3.28
+8.05
+257.19
+0.82
+0.56
+1.88×
+DPM++, 25 steps, CFG 1.5
+Baseline
+3.77
+10.63
+264.17
+0.82
+0.55
+1.00×
+OC-BLO
+3.69
+7.65
+229.30
+0.78
+0.57
+1.69×
+DPM++, 15 steps, CFG 1.5
+Baseline
+3.95
+11.09
+254.78
+0.82
+0.55
+1.00×
+OC-BLO
+4.07
+8.42
+189.45
+0.71
+0.58
+1.65×
+Table 2 presents the results on ImageNet-256 using DIT-XL/2 (Peebles and Xie, 2023). To com-
+prehensively evaluate the performance of our method, we conduct comparisons against a range
+of widely-used methods, including training-free approaches (TeaCache (Liu et al., 2025a), Ada-
+Cache (Kahatapitiya et al., 2024), FBCache (Cheng, 2025)), and learning-based caching methods
+such as L2C (Ma et al., 2024b), FastCache (Liu et al., 2025b). To ensure fairness, we align our
+settings with FastCache. Following standard protocols, we generate 50k samples across 1k classes for
+evaluation and ensure an identical baseline FID. All metrics are computed by the official OpenAI
+evaluator 3. We further evaluate the robustness of our method across different samplers and configura-
+tions, including DDIM (Song et al., 2021) and DPM-Solver++ (Lu et al., 2025). Under DPM++, 50
+steps, CFG 1.5 setting, OnlineCache achieves a 1.88× speedup while unexpectedly improving FID
+from 3.47 to 3.28. We attribute this improvement to the fact that ground-truth sampling trajectories
+are imperfect (see Figure 11). By selectively caching redundant steps and applying error correction,
+OnlineCache suppresses sampling noise and improves robustness, leading to higher-quality synthesis.
+Notably, these gains are achieved with <5 hours of additional training overhead (see Appendix C.1).
+4.3
+COGVIDEOX-2B Experiment
+Table 3: Quantitative comparison on CogVideoX-2b. We compare OnlineCache against TeaCache.
+Method
+Speedup ↑
+VBench ↑
+LPIPS ↓
+SSIM ↑
+PSNR ↑
+Baselines (12 frames, 480P)
+CogVideoX
+1.00×
+78.37%
+–
+–
+–
+OC-BLO
+1.30×
+78.37%
+0.019
+0.957
+39.849
+TeaCache (λ = 0.1)
+1.31×
+78.09%
+0.062
+0.932
+30.309
+OC-BLO
+1.61×
+78.23%
+0.057
+0.945
+35.705
+TeaCache (λ = 0.2)
+1.64×
+77.40%
+0.159
+0.854
+24.076
+OC-BLO
+1.79×
+78.09%
+0.106
+0.921
+29.983
+We further extend OnlineCache to the video generation modality. We evaluate it on the CogVideoX-
+2b (Yang et al., 2025). We follow the official VBench evaluation pipeline (Huang et al., 2024) and
+the released TeaCache implementation. For each prompt, five samples are generated using seeds 0–4.
+The evaluation metrics strictly adhere to the configuration used in TeaCache. To reduce computational
+cost, we set the number of frames to 12 and inference steps to 36, reproducing the reported TeaCache
+results and executing our OnlineCache under this setup. For visualization examples, see Figure 10.
+4.4
+Ablation Studies and Empirical Analysis
+We conduct thorough ablation studies and empirical analysis to validate our system design and
+understand its underlying mechanisms. Specifically, we investigate:
+▷Policy Input States (Sec. 4.4.1): Ablation on the contribution of individual features in state vector.
+▷Corrector Training Targets (Sec. C.2.1): Ablation on the training targets of the error corrector.
+▷Corrector Effectiveness (Sec. C.2.2): Module-level ablation confirms the corrector’s ability.
+▷Caching Dynamics (Sec. C.2.3): An empirical analysis of the policy’s adaptive caching behavior.
+3https://github.com/openai/guided-diffusion
+8
+
+
+--- Page 9 ---
+4.4.1
+Ablation on Policy Input States Design
+We adopt channel-wise statistical summaries (1×D) as a compact representation of latent states for
+policy network input and compare it with alternative designs:
+▷Full Latents (L×D): Directly using raw tokens is computationally prohibitive, as sequence length
+L can exceed 1,536 in FLUX.1-DEV. In contrast, statistics are both efficient and informative.
+Moreover, this formulation is resolution-agnostic and improves generalization (see Section 4.1.2).
+▷Global Flattening (1×1): Collapsing all information into a single scalar loses structural and
+semantic variations, making it insufficient for modeling denoising dynamics.
+▷Token-wise Statistics (L×1): While preserving per-token information along the sequence dimen-
+sion, this design discards channel-wise semantic structure. In contrast, retaining the D dimension
+better captures feature-level semantics. This formulation is also widely adopted in practice4.
+Figure 4: Ablation study on policy input state components. The full configuration (All) achieves the highest training reward
+and the best LPIPS score, while removing any individual component leads to consistent performance degradation.
+Having adopted the 1×D channel-wise statistical summaries, a natural question arises: which
+statistics should comprise it? To assess the contribution of each component in the state vector st,
+we conduct an ablation study by selectively removing input features. The results in Figure 4 report
+Average Reward (CMA) and LPIPS across four configurations. We consider features from three
+sources: the cached residual rcached, the current latent xt, and the time embedding embtime(t). As
+illustrated, the full configuration (Our Settings) consistently outperforms all ablated variants.
+▷Compared to No Residual: Removing the cached statistics rcached results in the most severe
+performance degradation. Without this cached information, the policy network is unable to track
+error accumulation and instead relies on uninformed estimates, leading to uncontrolled collapse.
+▷Compared to No Time Embed or No Hidden State: Removing either the time embedding embtime(t)
+or the current latent xt also causes consistent performance drops. The absence of temporal
+information prevents stage-aware adaptation in the non-stationary diffusion denoise process, while
+removing the latent xt deprives the policy of the current denoising state, thereby weakening its
+ability to reason about subsequent denoising dynamics.
+In summary, the synergy of time-awareness, current context, and cache information is essential for
+the policy to achieve an effective acceleration-quality trade-off.
+5
+Conclusion
+We propose OnlineCache, a dynamic cache-based acceleration framework that reformulates diffusion
+inference as an instance-aware sequential decision-making problem. By introducing a lightweight
+policy network and, in its advanced variant, jointly training an error corrector under a bilevel op-
+timization paradigm, OnlineCache adaptively navigates the delicate trade-off between generation
+quality and computational cost, effectively handling both sample-level and timestep-level hetero-
+geneities. Extensive experiments demonstrate the robustness, generality, and practical effectiveness
+of the proposed framework. By offering a globally optimized perspective, OnlineCache establishes a
+principled cache-based acceleration paradigm for high-fidelity, real-time generative modeling.
+4https://github.com/AntixK/PyTorch-VAE/blob/master/models/vanilla_vae.py
+9
+
+
+--- Page 10 ---
+References
+Jascha Sohl-Dickstein, Eric A. Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised
+learning using nonequilibrium thermodynamics. In Francis R. Bach and David M. Blei, editors,
+Proceedings of the 32nd International Conference on Machine Learning, ICML 2015, Lille, France,
+6-11 July 2015, volume 37 of JMLR Workshop and Conference Proceedings, pages 2256–2265.
+JMLR.org, 2015.
+Yang Song and Stefano Ermon. Generative modeling by estimating gradients of the data distribution.
+In Hanna M. Wallach, Hugo Larochelle, Alina Beygelzimer, Florence d’Alché-Buc, Emily B. Fox,
+and Roman Garnett, editors, Advances in Neural Information Processing Systems 32: Annual
+Conference on Neural Information Processing Systems 2019, NeurIPS 2019, December 8-14, 2019,
+Vancouver, BC, Canada, pages 11895–11907, 2019.
+Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. In Hugo
+Larochelle, Marc’Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, and Hsuan-Tien Lin,
+editors, Advances in Neural Information Processing Systems 33: Annual Conference on Neural
+Information Processing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual, 2020.
+Prafulla Dhariwal and Alexander Quinn Nichol. Diffusion models beat gans on image synthesis. In
+Marc’Aurelio Ranzato, Alina Beygelzimer, Yann N. Dauphin, Percy Liang, and Jennifer Wortman
+Vaughan, editors, Advances in Neural Information Processing Systems 34: Annual Conference on
+Neural Information Processing Systems 2021, NeurIPS 2021, December 6-14, 2021, virtual, pages
+8780–8794, 2021.
+Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Björn Ommer. High-
+resolution image synthesis with latent diffusion models. In IEEE/CVF Conference on Computer
+Vision and Pattern Recognition, CVPR 2022, New Orleans, LA, USA, June 18-24, 2022, pages
+10674–10685. IEEE, 2022.
+Andreas Blattmann, Tim Dockhorn, Sumith Kulal, Daniel Mendelevitch, Maciej Kilian, Dominik
+Lorenz, Yam Levi, Zion English, Vikram Voleti, Adam Letts, Varun Jampani, and Robin Rom-
+bach. Stable video diffusion: Scaling latent video diffusion models to large datasets. CoRR,
+abs/2311.15127, 2023.
+Zhifeng Kong, Wei Ping, Jiaji Huang, Kexin Zhao, and Bryan Catanzaro. Diffwave: A versatile
+diffusion model for audio synthesis. In 9th International Conference on Learning Representations,
+ICLR 2021, Virtual Event, Austria, May 3-7, 2021. OpenReview.net, 2021.
+Ben Poole, Ajay Jain, Jonathan T. Barron, and Ben Mildenhall. Dreamfusion: Text-to-3d using 2d
+diffusion. In The Eleventh International Conference on Learning Representations, ICLR 2023,
+Kigali, Rwanda, May 1-5, 2023. OpenReview.net, 2023.
+William Peebles and Saining Xie. Scalable diffusion models with transformers. In IEEE/CVF
+International Conference on Computer Vision, ICCV 2023, Paris, France, October 1-6, 2023,
+pages 4172–4182. IEEE, 2023.
+Gongfan Fang, Xinyin Ma, and Xinchao Wang. Structural pruning for diffusion models. In Alice
+Oh, Tristan Naumann, Amir Globerson, Kate Saenko, Moritz Hardt, and Sergey Levine, editors,
+Advances in Neural Information Processing Systems 36: Annual Conference on Neural Information
+Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16, 2023, 2023.
+Yuzhang Shang, Zhihang Yuan, Bin Xie, Bingzhe Wu, and Yan Yan. Post-training quantization on
+diffusion models. In IEEE/CVF Conference on Computer Vision and Pattern Recognition, CVPR
+2023, Vancouver, BC, Canada, June 17-24, 2023, pages 1972–1981. IEEE, 2023.
+Eric Luhman and Troy Luhman. Knowledge distillation in iterative generative models for improved
+sampling speed. CoRR, abs/2101.02388, 2021.
+Xinyin Ma, Gongfan Fang, and Xinchao Wang. Deepcache: Accelerating diffusion models for free.
+In IEEE/CVF Conference on Computer Vision and Pattern Recognition, CVPR 2024, Seattle, WA,
+USA, June 16-22, 2024, pages 15762–15772. IEEE, 2024a.
+10
+
+
+--- Page 11 ---
+Xinyin Ma, Gongfan Fang, Michael Bi Mi, and Xinchao Wang. Learning-to-cache: Accelerating
+diffusion transformer via layer caching. In Amir Globersons, Lester Mackey, Danielle Belgrave,
+Angela Fan, Ulrich Paquet, Jakub M. Tomczak, and Cheng Zhang, editors, Advances in Neural
+Information Processing Systems 38: Annual Conference on Neural Information Processing Systems
+2024, NeurIPS 2024, Vancouver, BC, Canada, December 10 - 15, 2024, 2024b.
+Pengtao Chen, Mingzhu Shen, Peng Ye, Jianjian Cao, Chongjun Tu, Christos-Savvas Bouganis, Yiren
+Zhao, and Tao Chen. ∆-dit: A training-free acceleration method tailored for diffusion transformers.
+CoRR, abs/2406.01125, 2024.
+Xurui Peng, Hong Liu, Chenqian Yan, Rui Ma, Fangmin Chen, Xing Wang, Zhihua Wu, Songwei Liu,
+and Mingbao Lin. Ertacache: Error rectification and timesteps adjustment for efficient diffusion.
+CoRR, abs/2508.21091, 2025.
+Feng Liu, Shiwei Zhang, Xiaofeng Wang, Yujie Wei, Haonan Qiu, Yuzhong Zhao, Yingya Zhang,
+Qixiang Ye, and Fang Wan. Timestep embedding tells: It’s time to cache for video diffusion model.
+In IEEE/CVF Conference on Computer Vision and Pattern Recognition, CVPR 2025, Nashville,
+TN, USA, June 11-15, 2025, pages 7353–7363. Computer Vision Foundation / IEEE, 2025a.
+Richard S. Sutton, David A. McAllester, Satinder Singh, and Yishay Mansour. Policy gradient
+methods for reinforcement learning with function approximation. In Sara A. Solla, Todd K. Leen,
+and Klaus-Robert Müller, editors, Advances in Neural Information Processing Systems 12, [NIPS
+Conference, Denver, Colorado, USA, November 29 - December 4, 1999], pages 1057–1063. The
+MIT Press, 1999.
+Pratheba Selvaraju, Tianyu Ding, Tianyi Chen, Ilya Zharkov, and Luming Liang. FORA: fast-forward
+caching in diffusion transformer acceleration. CoRR, abs/2407.01425, 2024.
+Felix Wimbauer, Bichen Wu, Edgar Schönfeld, Xiaoliang Dai, Ji Hou, Zijian He, Artsiom Sanakoyeu,
+Peizhao Zhang, Sam S. Tsai, Jonas Kohler, Christian Rupprecht, Daniel Cremers, Peter Vajda, and
+Jialiang Wang. Cache me if you can: Accelerating diffusion models through block caching. In
+IEEE/CVF Conference on Computer Vision and Pattern Recognition, CVPR 2024, Seattle, WA,
+USA, June 16-22, 2024, pages 6211–6220. IEEE, 2024.
+Jiazi Bu, Pengyang Ling, Yujie Zhou, Yibin Wang, Yuhang Zang, Tong Wu, Dahua Lin, and Jiaqi
+Wang. Dicache: Let diffusion model determine its own cache. CoRR, abs/2508.17356, 2025.
+Dong Liu, Jiayi Zhang, Yifan Li, Yanxuan Yu, Ben Lengerich, and Ying Nian Wu. Fastcache: Fast
+caching for diffusion transformer through learnable linear approximation. CoRR, abs/2505.20353,
+2025b.
+Black Forest Labs, Stephen Batifol, Andreas Blattmann, Frederic Boesel, Saksham Consul, Cyril
+Diagne, Tim Dockhorn, Jack English, Zion English, Patrick Esser, Sumith Kulal, Kyle Lacey, Yam
+Levi, Cheng Li, Dominik Lorenz, Jonas Müller, Dustin Podell, Robin Rombach, Harry Saini, Axel
+Sauer, and Luke Smith. FLUX.1 kontext: Flow matching for in-context image generation and
+editing in latent space. CoRR, abs/2506.15742, 2025.
+Richard Zhang, Phillip Isola, Alexei A. Efros, Eli Shechtman, and Oliver Wang. The unreasonable
+effectiveness of deep features as a perceptual metric. In 2018 IEEE Conference on Computer
+Vision and Pattern Recognition, CVPR 2018, Salt Lake City, UT, USA, June 18-22, 2018, pages
+586–595. Computer Vision Foundation / IEEE Computer Society, 2018.
+Zhou Wang, Alan C. Bovik, Hamid R. Sheikh, and Eero P. Simoncelli. Image quality assessment:
+from error visibility to structural similarity. IEEE Trans. Image Process., 13(4):600–612, 2004.
+Tsung-Yi Lin, Michael Maire, Serge J. Belongie, James Hays, Pietro Perona, Deva Ramanan, Piotr
+Dollár, and C. Lawrence Zitnick. Microsoft COCO: common objects in context. In David J. Fleet,
+Tomás Pajdla, Bernt Schiele, and Tinne Tuytelaars, editors, Computer Vision - ECCV 2014 - 13th
+European Conference, Zurich, Switzerland, September 6-12, 2014, Proceedings, Part V, volume
+8693 of Lecture Notes in Computer Science, pages 740–755. Springer, 2014.
+11
+
+
+--- Page 12 ---
+Jiahui Yu, Yuanzhong Xu, Jing Yu Koh, Thang Luong, Gunjan Baid, Zirui Wang, Vijay Vasudevan,
+Alexander Ku, Yinfei Yang, Burcu Karagol Ayan, Ben Hutchinson, Wei Han, Zarana Parekh, Xin
+Li, Han Zhang, Jason Baldridge, and Yonghui Wu. Scaling autoregressive models for content-rich
+text-to-image generation. Trans. Mach. Learn. Res., 2022, 2022.
+Kumara Kahatapitiya, Haozhe Liu, Sen He, Ding Liu, Menglin Jia, Chenyang Zhang, Michael S.
+Ryoo, and Tian Xie. Adaptive caching for faster video generation with diffusion transformers.
+CoRR, abs/2411.02397, 2024.
+Zeyi Cheng. Paraattention: Context parallel attention that accelerates dit model inference with
+dynamic caching. https://github.com/chengzeyi/ParaAttention, 2025.
+Jiaming Song, Chenlin Meng, and Stefano Ermon. Denoising diffusion implicit models. In 9th
+International Conference on Learning Representations, ICLR 2021, Virtual Event, Austria, May
+3-7, 2021. OpenReview.net, 2021.
+Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. Dpm-solver++: Fast
+solver for guided sampling of diffusion probabilistic models. Mach. Intell. Res., 22(4):730–751,
+2025.
+Zhuoyi Yang, Jiayan Teng, Wendi Zheng, Ming Ding, Shiyu Huang, Jiazheng Xu, Yuanming Yang,
+Wenyi Hong, Xiaohan Zhang, Guanyu Feng, Da Yin, Yuxuan Zhang, Weihan Wang, Yean Cheng,
+Bin Xu, Xiaotao Gu, Yuxiao Dong, and Jie Tang. Cogvideox: Text-to-video diffusion models with
+an expert transformer. In The Thirteenth International Conference on Learning Representations,
+ICLR 2025, Singapore, April 24-28, 2025. OpenReview.net, 2025.
+Ziqi Huang, Yinan He, Jiashuo Yu, Fan Zhang, Chenyang Si, Yuming Jiang, Yuanhan Zhang, Tianxing
+Wu, Qingyang Jin, Nattapol Chanpaisit, Yaohui Wang, Xinyuan Chen, Limin Wang, Dahua Lin,
+Yu Qiao, and Ziwei Liu. Vbench: Comprehensive benchmark suite for video generative models.
+In IEEE/CVF Conference on Computer Vision and Pattern Recognition, CVPR 2024, Seattle, WA,
+USA, June 16-22, 2024, pages 21807–21818. IEEE, 2024.
+Thibault Castells, Hyoung-Kyu Song, Bo-Kyeong Kim, and Shinkook Choi. Ld-pruner: Efficient
+pruning of latent diffusion models using task-agnostic insights. In IEEE/CVF Conference on
+Computer Vision and Pattern Recognition, CVPR 2024 - Workshops, Seattle, WA, USA, June 17-18,
+2024, pages 821–830. IEEE, 2024.
+Dingkun Zhang, Sijia Li, Chen Chen, Qingsong Xie, and Haonan Lu. Laptop-diff: Layer pruning
+and normalized distillation for compressing diffusion models. CoRR, abs/2404.11098, 2024.
+Junhyuk So, Jungwon Lee, Daehyun Ahn, Hyungjun Kim, and Eunhyeok Park. Temporal dynamic
+quantization for diffusion models. In Alice Oh, Tristan Naumann, Amir Globerson, Kate Saenko,
+Moritz Hardt, and Sergey Levine, editors, Advances in Neural Information Processing Systems 36:
+Annual Conference on Neural Information Processing Systems 2023, NeurIPS 2023, New Orleans,
+LA, USA, December 10 - 16, 2023, 2023.
+Yefei He, Luping Liu, Jing Liu, Weijia Wu, Hong Zhou, and Bohan Zhuang. PTQD: accurate post-
+training quantization for diffusion models. In Alice Oh, Tristan Naumann, Amir Globerson, Kate
+Saenko, Moritz Hardt, and Sergey Levine, editors, Advances in Neural Information Processing
+Systems 36: Annual Conference on Neural Information Processing Systems 2023, NeurIPS 2023,
+New Orleans, LA, USA, December 10 - 16, 2023, 2023.
+Yanjing Li, Sheng Xu, Xianbin Cao, Xiao Sun, and Baochang Zhang. Q-DM: an efficient low-bit
+quantized diffusion model. In Alice Oh, Tristan Naumann, Amir Globerson, Kate Saenko, Moritz
+Hardt, and Sergey Levine, editors, Advances in Neural Information Processing Systems 36: Annual
+Conference on Neural Information Processing Systems 2023, NeurIPS 2023, New Orleans, LA,
+USA, December 10 - 16, 2023, 2023.
+Tim Salimans and Jonathan Ho. Progressive distillation for fast sampling of diffusion models. In
+The Tenth International Conference on Learning Representations, ICLR 2022, Virtual Event, April
+25-29, 2022. OpenReview.net, 2022.
+12
+
+
+--- Page 13 ---
+Xingyi Yang, Daquan Zhou, Jiashi Feng, and Xinchao Wang. Diffusion probabilistic model made slim.
+In IEEE/CVF Conference on Computer Vision and Pattern Recognition, CVPR 2023, Vancouver,
+BC, Canada, June 17-24, 2023, pages 22552–22562. IEEE, 2023.
+Axel Sauer, Dominik Lorenz, Andreas Blattmann, and Robin Rombach. Adversarial diffusion
+distillation. CoRR, abs/2311.17042, 2023.
+Alexia Jolicoeur-Martineau, Ke Li, Rémi Piché-Taillefer, Tal Kachman, and Ioannis Mitliagkas.
+Gotta go fast when generating data with score-based models. CoRR, abs/2105.14080, 2021.
+Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. Dpm-solver: A fast
+ODE solver for diffusion probabilistic model sampling in around 10 steps. In Sanmi Koyejo,
+S. Mohamed, A. Agarwal, Danielle Belgrave, K. Cho, and A. Oh, editors, Advances in Neural
+Information Processing Systems 35: Annual Conference on Neural Information Processing Systems
+2022, NeurIPS 2022, New Orleans, LA, USA, November 28 - December 9, 2022, 2022.
+Fan Bao, Chongxuan Li, Jun Zhu, and Bo Zhang. Analytic-dpm: an analytic estimate of the optimal
+reverse variance in diffusion probabilistic models. In The Tenth International Conference on
+Learning Representations, ICLR 2022, Virtual Event, April 25-29, 2022. OpenReview.net, 2022.
+Luping Liu, Yi Ren, Zhijie Lin, and Zhou Zhao. Pseudo numerical methods for diffusion models
+on manifolds. In The Tenth International Conference on Learning Representations, ICLR 2022,
+Virtual Event, April 25-29, 2022. OpenReview.net, 2022.
+Tero Karras, Miika Aittala, Timo Aila, and Samuli Laine. Elucidating the design space of diffusion-
+based generative models. In Sanmi Koyejo, S. Mohamed, A. Agarwal, Danielle Belgrave, K. Cho,
+and A. Oh, editors, Advances in Neural Information Processing Systems 35: Annual Conference on
+Neural Information Processing Systems 2022, NeurIPS 2022, New Orleans, LA, USA, November
+28 - December 9, 2022, 2022.
+Qinsheng Zhang, Molei Tao, and Yongxin Chen. gddim: Generalized denoising diffusion implicit
+models. In The Eleventh International Conference on Learning Representations, ICLR 2023,
+Kigali, Rwanda, May 1-5, 2023. OpenReview.net, 2023a.
+Qinsheng Zhang and Yongxin Chen. Fast sampling of diffusion models with exponential integrator. In
+The Eleventh International Conference on Learning Representations, ICLR 2023, Kigali, Rwanda,
+May 1-5, 2023. OpenReview.net, 2023.
+Senmao Li, Taihang Hu, Joost van de Weijer, Fahad Shahbaz Khan, Tao Liu, Linxuan Li, Shiqi Yang,
+Yaxing Wang, Ming-Ming Cheng, and Jian Yang. Faster diffusion: Rethinking the role of the
+encoder for diffusion model inference. In Amir Globersons, Lester Mackey, Danielle Belgrave,
+Angela Fan, Ulrich Paquet, Jakub M. Tomczak, and Cheng Zhang, editors, Advances in Neural
+Information Processing Systems 38: Annual Conference on Neural Information Processing Systems
+2024, NeurIPS 2024, Vancouver, BC, Canada, December 10 - 15, 2024, 2024.
+Xuanlei Zhao, Xiaolong Jin, Kai Wang, and Yang You. Real-time video generation with pyramid
+attention broadcast. In The Thirteenth International Conference on Learning Representations,
+ICLR 2025, Singapore, April 24-28, 2025. OpenReview.net, 2025.
+Zhihang Yuan, Hanling Zhang, Lu Pu, Xuefei Ning, Linfeng Zhang, Tianchen Zhao, Shengen Yan,
+Guohao Dai, and Yu Wang. Ditfastattn: Attention compression for diffusion transformer models.
+In Amir Globersons, Lester Mackey, Danielle Belgrave, Angela Fan, Ulrich Paquet, Jakub M.
+Tomczak, and Cheng Zhang, editors, Advances in Neural Information Processing Systems 38:
+Annual Conference on Neural Information Processing Systems 2024, NeurIPS 2024, Vancouver,
+BC, Canada, December 10 - 15, 2024, 2024.
+Xin Zhou, Dingkang Liang, Kaijin Chen, Tianrui Feng, Xiwu Chen, Hongkai Lin, Yikang Ding,
+Feiyang Tan, Hengshuang Zhao, and Xiang Bai. Less is enough: Training-free video diffusion
+acceleration via runtime-adaptive caching. CoRR, abs/2507.02860, 2025.
+Jiacheng Liu, Chang Zou, Yuanhuiyi Lyu, Junjie Chen, and Linfeng Zhang. From reusing to
+forecasting: Accelerating diffusion models with taylorseers. CoRR, abs/2503.06923, 2025c.
+13
+
+
+--- Page 14 ---
+Jiacheng Liu, Chang Zou, Yuanhuiyi Lyu, Fei Ren, Shaobo Wang, Kaixin Li, and Linfeng
+Zhang. Speca: Accelerating diffusion transformers with speculative feature caching. CoRR,
+abs/2509.11628, 2025d.
+Chang Zou, Xuyang Liu, Ting Liu, Siteng Huang, and Linfeng Zhang. Accelerating diffusion
+transformers with token-wise feature caching. In The Thirteenth International Conference on
+Learning Representations, ICLR 2025, Singapore, April 24-28, 2025. OpenReview.net, 2025.
+Zhixin Zheng, Xinyu Wang, Chang Zou, Shaobo Wang, and Linfeng Zhang. Compute only 16 tokens
+in one timestep: Accelerating diffusion transformers with cluster-driven feature caching. CoRR,
+abs/2509.10312, 2025.
+Jerome Bracken and James T. McGill. Mathematical programs with optimization problems in the
+constraints. Oper. Res., 21(1):37–44, 1973.
+Yihua Zhang, Prashant Khanduri, Ioannis C. Tsaknakis, Yuguang Yao, Mingyi Hong, and Sijia Liu.
+An introduction to bi-level optimization: Foundations and applications in signal processing and
+machine learning. CoRR, abs/2308.00788, 2023b.
+Luca Franceschi, Paolo Frasconi, Saverio Salzo, Riccardo Grazzi, and Massimiliano Pontil. Bilevel
+programming for hyperparameter optimization and meta-learning. In Jennifer G. Dy and Andreas
+Krause, editors, Proceedings of the 35th International Conference on Machine Learning, ICML
+2018, Stockholmsmässan, Stockholm, Sweden, July 10-15, 2018, volume 80 of Proceedings of
+Machine Learning Research, pages 1563–1572. PMLR, 2018.
+Amirreza Shaban, Ching-An Cheng, Nathan Hatch, and Byron Boots. Truncated back-propagation
+for bilevel optimization. In Kamalika Chaudhuri and Masashi Sugiyama, editors, The 22nd
+International Conference on Artificial Intelligence and Statistics, AISTATS 2019, 16-18 April
+2019, Naha, Okinawa, Japan, volume 89 of Proceedings of Machine Learning Research, pages
+1723–1732. PMLR, 2019.
+Yihua Zhang, Yuguang Yao, Parikshit Ram, Pu Zhao, Tianlong Chen, Mingyi Hong, Yanzhi Wang,
+and Sijia Liu. Advancing model pruning via bi-level optimization. In Sanmi Koyejo, S. Mohamed,
+A. Agarwal, Danielle Belgrave, K. Cho, and A. Oh, editors, Advances in Neural Information
+Processing Systems 35: Annual Conference on Neural Information Processing Systems 2022,
+NeurIPS 2022, New Orleans, LA, USA, November 28 - December 9, 2022, 2022.
+Chelsea Finn, Pieter Abbeel, and Sergey Levine. Model-agnostic meta-learning for fast adaptation
+of deep networks. In Doina Precup and Yee Whye Teh, editors, Proceedings of the 34th Interna-
+tional Conference on Machine Learning, ICML 2017, Sydney, NSW, Australia, 6-11 August 2017,
+volume 70 of Proceedings of Machine Learning Research, pages 1126–1135. PMLR, 2017.
+Aravind Rajeswaran, Chelsea Finn, Sham M. Kakade, and Sergey Levine. Meta-learning with implicit
+gradients. In Hanna M. Wallach, Hugo Larochelle, Alina Beygelzimer, Florence d’Alché-Buc,
+Emily B. Fox, and Roman Garnett, editors, Advances in Neural Information Processing Systems
+32: Annual Conference on Neural Information Processing Systems 2019, NeurIPS 2019, December
+8-14, 2019, Vancouver, BC, Canada, pages 113–124, 2019.
+14
+
+
+--- Page 15 ---
+Appendix: OnlineCache: Learning Dynamic Caching Policies
+with Error Correction for Efficient Diffusion Inference
+Appendix Overview. This appendix is organized as follows:
+▷A presents the detailed policy gradient derivation and parameter optimization process.
+▷B provides a more comprehensive discussion of related work.
+▷C provides supplementary experimental details, including:
+▷C.1: Analysis of training time and memory consumption;
+▷C.2: Additional ablation studies beyond Section 4.4 in the main paper;
+▷C.3: Extended experimental results and detailed configuration;
+▷C.4: Training dynamics analysis on FLUX.1-DEV, DIT-XL/2 and COGVIDEOX-2B.
+▷D discusses the limitations of the paper.
+▷E provides a discussion of broader impacts.
+▷F includes a three-page full visual demonstration showcasing representative generation results.
+A
+Policy Gradient derivation and Parameter Optimization Process
+In this section, we provide the mathematical derivation for the optimization of the policy network
+parameters θ. Since the caching decision at is discrete and sampled from a Bernoulli distribution,
+the operation is non-differentiable with respect to θ. Therefore, standard backpropagation cannot
+be applied directly through the action at to the reward R(τ). Instead, we utilize the REINFORCE
+algorithm (Monte Carlo Policy Gradient) to estimate the gradient of the expected reward.
+A.1
+Policy Gradient of the Objective Function
+Our primary goal is to maximize the expected cumulative reward J(θ) over trajectories τ:
+J(θ) = Eτ∼πθ[R(τ)] =
+X
+τ
+P(τ | θ)R(τ),
+(13)
+where P(τ | θ) is the probability of a trajectory τ = {(s0, a0), . . . , (sT , aT )} occurring under policy
+πθ. The state are determined by the diffusion dynamics and only actions depend on θ, the probability
+of a trajectory is given by:
+P(τ | θ) ∝
+T
+Y
+t=1
+πθ(at | st).
+(14)
+To maximize J(θ), we perform gradient ascent. ∇θJ(θ) is derived using the log-derivative trick:
+∇θJ(θ) = ∇θ
+X
+τ
+P(τ | θ)R(τ) =
+X
+τ
+R(τ)∇θP(τ | θ)
+=
+X
+τ
+R(τ)P(τ | θ)∇θ log P(τ | θ) =
+X
+τ
+R(τ)P(τ | θ)∇θ log
+T
+Y
+t=1
+πθ(at | st)
+=
+X
+τ
+P(τ | θ)R(τ)
+T
+X
+t=1
+∇θ log πθ(at | st) = Eτ∼πθ
+"
+R(τ)
+T
+X
+t=1
+∇θ log πθ(at | st)
+#
+.
+(15)
+In practice, we approximate this expectation using a batch of B sampled trajectories.
+A.2
+Empirical Analysis: Variance Reduction via Batch Normalization
+To demonstrate the necessity of reward normalization, we visualize the training dynamics of the policy
+network (based on the COGVIDEOX-2B (Yang et al., 2025) model) during the optimizing iterations
+15
+
+
+--- Page 16 ---
+from 8k to 9k. At this stage, the policy network approaches convergence, exhibiting relatively strong
+stability. However, the raw reward signals still remain highly stochastic. We present the comparison
+between raw rewards and normalized advantages in Figure 5.
+Figure 5: Comparison of Raw Rewards and Normalized Advantages. (a) The raw reward R(τ) (red) exhibits high variance,
+even when the batch baseline µB (black dashed) is relatively stable. (b) The normalized advantage A(τ) (blue) effectively
+centers the signal (mean 0, std 1), ensuring that gradient updates are driven by relative performance within the batch.
+Instability of Raw Rewards. As shown in Figure 5 (a), the raw reward signal R(τ) (red line) is
+characterized by high-frequency oscillations and significant variance (std: 4.17). Although the batch
+baseline µB (black dashed line, computed with batch size B = 25) captures the local trend, the
+individual trajectories fluctuate wildly around this baseline. Since the model is near convergence,
+µB shows no obvious upward trend. Directly optimizing against such raw signals can introduce
+substantial noise into the policy gradient, potentially destabilizing the learning process.
+Stability via Normalized Advantage. To address this, we standardize rewards within each batch
+to compute the advantage A(τi), normalization is defined in Equation 7. Figure 5 (b) illustrates the
+resulting advantage reward signal. This transformation provides two key benefits:
+(1) Relative Performance Quantification: By subtracting the batch mean µR and dividing by the
+standard deviation σR, the advantage A(τi) captures the relative merit of a trajectory compared
+to its peers within the same batch. A positive value (i.e., A(τi) > 0) indicates above-average
+performance, providing a stable, scale-invariant optimization signal.
+(2) Gradient Stabilization: The normalization constrains the advantage values (with unit variance,
+typically within [−2, 2]), as visualized by the shaded region in Figure 5 (b). This mitigates the
+influence of reward outliers on gradient magnitude, leading to more stable convergence.
+A.3
+Entropy Regularization
+To prevent the policy from collapsing into a deterministic solution too early (e.g., always caching
+or never caching), we augment the objective with an entropy regularization term. As defined in
+Equation 8. Maximizing this entropy encourages the predicted probabilities pt to stay closer to 0.5
+when the reward signal is ambiguous, thereby promoting exploration of different caching strategies.
+Importantly, unlike the discrete action sampling, H is a differentiable function of the network output
+pt, allowing gradients to flow directly through the policy network without Monte Carlo estimation.
+A.4
+Surrogate Loss and Parameter Update
+We design a tailored surrogate loss to update the policy gradient within standard deep learning
+frameworks. By combining the policy objective and entropy regularization, we define the total
+16
+
+
+--- Page 17 ---
+surrogate loss L(θ) for a batch of B trajectories as:
+L(θ) = 1
+B
+B
+X
+i=1
+
+
+−A(τi)
+T
+X
+t=1
+log πθ(ai,t | si,t)
+|
+{z
+}
+Lpolicy
+−λe
+1
+T
+T
+X
+t=1
+H(πθ(si,t))
+|
+{z
+}
+Lentropy
+
+
+.
+(16)
+Note that the negative signs are introduced to convert the maximization problem (maximizing Reward
+and Entropy) into a minimization problem suitable for standard gradient descent optimizers.
+A.4.1
+Gradient Flow Mechanism
+The optimization proceeds by computing the gradient ∇θL(θ). The two components of the loss
+contribute to the parameter update in distinct ways:
+(1) Policy Gradient Flow (Lpolicy): The term A(τi) is treated as a detached scalar (fixed constant)
+during backpropagation. The gradient flows only through the log-probability term:
+∇θLpolicy = −1
+B
+B
+X
+i=1
+T
+X
+t=1
+A(τi) · ∇θ log πθ(ai,t | si,t).
+(17)
+This term implements the intuition of REINFORCE:
+▷We do not differentiate through the discrete action sampling at (from Bernoulli distribution,
+which is non-differentiable). Instead, we differentiate the probability of the sampling action.
+▷If the advantage A(τi) is positive, the negative sign ensures the gradient descent step increases
+the log-probability of that action; if negative, conversely, when negative, it decreases the
+log-probability, thereby discouraging that action.
+(2) Entropy Gradient Flow (Lentropy): The entropy H is a deterministic and differentiable function
+of the network output distribution, allowing gradients to propagate directly via the chain rule:
+∇θLentropy = −λe
+B · T
+B
+X
+i=1
+T
+X
+t=1
+∂H
+∂πθ
+· ∇θπθ(si,t).
+(18)
+This standard backpropagation encourages the policy to output probability distributions with
+higher variance, preventing mode collapse (model chooses to cache all or compute all).
+A.4.2
+Parameter Update
+Finally, the parameters are updated iteratively using the Adam optimizer with learning rate η:
+∇θL(θ) = ∇θLpolicy + ∇θLentropy,
+θ ←θ −η (∇θL(θ)) .
+(19)
+B
+Comprehensive Related Works
+Model- and Solver-based Acceleration.
+Substantial works have been devoted to diffusion inference
+acceleration. Existing approaches primarily focus on optimizing the model architecture or the
+representation. Key strategies include pruning (Fang et al., 2023; Castells et al., 2024; Zhang
+et al., 2024), quantization (Shang et al., 2023; So et al., 2023; He et al., 2023; Li et al., 2023), and
+distillation (Luhman and Luhman, 2021; Salimans and Ho, 2022; Yang et al., 2023; Sauer et al.,
+2023). In parallel, significant advances have been made in sampling solvers (Jolicoeur-Martineau
+et al., 2021; Song et al., 2021; Lu et al., 2022; Bao et al., 2022; Liu et al., 2022; Karras et al., 2022;
+Zhang et al., 2023a; Zhang and Chen, 2023; Lu et al., 2025) to accelerate denoising.
+17
+
+
+--- Page 18 ---
+Cache-based Acceleration.
+Cache-based acceleration exploits temporal redundancy between the
+current step and historical denoising steps to speedup inference without altering the backbone model.
+Previous works mainly adopt static caching schedules or utilize architectural properties. Deep-
+Cache (Ma et al., 2024a) and FORA (Selvaraju et al., 2024) perform periodic feature reuse with
+fixed intervals for U-Net and DiT, respectively. To mitigate drift from direct reuse, subsequent meth-
+ods introduce statistical calibration (Block Caching (Wimbauer et al., 2024)), increments caching
+(∆-DiT (Chen et al., 2024)) or error rectification (ERTACache (Peng et al., 2025)). Others exploit
+architectural redundancies like reusing U-Net encoder features (Li et al., 2024), broadcasting attention
+output (Zhao et al., 2025) and caching for window attention (Yuan et al., 2024). Recognizing that
+static methods fail to capture instance specificity, many studies shift towards dynamic strategies.
+Methods like TeaCache (Liu et al., 2025a) and DiCache (Bu et al., 2025) utilize lightweight indicators
+(timestep embedding differences and shallow feature probes, respectively) to dynamically trigger com-
+putation. Similarly, in video modality, AdaCache (Kahatapitiya et al., 2024) and EasyCache (Zhou
+et al., 2025) adjust caching policies based on motion complexity and transformation vectors. Moving
+beyond simple reuse, forecasting methods aim to predict future features. TaylorSeer (Liu et al.,
+2025c) uses Taylor expansion to extrapolate feature evolution, SpeCa (Liu et al., 2025d) adopts
+a forecast-then-verify paradigm inspired by speculative decoding. Furthermore, optimization has
+extended to finer granularities. Token-level methods (Zou et al., 2025; Zheng et al., 2025) reduce
+redundancy by selectively processing informative tokens or compressing attention. Finally, distinct
+from heuristic rules, learning-based methods often train routers (Ma et al., 2024b) or linear compen-
+sation layers (Liu et al., 2025b) to optimize caching decisions and approximate cached features. These
+approaches are not training-free but consistently achieve the state-of-the-art performance reported to
+date. Our proposed method, OnlineCache, follows a similar learning-based paradigm.
+Bilevel Optimization.
+Bilevel optimization (BLO), which involves nesting one optimization prob-
+lem within the constraints of another, serves as a fundamental mathematical framework for hierarchi-
+cal optimizing tasks. (Bracken and McGill, 1973) first formalized the general class of mathematical
+programs with optimization problems in the constraints, establishing the theoretical bedrock for this
+field. In the context of modern machine learning and deep learning, bilevel optimization has been
+widely adopted to model learning problems with hierarchical structures (Zhang et al., 2023b), such as
+hyperparameter optimization (Franceschi et al., 2018; Shaban et al., 2019), model pruning (Zhang
+et al., 2022) and model-agnostic meta-learning (Finn et al., 2017; Rajeswaran et al., 2019).
+C
+Supplementary Experiment Details
+C.1
+Analysis of Training Time and Memory Consumption
+Table 4: Training cost across different models. We report the number of training samples, total training time (including both
+policy and corrector stages), and peak GPU memory usage. All measurements are conducted on a single A100-80GB GPU.
+Model
+Training Samples
+Bilevel Iterations
+Time per Iteration
+Total Time
+Peak GPU Memory
+FLUX.1-DEV
+1k
+4 / 1
+∼43.1min / ∼49.7min
+∼25.9h
+∼38.0GB
+DIT-XL/2
+2.5k
+4 / 1
+∼27.8min / ∼30.0min
+∼4.7h
+∼4.0GB
+COGVIDEOX-2B
+200
+4 / 1
+∼36.6min / ∼36.1min
+∼48.7h
+∼29.0GB
+C.1.1
+Analysis of Computational Time Cost
+Table 4 details the computational overhead of OnlineCache. While it requires an additional training
+phase—unlike traditional training-free caching methods—this one-time cost is well justified by
+the resulting empirical gains. As shown in our experiments, OnlineCache consistently achieves a
+state-of-the-art speed-quality trade-off across diverse configurations. Notably, this gain incurs only a
+modest one-time training cost: the policy for FLUX.1-DEV converges within 26 hours on a single
+A100 GPU, making training practically affordable. Moreover, the learned policy exhibit strong
+zero-shot generalization ability (see Section 4.1.2), further supporting the effectiveness.
+18
+
+
+--- Page 19 ---
+C.1.2
+Memory-Efficient Implementation of Bilevel Training
+Implementing the bilevel optimization framework described in Section 3.4 presents significant
+computational challenges. A standard naive backpropagation through the time (BPTT) for a diffusion
+process with T = 30 steps requires storing the computation graph for the entire unrolling. For
+high-resolution latent diffusion models such as FLUX.1-DEV, this results in memory consumption
+exceeding 400GB, which is prohibitive for standard hardware configurations. To address this, we
+implement a memory-efficient training strategy equivalent to Truncated Backpropagation Through
+Time (TBPTT) with a horizon of k = 1 (Step-wise Optimization). With these techniques, GPU
+memory usage during training can be effectively controlled within an acceptable range (see Table 4).
+In our implementation, this memory-efficient training scheme is realized via a step-wise optimization
+procedure that decouples temporal gradient dependencies across steps. The details are as follows:
+(1) Input Detachment: At the beginning of step t, the input latent xt is detached from the computa-
+tion graph: xt ←xt.detach(). This blocks gradient flow to previous timesteps.
+(2) Selective Gradient Activation: We adopt a manually fragmented design to reduce memory
+usage, enabling gradients (torch.set_grad_enabled(True)) only for stage-specific modules,
+so that inner- and outer-loop optimizations activate gradients only for their respective components.
+(3) Immediate Backward Pass: The outer and inner losses are computed and backpropagated
+immediately after the forward pass at step t. Gradients are accumulated in the optimizer, and the
+computation graph for step t is promptly released before proceeding to t −1.
+C.2
+Additional Ablation Studies and Empirical Analysis
+C.2.1
+Ablation on Corrector Training Target
+High-Dim
+(Hidden States)
+Low-Dim
+(Velocity)
+20
+21
+22
+23
+24
+25
+26
+PSNR (
+)
+24.02
+23.45
+Difference is Negligible
+1. Alignment Target
+All Steps
+Cache Steps
+20
+21
+22
+23
+24
+25
+26
+23.65
+24.32
+2. Scope of Correction
+1.5
+2.0
+2.5
+3.0
+Inference Speedup (×)
+22
+24
+26
+3. Optimization Strategy
+Seq (40 eps)
+BLO (28 eps)
+Figure 6: Ablation on corrector training. Left: Alignment target (High-dim vs. Low-dim). Middle: Scope of correction (All
+steps vs. Cache steps). Right: Optimization strategy (Sequential vs. BLO). Marked in red is the strategy we chose.
+The right panel of Table 5 investigates three critical design choices in our framework, with the ablation
+results visualization shown in Figure 6 for easier understanding.
+(1) Alignment Target: High-dim vs. Low-dim. We compare aligning the high-dimension hid-
+den_states against the final low-dimensional output (normalized and projected transformer output
+velocity). Empirical results show negligible performance difference between the two strategies.
+However, aligning the low-dimensional velocity allows for a significantly more lightweight
+MLP-based corrector design, reducing inference overhead. Consequently, we adopt velocity
+alignment for its efficiency. As shown in the Figure 6 (left), we choose to align the output velocity
+(64 dimensions in FLUX.1-DEV (Labs et al., 2025) model, compared to 3072 dimensions of
+the hidden_states) and design the corrector to be very lightweight. During inference, adding the
+policy and corrector incurs a negligible additional inference time cost.
+(2) Scope of Correction: All Steps vs. Cache Steps. We investigated whether the corrector should
+be applied at every denoising step or only at the cached steps. Our results indicate that restricting
+correction to cached steps only yields better performance. This can be attributed to the fact
+that the initial diffusion steps—typically not cached by the policy network—are critical for
+establishing semantic content. Since the baseline model already produces accurate outputs at
+these early steps, introducing a corrector could disrupt the trajectory and accumulate errors.
+Limiting the correction to cached steps also reduces the computational cost during training.
+19
+
+
+--- Page 20 ---
+(3) Optimization Strategy: Sequential vs. Bilevel Optimization. We compare our BLO strategy
+with sequential training, where the policy is trained to convergence first, followed by the corrector.
+▷Sequential Training: Typically requires ∼40 epochs to converge the policy, followed by >10
+additional epochs to train the error corrector, resulting in a decoupled optimization process
+that fails to achieve genuine joint coordination between the two modules.
+▷Bilevel Optimization: The corrector continuously adapts to the evolving policy, enabling
+stable training and faster convergence. Empirically, our method reaches joint convergence in
+just 28 outer epochs and 7 inner epochs while achieving comparable inference quality.
+C.2.2
+Ablation on Corrector Effectiveness
+Figure 7: Accumulated L1 and L2 errors under different methods. The plot shows cumulative error over 30 inference steps,
+averaged across 50 generated samples using the FLUX.1-DEV model.
+Figure 7 illustrates the accumulated L1 and L2 residual error for ERTACache (Peng et al., 2025)
+and our proposed OnlineCache (vanilla and bilevel optimization version) over a 30-step inference
+trajectory. Without the Corrector, residual errors in OnlineCache exhibit progressive accumulation
+over timesteps, reflecting the compounding effect of cache-induced approximation errors during
+long-range sampling. Although this accumulation is initially mild, the drift becomes increasingly
+pronounced as inference proceeds. By contrast, the inclusion of the Corrector consistently suppresses
+this error growth, maintaining a uniformly lower error profile throughout the entire trajectory. This
+demonstrates that the Corrector effectively compensates for cache-induced residuals and prevents
+small local deviations from amplifying into significant global errors over time.
+C.2.3
+Analysis of Caching Dynamics
+Figure 8: Adaptive caching dynamics of OnlineCache. Left: Average step-wise caching frequency evaluated on MSCOCO.
+Right: Correlation between prompt complexity (proxied by word count) and the cache ratio, evaluated on Parti-Prompts.
+After training, the learned policy network exhibits strong adaptivity at both the timestep and sample
+levels, as evidenced by the following observations:
+20
+
+
+--- Page 21 ---
+(1) Timestep-Level Adaptivity. In Figure 8 (Left), the step-wise caching frequency exhibits a distinct
+pattern: conservative caching in early timesteps and more aggressive in later ones. This behavior
+inherently aligns with a fundamental property of diffusion generation: early denoising steps
+involve large inter-step transitions that establish global structure, making them highly sensitive to
+approximation errors. In contrast, later steps primarily perform fine-grained refinements with
+smaller updates, where caching introduces minimal perceptual degradation (Peng et al., 2025).
+(2) Sample-Level Adaptivity. To investigate prompt-aware adaptivity, we evaluate the learned policy
+on the Parti-Prompts dataset (Yu et al., 2022). Using word count as a proxy for prompt complexity,
+Figure 8 (Right) reveals a statistically significant negative correlation between prompt complexity
+and the assigned cache ratio, with a Pearson correlation coefficient of r = −0.1994. The fitted
+regression line demonstrates a clear downward trend, confirming that the policy dynamically
+reduces caching (allocating more computational steps) when processing more complex prompts,
+thereby preserving generation fidelity for difficult instances.
+C.3
+Extended experimental results and detailed configuration
+Table 5: Extended experimental results on FLUX.1-DEV. The left panel shows the training dynamics of the vanilla
+OnlineCache across different checkpoints, revealing underfitting, optimal, and overfitting regimes. The right panel presents
+ablations on the corrector’s alignment target, the scope of correction, and sequential optimization versus our BLO strategy.
+Method
+Efficiency
+Visual Quality
+CR ↑
+Speed ↑
+Lat ↓
+LPIPS ↓
+SSIM ↑
+PSNR ↑
+Previous Baselines
+FLUX.1-dev
+1.00x
+5.099
+–
+–
+–
+0.00%
+Vanilla OnlineCache
+Underfitting
+OnlineCache(12k)
+2.56x
+1.991
+0.253
+0.719
+19.934
+65.26%
+OnlineCache(12k)
+2.21x
+2.306
+0.207
+0.763
+21.026
+58.40%
+OnlineCache(12k)
+1.84x
+2.760
+0.162
+0.809
+22.606
+48.80%
+OnlineCache(20k)
+2.88x
+1.772
+0.252
+0.719
+20.477
+69.62%
+OnlineCache(20k)
+2.49x
+2.045
+0.205
+0.763
+21.529
+63.19%
+OnlineCache(36k)
+3.20x
+1.596
+0.300
+0.675
+19.755
+74.09%
+OnlineCache(36k)
+3.02x
+1.691
+0.276
+0.697
+20.173
+72.07%
+Best Range
+OnlineCache(38k)
+2.97x
+1.718
+0.255
+0.716
+20.903
+71.21%
+OnlineCache(38k)
+2.74x
+1.860
+0.222
+0.747
+21.591
+67.84%
+OnlineCache(38k)
+2.51x
+2.033
+0.195
+0.771
+22.200
+65.28%
+OnlineCache(38k)
+2.13x
+2.394
+0.137
+0.828
+23.955
+56.61%
+OnlineCache(38k)
+1.84x
+2.770
+0.106
+0.861
+25.251
+49.37%
+OnlineCache(40k)
+3.00x
+1.702
+0.256
+0.711
+20.935
+71.83%
+OnlineCache(40k)
+2.88x
+1.770
+0.247
+0.720
+21.159
+70.85%
+OnlineCache(40k)
+2.74x
+1.863
+0.220
+0.746
+21.609
+68.55%
+OnlineCache(40k)
+2.62x
+1.945
+0.202
+0.762
+22.145
+66.95%
+OnlineCache(40k)
+2.56x
+1.993
+0.195
+0.771
+22.243
+65.90%
+OnlineCache(40k)
+2.47x
+2.064
+0.182
+0.783
+22.647
+64.69%
+OnlineCache(40k)
+2.36x
+2.161
+0.167
+0.797
+23.086
+62.28%
+OnlineCache(40k)
+2.24x
+2.274
+0.159
+0.806
+23.232
+60.36%
+OnlineCache(40k)
+2.14x
+2.381
+0.140
+0.826
+23.981
+58.22%
+OnlineCache(40k)
+2.05x
+2.488
+0.129
+0.837
+24.420
+55.45%
+Overfitted
+OnlineCache(42k)
+3.04x
+1.677
+0.272
+0.699
+20.296
+72.50%
+OnlineCache(42k)
+2.89x
+1.765
+0.253
+0.716
+20.680
+70.88%
+OnlineCache(42k)
+2.83x
+1.804
+0.237
+0.728
+21.000
+69.62%
+OnlineCache(42k)
+2.64x
+1.931
+0.220
+0.746
+21.524
+67.63%
+OnlineCache(45k)
+3.08x
+1.656
+0.273
+0.698
+20.276
+72.93%
+OnlineCache(45k)
+2.98x
+1.710
+0.262
+0.710
+20.550
+71.76%
+OnlineCache(50k)
+2.97x
+1.717
+0.270
+0.702
+20.362
+71.68%
+OnlineCache(50k)
+2.72x
+1.877
+0.230
+0.740
+21.144
+68.27%
+Method
+Efficiency
+Visual Quality
+CR ↑
+Speed ↑
+Lat ↓
+LPIPS ↓
+SSIM ↑
+PSNR ↑
+OnlineCache with Corrector Post-Training
+Post-Training (hidden_states alignment whole steps)
++Corrector(6k)
+2.14x
+2.390
+0.140
+0.825
+24.017
+57.82%
++Corrector(12k)
+2.14x
+2.387
+0.137
+0.827
+24.102
+57.76%
++Corrector(18k)
+2.15x
+2.368
+0.140
+0.827
+24.018
+58.20%
+Post-Training (output_velocity alignment whole steps)
++Corrector(1k)
+2.13x
+2.392
+0.140
+0.827
+23.833
+57.71%
++Corrector(2k)
+2.12x
+2.403
+0.143
+0.825
+23.654
+57.46%
++Corrector(3k)
+2.13x
+2.394
+0.148
+0.820
+23.452
+57.67%
+Post-Training (output_velocity alignment cache steps)
++Corrector(3k)
+2.14x
+2.379
+0.135
+0.839
+24.325
+58.23%
++Corrector(5k)
+2.15x
+2.370
+0.137
+0.839
+24.359
+58.08%
++Corrector(10k)
+2.14x
+2.384
+0.140
+0.837
+24.284
+57.91%
+Sequential Training: Policy (40k) + Corrector (12k)
+Sequential
+3.05x
+1.673
+0.254
+0.730
+21.042
+73.17%
+Sequential
+2.75x
+1.851
+0.212
+0.768
+22.084
+69.36%
+Sequential
+2.56x
+1.987
+0.184
+0.793
+22.678
+66.48%
+Sequential
+2.14x
+2.388
+0.135
+0.842
+24.499
+57.66%
+Sequential
+1.92x
+2.654
+0.109
+0.867
+25.486
+51.95%
+Sequential
+1.75x
+2.916
+0.089
+0.886
+26.643
+46.42%
+Sequential
+1.61x
+3.161
+0.076
+0.901
+27.531
+41.15%
+OnlineCache with BLO (Outer+Inner epochs)
+BLO (36k+9k)
+2.82x
+1.806
+0.226
+0.758
+21.802
+70.54%
+BLO (36k+9k)
+2.62x
+1.944
+0.197
+0.784
+22.558
+67.64%
+BLO (36k+9k)
+2.55x
+1.997
+0.185
+0.793
+22.792
+66.23%
+BLO (32k+8k)
+2.55x
+1.999
+0.189
+0.790
+22.758
+66.38%
+BLO (28k+7k)
+2.96x
+1.725
+0.245
+0.739
+21.442
+72.22%
+BLO (28k+7k)
+2.83x
+1.780
+0.225
+0.758
+21.917
+70.56%
+BLO (28k+7k)
+2.54x
+2.011
+0.185
+0.794
+22.849
+65.98%
+BLO (28k+7k)
+2.23x
+2.283
+0.147
+0.830
+24.015
+60.20%
+BLO (28k+7k)
+2.07x
+2.463
+0.125
+0.850
+24.768
+56.32%
+BLO (28k+7k)
+1.76x
+2.898
+0.091
+0.881
+26.182
+46.72%
+BLO (28k+7k)
+1.58x
+3.228
+0.081
+0.896
+27.104
+41.19%
+BLO (24k+6k)
+2.61x
+1.951
+0.203
+0.779
+22.152
+67.18%
+BLO (20k+5k)
+2.58x
+1.979
+0.199
+0.781
+22.175
+66.68%
+The left panel of Table 5 details the performance evolution of the vanilla OnlineCache method on
+FLUX.1-DEV model at various training checkpoints. We observe three distinct phases:
+▷Underfitting Phase (12k–36k steps): The model exhibits lower visual quality as the caching
+policy has not yet fully adapted to the diffusion trajectory.
+▷Optimal Range (38k–40k steps): The model achieves the best speed-quality trade-off.
+▷Overfitting Phase (42k+ steps): Extended training leads to overfitting, where the policy becomes
+too aggressive or rigid, resulting in a degradation of visual fidelity.
+The right panel of Table 5 reports supporting quantitative results. Specifically, the upper block
+"OnlineCache with Corrector Post-Training" examines different corrector training targets. The
+bottom block demonstrates that the proposed bilevel optimization framework consistently outperforms
+sequential training pipeline. Detailed analysis of both are provided in Section C.2.1.
+For the detailed experimental configuration, please check the Table 6.
+21
+
+
+--- Page 22 ---
+Table 6: Implementation details and experimental configuration.
+Category
+Configuration
+Hardware & System
+GPU / CUDA / Python NVIDIA A100-SXM4-80GB (×1) / 12.1 / 3.10.12
+Core Libraries
+PyTorch / Diffusers
+2.3.0+cu121 / 0.34.0
+Training Hyperparameters
+FLUX.1-dev
+Grad. Accum.: 30;
+Batch Size: 1;
+Loss Weights (λq,a,s,e, ktol): (2.5, 10.0, 1.0, 0.5), 6;
+DiT-XL/2
+Grad. Accum.: 30;
+Batch Size: 1;
+Loss Weights (λq,a,s,e, ktol): (2.5, 10.0, 1.0, 0.5), 6;
+CogVideoX-2b
+Grad. Accum.: 25;
+Batch Size: 1;
+Loss Weights (λq,a,s,e, ktol): (5.0, 35.0, 1.5, 0.1), 6;
+Baseline Evaluation Settings
+FLUX.1-dev
+Steps: 30;
+CFG: 3.5;
+Resolution: 512×512;
+Scheduler: FlowMatchEulerDiscreteScheduler
+DiT-XL/2
+Steps: 30;
+CFG: 1.7;
+Resolution: 256×256;
+Scheduler: DDIMScheduler
+CogVideoX-2b
+Steps: 36;
+CFG: 6.0;
+Resolution: 480×720;
+Scheduler: CogVideoXDDIMScheduler
+C.4
+Training Dynamics
+To examine the convergence behavior of OnlineCache, we analyze the training dynamics of three
+models, with the corresponding curves visualized in Figure 9. As shown in 9a, the policy exhibits
+stable convergence behavior during training, with the cache ratio and reward curves gradually
+stabilizing over iterations, indicating reliable optimization dynamics. Figure 9b illustrates the inner-
+loop training dynamics. The error corrector consistently enhances inference performance across
+training. In particular, the corrected loss (green curve) remains steadily lower than the raw loss (red
+curve) throughout the entire training process, yielding an average error reduction of 11.97%.
+(a) FLUX.1-DEV: Outer Loop (Policy Training)
+(b) FLUX.1-DEV: Inner Loop (Corrector Training)
+(c) DIT-XL/2 Dynamics
+(d) COGVIDEOX-2B Dynamics
+Figure 9: Comprehensive training dynamics of OnlineCache across models and modalities. (a–b) Drill-down analysis of
+the bilevel optimization on FLUX.1-DEV, showing the evolution of the reward-weighted cache ratio (outer loop) and the
+rectification of cache-induced errors (inner loop). (c–d) Stable convergence of the policy and corrector on DIT-XL/2 (image)
+and COGVIDEOX-2B (video). All curves demonstrate that our BLO framework facilitates robust joint optimization.
+22
+
+
+--- Page 23 ---
+We also employ the BLO variant of OnlineCache to accelerate inference for both DIT-XL/2 (Peebles
+and Xie, 2023) and COGVIDEOX-2B (Yang et al., 2025). For DIT-XL/2, we utilize the outer-level
+policy network from the 20k iteration checkpoint and the inner-level error corrector from the 5k
+iteration checkpoint to conduct the main paper experiments. Regarding COGVIDEOX-2B, the policy
+and corrector are selected at 12k (12,800) and 3k (3,200) iterations.
+As illustrated in Figure 9c, the training process for both models exhibits remarkable stability. The
+reward CMA (orange) consistently ascends, while the inner-level correction loss (green) shows a
+steady decline, demonstrating robust convergence across different architectures. Specifically, in
+the bottom panel of Figure 9d, the correction loss (green) consistently remains below the raw loss
+(red), underscoring the effectiveness of the corrector. While the gap in the right plot appears visually
+narrower compared to the DiT results, this is primarily an artifact of the y-axis scaling: the initial
+training fluctuations in CogVideoX result in a larger range, whereas the DiT plot focuses on a much
+finer scale. Despite these visualization differences, both models confirm that the BLO framework
+achieves reliable and stable convergence.
+D
+Limitations
+While OnlineCache provides a robust, instance-aware framework for dynamic caching in diffusion
+inference, we identify the following limitations that outline promising directions for future research:
+▷Training Overhead Requirements: Unlike purely heuristic caching strategies that operate in a
+strict training-free manner, OnlineCache requires an upfront training phase to optimize the policy
+and corrector. Although this one-time computational cost is empirically manageable as discussed,
+it still introduces an additional pipeline step before deployment.
+▷Approximations in Bilevel Optimization: The exact computation of implicit gradients in our
+Bilevel Optimization (BLO) framework is intractable. Furthermore, unrolling the full diffusion tra-
+jectory for high-resolution models incurs a prohibitive memory footprint (>400GB). Consequently,
+we employ a first-order approximation alongside Truncated Backpropagation Through Time. While
+empirically effective and memory-efficient, this alternating coordinate-descent approximation may
+theoretically converge to a suboptimal local equilibrium compared to an exact unrolled solution.
+▷Cross-Architecture Dependency: As demonstrated in Section 4.1.2, the learned modules exhibit
+strong zero-shot generalization across varying resolutions, dataset distributions, and closely aligned
+models (e.g., FLUX.1-DEV to FLUX.1-SCHNELL). However, because the policy state vector
+st natively depends on channel-wise statistics (D-dimensional) tied to a specific latent space,
+transferring the framework to a fundamentally different backbone architecture (e.g., adapting a
+DiT-trained policy to a standard U-Net) inherently necessitates retraining from scratch.
+E
+Broader Impacts
+Our work focuses on accelerating the inference of diffusion models. A primary positive societal
+impact of this research is the significant reduction in computational resources and energy consumption
+required for high-fidelity generation, which directly contributes to lowering the carbon footprint of
+deploying large-scale generative AI systems. Furthermore, by improving inference efficiency, our
+method helps democratize access to state-of-the-art generative models for researchers and end-users
+with limited compute budgets.
+On the potential negative side, making high-quality image and video generation faster and cheaper
+could inadvertently facilitate the production of malicious content, such as disinformation or deepfakes.
+However, our method is fundamentally a generic algorithmic optimization; it does not introduce
+new capabilities to the base models. The mitigation of such malicious uses relies on existing safety
+guardrails and ethical deployment strategies implemented at the foundation model level.
+23
+
+
+--- Page 24 ---
+F
+Qualitative Visual Results
+GT
+Ours
+A tranquil tableau of restaurant. (seed 3)
+A tranquil tableau of a bowl. (seed 3)
+Speedup
+1.83x
+GT
+Ours
+Speedup
+1.91x
+A tranquil tableau of tower. (seed 3)
+GT
+Ours
+Speedup
+1.78x
+A person is bending back. (seed 0)
+GT
+Ours
+Speedup
+1.74x
+A tranquil tableau of house. (seed 1)
+In a still frame, gas station. (seed 3)
+GT
+Ours
+Speedup
+1.76x
+GT
+Ours
+Speedup
+1.71x
+Figure 10: Qualitative visualization of generation quality using the COGVIDEOX-2B (Yang et al., 2025) model. Our method
+consistently yields high-fidelity results that are visually indistinguishable from the ground-truth (GT) samples, even while
+achieving an average speedup exceeding 1.75×.
+24
+
+
+--- Page 25 ---
+Figure 11: Qualitative visualization of generation quality using the DIT-XL/2 (Peebles and Xie, 2023) model. We compare
+OnlineCache with the non-acceleration baseline under identical sampling settings: DPM-Solver++ (Lu et al., 2025) scheduler
+with 50 denoising steps, CFG scale of 1.5. Evaluations are conducted on 4 semantic labels. When evaluating all 1k classes
+with 50k samples using FID, our method achieves a 1.88× acceleration while still outperforming the baseline (quantitative
+results are reported in the main paper). Notably, our accelerated generation even surpasses the ground-truth (GT) images in
+certain cases. As highlighted by the red boxes in the first row, the GT image of the husky exhibits noticeable bodily structural
+defects, whereas our method produces a more complete and coherent structure. For the Golden Retriever in the second row,
+our model generates fur textures that appear smoother and more natural than GT.
+25
+
+
+--- Page 26 ---
+Figure 12: Qualitative visualization of generation quality using the FLUX.1-DEV (Labs et al., 2025) model. The upper portion
+of the figure presents a visual comparison between OnlineCache and ERTACache (Peng et al., 2025), demonstrating that
+our approach achieves superior visual quality while maintaining effective acceleration. The lower portion further provides
+additional qualitative results, comparing our generated samples with the corresponding ground-truth images, highlighting the
+high-fidelity generation of our method.
+26

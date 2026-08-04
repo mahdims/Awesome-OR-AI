@@ -1,0 +1,2193 @@
+--- Page 1 ---
+HorizonServe: Coordinating Request Scheduling with
+GPU Sharing for Omni-Model Serving
+Yuning Zhang
+yuning.zhang1@sydney.edu.au
+School of Electrical and Computer Engineering, The
+University of Sydney
+Sydney, NSW, Australia
+Dong Yuan∗
+dong.yuan@sydney.edu.au
+School of Electrical and Computer Engineering, The
+University of Sydney
+Sydney, NSW, Australia
+Abstract
+Omni models unify text, speech, image, and multimodal
+reasoning in a single serving backend, but this unified de-
+ployment exposes a new scheduling problem. Requests with
+different output modalities may share an initial multimodal
+backbone and then diverge into downstream generation
+stages, creating heterogeneous first-response metrics and
+service-level objective (SLO) targets on the same GPU. Exist-
+ing large language model (LLM) and multimodal serving sys-
+tems mainly optimize token progress or input-side process-
+ing, and they do not jointly control temporal sharing in the
+shared stage and spatial sharing among co-running stages.
+This paper presents HorizonServe, a single-GPU omni-model
+serving system that coordinates request admission and GPU
+allocation under heterogeneous SLOs. HorizonServe pro-
+files per-class first-response latency, protects requests with
+limited slack, rotates shared-stage opportunities across exe-
+cution paths, and throttles the shared-stage streaming mul-
+tiprocessor (SM) allocation when downstream stages are
+active. Across three omni-model workloads and two GPU
+platforms, HorizonServe improves SLO attainment by up
+to 4.9× in arrival-rate sweeps and 7.0× under downstream-
+heavy traffic, and reduces per-class first-response latency by
+38.4–63.7%.
+Keywords: Omni-model serving, multimodal inference, service-
+level objectives, GPU sharing, scheduling
+1
+Introduction
+Interactive model services are moving from text-only chat
+toward omni models that accept and produce text, speech,
+image, and video. GPT-4o was an early public example of
+real-time reasoning across audio, vision, and text [38], and
+recent open omni or unified multimodal models extend simi-
+lar capabilities to text, speech, image, video, and multimodal
+generation [14, 56, 63]. This changes the serving target. A
+serving system no longer hosts only a homogeneous text
+generator, but instead may host a multi-stage model that
+receives heterogeneous requests and routes them through
+different output paths.
+Omni models are also useful beyond large public assis-
+tants. In private, on-premises, and edge settings, speech,
+∗Corresponding author: Dong Yuan.
+Multimodal 
+input
+Shared Stage
+Modality
+Encoder
+Autoregressive
+ model
+Output
+Short path Req.
+Downstream Stage
+Modality
+Generator
+Output
+Long path Req.
+(a) Omni-model execution architecture.
+ Request classes
+Why does goodput collapse?
+SLO attainment (%)
+0
+drops by
+ >10x
+Short path
+Long path
+Shared
+Shared
+Tight
+Relaxed
+Shared
+Tight
+Out
+Relaxed
+Downstream
+Out
+Deadline
+Same delay
+Downstream
+ Asymmetric SLO impact
+Deadline
+Cross-stage contention
+SM
+Long path request ratio
+0%
+20%
+40%
+Shared GPU resources
+Mem. BW
+(b) Goodput collapse as long-path traffic increases.
+Figure 1. Single-GPU omni-model serving couples hetero-
+geneous request paths and GPU resource sharing.
+images, and video can be sensitive, bandwidth-heavy, and
+latency-sensitive, motivating inference close to where data
+is produced [11, 29, 30, 49, 60]. Large services can amortize
+omni-model execution across GPU clusters or disaggregate
+stages across devices [1, 25, 67], but site-level deployments
+often have a smaller resource envelope. Recent omni mod-
+els already support local inference, low-memory execution,
+and edge deployment [63], while workstation GPUs are po-
+sitioned for local generative-AI inference [35–37]. This pa-
+per studies single-GPU omni-model serving under heteroge-
+neous service-level objectives (SLOs).
+Single-GPU deployment may seem like a packaging con-
+straint: fit all components on one GPU and reuse an existing
+serving system. The difficulty is that an omni-model service
+is not a homogeneous workload. Figure 1a sketches the exe-
+cution architecture: requests first enter a shared multimodal
+stage, then either return text immediately or continue into
+output-specific generators, such as speech decoders, codec
+modules, image generators, or renderers [56, 63, 64]. On a
+single GPU, this structure creates two coupled sharing prob-
+lems: heterogeneous request paths share the initial stage
+1
+arXiv:2608.01785v1  [cs.DC]  3 Aug 2026
+
+
+--- Page 2 ---
+over time, while co-running model stages share SMs and
+GPU memory-bandwidth resources in space.
+This coupling breaks the assumptions behind text-only
+SLO scheduling. Different output modalities expose different
+first-response metrics, such as time-to-first-token (TTFT)
+for text and time-to-first-output (TTFO) for speech or image
+generation. Their natural response times are different by
+orders of magnitude, so the same shared-stage delay can be
+harmless for one class but fatal for another. Figure 1b shows
+this effect in a motivating workload: as long-path traffic in-
+creases, short-path requests lose SLO attainment first, which
+directly reduces SLO-satisfied goodput at the same offered
+load. The collapse is not simply a higher average load, and
+it reflects asymmetric SLO impact under shared-stage delay.
+Spatial contention reinforces the problem because down-
+stream generators can slow the shared stage by consuming
+memory bandwidth and execution resources.
+Prior systems cover adjacent axes of this problem but
+not their combination. LLM serving systems assume a com-
+mon text-generation path [1, 25, 68, 76]; VLM/LMM serving
+mainly handles input-side multimodal processing before text
+generation [4, 19, 43]; and GPU sharing systems expose co-
+location or partitioning mechanisms without deciding which
+omni paths should enter the shared stage [28, 33, 34, 77].
+The missing interface is the one created by omni models:
+a scheduling decision at the shared stage can change both
+immediate SLO slack and later downstream GPU pressure.
+HorizonServe’s contribution is the omni-specific feedback
+loop that connects output-path admission, deadline slack,
+downstream activation, and bounded stage-level GPU allo-
+cation on one GPU.
+We present HorizonServe, a serving system for single-GPU
+omni-model workloads with heterogeneous first-response
+SLOs. HorizonServe coordinates two decisions at each sched-
+uling opportunity: which execution paths should enter the
+shared stage, and how much GPU parallelism the shared
+stage should use when downstream stages are active. It re-
+alizes these decisions with three mechanisms. First, Hori-
+zonServe profiles per-class first-response latency and esti-
+mates remaining slack from offline stage profiles and on-
+line progress, so near-deadline requests can bypass ordinary
+path filtering. Second, it uses shared-stage path rotation
+with a long-path admission cap, preventing long-path bursts
+from monopolizing shared-stage slots and limiting future
+downstream activation. Third, it maps runtime memory-
+bandwidth pressure to a bounded shared-stage SM cap dur-
+ing co-running, giving downstream stages headroom while
+avoiding the harmful full-allocation regime. Together, these
+mechanisms turn uncontrolled temporal and spatial sharing
+into explicit SLO-oriented control.
+This paper makes the following contributions:
+• We identify a new serving problem in single-GPU
+omni-model deployment. Heterogeneous omni requests
+share an initial stage in time and co-located down-
+stream stages share the same GPU in space, causing
+asymmetric SLO violations and cross-stage interfer-
+ence.
+• We design and implement HorizonServe, an inference
+serving system for omni-model workloads with het-
+erogeneous first-response SLOs. HorizonServe jointly
+schedules shared-stage admission and stage-level GPU
+allocation using request slack and runtime bandwidth
+pressure.
+• We evaluate HorizonServe across omni-model work-
+loads and GPU platforms against representative serv-
+ing baselines. HorizonServe improves SLO attainment
+by up to 4.9× in arrival-rate sweeps and 7.0× under
+downstream-heavy traffic, while reducing per-class
+first-response latency by 38.4–63.7%.
+2
+Background
+2.1
+Model Components and Execution Patterns
+Modern omni-models combine several components for mul-
+timodal understanding and generation. We briefly review
+the building blocks that shape serving behavior: modality en-
+coders, autoregressive transformers, visual generators, and
+audio-codec-based speech generators.
+Modality encoders. Omni-models often convert images,
+video frames, or audio features into representations con-
+sumed by the multimodal backbone. Representative image
+encoders include CLIP and SigLIP [44, 71]. Whisper is a rep-
+resentative audio encoder that maps waveform inputs into
+speech representations [45]. Because modality encoders are
+usually lightweight, serving systems often co-execute them
+with the AR stage instead of treating them as independent
+serving stages.
+Autoregressive transformers. Autoregressive (AR) trans-
+formers generate tokens sequentially [46, 59] and are widely
+used for language reasoning, multimodal understanding, and
+token generation in recent omni or unified multimodal mod-
+els [8, 14, 56, 62–64]. AR inference consists of prefill, which
+processes the input context and builds the key-value (KV)
+cache, and decode, which repeatedly accesses model weights
+and the accumulated KV cache to generate new tokens.
+Visual generators. Diffusion models [22, 47] and diffu-
+sion transformers (DiTs) [41] generate visual content through
+iterative denoising or refinement. They appear in recent uni-
+fied omni-models [14, 62] and create output-side generation
+loops distinct from AR decode.
+Audio-codec and waveform generators. Speech-output
+omni-models often generate or consume discrete audio codes
+before producing waveform samples. Recent audio-capable
+omni-models [56, 57] use speech-token generators, codec
+decoders, residual vector quantization (RVQ), or code-to-
+waveform modules [7, 13, 24, 70], adding generation or re-
+construction loops beyond text decoding.
+2
+
+
+--- Page 3 ---
+Table 1. Representative omni and unified multimodal mod-
+els. T, S, and I denote text, speech, and image output. S gen,
+I gen, and multi-gen denote downstream speech, image, and
+multiple generation paths after the shared multimodal com-
+putation.
+Model
+Output
+Org.
+Serving pattern
+Qwen2.5-Omni [63]
+T,S
+Thinker-Talker
+Shared + S gen
+Qwen3-Omni [64]
+T,S
+Thinker-Talker
+Shared + S gen
+LongCat-Flash-Omni [57]
+T,S
+LLM + speech
+Shared + S gen
+MiniCPM-o [65]
+T,S
+Omni LLM
+Shared + S gen
+VITA-1.5 [16]
+T,S
+Omni LLM
+Shared + S gen
+InteractiveOmni [58]
+T,S
+LLM + speech
+Shared + S gen
+Ming-Omni [3]
+T,S,I
+MoE / routed
+Shared + multi-gen
+Ming-Flash-Omni [2]
+T,S,I
+Sparse / routed
+Shared + multi-gen
+BAGEL [14]
+T,I
+MoT experts
+Shared + I gen
+MiMo-Audio [56]
+T,S
+Fused audio LM
+Shared + waveform
+2.2
+Omni-Model Serving Patterns
+Omni models are different from conventional multimodal
+models at the model boundary. Many vision-language and
+large multimodal serving targets accept non-text inputs but
+still expose a single text-generation path: images, audio, or
+video are encoded on the input side and then consumed by an
+autoregressive language model [4, 19, 43]. Recent omni and
+unified multimodal models extend the output side as well.
+A single model family may return text directly, synthesize
+speech through a Talker or codec decoder, generate images
+through visual experts, or combine several generation mod-
+ules [14, 56, 63]. Thus, an omni model is not merely a text
+LLM with richer inputs. From the serving perspective, it is a
+coupled multi-stage model with conditional output paths.
+Table 1 summarizes representative models and the serv-
+ing patterns we abstract from them. Their architectures are
+different: some separate a reasoning backbone from a speech
+generator, some attach image generation experts, and others
+fuse audio-language modeling with waveform reconstruc-
+tion. The common feature is that requests first share an initial
+multimodal computation, but only some requests continue
+into output-specific generation.
+The table highlights a model-level serving shape behind
+these systems. A request first enters a shared backbone, ex-
+pert, or fused thinker-talker that performs input understand-
+ing, cross-modal reasoning, token generation, or routing. We
+call this component the shared stage. The shared stage also
+includes input-side modality encoders unless the serving
+runtime explicitly separates them, because these encoders
+are part of the computation that corresponding multimodal
+requests must pass through before output generation begins.
+After the shared stage, requests diverge. Text-output re-
+quests can often return their first visible response directly
+from the shared stage. Speech-output requests may enter a
+Talker, audio-code generator, codec decoder, or Code2Wav
+module before the first audio chunk is available. Image-
+output requests may enter a diffusion model, a visual gen-
+erator, or a generation expert before a rendered image is
+produced. We call these output-side components the down-
+stream stage. They are not always active: a short text re-
+quest may never use them, while a speech or image request
+can activate one or more of them after consuming shared-
+stage work.
+This abstraction is serving-oriented rather than architecture-
+specific. A Thinker–Talker model, a mixture-of-transformers
+model, and a fused audio language model can all be viewed
+as sharing an initial stage and optionally invoking output-
+side generation. We call requests that stop at the shared
+stage short-path requests, and requests that continue down-
+stream long-path requests. This distinction is central to
+HorizonServe because existing text and input-side multi-
+modal serving abstractions do not expose these output-path
+choices: short and long paths contend for the same shared-
+stage scheduling opportunities, but create different down-
+stream activity and first-response SLOs.
+2.3
+SLO-Oriented Serving and GPU Sharing
+Online model serving systems are commonly evaluated using
+latency targets or service-level objectives (SLOs). For text
+generation, a key first-response metric is time-to-first-token
+(TTFT). Omni-model serving adds first-response metrics for
+paths that terminate at different stages, such as time-to-first-
+output (TTFO) for the first audio chunk, speech segment, or
+rendered image. Since these outputs have different natural
+time scales, each request class may need its own SLO target.
+Our optimization goal is SLO-satisfied goodput: useful
+throughput from requests whose first-response latency sat-
+isfies a class-specific SLO. Goodput is widely used in serving
+systems that optimize latency under load [1, 9, 76]. We re-
+port SLO attainment, the fraction of requests that meet the
+corresponding target, because omni-model requests expose
+different first-response metrics and SLO slack.
+These metrics distinguish omni-model serving from text-
+only serving. LLM serving usually optimizes a prefill–decode
+loop around TTFT, token latency, or online goodput [1, 68,
+76]. VLM and LMM serving systems add input-side encoders
+and multimodal preprocessing before text generation [4, 19,
+43]. Omni-model serving must also attach SLOs to output-
+side generation paths, where the first visible response may
+be a token, audio chunk, or image.
+GPU runtimes provide mechanisms for spatial sharing.
+CUDA streams expose concurrent work submission within a
+process, while NVIDIA Multi-Process Service (MPS) allows
+kernels from multiple processes to execute concurrently on
+one GPU [31, 33]. Multi-Instance GPU (MIG) partitions sup-
+ported GPUs into isolated instances [34]. For finer-grained
+SM control, libsmctrl exposes hardware compute partition-
+ing, and CUDA Green Contexts provide a driver API for
+provisioning SM resources to lightweight contexts [5, 32].
+These mechanisms motivate treating the shared-stage SM
+count as a runtime control knob.
+3
+
+
+--- Page 4 ---
+10
+2
+10
+3
+10
+4
+Solo p95 latency (ms)
+Qwen-Omni
+416x
+MiMo
+15x
+BAGEL
+348x
+Short-path
+Long-path
+Figure 2. Solo p95 first-response latency across request types
+on one GPU. Short-path and long-path requests occupy dis-
+tinct latency regimes across Qwen-Omni, MiMo-Audio, and
+BAGEL.
+3
+Motivation
+3.1
+SLO Heterogeneity
+Omni-model serving multiplexes requests that live in fun-
+damentally different latency regimes. A text-output request
+may complete its first response after only the shared stage,
+while a speech or image generation request continues through
+downstream generators before producing user-visible out-
+put. Even when each request type runs alone on one GPU,
+these paths already exhibit orders-of-magnitude gaps in p95
+first-response latency, as shown in Figure 2. This gap is not
+merely a performance detail. In online serving, SLO targets
+are typically derived from each request class’s solo latency,
+so the latency spread becomes an SLO spread: some requests
+have sub-second deadlines, while others naturally tolerate
+second-level first-response latency.
+This heterogeneity changes the meaning of sharing. If
+all request classes are scheduled through the same shared
+stage, a delay that is negligible for a long-path request can
+consume a large fraction of the slack of a short-path request.
+Thus, a single-GPU omni server must not only maximize
+aggregate throughput; it must preserve latency slack across
+request classes whose natural response times are separated
+by orders of magnitude.
+Takeaway 1. Omni serving starts from heterogeneous latency
+regimes, so shared-stage scheduling must preserve SLO slack
+rather than treating all request classes as interchangeable work.
+3.2
+Goodput Collapse
+We next show that heterogeneous serving paths can cause
+severe goodput loss even when long-path requests account
+for only a small fraction of the workload. We vary the frac-
+tion of long-path traffic from 0% to 60%. For Qwen-Omni,
+long-path requests generate audio; for BAGEL, they gener-
+ate images. Short-path requests in both workloads produce
+text and terminate after the shared stage. Since the offered
+load is fixed within this sweep, a drop in SLO attainment
+corresponds to a drop in SLO-satisfied goodput.
+0
+20
+40
+60
+Long-stage traffic (%)
+0
+50
+100
+Short-path goodput (%)
+BAGEL text
+43% -> 4.3%
+>10x drop
+Qwen avg
+BAGEL avg
+Qwen text
+BAGEL text
+Figure 3. Long-path traffic collapses short-path goodput un-
+der single-GPU co-location. We plot SLO attainment, which
+is the normalized SLO-satisfied goodput at fixed offered load.
+The tightest-SLO class degrades first as long-path traffic in-
+creases.
+Figure 3 shows that short-path SLO attainment, and hence
+normalized goodput, drops sharply as long-path traffic in-
+creases. The solid lines show the tightest-SLO text request,
+while the dashed lines show aggregate attainment across all
+short-path request types. The aggregate short-path curves
+remain higher than the text-only curves because other short-
+path request types have looser SLO targets, but they also
+decline as long-path traffic increases.
+This result shows that long-path traffic does not merely
+add proportional load. Long-path requests share the same
+initial stage with short-path requests before continuing to
+downstream generators, so they consume shared-stage sched-
+uling opportunities before producing their own downstream
+work. The resulting delay is experienced by multiple short-
+path classes, but its SLO impact is asymmetric: a small in-
+crease in shared-stage waiting time can consume most of
+the slack of a tight-SLO request, while looser classes may
+still complete before their deadlines. This motivates a shared-
+stage scheduler that regulates which paths enter the shared
+stage while still allowing near-deadline requests to bypass
+normal ordering.
+Takeaway 2. Long-path traffic can sharply reduce short-path
+goodput, and the tightest-SLO request class degrades first be-
+cause shared-stage delay consumes its limited slack.
+3.3
+Cross-Stage Bandwidth Contention
+Temporal interference alone does not fully explain the degra-
+dation in mixed omni-model workloads. In the single-GPU
+co-location setting, long-path requests that continue beyond
+the shared stage also activate downstream generators on the
+same GPU. As a result, the shared stage and downstream
+stage do not run in isolation: they execute concurrently and
+compete for the same physical resources. Figure 4 is a fixed-
+SM profiling experiment rather than a controller trace: we
+use CUDA Green Contexts to sweep the shared-stage SM
+allocation and expose when full shared-stage allocation be-
+comes unsafe under co-running.
+4
+
+
+--- Page 5 ---
+S0
+S1
+co-run
+0
+10
+20
+30
+40
+Time (s)
+0
+50
+100
+BW (%)
+HBW near peak
+co-run
+0
+100
+200
+TTFT (ms)
+TTFT spikes
+(a) Cross-stage co-running over time.
+8
+57
+80
+120
+Stage-0 SM
+0
+100
+TTFT (ms)
++82% TTFT
+more SMs hurt
+co-run latency
+TTFT
+TPOT
+best
+5.0
+7.5
+TPOT (ms)
+decode
+saturates
+(b) SM allocation, shared-stage scaling, and short-request TTFT.
+Figure 4. Cross-stage bandwidth contention in single-GPU
+omni-model serving.
+Figure 4(a) visualizes this process over time. Shared-stage
+decode remains active throughout the execution, while the
+downstream stage becomes active only during the co-running
+interval. Before downstream execution starts, the measured
+GPU memory-bandwidth utilization stays around 76% of
+peak and short text-output requests show stable TTFTs. Once
+the downstream stage becomes active, memory-bandwidth
+utilization rises to about 93% of peak, and the TTFT of short
+text-output requests frequently spikes into the 90–200 ms
+range. This temporal alignment indicates that downstream
+execution increases memory pressure on the shared GPU,
+which in turn degrades the first-response latency of short
+requests.
+Figure 4(b) further diagnoses the source of this interfer-
+ence. The dashed curve shows the isolated scaling behavior
+of shared-stage decode under fixed SM allocations. Decode
+TPOT is already close to saturation in the 64–80 SM range: it
+reaches 4.80 ms at 64 SM and 4.65 ms at 80 SM, but worsens
+to 5.57 ms at 120 SM. This indicates that full shared-stage
+allocation provides no TPOT benefit once decode approaches
+its useful saturation range. In contrast, the solid curve shows
+the TTFT of short text-output requests when the shared
+stage and downstream stage co-run. Allocating 120 SM to
+the shared stage increases TTFT from 43.3 ms at 80 SM to
+94.2 ms, a 118% degradation. Thus, giving the shared stage
+a full allocation under co-running can amplify cross-stage
+bandwidth contention and harm first-response latency.
+This result clarifies an important design point. The domi-
+nant cross-stage bottleneck is not simply SM shortage, but
+GPU memory-bandwidth contention. Full shared-stage al-
+location is unsafe under co-running because it can increase
+memory pressure without improving decode TPOT. This
+observation motivates bounding the shared-stage cap near
+its useful saturation range and leaving the remaining SMs
+as downstream headroom, rather than allowing the shared
+stage to expand to the full GPU allocation by default.
+Takeaway 3. In single-GPU omni-model serving, full shared-
+stage allocation is unsafe under co-running. The shared stage
+should be bounded near its useful saturation range to reduce
+cross-stage bandwidth contention and protect short-request
+latency.
+3.4
+Design Goals
+The three observations above suggest that single-GPU omni-
+model serving needs a scheduler that jointly controls request
+scheduling in time and GPU sharing in space. We summarize
+the design goals as follows.
+G1: Slack-based deadline protection. The scheduler
+should protect requests with little remaining latency slack,
+since the same shared-stage delay can be tolerable for one
+class but fatal for another.
+G2: Path rotation in the shared stage. The scheduler
+should regulate which execution paths enter the shared
+stage, instead of treating all requests as homogeneous token-
+progress units.
+G3: Bandwidth-guided SM throttling. The scheduler
+should use SM allocation as a bandwidth-control knob, se-
+lecting a bounded shared-stage cap that protects tight-SLO
+short-path requests without expanding the shared stage to
+the full GPU during co-running.
+4
+HorizonServe
+4.1
+System Overview
+To satisfy the design goals in Section 3.4, we present Horizon-
+Serve, a multi-SLO inference serving system for single-GPU
+omni-model serving. Figure 5 shows its workflow. Horizon-
+Serve separates the serving loop into four components: of-
+fline preprocessing, a request profiler, a temporal scheduler,
+and a spatial controller. These components share one control
+state rather than operating as independent optimizers.
+Offline preprocessing builds a class-level SLO table and
+an SM ladder for each model-platform pair. At runtime, the
+request profiler maps each request to an execution path,
+deadline, remaining-slack signal, and downstream-activation
+flag. The temporal scheduler uses the path and slack signals
+to expose a temporary queue view to the base scheduler. The
+spatial controller uses downstream activity and memory-
+bandwidth pressure to select the shared-stage SM cap for
+the selected batch.
+The three online components are coupled at every sched-
+uling step. A short-path request can return after the shared
+stage, while a long-path request may activate downstream
+generation. Thus, admitting long-path work affects both
+current shared-stage queueing and later spatial pressure.
+HorizonServe therefore rotates shared-stage opportunities
+across paths, protects near-deadline requests, caps long-path
+5
+
+
+--- Page 6 ---
+Figure 5. System overview of HorizonServe.
+bursts, and maps observed memory-bandwidth pressure to
+a bounded shared-stage SM cap during co-running.
+The joint scheduler applies the queue-view and SM-cap
+decisions on the single GPU. The queue view determines
+which paths may consume shared-stage slots in this step, and
+the SM cap determines how the resulting batch shares the
+GPU with any active downstream stage. After execution, the
+runtime feeds back request progress, downstream activity,
+and memory-system usage. These feedback signals update
+both deadline slack and spatial pressure, closing the loop for
+the next batch and cap decision.
+4.2
+Offline Preprocessing and Request Signals
+The request profiler bridges offline preprocessing and on-
+line scheduling. Following common practice in SLO-driven
+LLM serving systems [1, 26, 27], HorizonServe constructs
+class-specific SLO targets and a bounded SM ladder before
+deployment. At runtime, the profiler maps each request to a
+class, assigns a deadline, and computes the slack signal used
+by the schedulers.
+Offline preprocessing. For each request class 𝑐∈C,
+HorizonServe measures solo p95 first-response latency𝑝solo
+95 (𝑐)
+and sets the class SLO target to Δ𝑐= 𝑝solo
+95 (𝑐)𝑚𝑐, where
+𝑚𝑐is a deployment policy multiplier. It also sweeps fixed
+shared-stage SM caps, chooses the co-running cap 𝑆cap as
+the smallest SM count that reaches near-best decode TPOT
+without the full-allocation latency degradation observed in
+Section 3.3, and builds an SM ladder within [𝑆min,𝑆cap]. On-
+line serving only looks up these calibrated values; Section 6.1
+describes the SLO multiplier used in our experiments.
+Online request analysis. When request 𝑖arrives, Hori-
+zonServe maps it to a request class 𝑐(𝑖) according to its
+input and requested output modalities. The class determines
+whether the request terminates after the shared stage or
+continues downstream, and gives the first-response deadline
+𝑑𝑖= 𝑎𝑖+ Δ𝑐(𝑖), where 𝑎𝑖is the arrival time.
+Remaining-slack ratio. At scheduling time, Horizon-
+Serve computes 𝑢𝑖(𝑡) = (𝑑𝑖−𝑡)/ˆ𝑟𝑖(𝑡), where 𝑑𝑖−𝑡is the
+remaining time before the first-response deadline and ˆ𝑟𝑖(𝑡)
+is a coarse remaining-time estimate rather than an oracle.
+HorizonServe temporal scheduling (one scheduling step k)
+short-path 
+prefill
+long-path 
+prefill
+decode continuation
+(always kept)
+urgency-critical
+(u < u_crit)
+FCFS admission
+Shared-stage
+Execution 
+Original queue
+snapshot
+Temporary stash
+(hidden)
+Visible scheduling
+view
+Selected shared-
+stage batch
+(this step)
+Restore hidden 
+requests
+Short-path arrives
+Long-path burst
+Short-path 
+waits behind
+long-path 
+prefill burst.
+...
+HoL blocking
+Tight SLO risk
+Time
+temporary 
+stashed
+Urgent
+Urgent
+...
+stash
+stash
+stash
+Relaxed SLO 
+long-path prefill
+...
+temporarily hidden only for this scheduling step
+phase 
+keep
+urgent 
+bypass
+Selected shared-stage batch (bs = 4)
+These requests enter
+the shared stage in
+this step.
+served early bypass kept not interrupted phase keep
+After the step finishes, all stashed requests are restored 
+to the queue with their remaining work unchanged.
+decode
+protected
+urgent 
+bypass
+Scheduler sees only 
+this filtered view.
+restore
+after
+step k
+Figure 6. Shared-stage path rotation. HorizonServe hides
+ordinary non-phase prefill requests for one scheduling step,
+keeps protected and decode work visible, selects a shared-
+stage batch, and restores hidden work afterward.
+The estimate combines offline per-stage profiles with on-
+line progress counters. The profile keys include input-token
+count, audio length, image or video count, and requested
+output path; the online counters subtract completed shared-
+stage decode progress and downstream remaining steps such
+as codec, waveform, or diffusion iterations. A request with
+𝑢𝑖(𝑡) > 1 has enough slack under the current estimate, while
+a request with 𝑢𝑖(𝑡) close to 1 is near its deadline. Horizon-
+Serve marks a request as protected when 𝑢𝑖(𝑡) < 𝑢guard,
+using the guard band to absorb estimator error, scheduling
+granularity, and runtime variation.
+The request profiler exposes the request path, the pro-
+tected bit, and whether the request may activate downstream
+stages. These signals drive path rotation, bypass decisions,
+and later SM capping.
+4.3
+Shared-Stage Path Rotation
+The temporal scheduler consumes the path and slack signals
+produced by the request profiler and decides which requests
+participate in each shared-stage forward pass. This decision
+also shapes later spatial pressure: admitting a long-path re-
+quest consumes a shared-stage slot now and may activate
+downstream work later. A temporal policy alone can pro-
+tect queue order, but it cannot prevent admitted long-path
+work from creating bandwidth pressure for later batches.
+Therefore, HorizonServe rotates shared-stage opportunities
+while exposing downstream-activation signals to the spatial
+controller.
+Path rotation. HorizonServe uses an 𝑁:𝑀rotation over
+shared-stage scheduling steps: step 𝑘is a short-path phase
+when 𝑘mod (𝑁+ 𝑀) < 𝑁, and a long-path phase other-
+wise. During a short-path phase, ordinary long-path prefill
+6
+
+
+--- Page 7 ---
+requests are temporarily hidden from the base scheduler; dur-
+ing a long-path phase, ordinary short-path prefill requests
+can be hidden instead. Hidden requests are restored imme-
+diately after the step, so HorizonServe changes only the
+scheduler’s view rather than permanently reordering the
+queue.
+Figure 6 illustrates one short-path phase. Under FCFS ad-
+mission, a long-path burst can occupy consecutive shared-
+stage slots. HorizonServe instead stashes ordinary non-phase
+prefills, so the base scheduler operates on a filtered view that
+favors the current phase.
+Slack guard. Path rotation alone can delay a request
+that is close to its deadline. HorizonServe therefore exempts
+protected requests from phase filtering: any request with
+𝑢𝑖(𝑡) < 𝑢guard remains visible even if its path does not match
+the current phase. Decode continuations also remain visible
+across phases, because hiding them can introduce token-
+streaming jitter and increase inter-token delay.
+Adaptive rotation ratio. The rotation ratio reflects cur-
+rent SLO pressure. HorizonServe fixes 𝑀= 2 rather than
+tuning it per workload. Here 𝑀is a shared-stage admis-
+sion quota, not a downstream execution quota: downstream
+progress is governed by the downstream stage and the SM
+headroom selected by the spatial controller. The lower bound
+comes from feeding the shared-to-downstream pipeline. A
+long-path first response cannot begin output-side generation
+until its shared-stage work has been admitted; with only one
+long-path phase, that opportunity can be consumed by pro-
+tected bypasses or decode continuations that remain visible
+across phases. Two long-path phases provide a small stable
+window for ordinary long-path prefills to enter the shared
+stage. We do not enlarge 𝑀further because long-path first-
+response SLOs are much looser, often by one to two orders of
+magnitude, than short-path SLOs (Figure 2). The remaining
+elasticity is handled by the short-path count 𝑁: HorizonServe
+measures the fraction of waiting short-path requests that
+are protected, maps it linearly to 𝑁∈[𝑁min, 𝑁max] = [2, 8],
+and rounds it to the current short-path phase count. Even
+at maximum short-path pressure, long-path requests retain
+𝑀/(𝑁max + 𝑀) = 20% of scheduling steps; when pressure is
+low, 𝑁shrinks and their share increases.
+Long-path admission cap. HorizonServe further limits
+how many ordinary long-path prefills can occupy shared-
+stage slots. The cap prevents long-path bursts from consum-
+ing excessive KV-cache capacity, blocking short-path ad-
+mission, and activating too many downstream generators at
+once. This is the temporal scheduler’s direct handle on future
+spatial pressure: bounding long-path admission bounds how
+quickly downstream stages become active. When candidates
+exceed the cap, HorizonServe prioritizes earlier deadlines;
+protected requests remain exempt.
+Shared 
+Stage
+Co-running
+on the same GPU
+Downstream
+Stage
+Observed pressure
+t0
+t1
+t2
+Drive SM allocation
+Sshared 
+Co-running (mid pressure)
+More downstream 
+headroom.
+Sshared (40% SMs)
+Sdown (60% SMs)
+Co-running (high pressure)
+Raise shared cap to protect 
+short-path first response.
+Sshared (60% SMs)
+Sdown (40% SMs)
+Sdown = Stotal - Sshared
+shared-stage SM
+downstream-stage SM
+Shared stage exclusively
+ uses all SMs. 
+Downstream inactive
+Figure 7. Bandwidth-guided SM throttling. HorizonServe
+uses an aggressive shared-stage cap when downstream
+stages are inactive and throttles the shared stage to a
+bounded ladder during co-running.
+Together, path rotation, slack protection, and the long-
+path cap shape both current queueing delay and future down-
+stream activity. The next section describes the complemen-
+tary decision: how HorizonServe sets the shared-stage SM
+cap after those temporal choices create co-running pressure
+on the same GPU.
+4.4
+Bandwidth-Guided SM Throttling
+Given the batch stream produced by the temporal sched-
+uler, the spatial controller controls how much GPU foot-
+print the shared stage uses during execution. When long-
+path requests activate downstream stages, admission con-
+trol alone is insufficient because co-running stages can in-
+crease memory-system pressure and delay short-path first
+responses. HorizonServe uses the shared-stage SM count as
+an indirect pressure-control knob: it does not claim that SMs
+are the bottleneck, but bounds the shared stage’s execution
+footprint so full allocation does not amplify cross-stage con-
+tention. The cap is selected from the useful saturation range
+identified by fixed-SM profiling.
+Bandwidth-pressure signal. HorizonServe tracks mem-
+ory pressure using the normalized GPU memory-activity
+signal from PyNVML as an online proxy rather than a pre-
+cise achieved-bandwidth counter, and smooths it with an
+EWMA ˆ𝐵(𝑡) with weight𝛾. Figure 7 illustrates how this pres-
+sure signal drives a shared-stage cap and complementary
+downstream headroom.
+SM ladder. HorizonServe maps bandwidth pressure to a
+shared-stage SM cap through an offline ladder S, ordered
+7
+
+
+--- Page 8 ---
+from 𝑆min to 𝑆cap. It normalizes ˆ𝐵(𝑡) by the saturation pres-
+sure 𝐵sat, clamps the ratio to [0, 1], and selects
+𝑠∗
+shared(𝑡) =
+(
+𝑆aggr,
+𝐴(𝑡) = 0,
+snapS
+ 𝑆min + 𝜌(𝑡)(𝑆cap −𝑆min) ,
+𝐴(𝑡) > 0.
+(1)
+Here 𝐴(𝑡) denotes downstream activity, 𝑆aggr is the aggres-
+sive no-downstream cap, and 𝑆cap < 𝑆aggr ≤𝑆tot is the maxi-
+mum cap allowed during co-running. Thus, increasing pres-
+sure can only move the shared stage within the bounded
+ladder up to 𝑆cap, never back to full allocation. This lets
+HorizonServe drain tight-SLO short-path requests while pre-
+serving downstream headroom and avoiding the harmful
+full-allocation regime from Section 3.3.
+Complementary downstream headroom. Given the
+total SM count 𝑆tot, HorizonServe assigns the remaining
+budget 𝑠down(𝑡) = 𝑆tot −𝑠shared(𝑡) as downstream headroom.
+This loop does not optimize the shared stage in isolation: it
+gives downstream generation headroom when pressure is
+low, but raises the shared stage toward 𝑆cap when bandwidth
+pressure threatens short-path first-response latency. The
+resulting progress or slowdown is reflected in the remaining-
+slack ratio used by the next temporal step.
+When downstream stages are inactive, HorizonServe uses
+an aggressive shared-stage allocation. During co-running,
+low memory pressure leaves more SMs to downstream gen-
+eration, while high pressure raises the shared-stage cap only
+up to 𝑆cap, avoiding the full-allocation regime shown to be
+harmful in Section 3.3. To avoid oscillation, HorizonServe
+changes the cap only when the new ladder level differs from
+the previous cap by at least one ladder step Δstep.
+This SM throttling policy complements path rotation. Ro-
+tation determines which requests enter the shared stage and
+thereby shapes downstream activity; the cap determines how
+much GPU parallelism the shared stage receives during the
+resulting co-running periods. The effect feeds back into later
+temporal decisions because memory pressure and execution
+slowdown change the remaining slack observed in subse-
+quent steps.
+4.5
+HorizonServe Scheduling Loop
+Sections 4.3 and 4.4 introduce temporal and spatial controls
+separately for clarity, but the runtime decision is joint. One
+scheduling step is a shared-stage opportunity: HorizonServe
+refreshes request and GPU signals, forms a temporary queue
+view, selects a batch, chooses the SM cap, and executes that
+batch. The queue view decides which long-path requests may
+create downstream work, while the SM cap determines how
+the admitted work shares the GPU with active downstream
+stages.
+The dependence runs in both directions. Without spatial
+control, temporal admission can reserve shared-stage oppor-
+tunities for the right paths, but the resulting batches may
+Algorithm 1 One HorizonServe Scheduling Step
+Input: queue Q, step 𝑘, SLO/control parameters, downstream activity
+𝐴(𝑡), memory-pressure signal 𝐵(𝑡), previous cap 𝑠prev
+Output: batch B, shared-stage cap 𝑠shared, downstream headroom 𝑠down
+Step 1: Refresh signals. Update each request’s class, path, deadline,
+slack, and protected bit from the SLO table and progress; sample the GPU
+memory-activity signal and update ˆ𝐵(𝑡).
+Step 2: Build temporal view. Update 𝑁from protected short-path
+pressure, choose phase 𝜙, hide ordinary non-𝜙prefills, keep protected
+and decode work visible, cap ordinary long-path prefills, and call B ←
+BaseScheduler(V).
+Step 3: Select SM split. Compute 𝑠∗from Equation 1. Apply it if down-
+stream stages are inactive or the ladder level changes by Δstep; otherwise
+keep 𝑠prev. Set 𝑠down ←max(0,𝑆tot −𝑠shared).
+Step 4: Execute and publish. Run B with cap 𝑠shared, restore hidden
+requests, and publish request progress, downstream activity, and ˆ𝐵(𝑡).
+return B,𝑠shared,𝑠down
+still be slowed by downstream bandwidth contention. With-
+out temporal control, spatial throttling can react to memory
+pressure, but it cannot prevent long-path bursts from occu-
+pying shared-stage slots or decide which near-deadline re-
+quests should be protected before pressure appears. Horizon-
+Serve closes this loop by letting temporal admission shape
+future downstream activity and letting spatial control feed
+its progress and pressure back into the slack seen by the next
+step.
+Algorithm 1 shows this loop. Step 1 refreshes the request
+and GPU signals left by prior decisions. Step 2 builds the
+temporal view, including the long-path cap that bounds
+future downstream work. Step 3 chooses the SM split for
+the selected batch, trading shared-stage progress against
+downstream headroom during co-running. Step 4 publishes
+progress and pressure so the next step observes the conse-
+quences of both decisions. HorizonServe therefore controls
+admission and SM allocation as one feedback loop, while the
+base scheduler still performs low-level batch construction
+and resource checks.
+5
+Implementation
+We implement HorizonServe on top of vLLM-Omni [67].
+HorizonServe keeps vLLM-Omni’s batching, KV-cache man-
+agement, and model execution unchanged, and interposes
+only at scheduling-step boundaries. For each step, it anno-
+tates requests with class and deadline metadata: the request
+class is inferred from a priority field set at the API layer
+(0 = text output, 10 = audio output, 20 = image output), and
+the deadline is stamped at admission time using a monotonic
+clock with a per-type SLO threshold read from environment
+variables, so thresholds can be recalibrated to measured solo-
+run latencies on the target device without recompilation.
+HorizonServe then hides requests that should not be visible
+in the current temporary scheduler view, invokes the origi-
+nal vLLM-Omni scheduler, and restores the hidden requests.
+8
+
+
+--- Page 9 ---
+Table 2. Experimental GPU platforms.
+Item
+RTX 6000 Ada
+RTX PRO 6000
+Host CPU
+AMD Ryzen Threadripper
+PRO 5955WX
+24 vCPU Intel Xeon Platinum
+8568Y+
+System memory
+128 GB
+120 GB
+GPU memory
+48 GB GDDR6 ECC
+96 GB GDDR7 ECC
+Peak bandwidth
+960 GB/s
+1,792 GB/s
+Compute resources
+142 SMs
+188 SMs
+This realizes HorizonServe’s admission policy without mov-
+ing KV-cache state or rewriting batch construction.
+For spatial control, our prototype applies the selected
+shared-stage SM cap with CUDA Green Contexts. Each stage
+process pre-allocates a full ladder of Green Contexts at startup,
+one per SM level, so runtime control only selects an exist-
+ing level and activates the corresponding context before a
+forward pass. Stage 0 and Stage 1 hold complementary lad-
+ders: their SM counts always sum to the physical GPU total,
+ensuring the hardware is fully utilized under any SM split.
+HorizonServe can also use any backend that exposes a per-
+stage SM cap. Stage processes pass compact control state
+through a shared-memory monitor in /dev/shm; the record
+carries downstream-stage activity and the current SM de-
+cision. Stage outputs are exchanged through the runtime’s
+existing inter-process queues. We sample the GPU memory-
+activity signal with PyNVML, the Python bindings for the
+NVIDIA Management Library (NVML), at scheduling-step
+boundaries and publish the normalized value through the
+same monitor for the spatial controller.
+6
+Experiments
+6.1
+Experimental Setup
+Platform. All experiments use single-GPU co-location: the
+shared stage and downstream stages run as separate pro-
+cesses on the same GPU. Table 2 summarizes the host and
+GPU environments. Our evaluation spans two single-GPU
+platforms, RTX 6000 Ada and RTX PRO 6000, allowing us to
+study the system under different SM counts, memory capac-
+ities, and memory bandwidths. Both platforms use Ubuntu
+22.04.5 LTS, CUDA 13.1, and NVIDIA driver 590.48.01.
+Models. We evaluate three omni-model serving pipelines:
+Qwen2.5-Omni [63], MiMo-Audio [56], and BAGEL [14].
+They cover distinct downstream-generation patterns: speech-
+output generation, audio-code generation, and image genera-
+tion. Together, they exercise both short paths that terminate
+after the shared stage and long paths that activate down-
+stream stages before producing the first user-visible output.
+Workloads. Requests arrive according to a Poisson pro-
+cess. We construct model-specific request classes from the
+modalities supported by each model, using ShareGPT con-
+versations for interactive text prompts, LibriSpeech for audio
+inputs [39], Food-101 for image inputs [6], UCF-101-style
+synthetic clips for video inputs [54], and CNN/DailyMail
+for long-text summarization prompts [21]. Each experiment
+uses a mixed stream of short-path and long-path requests
+and runs each plotted point for 15 minutes. We observed con-
+sistent trends across repeated runs and report representative
+runs. In arrival-rate sweeps, we increase the total offered
+load at a fixed traffic mix. In long-path sweeps, we keep the
+offered load fixed and vary the fraction of requests that acti-
+vate downstream stages. This separates queueing pressure
+from downstream co-running pressure.
+Baselines. We use vLLM-Omni (v0.16.0) as the base run-
+time and vanilla baseline because it supports the omni-model
+pipelines evaluated in this paper and exposes their shared/-
+downstream execution structure on a single GPU. Existing
+VLM/LMM systems mainly target input-side multimodal
+processing followed by text generation. GPU-sharing sys-
+tems provide low-level mechanisms rather than omni-path
+admission policies, and disaggregated serving systems as-
+sume multi-GPU or cluster-level stage placement rather than
+single-GPU co-location [4, 15, 19, 28, 43, 67, 77]. We there-
+fore build controlled baselines inside the same vLLM-Omni
+runtime: Vanilla, EDF, MPS, and EDF-MPS. Keeping the run-
+time fixed makes the comparison focus on scheduling and
+GPU-sharing policy rather than model support, batching
+implementation, or IPC differences. Vanilla is unmodified
+vLLM-Omni. EDF orders eligible requests by first-response
+deadline while leaving GPU sharing unchanged. MPS is our
+practical spatial-sharing baseline: it delegates multi-process
+GPU sharing to NVIDIA’s runtime-managed MPS scheduler,
+allowing shared and downstream stage processes to co-run
+on one GPU without application-level SM control. EDF-MPS
+combines EDF request ordering with MPS-based runtime
+GPU sharing. Together, these baselines isolate deadline or-
+dering, runtime-managed GPU co-running, and their direct
+combination without HorizonServe’s feedback between path-
+aware admission and stage-level GPU allocation.
+Metrics. HorizonServe’s objective is to increase SLO-
+satisfied goodput, i.e., useful throughput from requests that
+meet their class-specific SLOs. In the main result, we report
+SLO attainment: the fraction of requests whose user-visible
+response satisfies the target. At a fixed offered load, higher
+SLO attainment directly means higher SLO-satisfied goodput.
+Because omni requests expose different output forms, we re-
+port the first response latency, which includes the queueing
+time. The latency metric used to judge attainment is class-
+specific: text-output requests use time-to-first-token (TTFT),
+audio-output requests use time-to-first-output (TTFO), and
+image-output requests use end-to-end latency. We set each
+class SLO target to 5× its isolated p95 first-response la-
+tency, following prior SLO and goodput-oriented serving
+practice [1, 26, 27]. We use the same multiplier for all re-
+quest classes, models, GPUs, and serving policies. This keeps
+SLO tightness tied to each class’s solo latency while using a
+common policy across workloads. We compute SLO attain-
+ment over completed requests in each run and also report
+9
+
+
+--- Page 10 ---
+0.2
+0.3
+0.4
+0.5
+arrival rate  (req/s)
+0
+20
+40
+60
+80
+100
+MiMo-Audio
+SLO Attain. (%)
+RTX 6000 Ada
+arrival rate  (frac=0.30)
+0.2
+0.4
+0.6
+0.8
+long-path fraction
+RTX 6000 Ada
+long-path frac ( =0.35)
+0.2
+0.3
+0.4
+0.5
+arrival rate  (req/s)
+RTX PRO 6000
+arrival rate  (frac=0.30)
+0.2
+0.4
+0.6
+0.8
+long-path fraction
+RTX PRO 6000
+long-path frac ( =0.35)
+0.3
+0.4
+0.5
+0.6
+0.7
+arrival rate  (req/s)
+0
+20
+40
+60
+80
+100
+BAGEL
+SLO Attain. (%)
+0.2
+0.4
+0.6
+0.8
+long-path fraction
+0.3
+0.4
+0.5
+0.6
+0.7
+arrival rate  (req/s)
+0.2
+0.4
+0.6
+0.8
+long-path fraction
+0.2
+0.3
+0.4
+0.5
+arrival rate  (req/s)
+0
+20
+40
+60
+80
+100
+Qwen2.5-Omni
+SLO Attain. (%)
+0.2
+0.4
+0.6
+0.8
+long-path fraction
+0.2
+0.3
+0.4
+0.5
+arrival rate  (req/s)
+0.2
+0.4
+0.6
+0.8
+long-path fraction
+Vanilla
+EDF
+MPS
+EDF+MPS
+HorizonServe
+Figure 8. End-to-end SLO attainment under increasing arrival rates and long-path request ratios.
+p95 response latency, shared-stage TPOT, GPU memory-
+bandwidth utilization, and scheduling overhead.
+6.2
+Main Results
+Figure 8 shows the main result under mixed omni traffic.
+For each model and GPU platform, we run two sweeps: in-
+creasing the total Poisson arrival rate at a fixed traffic mix,
+and increasing the long-path request ratio at a fixed offered
+load. SLO attainment is computed with the class-specific
+first-response metric from Section 6.1.
+HorizonServe consistently preserves higher SLO attain-
+ment in the stressed region of both sweeps. The largest gap
+appears on RTX PRO 6000 with Qwen2.5-Omni: at arrival
+rate 0.45, HorizonServe reaches 71.9% SLO attainment, while
+the best baseline reaches 14.6%. The same trend appears on
+RTX 6000 Ada, where HorizonServe keeps Qwen2.5-Omni
+at 53.5% attainment at arrival rate 0.5, compared with 12.7%
+for the best baseline. Thus, the larger PRO platform raises
+absolute capacity but does not remove the scheduling prob-
+lem when the mixed stream reaches the stressed region;
+uncontrolled sharing still loses most SLO-satisfied work.
+The long-path-ratio sweep stresses the other half of the
+design. It keeps the total offered load fixed while increasing
+the amount of downstream generation. Under 60% long-path
+traffic on RTX 6000 Ada, HorizonServe reaches 70.0% attain-
+ment for Qwen2.5-Omni and 49.0% for BAGEL, compared
+with 27.5% and 7.0% for the best baselines. This shows that
+the gain is not only from handling higher arrival rates; it also
+comes from preventing downstream-heavy traffic from con-
+suming shared-stage opportunities and creating cross-stage
+contention.
+The baselines fail in complementary ways. EDF improves
+deadline ordering, but it does not reduce the downstream
+work created by long-path bursts or change how co-running
+stages share the GPU. MPS improves concurrent execution,
+but it keeps the original request admission policy and there-
+fore cannot protect short-path slack. EDF-MPS combines
+both mechanisms, yet still lacks a feedback loop between
+path admission and stage-level GPU allocation. Horizon-
+Serve performs better because the temporal decision and the
+spatial decision are made together: it controls which paths
+enter the shared stage and how much SM capacity the shared
+stage uses when downstream stages are active.
+6.3
+Latency and Per-Class Analysis
+This section examines whether the end-to-end gains in Fig-
+ure 8 come from broad request-level improvement rather
+than one dominant class. Figure 9 breaks down p95 response
+latency by request class at representative load points. The
+latency is measured from request arrival to the first user-
+visible response, so it includes queueing delay as well as
+model execution. Since different classes expose different re-
+sponse signals, we report TTFT for text-output requests,
+TTFO for audio-output requests, and end-to-end latency for
+image-output requests.
+The per-class view complements the aggregate SLO at-
+tainment in Section 6.2. A serving policy can improve the
+aggregate result by favoring an easier request class, but Hori-
+zonServe aims to protect tight-SLO short-path requests while
+still admitting long-path work. Compared with the best base-
+line for each class, HorizonServe reduces p95 response la-
+tency by 57.1% for Qwen2.5-Omni, 42.1% for MiMo-Audio,
+and 38.4% for BAGEL on RTX 6000 Ada. The gains persist on
+RTX PRO 6000, where the corresponding p95 reductions are
+55.2%, 63.7%, and 38.4%. These reductions cover both short-
+path and long-path classes, indicating that HorizonServe is
+not simply shifting delay from one request type to another.
+The latency breakdown also explains why EDF and MPS
+are insufficient alone. EDF can reduce queueing for some
+near-deadline classes, but it leaves co-running interference
+10
+
+
+--- Page 11 ---
+t2t
+a2t
+i2t
+v2t
+a2a
+t2a
+i2a
+v2a
+10
+3
+10
+4
+10
+5
+p95 lat. (ms)
+RTX 6000 Ada 
+ Qwen2.5-Omni
+TTFT
+TTFO
+t2t
+a2t
+a2a
+t2a
+10
+3
+10
+4
+10
+5
+p95 lat. (ms)
+MiMo-Audio
+TTFT
+TTFO
+t2t
+i2t
+t2i
+i2i
+10
+3
+10
+4
+10
+5
+BAGEL
+TTFT
+E2E
+t2t
+a2t
+i2t
+v2t
+a2a
+t2a
+i2a
+v2a
+10
+3
+10
+4
+10
+5
+p95 lat. (ms)
+RTX PRO 6000 
+ Qwen2.5-Omni
+TTFT
+TTFO
+t2t
+a2t
+a2a
+t2a
+request type
+10
+3
+10
+4
+10
+5
+p95 lat. (ms)
+MiMo-Audio
+TTFT
+TTFO
+t2t
+i2t
+t2i
+i2i
+request type
+10
+3
+10
+4
+10
+5
+BAGEL
+TTFT
+E2E
+Vanilla
+EDF
+MPS
+EDF+MPS
+HorizonServe
+Figure 9. Per-class p95 response latency including queueing
+delay.
+Table 3. Shared-stage (Stage 0) TPOT by serving policy.
+Values are p50/p95 in ms/token.
+Model
+GPU
+Van.
+EDF
+MPS
+E+M
+Horizon
+Qwen2.5-Omni Ada
+39.5/62.9
+39.7/63.3
+39.7/45.9
+39.8/45.8
+40.0/64.0
+PRO
+36.0/57.5
+36.1/57.8
+36.1/42.0
+36.2/41.8
+36.3/58.1
+MiMo-Audio
+Ada
+52.4/54.6
+52.4/54.7
+52.5/55.0
+52.4/54.8
+52.4/54.6
+PRO
+48.0/50.0
+48.0/50.1
+48.1/50.4
+48.0/50.2
+48.0/50.0
+BAGEL
+Ada
+37.1/38.6
+37.1/38.6
+37.1/38.7
+37.1/38.7
+37.4/38.8
+PRO
+34.1/35.5
+34.0/35.5
+34.1/35.6
+34.1/35.6
+34.0/35.4
+unresolved. MPS can reduce some long-path latency by al-
+lowing concurrent kernels, but it does not prevent long-path
+work from occupying shared-stage opportunities. Horizon-
+Serve reduces both effects: path rotation and slack protection
+lower shared-stage waiting time for tight-SLO classes, while
+bandwidth-guided SM throttling reduces interference when
+downstream stages are active.
+We also report shared-stage (Stage 0) TPOT in Table 3. The
+table reports p50/p95 TPOT, checking whether improving
+first-response latency harms token streaming in the shared
+stage, which is the component directly affected by Horizon-
+Serve’s admission and SM-allocation decisions.
+Table 3 shows that HorizonServe’s first-response gains do
+not come from sacrificing shared-stage token streaming. Rel-
+ative to Vanilla, HorizonServe changes p50 TPOT by at most
+0.0
+2.5
+5.0
+audio
+co-running
+(a) downstream audio load
+0
+1
+BW util
+(b) BW util
+20
+40
+60
+80
+100
+time (s)
+0
+63
+100
+Stage0
+SM cap (%)
+(c) Stage0 SM ladder
+Figure 10. Hardware signal and SM response in a represen-
+tative Qwen2.5-Omni run.
+0.5 ms/token on RTX 6000 Ada and 0.3 ms/token on RTX PRO
+6000. The p95 TPOT is also essentially unchanged for MiMo-
+Audio and BAGEL, and changes by only about 1 ms/token
+for Qwen2.5-Omni. MPS sometimes lowers Qwen2.5-Omni
+p95 TPOT, but Figure 8 shows that better token streaming
+alone does not preserve SLO-satisfied goodput without path
+and slack control.
+6.4
+Hardware-Signal Analysis
+Figure 10 shows the spatial-control loop for Qwen2.5-Omni
+on RTX 6000 Ada at 𝜆= 0.3 with 40% audio traffic. The
+top panel shows the number of concurrent audio-output re-
+quests, which marks when downstream generation is active.
+The middle panel shows the memory-pressure proxy sam-
+pled through PyNVML and smoothed with an exponentially
+weighted moving average (𝛾= 0.4). The bottom panel shows
+the shared-stage SM cap selected by HorizonServe.
+The three traces align in time. When no audio request
+is running, the shared stage can use its aggressive cap be-
+cause there is no downstream co-running stage. Once audio
+generation becomes active, HorizonServe switches to the
+calibrated ladder. Under low or moderate pressure, it leaves
+more SM headroom to downstream generation. As measured
+memory pressure grows and often crosses the saturation
+threshold, the controller raises the shared-stage cap toward
+𝑆cap so short-path requests can still reach their first response
+under tighter SLOs. Across this run, the correlation between
+the smoothed memory signal and the selected cap is 0.926,
+showing that the controller tracks the pressure signal while
+staying within the cap range motivated by Figure 4.
+This figure is not a standalone performance comparison
+or a direct achieved-bandwidth measurement; it validates
+the online pressure proxy used by the controller. The PyN-
+VML signal follows downstream activity and drives a stable
+bounded-cap response after EWMA smoothing, linking the
+fixed-SM profiling in Section 3.3 to the runtime policy in
+Section 4.4.
+11
+
+
+--- Page 12 ---
+Qwen2.5-Omni MiMo-Audio
+BAGEL
+0
+25
+50
+75
+100
+SLO Attainment (%)
+96
+89
+94
+69
+65
+65
+64
+59
+64
+RTX 6000 Ada
+Qwen2.5-Omni MiMo-Audio
+BAGEL
+96
+91
+91
+66
+72
+63
+60
+67
+62
+RTX PRO 6000
+HorizonServe (full)
+w/o SM throttle
+w/o path rotation
+Figure 11. Ablation of HorizonServe mechanisms under
+representative mixed workloads.
+Table 4. Runtime overheads introduced by HorizonServe.
+Component
+Metric
+Ada
+PRO
+Request annotation
+𝜇s/request
+0.4
+0.4
+Scheduler-view wrapper
+𝜇s/step
+1.0
+1.0
+PyNVML sampling
+𝜇s/step
+1.3
+1.4
+SM-cap selection
+𝜇s/step
+0.3
+0.3
+Shared-memory monitor
+𝜇s/update
+33
+35
+Green Context activation
+𝜇s/switch
+4.8
+5.0
+End-to-end tax
+Throughput loss (%)
+< 1
+< 1
+6.5
+Ablation and Overhead
+This section isolates the contribution of the mechanisms
+shown in our ablation and quantifies runtime overhead. Fig-
+ure 11 compares full HorizonServe with variants that remove
+shared-stage path rotation or bandwidth-guided SM throt-
+tling while keeping the remaining policy unchanged. We
+run these variants on both GPU platforms at representative
+load points from the main experiment. The figure reports
+SLO attainment, so lower bars indicate that the removed
+mechanism is necessary for preserving SLO-satisfied good-
+put under mixed traffic.
+The ablation confirms that both sides of the joint policy
+are needed. Removing path rotation lets long-path bursts
+occupy shared-stage opportunities, which primarily hurts
+tight-SLO short paths and also increases later downstream
+pressure. Removing bandwidth-guided SM throttling leaves
+the temporal scheduler intact, but exposes requests to co-
+running interference once downstream generation is active.
+Full HorizonServe performs best because the two mecha-
+nisms close the loop: temporal admission controls future
+downstream work, and SM throttling controls how active
+downstream work shares the GPU with the shared stage.
+Table 4 reports the online costs on the serving path. Re-
+quest annotation, scheduler-view filtering, PyNVML sam-
+pling, and SM-cap selection are all within a few microseconds.
+The shared-memory monitor is the largest Python-side con-
+trol cost, but it is still tens of microseconds per update, and
+Green Context activation adds about 5 𝜇s per switch. The
+measured end-to-end throughput loss is below 1% on both
+platforms, so the runtime control loop is lightweight relative
+to model execution.
+Offline preprocessing runs before serving starts. SLO col-
+lection runs each request class in isolation, measures p95 solo
+first-response latency, and stores the resulting SLO table. In
+our setup, Qwen2.5-Omni has eight request classes and takes
+about 30–60 minutes, with short text classes taking about
+10 seconds and longer audio or video-related classes taking
+2–5 minutes each. MiMo-Audio has four classes and takes
+about 10 minutes. BAGEL has four classes and takes about
+15 minutes, with the diffusion-output class taking about 3
+minutes. HorizonServe also performs the fixed-SM sweep
+used to set the SM ladder and 𝑆cap. These offline artifacts
+are regenerated only when the model, hardware platform,
+or SLO policy changes.
+7
+Related Work
+Model serving systems. General prediction-serving sys-
+tems optimize batching, model selection, autoscaling, in-
+terference control, and predictable latency for DNN infer-
+ence [12, 18, 48, 50, 52, 72–74]. SLO-aware and multi-SLO
+serving has been studied through latency-targeted sched-
+uling, goodput optimization, request prioritization, spec-
+ulative decoding, and fine-grained execution control [18,
+26, 27, 42, 55, 72, 73, 76]. Recent LLM serving systems im-
+prove iteration-level batching, KV-cache management, and
+structured generation [25, 68, 75]; they also optimize chun-
+ked prefill, prefill–decode disaggregation, phase splitting,
+and KV-cache-centric serving [1, 23, 40, 42, 76]. Other work
+addresses long-context scheduling, request migration, and
+serverless loading [17, 55, 61]. FlexGen and PowerInfer study
+limited-resource or consumer-GPU LLM inference [51, 53].
+These systems are closest in their concern for latency and
+resource efficiency, but they primarily target text genera-
+tion or model-level serving. HorizonServe instead targets
+multimodal, multi-SLO inference serving: it treats an omni
+request as a shared stage followed by optional output-side
+generators, and schedules these paths under first-response
+SLOs.
+Multimodal serving and GPU sharing. Multimodal
+and generative serving systems extend the serving target be-
+yond text by optimizing visual encoders, multimodal prepro-
+cessing, encode-prefill-decode pipelines, or disaggregated
+any-to-any serving [4, 19, 43, 66, 67]. GPU sharing mech-
+anisms and systems provide the substrate for co-location.
+They include CUDA streams, MPS, and MIG [31, 33, 34], fast
+GPU sharing and preemption [20, 69], spatio-temporal parti-
+tioning and hardware compute partitioning [5, 10, 32], and
+LLM-oriented spatial sharing [15, 28, 77]. These works pro-
+vide important mechanisms, but they do not jointly handle
+output-side omni paths, heterogeneous first-response SLOs,
+single-GPU shared/downstream co-location, and feedback
+between path admission and stage-level GPU allocation.
+12
+
+
+--- Page 13 ---
+8
+Conclusion
+Omni-model serving introduces heterogeneous execution
+paths through a shared multi-stage pipeline. This path het-
+erogeneity creates temporal interference in the shared back-
+bone and spatial interference across concurrent GPU stages.
+We presented HorizonServe, a joint temporal-spatial sched-
+uler that rotates shared-stage opportunities across paths and
+throttles the shared stage during co-running. Across three
+omni-model workloads and two GPU platforms, Horizon-
+Serve improves SLO attainment by up to 4.9× in arrival-rate
+sweeps and 7.0× under downstream-heavy traffic. It also
+reduces per-class first-response latency by 38.4–63.7%, pre-
+serves shared-stage TPOT, and adds less than 1% through-
+put overhead. These results show that deadline slack and
+bandwidth pressure must be controlled together for efficient
+multi-SLO omni-model serving.
+References
+[1] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun
+Kwatra, Bhargav Gulavani, Alexey Tumanov, and Ramachandran Ram-
+jee. 2024. Taming Throughput-Latency Tradeoff in LLM Inference with
+Sarathi-Serve. In 18th USENIX Symposium on Operating Systems Design
+and Implementation (OSDI 24). USENIX Association, Santa Clara, CA,
+117–134.
+https://www.usenix.org/conference/osdi24/presentation/
+agrawal
+[2] Inclusion AI, :, Bowen Ma, Cheng Zou, ChengKun Du, Canxiang Yan,
+Chunxiang Jin, Chunjie Shen, Chenyu Lian, Chengxiang Fan, Dan-
+dan Zheng, Fudong Wang, Furong Xu, Guangming Yao, Haohao Liu,
+Han Peng, Jun Zhou, Junluan Xia, Jingdong Chen, Jianing Li, Jianxin
+Sun, Jianjiang Zhu, Jianping Jiang, Jinpeng Ou, Jun Peng, Jin Peng,
+Kaixiang Ji, Li Tang, Libin Wang, Lixiang Ru, Longhua Tan, Lu Ma,
+Lan Wang, Mochen Bai, Minghong Cai, Mingxue Yang, Ning Gao,
+Qingpei Guo, Qinglong Zhang, Qiang Xu, Qin Zhao, Rui Liu, Ruijie
+Xiong, Ruobing Zheng, Sirui Gao, Shaoxiong Lin, Tao Zhang, Tianqi
+Li, Tinghao Liu, Tongli Wang, Taoye Huang, Weilong Chai, Xiaomei
+Wang, Xiaolong Wang, Xiaojian Liu, Xiao Lu, Xiaoyu Li, Xingning
+Dong, Xuzheng Yu, Xuezhi Wang, Yi Yuan, Yuting Gao, Yuting Xiao,
+Yunxiao Sun, Yipeng Chen, Yifan Mao, Yifei Wu, Yongjie Lyu, Yingy-
+ing Zhang, YuQian Li, Ziping Ma, Zhiqiang Fang, Zhihao Qiu, Ziyuan
+Huang, Zizheng Yang, and Zhengyu He. 2026. Ming-Flash-Omni: A
+Sparse, Unified Architecture for Multimodal Perception and Genera-
+tion. arXiv:2510.24821 [cs.CV] https://arxiv.org/abs/2510.24821
+[3] Inclusion AI, Biao Gong, Cheng Zou, Chuanyang Zheng, Chunluan
+Zhou, Canxiang Yan, Chunxiang Jin, Chunjie Shen, Dandan Zheng,
+Fudong Wang, Furong Xu, GuangMing Yao, Jun Zhou, Jingdong Chen,
+Jianxin Sun, Jiajia Liu, Jianjiang Zhu, Jun Peng, Kaixiang Ji, Kaiyou
+Song, Kaimeng Ren, Libin Wang, Lixiang Ru, Lele Xie, Longhua Tan,
+Lyuxin Xue, Lan Wang, Mochen Bai, Ning Gao, Pei Chen, Qingpei Guo,
+Qinglong Zhang, Qiang Xu, Rui Liu, Ruijie Xiong, Sirui Gao, Tinghao
+Liu, Taisong Li, Weilong Chai, Xinyu Xiao, Xiaomei Wang, Xiaoxue
+Chen, Xiao Lu, Xiaoyu Li, Xingning Dong, Xuzheng Yu, Yi Yuan, Yuting
+Gao, Yunxiao Sun, Yipeng Chen, Yifei Wu, Yongjie Lyu, Ziping Ma,
+Zipeng Feng, Zhijiang Fang, Zhihao Qiu, Ziyuan Huang, and Zhengyu
+He. 2025. Ming-Omni: A Unified Multimodal Model for Perception and
+Generation. arXiv:2506.09344 [cs.AI] https://arxiv.org/abs/2506.09344
+[4] Fan Bai, Pai Peng, Zhengzhi Tang, Zhe Wang, Gong Chen, Xiang Lu,
+Yinuo Li, Huan Lin, Weizhe Lin, Yaoyuan Wang, et al. 2026. EPD-Serve:
+A Flexible Multimodal EPD Disaggregation Inference Serving System
+On Ascend. arXiv preprint arXiv:2601.11590 (2026).
+[5] Joshua Bakita and James H. Anderson. 2023. Hardware Compute
+Partitioning on NVIDIA GPUs. In Proceedings of the 29th IEEE Real-
+Time and Embedded Technology and Applications Symposium. IEEE,
+Piscataway, NJ, USA, 54–66. doi:10.1109/RTAS58335.2023.00012
+[6] Lukas Bossard, Matthieu Guillaumin, and Luc Van Gool. 2014. Food-
+101: Mining Discriminative Components with Random Forests. In
+Proceedings of the European Conference on Computer Vision Workshops.
+Springer, 446–461.
+[7] Sanyuan Chen, Chengyi Wang, Yu Wu, Ziqiang Zhang, Long Zhou,
+Shujie Liu, Zhuo Chen, Yanqing Liu, Huaming Wang, Jinyu Li, Lei
+He, Sheng Zhao, and Furu Wei. 2025.
+Neural Codec Language
+Models are Zero-Shot Text to Speech Synthesizers. IEEE Transac-
+tions on Audio, Speech and Language Processing 33 (2025), 705–718.
+doi:10.1109/TASLPRO.2025.3530270
+[8] Xiaokang Chen, Zhiyu Wu, Xingchao Liu, Zizheng Pan, Wen Liu,
+Zhenda Xie, Xingkai Yu, and Chong Ruan. 2025. Janus-Pro: Unified
+Multimodal Understanding and Generation with Data and Model Scal-
+ing. arXiv:2501.17811 [cs.AI] https://arxiv.org/abs/2501.17811
+[9] Yukang Chen, Weihao Cui, Han Zhao, Ziyi Xu, Xiaoze Fan, Xusheng
+Chen, Yangjie Zhou, Shixuan Sun, Bingsheng He, and Quan Chen. 2026.
+Towards High-Goodput LLM Serving with Prefill-decode Multiplexing.
+In Proceedings of the 31st ACM International Conference on Architectural
+Support for Programming Languages and Operating Systems, Volume 2.
+2030–2047.
+[10] Seungbeom Choi, Sunho Lee, Yeonjae Kim, Jongse Park, Youngjin
+Kwon, and Jaehyuk Huh. 2022.
+Serving Heterogeneous Machine
+Learning Models on Multi-GPU Servers with Spatio-Temporal Shar-
+ing. In 2022 USENIX Annual Technical Conference (USENIX ATC 22).
+USENIX Association, Carlsbad, CA, 199–216. https://www.usenix.org/
+conference/atc22/presentation/choi-seungbeom
+[11] Xiangxiang Chu, Limeng Qiao, Xinyang Lin, Shuang Xu, Yang Yang,
+Yiming Hu, Fei Wei, Xinyu Zhang, Bo Zhang, Xiaolin Wei, and
+Chunhua Shen. 2023. MobileVLM: A Fast, Strong and Open Vision
+Language Assistant for Mobile Devices. arXiv:2312.16886 [cs.CV]
+https://arxiv.org/abs/2312.16886
+[12] Daniel Crankshaw, Xin Wang, Guilio Zhou, Michael J. Franklin,
+Joseph E. Gonzalez, and Ion Stoica. 2017. Clipper: A Low-Latency
+Online Prediction Serving System. In 14th USENIX Symposium on
+Networked Systems Design and Implementation (NSDI 17). USENIX As-
+sociation, Boston, MA, 613–627. https://www.usenix.org/conference/
+nsdi17/technical-sessions/presentation/crankshaw
+[13] Alexandre Défossez, Jade Copet, Gabriel Synnaeve, and Yossi Adi.
+2023.
+High Fidelity Neural Audio Compression.
+Transactions on
+Machine Learning Research (2023). https://openreview.net/forum?id=
+ivCd8z8zR2 Featured Certification, Reproducibility Certification.
+[14] Chaorui Deng, Deyao Zhu, Kunchang Li, Chenhui Gou, Feng Li, Zeyu
+Wang, Shu Zhong, Weihao Yu, Xiaonan Nie, Ziang Song, Guang Shi,
+and Haoqi Fan. 2025. Emerging Properties in Unified Multimodal
+Pretraining. arXiv preprint arXiv:2505.14683 (2025).
+[15] Jiangfei Duan, Runyu Lu, Haojie Duanmu, Xiuhong Li, Xingcheng
+Zhang, Dahua Lin, Ion Stoica, and Hao Zhang. 2024. MuxServe: flexible
+spatial-temporal multiplexing for multiple LLM serving. In Proceed-
+ings of the 41st International Conference on Machine Learning (Vienna,
+Austria) (ICML’24). JMLR.org, Article 473, 13 pages.
+[16] Chaoyou Fu, Haojia Lin, Xiong Wang, YiFan Zhang, Yunhang Shen,
+Xiaoyu Liu, Haoyu Cao, Zuwei Long, Heting Gao, Ke Li, Long MA,
+Xiawu Zheng, Rongrong Ji, Xing Sun, Caifeng Shan, and Ran He. 2026.
+VITA-1.5: Towards GPT-4o Level Real-Time Vision and Speech Inter-
+action. In The Thirty-ninth Annual Conference on Neural Information
+Processing Systems. https://openreview.net/forum?id=8PUzLga3lU
+[17] Yao Fu, Leyang Xue, Yeqi Huang, Andrei-Octavian Brabete, Dmitrii
+Ustiugov, Yuvraj Patel, and Luo Mai. 2024.
+ServerlessLLM: Low-
+Latency Serverless Inference for Large Language Models. In 18th
+13
+
+
+--- Page 14 ---
+USENIX Symposium on Operating Systems Design and Implementa-
+tion (OSDI 24). USENIX Association, Santa Clara, CA, 135–153. https:
+//www.usenix.org/conference/osdi24/presentation/fu
+[18] Arpan Gujarati, Reza Karimi, Safya Alzayat, Wei Hao, Antoine Kauf-
+mann, Ymir Vigfusson, and Jonathan Mace. 2020. Serving DNNs
+like Clockwork: Performance Predictability from the Bottom Up. In
+14th USENIX Symposium on Operating Systems Design and Imple-
+mentation (OSDI 20). USENIX Association, Virtual Event, 443–462.
+https://www.usenix.org/conference/osdi20/presentation/gujarati
+[19] Tianyu Guo, Tianming Xu, Xianjie Chen, Junru Chen, Nong Xiao, and
+Xianwei Zhang. 2025. Rserve: Overlapping encoding and prefill for
+efficient lmm inference. arXiv preprint arXiv:2509.24381 (2025).
+[20] Mingcong Han, Hanze Zhang, Rong Chen, and Haibo Chen. 2022.
+Microsecond-scale Preemption for Concurrent GPU-accelerated DNN
+Inferences. In 16th USENIX Symposium on Operating Systems Design
+and Implementation (OSDI 22). USENIX Association, Carlsbad, CA, 539–
+558. https://www.usenix.org/conference/osdi22/presentation/han
+[21] Karl Moritz Hermann, Tomáš Kočiský, Edward Grefenstette, Lasse Es-
+peholt, Will Kay, Mustafa Suleyman, and Phil Blunsom. 2015. Teaching
+machines to read and comprehend. In Proceedings of the 29th Inter-
+national Conference on Neural Information Processing Systems - Vol-
+ume 1 (Montreal, Canada) (NIPS’15). MIT Press, Cambridge, MA, USA,
+1693–1701.
+[22] Jonathan Ho, Ajay Jain, and Pieter Abbeel. 2020. Denoising Diffu-
+sion Probabilistic Models. In Advances in Neural Information Pro-
+cessing Systems, H. Larochelle, M. Ranzato, R. Hadsell, M.F. Bal-
+can, and H. Lin (Eds.), Vol. 33. Curran Associates, Inc., 6840–
+6851.
+https://proceedings.neurips.cc/paper_files/paper/2020/file/
+4c5bcfec8584af0d967f1ab10179ca4b-Paper.pdf
+[23] Yibo Jin, Tao Wang, Huimin Lin, Mingyang Song, Peiyang Li, Yipeng
+Ma, Yicheng Shan, Zhengfan Yuan, Cailong Li, Yajing Sun, Tiandeng
+Wu, Xing Chu, Ruizhi Huan, Li Ma, Xiao You, Wenting Zhou, Yun-
+peng Ye, Wen Liu, Xiangkun Xu, Yongsheng Zhang, Tiantian Dong,
+Jiawei Zhu, Zhe Wang, Xijian Ju, Jianxun Song, Haoliang Cheng, Xi-
+aojing Li, Jiandong Ding, Hefei Guo, and Zhengyong Zhang. 2024.
+P/D-Serve: Serving Disaggregated Large Language Model at Scale.
+arXiv:2408.08147 [cs.DC] https://arxiv.org/abs/2408.08147
+[24] Jungil Kong, Jaehyeon Kim, and Jaekyoung Bae. 2020. HiFi-GAN:
+generative adversarial networks for efficient and high fidelity speech
+synthesis. In Proceedings of the 34th International Conference on Neural
+Information Processing Systems (Vancouver, BC, Canada) (NIPS ’20).
+Curran Associates Inc., Red Hook, NY, USA, Article 1428, 12 pages.
+[25] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Sto-
+ica. 2023. Efficient Memory Management for Large Language Model
+Serving with PagedAttention. In Proceedings of the 29th Symposium on
+Operating Systems Principles. Association for Computing Machinery,
+New York, NY, USA, 611–626. doi:10.1145/3600006.3613165
+[26] Zikun Li, Zhuofu Chen, Remi Delacourt, Gabriele Oliaro, Zeyu Wang,
+Qinghan Chen, Shuhuai Lin, April Yang, Zhihao Zhang, Zhuom-
+ing Chen, Yi-Hsiang Lai, Xinhao Cheng, Xupeng Miao, and Zhi-
+hao Jia. 2026. AdaServe: Accelerating Multi-SLO LLM Serving with
+SLO-Customized Speculative Decoding. In Proceedings of the 21st
+European Conference on Computer Systems (McEwan Hall/The Uni-
+versity of Edinburgh, Edinburgh, Scotland UK) (EUROSYS ’26). As-
+sociation for Computing Machinery, New York, NY, USA, 36–54.
+doi:10.1145/3767295.3769315
+[27] Jianxiong Liao, Quanxing Dong, Yunkai Liang, Zhi Zhou, and Xu Chen.
+2026. Laser: Unlocking Layer-Level Scheduling for Efficient Multi-
+SLO LLM Serving. In Proceedings of the 31st ACM SIGPLAN Annual
+Symposium on Principles and Practice of Parallel Programming (Sydney,
+NSW, Australia) (PPoPP ’26). Association for Computing Machinery,
+New York, NY, USA, 509–521. doi:10.1145/3774934.3786413
+[28] Zejia Lin, Hongxin Xu, Guanyi Chen, Zhiguang Chen, Yutong Lu,
+and Xianwei Zhang. 2026. Bullet: Boosting GPU Utilization for LLM
+Serving via Dynamic Spatial-Temporal Orchestration. In Proceedings
+of the 31st ACM International Conference on Architectural Support for
+Programming Languages and Operating Systems, Volume 2 (USA) (ASP-
+LOS ’26). Association for Computing Machinery, New York, NY, USA,
+290–306. doi:10.1145/3779212.3790135
+[29] Microsoft. 2025. Choose Between Cloud-Based and Local AI Models.
+https://learn.microsoft.com/en-us/windows/ai/cloud-ai
+[30] NVIDIA. 2022. What Is Edge AI and How Does It Work?
+https:
+//blogs.nvidia.com/blog/what-is-edge-ai/
+[31] NVIDIA. 2026. CUDA C++ Programming Guide. https://docs.nvidia.
+com/cuda/cuda-c-programming-guide/
+[32] NVIDIA. 2026.
+CUDA Driver API: Green Contexts.
+https:
+//docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GREEN_
+_CONTEXTS.html
+[33] NVIDIA. 2026. Multi-Process Service User Guide. https://docs.nvidia.
+com/deploy/mps/
+[34] NVIDIA. 2026. NVIDIA Multi-Instance GPU User Guide. https://docs.
+nvidia.com/datacenter/tesla/mig-user-guide/
+[35] NVIDIA. 2026. NVIDIA RTX 6000 Ada Generation Graphics Card. https:
+//www.nvidia.com/en-us/products/workstations/rtx-6000/
+[36] NVIDIA. 2026.
+NVIDIA RTX PRO 6000 Blackwell Workstation
+Edition.
+https://www.nvidia.com/en-us/products/workstations/
+professional-desktop-gpus/rtx-pro-6000/
+[37] NVIDIA. 2026. NVIDIA RTX PRO AI Workstation Solutions.
+https:
+//www.nvidia.com/en-us/products/workstations/ai-workstations/
+[38] OpenAI. 2024. Hello GPT-4o. https://openai.com/index/hello-gpt-4o/
+[39] Vassil Panayotov, Guoguo Chen, Daniel Povey, and Sanjeev Khudanpur.
+2015. LibriSpeech: An ASR Corpus Based on Public Domain Audio
+Books. In Proceedings of the IEEE International Conference on Acoustics,
+Speech and Signal Processing. IEEE, 5206–5210.
+[40] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo
+Goiri, Saeed Maleki, and Ricardo Bianchini. 2025. Splitwise: Efficient
+Generative LLM Inference Using Phase Splitting. In Proceedings of
+the 51st Annual International Symposium on Computer Architecture
+(Buenos Aires, Argentina) (ISCA ’24). IEEE Press, 118–132. doi:10.
+1109/ISCA59077.2024.00019
+[41] William Peebles and Saining Xie. 2023. Scalable diffusion models with
+transformers. In Proceedings of the IEEE/CVF international conference
+on computer vision. 4195–4205.
+[42] Ruoyu Qin, Zheming Li, Weiran He, Jialei Cui, Feng Ren, Mingxing
+Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu. 2025. Moon-
+cake: Trading More Storage for Less Computation — A KVCache-
+centric Architecture for Serving LLM Chatbot. In 23rd USENIX Confer-
+ence on File and Storage Technologies (FAST 25). USENIX Association,
+Santa Clara, CA, 155–170. https://www.usenix.org/conference/fast25/
+presentation/qin
+[43] Haoran Qiu, Anish Biswas, Zihan Zhao, Jayashree Mohan, Alind Khare,
+Esha Choukse, Íñigo Goiri, Zeyu Zhang, Haiying Shen, Chetan Bansal,
+Ram Ramjee, and Rodrigo Fonseca. 2026. ModServe: Modality- and
+Stage-Aware Resource Disaggregation for Scalable Multimodal Model
+Serving. In Proceedings of the 2025 ACM Symposium on Cloud Comput-
+ing (SoCC ’25). Association for Computing Machinery, New York, NY,
+USA, 817–830. doi:10.1145/3772052.3772254
+[44] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel
+Goh, Sandhini Agarwal, Girish Sastry, Amanda Askell, Pamela Mishkin,
+Jack Clark, Gretchen Krueger, and Ilya Sutskever. 2021. Learning
+Transferable Visual Models From Natural Language Supervision. In
+Proceedings of the 38th International Conference on Machine Learning
+(Proceedings of Machine Learning Research, Vol. 139). PMLR, Virtual
+Event, 8748–8763. https://proceedings.mlr.press/v139/radford21a.html
+[45] Alec Radford, Jong Wook Kim, Tao Xu, Greg Brockman, Christine
+McLeavey, and Ilya Sutskever. 2023. Robust speech recognition via
+14
+
+
+--- Page 15 ---
+large-scale weak supervision. In International conference on machine
+learning. PMLR, 28492–28518.
+[46] Alec Radford, Karthik Narasimhan, Tim Salimans, Ilya Sutskever, et al.
+2018. Improving language understanding by generative pre-training.
+(2018).
+[47] Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser,
+and Björn Ommer. 2022. High-resolution image synthesis with latent
+diffusion models. In Proceedings of the IEEE/CVF conference on computer
+vision and pattern recognition. 10684–10695.
+[48] Francisco Romero, Qian Li, Neeraja J. Yadwadkar, and Christos
+Kozyrakis. 2021.
+INFaaS: Automated Model-less Inference Serv-
+ing. In 2021 USENIX Annual Technical Conference (USENIX ATC 21).
+USENIX Association, Virtual Event, 397–411.
+https://www.usenix.
+org/conference/atc21/presentation/romero
+[49] Charlie F. Ruan, Yucheng Qin, Xun Zhou, Ruihang Lai, Hongyi
+Jin, Yixin Dong, Bohan Hou, Meng-Shiun Yu, Yiyan Zhai, Sudeep
+Agarwal, Hangrui Cao, Siyuan Feng, and Tianqi Chen. 2024. We-
+bLLM: A High-Performance In-Browser LLM Inference Engine.
+arXiv:2412.15803 [cs.LG] https://arxiv.org/abs/2412.15803
+[50] Haichen Shen, Lequn Chen, Yuchen Jin, Liangyu Zhao, Bingyu Kong,
+Matthai Philipose, Arvind Krishnamurthy, and Ravi Sundaram. 2019.
+Nexus: A GPU Cluster Engine for Accelerating DNN-Based Video
+Analysis. In Proceedings of the 27th ACM Symposium on Operating
+Systems Principles. Association for Computing Machinery, New York,
+NY, USA, 322–337. doi:10.1145/3341301.3359658
+[51] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin,
+Beidi Chen, Percy Liang, Christopher Ré, Ion Stoica, and Ce Zhang.
+2023. FlexGen: high-throughput generative inference of large language
+models with a single GPU. In Proceedings of the 40th International
+Conference on Machine Learning (Honolulu, Hawaii, USA) (ICML’23).
+JMLR.org, Article 1288, 23 pages.
+[52] Sudipta Saha Shubha, Haiying Shen, and Anand Iyer. 2024. USHER:
+Holistic Interference Avoidance for Resource Optimized ML Inference.
+In 18th USENIX Symposium on Operating Systems Design and Imple-
+mentation (OSDI 24). USENIX Association, Santa Clara, CA, 947–964.
+https://www.usenix.org/conference/osdi24/presentation/shubha
+[53] Yixin Song, Zeyu Mi, Haotong Xie, and Haibo Chen. 2024. PowerInfer:
+Fast Large Language Model Serving with a Consumer-grade GPU. In
+Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems
+Principles (Austin, TX, USA) (SOSP ’24). Association for Computing
+Machinery, New York, NY, USA, 590–606. doi:10.1145/3694715.3695964
+[54] Khurram Soomro, Amir Roshan Zamir, and Mubarak Shah. 2012.
+UCF101: A Dataset of 101 Human Actions Classes From Videos in
+the Wild. arXiv:1212.0402 [cs.CV]
+[55] Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao, Xinyi Zhang,
+Yong Li, and Wei Lin. 2024. Llumnix: Dynamic Scheduling for Large
+Language Model Serving. In 18th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI 24). USENIX Association,
+Santa Clara, CA, 173–191. https://www.usenix.org/conference/osdi24/
+presentation/sun-biao
+[56] Core Team, Dong Zhang, Gang Wang, Jinlong Xue, Kai Fang, Liang
+Zhao, Rui Ma, Shuhuai Ren, Shuo Liu, Tao Guo, Weiji Zhuang, Xin
+Zhang, Xingchen Song, Yihan Yan, Yongzhe He, Cici, Bowen Shen,
+Chengxuan Zhu, Chong Ma, Chun Chen, Heyu Chen, Jiawei Li, Lei Li,
+Menghang Zhu, Peidian Li, Qiying Wang, Sirui Deng, Weimin Xiong,
+Wenshan Huang, Wenyu Yang, Yilin Jiang, Yixin Yang, Yuanyuan Tian,
+Yue Ma, Yue Yu, Zihan Zhang, Zihao Yue, Bangjun Xiao, Bingquan
+Xia, Bofei Gao, Bowen Ye, Can Cai, Chang Liu, Chenhong He, Chu-
+nan Li, Dawei Zhu, Duo Zhang, Fengyuan Shi, Guoan Wang, Hailin
+Zhang, Hanglong Lv, Hanyu Li, Hao Tian, Heng Qu, Hongshen Xu,
+Houbin Zhang, Huaqiu Liu, Jiangshan Duo, Jianguang Zuo, Jianyu Wei,
+Jiebao Xiao, Jinhao Dong, Jun Shi, Junhao Hu, Kainan Bao, Kang Zhou,
+Linghao Zhang, Meng Chen, Nuo Chen, Peng Zhang, Qianli Chen,
+Qiantong Wang, Rang Li, Shaohui Liu, Shengfan Wang, Shicheng Li,
+Shihua Yu, Shijie Cao, Shimao Chen, Shuhao Gu, Weikun Wang, Wen-
+han Ma, Xiangwei Deng, Xing Yong, Xing Zhang, Xu Wang, Yifan
+Song, Yihao Zhao, Yingbo Zhao, Yizhao Gao, Yu Cheng, Yu Tu, Yudong
+Wang, Zhaojun Huang, Zhengju Tang, Zhenru Lin, Zhichao Song,
+Zhipeng Xu, Zhixian Zheng, and Zihan Jiang. 2025. MiMo-Audio: Au-
+dio Language Models are Few-Shot Learners. arXiv:2512.23808 [cs.CL]
+https://arxiv.org/abs/2512.23808
+[57] Meituan LongCat Team, Bairui Wang, Bayan, Bin Xiao, Bo Zhang,
+Bolin Rong, Borun Chen, Chang Wan, Chao Zhang, Chen Huang, Chen
+Chen, Chen Chen, Chengxu Yang, Chengzuo Yang, Cong Han, Dandan
+Peng, Delian Ruan, Detai Xin, Disong Wang, Dongchao Yang, Fanfan
+Liu, Fengjiao Chen, Fengyu Yang, Gan Dong, Gang Huang, Gang
+Xu, Guanglu Wan, Guoqiang Tan, Guoqiao Yu, Haibo Qiu, Hao Lu,
+Hongbo Liu, Hongyu Xiang, Jiaheng Wu, Jian Yang, Jiaxing Liu, Jing
+Huang, Jingang Wang, Jinrui Ding, Juchao Jiang, Jun Kuang, Jun Wang,
+Junhui Mei, Ke Ding, Kefeng Zhang, Lei Chen, Liang Shi, Limeng Qiao,
+Liming Zheng, Lin Ma, Liuyang Guo, Liya Ma, Luying Sun, Man Gao,
+Mengshen Zhu, Miao Cao, Minliang Lin, Nuo Xu, Peng Shi, Qi Zhang,
+Qian Fang, Qian Wang, Qian Yang, Quanxiu Wang, Rongxiang Weng,
+Rongxin Guo, Ruoxuan Liang, Senbin Yang, Shanbo Xu, Shanglin Lei,
+Shengze Ye, Shimin Chen, Shuaiqi Chen, Shujie Hu, Shuo Li, Siqi Yang,
+Siyu Xu, Siyu Ren, Song Li, Songxiang Liu, Tianhao Bai, Tianye Dai,
+Wei Hong, Wei Wang, Weixiao Zhao, Wengang Cao, Wenlong Zhu,
+Wenlong He, Xi Su, Xi Nan, Xiaohan Zhao, Xiaohao Wang, Xiaoyu
+Zhao, Xiaoyu Wang, Xiaoyu Li, Xin Pan, Xin Chen, Xiusong Sun, Xu
+Xiang, Xudong Xing, Xuezhi Cao, Xunliang Cai, Yang Yang, Yanli Tan,
+Yao Yao, Yerui Sun, Yi Chen, Yifan Lu, Yin Gong, Yining Zhang, Yitian
+Chen, Yiyang Gan, Yuchen Tang, Yuchen Xie, Yueqian Wang, Yuewen
+Zheng, Yufei Zhang, Yufeng Zhong, Yulei Qian, Yuqi Peng, Yuqian
+Li, Yuwei Jiang, Zeyang Hu, Zheng Zhang, Zhengkun Tian, Zhiqing
+Hong, Zhixiong Zeng, Zhuqi Mi, Ziran Li, Ziwen Wang, Ziyi Zhao,
+Ziyuan Zhuang, and Zizhe Zhao. 2025. LongCat-Flash-Omni Technical
+Report. arXiv:2511.00279 [cs.MM] https://arxiv.org/abs/2511.00279
+[58] Wenwen Tong, Hewei Guo, Dongchuan Ran, Jiangnan Chen, Jiefan Lu,
+Kaibin Wang, Keqiang Li, Xiaoxu Zhu, Jiakui Li, Kehan Li, Xueheng
+Li, Lumin Li, Chenxu Guo, Jiasheng Zhou, Jiandong Chen, Xianye
+Wu, Jiahao Wang, Silei Wu, Lei Chen, Hanming Deng, Yuxuan Song,
+Dinghao Zhou, Guiping Zhong, Ken Zheng, Shiyin Kang, and Lewei Lu.
+2025. InteractiveOmni: A Unified Omni-modal Model for Audio-Visual
+Multi-turn Dialogue. arXiv:2510.13747 [cs.CV] https://arxiv.org/abs/
+2510.13747
+[59] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion
+Jones, Aidan N Gomez, Ł ukasz Kaiser, and Illia Polosukhin. 2017.
+Attention is All you Need. In Advances in Neural Information Pro-
+cessing Systems, I. Guyon, U. Von Luxburg, S. Bengio, H. Wallach,
+R. Fergus, S. Vishwanathan, and R. Garnett (Eds.), Vol. 30. Curran As-
+sociates, Inc. https://proceedings.neurips.cc/paper_files/paper/2017/
+file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf
+[60] Haoxin Wang, Xiaolong Tu, Hongyu Ke, Huirong Chai, Dawei Chen,
+and Kyungtae Han. 2025. lm-Meter: Unveiling Runtime Inference La-
+tency for On-Device Language Models. In Proceedings of the Tenth
+ACM/IEEE Symposium on Edge Computing (the Hilton Arlington
+National Landing, Arlington, VA, USA) (SEC ’25). Association for
+Computing Machinery, New York, NY, USA, Article 17, 17 pages.
+doi:10.1145/3769102.3770614
+[61] Bingyang Wu, Shengyu Liu, Yinmin Zhong, Peng Sun, Xuanzhe Liu,
+and Xin Jin. 2024. LoongServe: Efficiently Serving Long-Context Large
+Language Models with Elastic Sequence Parallelism. In Proceedings
+of the ACM SIGOPS 30th Symposium on Operating Systems Principles
+(Austin, TX, USA) (SOSP ’24). Association for Computing Machinery,
+New York, NY, USA, 640–654. doi:10.1145/3694715.3695948
+[62] Chengyue Wu, Xiaokang Chen, Zhiyu Wu, Yiyang Ma, Xingchao
+Liu, Zizheng Pan, Wen Liu, Zhenda Xie, Xingkai Yu, Chong Ruan,
+and Ping Luo. 2024. Janus: Decoupling Visual Encoding for Unified
+15
+
+
+--- Page 16 ---
+Multimodal Understanding and Generation. arXiv:2410.13848 [cs.CV]
+https://arxiv.org/abs/2410.13848
+[63] Jin Xu, Zhifang Guo, Jinzheng He, Hangrui Hu, Ting He, Shuai Bai,
+Keqin Chen, Jialin Wang, Yang Fan, Kai Dang, Bin Zhang, Xiong Wang,
+Yunfei Chu, and Junyang Lin. 2025. Qwen2.5-Omni Technical Report.
+arXiv:2503.20215 [cs.CL] https://arxiv.org/abs/2503.20215
+[64] Jin Xu, Zhifang Guo, Hangrui Hu, Yunfei Chu, Xiong Wang, Jinzheng
+He, Yuxuan Wang, Xian Shi, Ting He, Xinfa Zhu, Yuanjun Lv, Yongqi
+Wang, Dake Guo, He Wang, Linhan Ma, Pei Zhang, Xinyu Zhang,
+Hongkun Hao, Zishan Guo, Baosong Yang, Bin Zhang, Ziyang Ma,
+Xipin Wei, Shuai Bai, Keqin Chen, Xuejing Liu, Peng Wang, Mingkun
+Yang, Dayiheng Liu, Xingzhang Ren, Bo Zheng, Rui Men, Fan Zhou,
+Bowen Yu, Jianxin Yang, Le Yu, Jingren Zhou, and Junyang Lin. 2025.
+Qwen3-Omni Technical Report. arXiv:2509.17765 [cs.CL] https://arxiv.
+org/abs/2509.17765
+[65] Yuan Yao, Tianyu Yu, Ao Zhang, Chongyi Wang, Junbo Cui, Hongji
+Zhu, Tianchi Cai, Haoyu Li, Weilin Zhao, Zhihui He, et al. 2024.
+MiniCPM-V: A GPT-4V Level MLLM on Your Phone. arXiv preprint
+arXiv:2408.01800 (2024).
+[66] Fanjiang Ye, Zhangke Li, Xinrui Zhong, Ethan Ma, Russell Chen, Kai-
+jian Wang, Jingwei Zuo, Desen Sun, Ye Cao, Triston Cao, Myungjin
+Lee, Arvind Krishnamurthy, and Yuke Wang. 2026.
+GENSERVE:
+Efficient Co-Serving of Heterogeneous Diffusion Model Workloads.
+arXiv:2604.04335 [cs.DC] https://arxiv.org/abs/2604.04335
+[67] Peiqi Yin, Jiangyun Zhu, Han Gao, Chenguang Zheng, Yongxiang
+Huang, Taichang Zhou, Ruirui Yang, Weizhi Liu, Weiqing Chen, Canlin
+Guo, Didan Deng, Zifeng Mo, Cong Wang, James Cheng, Roger Wang,
+and Hongsheng Liu. 2026. vLLM-Omni: Fully Disaggregated Serving
+for Any-to-Any Multimodal Models. arXiv:2602.02204 [cs.DC] https:
+//arxiv.org/abs/2602.02204
+[68] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and
+Byung-Gon Chun. 2022.
+Orca: A Distributed Serving System for
+Transformer-Based Generative Models. In 16th USENIX Symposium on
+Operating Systems Design and Implementation (OSDI 22). USENIX Asso-
+ciation, Carlsbad, CA, 521–538. https://www.usenix.org/conference/
+osdi22/presentation/yu
+[69] Peifeng Yu and Mosharaf Chowdhury. 2020.
+Salus: Fine-
+Grained GPU Sharing Primitives for Deep Learning Applications.
+arXiv:1902.04610 [cs.DC] https://arxiv.org/abs/1902.04610
+[70] Neil Zeghidour, Alejandro Luebs, Ahmed Omran, Jan Skoglund, and
+Marco Tagliasacchi. 2021. Soundstream: An end-to-end neural au-
+dio codec. IEEE/ACM Transactions on Audio, Speech, and Language
+Processing 30 (2021), 495–507.
+[71] Xiaohua Zhai, Basil Mustafa, Alexander Kolesnikov, and Lucas Beyer.
+2023. Sigmoid Loss for Language Image Pre-Training. In Proceedings
+of the IEEE/CVF International Conference on Computer Vision. IEEE,
+Paris, France, 11975–11986. https://openaccess.thecvf.com/content/
+ICCV2023/html/Zhai_Sigmoid_Loss_for_Language_Image_Pre-
+Training_ICCV_2023_paper.html
+[72] Chengliang Zhang, Minchen Yu, Wei Wang, and Feng Yan. 2019. MArk:
+Exploiting Cloud Services for Cost-Effective, SLO-Aware Machine
+Learning Inference Serving. In 2019 USENIX Annual Technical Con-
+ference (USENIX ATC 19). USENIX Association, Renton, WA, 1049–
+1062. https://www.usenix.org/conference/atc19/presentation/zhang-
+chengliang
+[73] Hong Zhang, Yupeng Tang, Anurag Khandelwal, and Ion Stoica. 2023.
+SHEPHERD: Serving DNNs in the Wild. In 20th USENIX Symposium on
+Networked Systems Design and Implementation (NSDI 23). USENIX As-
+sociation, Boston, MA, 787–808. https://www.usenix.org/conference/
+nsdi23/presentation/zhang-hong
+[74] Yuning Zhang, Nan Yang, Chen Pan, and Dong Yuan. 2026. Joint
+Optimization of Resource Allocation and Request Batching for Multi-
+Tenant Inference Serving on GPU. IEEE Transactions on Parallel and Dis-
+tributed Systems 37, 1 (2026), 287–303. doi:10.1109/TPDS.2025.3627574
+[75] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff
+Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica,
+Joseph E. Gonzalez, Clark Barrett, and Ying Sheng. 2024. SGLang:
+efficient execution of structured language model programs. In Pro-
+ceedings of the 38th International Conference on Neural Information
+Processing Systems (Vancouver, BC, Canada) (NIPS ’24). Curran Asso-
+ciates Inc., Red Hook, NY, USA, Article 2000, 27 pages.
+[76] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-
+anzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: Disaggregating
+Prefill and Decoding for Goodput-optimized Large Language Model
+Serving. In 18th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 24). USENIX Association, Santa Clara, CA, 193–
+210. https://www.usenix.org/conference/osdi24/presentation/zhong-
+yinmin
+[77] Kan Zhu, Yufei Gao, Yilong Zhao, Liangyu Zhao, Gefei Zuo, Yile Gu,
+Dedong Xie, Zihao Ye, Keisuke Kamahori, Chien-Yu Lin, Ziren Wang,
+Stephanie Wang, Arvind Krishnamurthy, and Baris Kasikci. 2025.
+NanoFlow: Towards Optimal Large Language Model Serving Through-
+put. In 19th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 25). USENIX Association, Boston, MA, 749–765.
+https://www.usenix.org/conference/osdi25/presentation/zhu-kan
+16
