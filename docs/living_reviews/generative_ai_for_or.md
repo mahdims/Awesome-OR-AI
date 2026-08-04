@@ -1,10 +1,37 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-07-30
+**Last Updated:** 2026-08-04
 
 ---
 
 ## Recent Papers
+
+#### 2026-08-04 (3 papers)
+
+### [ModelEquivBench: Certifying Multi-Relational Evaluation of LLM-Generated Optimization Models](https://arxiv.org/abs/2607.29431)
+
+**2026-07-31** | University of the Chinese Academy of Sciences | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Certifying multi-relational evaluation system (E0-E6 semantic profile) using exact-rational certificates | *LLM role:* none
+
+> This paper introduces ModelEquivBench, a certifying evaluation system that assesses LLM-generated optimization models across a seven-dimensional semantic profile (E0-E6) using exact-rational mathematical certificates rather than simple execution or structural matching. The results are rigorously backed by numbers on 173 Bench4Opt problems, demonstrating that standard execution-success metrics overestimate correctness by up to 49 cases per model, while structural baselines falsely reject mathematically equivalent models. The key insight is that the evaluation of generated OR models cannot be reduced to a single scalar or structural graph match; instead, using exact-rational certificates (e.g., Farkas lemma for feasible set containment) provides a mathematically sound, multi-relational profile of model correctness. This is highly relevant to the team's work in OR benchmarking and symbolic OR modeling evaluation, as adopting this exact-verification approach could significantly improve the rigor of our own LLM reasoning benchmarks.
+
+### [OptGraph: Large Language Models Enhanced Evolutionary Optimization Via Graph Retrieval-Augmented Generation](https://arxiv.org/abs/2607.27918)
+
+**2026-07-30** | Shanghai University, Sun Yat-sen University, Guangxi University | M=7 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Graph Retrieval-Augmented Generation (GraphRAG) based agentic workflow | *LLM role:* modeling_pattern_generator, formulation_generator, code_synthesizer, verification_feedback_interpreter, repair_agent
+
+> OptGraph introduces a GraphRAG-based multi-agent workflow for automated operations research modeling, translating natural language problem descriptions into executable solver code. Backed by strong empirical results, it achieves an average exact accuracy of 75.4% across six benchmarks (including NL4Opt and OptMATH), outperforming recent baselines like OptiTree and Lean-LLM-OPT by approximately 9%. The key insight is the use of a dynamic, heterogeneous graph memory that links problem variants, math models, code snippets, and typical errors, which is adaptively updated with execution traces and validation feedback without requiring LLM fine-tuning. This is highly relevant for our research in generative AI for OR modeling and multi-agent memory architectures, offering a concrete method to improve continuous learning and error-aware refinement in LLM-driven optimization systems.
+
+### [Large Language Model for Operations Research Formulation Selection in Multi-Warehouse Inventory Allocation](https://arxiv.org/abs/2607.25956)
+
+**2026-07-28** | JD.com | M=7 P=6 I=7 *discuss*
+
+*Method:* Solver-guided Large Language Model (LLM) framework for OR formulation selection, progressively post-trained with Supervised Fine-Tuning (SFT), Identity Preference Optimization (IPO), and Group Relative Policy Optimization (GRPO) | *LLM role:* selector
+
+> Xu et al. propose an LLM-based selector trained via SFT, IPO, and GRPO to route multi-warehouse inventory allocation instances to the most suitable mixed-integer programming (MIP) formulation. Backed by real-world data from JD.com, the GRPO-trained selector improves top-1 expert selection accuracy by 29 percentage points over an SFT+IPO baseline, translating to a 12.5% allocation accuracy gain over the incumbent system. The key insight is the offline GRPO metadata construction: pre-computing and caching solver evaluations (scores, rankings, best expert) for historical instances to serve as fast, reliable reward signals during iterative RL post-training, which avoids expensive solver calls in the RL loop. This is highly relevant for our work in RL-infused algorithm and operator selection, providing a concrete blueprint for using solver-guided RL to train LLM routing policies efficiently.
+
 
 #### 2026-07-30 (2 papers)
 

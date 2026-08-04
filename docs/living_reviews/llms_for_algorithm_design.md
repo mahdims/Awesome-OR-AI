@@ -1,10 +1,61 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-07-30
+**Last Updated:** 2026-08-04
 
 ---
 
 ## Recent Papers
+
+#### 2026-08-04 (6 papers)
+
+### [Frontis-MA1: Training an AI4AI Model towards Recursive Self-Improvement in Machine Learning Engineering](https://arxiv.org/abs/2607.28568)
+
+**2026-07-30** | Horizon Research, Frontis.AI, Tsinghua University, Zhejiang University, Shanghai Jiao Tong University, Georgia Institute of Technology | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Meta-evolution agent (Frontis-MA1-35B) trained with execution-grounded supervised fine-tuning (SFT) and reinforcement learning (RL) on atomic program-evolution operators (Draft, Improve, Debug, Crossover), deployed in an experience-driven long-horizon evolutionary search (OpenMLE-Evo). | *LLM role:* meta_evolution_agent
+
+> Yang et al. introduce OpenMLE, a full-stack framework that post-trains an LLM via execution-grounded RL to act as the variation engine for long-horizon evolutionary search in machine learning engineering. The results are highly rigorous and backed by extensive numbers, showing their 35B model improving from a 39.4% to 71.2% medal rate on MLE-Bench Lite, surpassing GPT-5.5. The key insight is the meta-evolutionary loop: instead of using a frozen LLM, they explicitly train atomic operators (Draft, Improve, Debug, Crossover) using RL with adaptive bounds and entropic advantages, and deploy them in a search harness that uses multi-factor parent selection (quality, progress, novelty) and lazy, operator-conditioned memory synthesis. This is a must-read for LLM evolutionary search, as the structured experience cards and RL-infused operator training directly address the community's core challenges in sample efficiency, memory, and scalability.
+
+### [MOT-SR: Multi-Objective Tool-Augmented Scientific Equation Discovery with Large Language Models](https://arxiv.org/abs/2607.29561)
+
+**2026-07-31** | Institute of Automation, Chinese Academy of Sciences, University of the Chinese Academy of Sciences, Goethe University Frankfurt | M=8 P=6 I=8 **MUST-READ** *discuss*
+
+*Method:* Multi-Objective Tool-augmented Symbolic Regression (MOT-SR) framework | *LLM role:* Guides evolutionary search and generates equations based on data analysis and structural priors
+
+> Wang et al. propose MOT-SR, an LLM-based evolutionary search framework for symbolic regression that uses a meta-strategy LLM to analyze data residuals with external tools and maintains a multi-objective Pareto front to guide equation generation. The results are rigorously backed by numbers, achieving state-of-the-art NMSE on 40 benchmark tasks and a 26.8x error reduction on a real-world astrophysics dataset compared to prior LLM-SR methods. The key insight is the 'Meta Strategy Generator' which autonomously invokes external analysis tools on the residuals of the current Pareto-optimal candidates to synthesize a natural language search strategy for the generator LLM, effectively acting as an automated planner for the evolutionary process. This is highly relevant for our work in LLM evolutionary search; the dual-LLM strategy-generation loop and their AST-based structural diversity sampling could be directly adapted to improve sample efficiency and population diversity in automated heuristic design.
+
+### [Budget-Aware LLM Discovery via Cost-Calibrated Frontier Utility](https://arxiv.org/abs/2607.26828)
+
+**2026-07-29** | Mohamed bin Zayed University of Artificial Intelligence (MBZUAI), City University of Hong Kong, International Digital Economy Academy (IDEA) | M=8 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Cost-calibrated adaptive controller (CostAda) using cost-calibrated frontier utility with remaining-budget conditioning | *LLM role:* heuristic_generator
+
+> This paper introduces CostAda, an adaptive controller for LLM evolutionary search that allocates compute across search frontiers based on cost-calibrated utility (progress divided by realized token cost) and remaining budget. The results are rigorously backed by empirical evaluations across 8 benchmarks using GLM-5 and GPT-5.4, demonstrating that CostAda reaches the full-budget quality of state-of-the-art baselines (AdaEvolve, EvoX) using only half the token budget. The key insight is that progress-only credit is fundamentally flawed when search actions (e.g., short refinements vs. long-context guidance) have vastly different token costs; dividing fitness gains by the log of realized cost and shifting weight from local to global progress as the budget drains drastically improves search efficiency. This is highly relevant to our focus on sample efficiency and scalability in LLM evolutionary search, providing a concrete, implementable utility formulation to optimize massively parallel evolution runs and reduce compute costs.
+
+### [EvoPINN: Agentic Discovery of Executable Algorithms for Physics-Informed Neural Networks](https://arxiv.org/abs/2607.26490)
+
+**2026-07-29** | Institute of Automation, Chinese Academy of Sciences, University of Chinese Academy of Sciences | M=8 P=7 I=8 **MUST-READ** *discuss*
+
+*Method:* LLM-guided evolutionary search with module-wise evolution, UCB-style adaptive scheduling, and diagnosis-guided program generation | *LLM role:* evolutionary_search
+
+> EvoPINN is an LLM-driven evolutionary framework that autonomously discovers novel neural architectures and training programs for Physics-Informed Neural Networks (PINNs). Backed by rigorous empirical results, the framework evaluated only 56 candidates to discover algorithms that outperformed expert-designed baselines by up to 35% on complex PDE benchmarks. The key insight is its decoupled, module-wise evolution strategy: it uses a UCB scheduler to dynamically allocate LLM mutation budget between different algorithm components, combined with AST-based structural verification to filter out cosmetic LLM edits before triggering expensive evaluations. This is highly relevant for LLM evolutionary search research, as the telemetry-guided generation and modular credit assignment directly address the sample efficiency and sparse reward challenges inherent in automated heuristic discovery.
+
+### [FunL2O: LLM-Guided Feature Function Design for Learning to Optimize](https://arxiv.org/abs/2607.27389)
+
+**2026-07-29** | IBM Research, University of Southern California, University of Wisconsin–Madison, Michigan State University | M=7 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* LLM-driven program evolution in a FunSearch-style loop | *LLM role:* code_writer
+
+> FunL2O uses an LLM in an evolutionary loop to automatically generate executable feature extraction code for Learning-to-Optimize (L2O) pipelines, replacing hand-crafted representations. Results are rigorously backed by numbers, showing consistent improvements across eight L2O baselines (e.g., reducing MILP solver wall time by 11-55% and LP objective gaps by 16-49%) while controlling for feature width and LLM sampling budgets. The key insight is the use of 'semantic feature contracts' to statically and dynamically validate LLM-generated tensor operations before triggering expensive model retraining, effectively constraining the search space. This is highly relevant to our work in LLM evolutionary search for operations research, demonstrating that evolving the state representation can be just as impactful as evolving the heuristic itself.
+
+### [A Control System, a Dataset, and a Recipe for Making Frozen LLM Agents Learn a Domain](https://arxiv.org/abs/2607.25415)
+
+**2026-07-28** |  | M=6 P=7 I=7 *changes-thinking* *discuss*
+
+*Method:* Sample-efficient reinforcement learning (ϵ-greedy contextual bandit and REINFORCE) | *LLM role:* agent_executor
+
+> This paper formulates LLM agent harness optimization (prompts, tools, memory, planning) as a discrete control problem and evaluates online RL (bandits, REINFORCE) against a static DSPy-optimized baseline. Backed by rigorous empirical results across multiple domains and models, the authors find that online RL consistently underperforms the static DSPy baseline within practical episode budgets (e.g., 62% vs 96% success on tool-use). The key insight is that starting online controllers from a uniform prior over a discrete harness space is severely sample-inefficient; dynamic harness optimization must be bootstrapped from a metric-guided static optimizer to be viable. This is highly relevant for our work in LLM evolutionary search and agent optimization, as it provides concrete evidence on the sample efficiency bottlenecks of dynamic harness tuning and offers a practical deployment recipe.
+
 
 #### 2026-07-30 (7 papers)
 

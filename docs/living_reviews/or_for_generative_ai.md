@@ -1,10 +1,37 @@
 # Living Review: OR for Generative AI
 
-**Last Updated:** 2026-07-30
+**Last Updated:** 2026-08-04
 
 ---
 
 ## Recent Papers
+
+#### 2026-08-04 (3 papers)
+
+### [Energy-Efficient LLM Serving via Disaggregated Attention--FFN and Flexible Frequency Scaling](https://arxiv.org/abs/2608.01891)
+
+**2026-08-03** | University of Science and Technology of China, China Telecom Cloud Computing Research Institute, Xidian University, SKLP, ICT, CAS | M=8 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Two-level control plane (Global Scheduler using Integer Linear Program, Local DVFS Controller) combined with an interleaved A/F pipeline with dynamic microbatch depth and adaptive request batching | *LLM role:* none
+
+> AFlex optimizes energy consumption in LLM serving by disaggregating Attention and FFN operators and applying an Integer Linear Program (ILP) alongside a local controller to dynamically scale GPU frequencies. The results are empirically validated on NVIDIA A800 GPUs, demonstrating up to a 49% reduction in energy per token compared to state-of-the-art disaggregated serving systems while maintaining strict latency SLOs. The key insight is that Attention and FFN operators exhibit distinct frequency sensitivities; formulating an ILP to independently provision and scale frequencies for these operators yields massive energy savings over coarse-grained phase-level controls. This is highly relevant for our work in OR formulations for LLM serving scheduling, providing a concrete mathematical programming approach to fine-grained GPU resource allocation.
+
+### [HorizonServe: Coordinating Request Scheduling with GPU Sharing for Omni-Model Serving](https://arxiv.org/abs/2608.01785)
+
+**2026-08-03** | The University of Sydney | M=7 P=8 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Joint temporal-spatial scheduling with slack-based deadline protection, shared-stage path rotation, and bandwidth-guided SM throttling | *LLM role:* none
+
+> HorizonServe introduces a joint temporal-spatial scheduler for single-GPU omni-model serving that coordinates request admission and streaming multiprocessor (SM) allocation to meet heterogeneous service-level objectives (SLOs). Backed by strong empirical results, it improves SLO attainment by up to 7.0x and reduces p95 first-response latency by up to 63.7% compared to vLLM-Omni and EDF baselines on RTX 6000 GPUs. The key insight is that the critical bottleneck in omni-model serving is cross-stage memory bandwidth contention between the shared multimodal backbone and downstream generators; bounding the shared-stage SM allocation during co-running prevents goodput collapse for tight-SLO text requests. This is highly relevant for our research in LLM serving scheduling, as it defines the next-generation scheduling problem (omni-models with divergent output paths) and provides the system-level constraints that should be incorporated into formal OR scheduling formulations.
+
+### [BANDMAS: Causality-Inspired Semantic Packet Scheduling for Bandwidth-Efficient Multi-Agent Collaboration](https://arxiv.org/abs/2608.00458)
+
+**2026-08-01** | The Hong Kong Polytechnic University | M=7 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* Causality-inspired replay valuation and shrinkage-based packet-value prediction for resource-constrained semantic packet admission | *LLM role:* none
+
+> BANDMAS optimizes multi-agent LLM communication by breaking messages into semantic packets and scheduling their transmission based on a causality-inspired value predictor and resource constraints. Backed by strong empirical results, it reduces transmitted bytes by 53-77% on QA benchmarks while maintaining or improving task accuracy compared to pruning baselines. The key insight is the 'causality-inspired replay valuation'—using offline counterfactual removal (testing sufficiency and necessity of individual message chunks) to train a lightweight predictor of a message's contribution to the final outcome. This is highly relevant for our research in multi-agent optimization and LLM serving scheduling, as the counterfactual valuation technique can be directly adapted to build better process reward models for multi-agent debate.
+
 
 #### 2026-07-30 (1 papers)
 
