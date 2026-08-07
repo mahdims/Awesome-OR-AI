@@ -1,10 +1,37 @@
 # Living Review: LLMs for Algorithm Design
 
-**Last Updated:** 2026-08-04
+**Last Updated:** 2026-08-07
 
 ---
 
 ## Recent Papers
+
+#### 2026-08-07 (3 papers)
+
+### [DGA$_2$D: Directed Graph-Guided Automated Algorithm Design with Large Language Models](https://arxiv.org/abs/2608.00700)
+
+**2026-08-01** | Beihang University | M=9 P=9 I=9 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* LLM-driven automated algorithm design using a directed graph representation for operator evolution and a first-order path-dependent credit assignment mechanism | *LLM role:* code_writer, decomposition_guide, evolutionary_search
+
+> DGA2D is an LLM-driven automated algorithm design framework that represents the search space as a directed graph, allowing simultaneous evolution of both the algorithmic pipeline structure and the underlying operator implementations. The results are rigorously backed by numbers across 12 combinatorial optimization problems (including routing and scheduling), showing a reduction in the optimality gap by up to 10.96 percentage points compared to state-of-the-art baselines like EoH and ReEvo. The KEY INSIGHT is the first-order path-dependent credit assignment mechanism, which evaluates the fitness of a specific code implementation based on its immediate topological context (the preceding operator) rather than just the end-to-end score. This is highly relevant to our work in LLM evolutionary search, as it provides a concrete architectural upgrade over fixed-template generation and directly solves the sparse reward problem in long algorithmic pipelines.
+
+### [MuEvo: LLM-Driven Evolution of Multi-Heuristic Ensemble](https://arxiv.org/abs/2608.03636)
+
+**2026-08-04** | Southern University of Science and Technology, The Hong Kong University of Science and Technology | M=8 P=8 I=8 **MUST-READ** *discuss*
+
+*Method:* LLM-driven co-evolutionary framework combining Dynamic Component Management (short-budget probing, reversible lifecycle) with LLM-Driven Co-Evolution (Multi-Ensemble Evaluation, Cross-Component Information Sharing, Relation-Guided Pair Evolution, Adaptive Budget Allocation) for heuristic ensembles. | *LLM role:* evolutionary_search
+
+> MuEvo introduces an LLM-driven co-evolutionary framework that simultaneously optimizes multiple interacting heuristics within an algorithmic solver (like ACO or Selection Hyper-Heuristics) rather than isolating a single component. The results are backed by extensive numerical evidence across TSP, CVRP, BPP, and Flowshop, showing consistent improvements over human-designed defaults and single-component LLM-AHD baselines (e.g., reducing the TSP-L optimality gap from 6.26% to 5.24%). KEY INSIGHT: To prevent a component from overfitting to a specific set of collaborators, candidate heuristics should be evaluated across multiple contexts (e.g., the current best ensemble, the initial ensemble, and a diverse secondary ensemble), while an LLM summarizes cross-component interaction history to guide joint pair evolution. This is highly relevant to our work in LLM evolutionary search; the multi-ensemble evaluation and dynamic component lifecycle directly address the co-adaptation challenges we face when evolving complex, multi-operator routing and scheduling solvers.
+
+### [MOT-SR: Multi-Objective Tool-Augmented Scientific Equation Discovery with Large Language Models](https://arxiv.org/abs/2607.29561)
+
+**2026-07-31** | Institute of Automation, Chinese Academy of Sciences, University of the Chinese Academy of Sciences, Goethe University Frankfurt | M=8 P=6 I=8 **MUST-READ** *discuss*
+
+*Method:* Multi-Objective Tool-augmented Symbolic Regression (MOT-SR) framework | *LLM role:* Guides evolutionary search and generates equations based on data analysis and structural priors
+
+> Wang et al. propose MOT-SR, an LLM-based evolutionary search framework for symbolic regression that uses a meta-strategy LLM to analyze data residuals with external tools and maintains a multi-objective Pareto front to guide equation generation. The results are rigorously backed by numbers, achieving state-of-the-art NMSE on 40 benchmark tasks and a 26.8x error reduction on a real-world astrophysics dataset compared to prior LLM-SR methods. The key insight is the 'Meta Strategy Generator' which autonomously invokes external analysis tools on the residuals of the current Pareto-optimal candidates to synthesize a natural language search strategy for the generator LLM, effectively acting as an automated planner for the evolutionary process. This is highly relevant for our work in LLM evolutionary search; the dual-LLM strategy-generation loop and their AST-based structural diversity sampling could be directly adapted to improve sample efficiency and population diversity in automated heuristic design.
+
 
 #### 2026-08-04 (6 papers)
 

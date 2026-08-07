@@ -1,10 +1,29 @@
 # Living Review: Generative AI for OR
 
-**Last Updated:** 2026-08-04
+**Last Updated:** 2026-08-07
 
 ---
 
 ## Recent Papers
+
+#### 2026-08-07 (2 papers)
+
+### [ModelEquivBench: Certifying Multi-Relational Evaluation of LLM-Generated Optimization Models](https://arxiv.org/abs/2607.29431)
+
+**2026-07-31** | University of the Chinese Academy of Sciences | M=8 P=9 I=8 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Certifying multi-relational evaluation system (E0-E6 semantic profile) using exact-rational certificates | *LLM role:* none
+
+> This paper introduces ModelEquivBench, a certifying evaluation system that assesses LLM-generated optimization models across a seven-dimensional semantic profile (E0-E6) using exact-rational mathematical certificates rather than simple execution or structural matching. The results are rigorously backed by numbers on 173 Bench4Opt problems, demonstrating that standard execution-success metrics overestimate correctness by up to 49 cases per model, while structural baselines falsely reject mathematically equivalent models. The key insight is that the evaluation of generated OR models cannot be reduced to a single scalar or structural graph match; instead, using exact-rational certificates (e.g., Farkas lemma for feasible set containment) provides a mathematically sound, multi-relational profile of model correctness. This is highly relevant to the team's work in OR benchmarking and symbolic OR modeling evaluation, as adopting this exact-verification approach could significantly improve the rigor of our own LLM reasoning benchmarks.
+
+### [IR2Solve: Structured Intermediate Representations for Cost-Efficient Optimization Autoformulation](https://arxiv.org/abs/2608.02641)
+
+**2026-07-31** | University of the Chinese Academy of Sciences | M=7 P=8 I=7 **MUST-READ** *changes-thinking* *discuss*
+
+*Method:* Intermediate representation-first autoformulation pipeline with deterministic verification and compilation | *LLM role:* structured_representation_generator
+
+> IR2Solve translates natural language optimization problems into solver-ready code using a single LLM call to generate a structured JSON intermediate representation (ModelIR), followed by deterministic verification and compilation. The results are rigorously backed by numbers across six cleaned benchmarks, demonstrating that the system matches the accuracy of complex multi-agent and iterative systems while using up to 22x fewer tokens and only one API call. The key insight is that constraining the LLM to output a strict mathematical IR—thereby separating semantic modeling from solver API syntax—eliminates the need for expensive LLM-based iterative repair. This is highly relevant for our research in OR modeling and multi-agent optimization systems, as it establishes a strong, cost-efficient baseline that our multi-agent approaches must justify beating.
+
 
 #### 2026-08-04 (3 papers)
 
