@@ -1,0 +1,1951 @@
+--- Page 1 ---
+IR2Solve: Structured Intermediate Representations for
+Cost-Efficient Optimization Autoformulation
+Penglin Zhu
+Linhai Zhang
+Jungang Xu∗
+Xinchi Wei
+Xiuqi Wu
+School of Computer Science and Technology, University of the Chinese Academy of Sciences
+{zhupenglin21, zhanglinhai24, weixinchi22, wuxiuqi22}@mails.ucas.ac.cn
+xujg@ucas.ac.cn
+Abstract
+Large language models (LLMs) can translate natural-
+language optimization problems into solver-ready formu-
+lations, but direct code generation is brittle: schema, in-
+dexing, and semantic errors can cause compilation fail-
+ures, infeasible models, or incorrect objectives, while iter-
+ative repair, search, and multi-agent workflows increase
+inference cost. We present IR2Solve, an intermediate-
+representation-first autoformulation pipeline that uses a
+single semantic LLM call to produce a schema-constrained
+ModelIR, followed by two deterministic stages: verifica-
+tion and IR-to-solver compilation. ModelIR explicitly rep-
+resents sets, parameters, variables, objectives, and con-
+straints using restricted Python-like expression strings. A
+concrete scalar-constraint convention represents finite per-
+index constraint families as individual entries, reducing
+free-index and implicit-quantification errors while simpli-
+fying downstream verification and compilation. Across
+six cleaned optimization benchmarks, IR2Solve achieves
+strong objective correctness and remains competitive with
+recent optimization-modeling systems. A controlled abla-
+tion on 153 IndustryOR and ComplexLP instances shows
+sequential gains from the structured IR interface, the
+scalar-constraint instruction, and deterministic verifica-
+tion. On a matched ten-instance cost panel, IR2Solve uses
+one semantic call per instance, whereas Chain-of-Experts
+and SAC-Opt use 8 and 39 calls per instance and consume
+3.3× and 22.9× the token volume of IR2Solve, respectively.
+These results show that structured intermediate repre-
+sentations, combined with deterministic post-generation
+processing, provide a practical accuracy–cost trade-off for
+LLM-based optimization autoformulation.
+1
+Introduction
+Optimization models are central tools in operations re-
+search for complex decision-making in healthcare, trans-
+portation, and scientific discovery [Delgado et al., 2022,
+Jiao et al., 2024, Bartlett and Cussens, 2017]. The stan-
+dard workflow has two stages: first, abstract the problem
+∗Corresponding author: xujg@ucas.ac.cn.
+into a formal optimization model; then, apply an algorith-
+mic solver. While the second stage is largely automated,
+the first—translating a real-world description into the ap-
+propriate variables, objective, and constraints—remains
+a major bottleneck in applied operations research.
+Automatic modeling aims to reduce this burden by
+generating solver-ready models from natural-language
+descriptions. Such interfaces can make optimization more
+accessible to practitioners without specialized modeling
+training and allow experienced modelers to spend less
+effort on routine formulation. Formally, autoformulation
+maps an unstructured language description to a formal,
+solver-executable model.
+LLMs are attractive for this task because of their se-
+mantic and reasoning capabilities [Patil and Gudivada,
+2024, Wei et al., 2022, Yao et al., 2023, Besta et al., 2024],
+but their outputs also exhibit hallucinations, format in-
+consistencies, and mathematical inaccuracies. These prop-
+erties conflict with the precision and logical consistency
+required by solver models. Existing systems improve ac-
+curacy through prompt decomposition, multiple agents,
+reflection, search, or iterative correction [Xiao et al., 2024,
+AhmadiTeshnizi et al., 2024, Astorga et al., 2025, Zhang
+et al., 2026], but this often increases API calls, token
+consumption, and workflow complexity. The resulting
+accuracy–cost trade-off can hinder large-scale deployment.
+To address this accuracy-cost trade-off, IR2Solve intro-
+duces an intermediate representation (IR) as a structured
+target for LLM generation. A single semantic call maps
+the problem description into a schema-constrained Mod-
+elIR. A deterministic verifier then applies a fixed set of
+conservative rewrites, after which a deterministic compiler
+constructs the Gurobi model. Mathematical expressions
+are stored as restricted Python-like strings rather than
+complete programs. ModelIR also represents per-index
+constraint families as concrete scalar entries, reducing free-
+index and implicit-quantification errors and simplifying
+downstream checking. The final pipeline uses one seman-
+tic LLM call and no iterative generation or LLM-based
+rescue.
+Our main contributions are:
+1. We formulate optimization autoformulation through
+an explicit representation layer and introduce Mod-
+1
+arXiv:2608.02641v1  [cs.SE]  31 Jul 2026
+
+
+--- Page 2 ---
+elIR, which constrains open-ended code generation
+into a structured, solver-oriented artifact.
+2. We present IR2Solve, a practical one-call pipeline
+combining ModelIR with a deterministic verifier and
+deterministic IR-to-solver compilation. A concrete
+scalar-constraint convention is used to reduce index-
+scope ambiguity, while its length and scaling limita-
+tions are stated explicitly.
+3. We provide an evaluation on six cleaned benchmarks,
+a full 153-instance ablation of the structured IR inter-
+face, scalar-constraint instruction, and verifier, and
+matched inference-cost profiling against representa-
+tive one-call, multi-agent, and iterative systems.
+The rest of the paper reviews related work, formal-
+izes the task and its challenges, presents IR2Solve, and
+evaluates accuracy, ablations, failure modes, and infer-
+ence cost. Full prompts, schema details, verifier rules, and
+implementation notes are provided in the appendix.
+2
+Related Work
+2.1
+Code-First Autoformulation
+The most direct approach asks an LLM to generate com-
+plete solver code from a problem description. Standard
+prompting and chain-of-thought provide natural base-
+lines [Wei et al., 2022]; CAFA [Deng et al., 2024] explic-
+itly adopts coding as the autoformulation interface and
+uses one generation followed by deterministic cleaning.
+This design is inexpensive, but it couples mathematical
+modeling with imports, solver APIs, indexing, status han-
+dling, and program execution. IR2Solve instead makes the
+mathematical formulation an explicit intermediate object
+before solver-specific construction. Our R0 condition is a
+controlled one-call code-generation ablation, while CAFA
+is retained as a stronger external code-first baseline.
+2.2
+Multi-Agent and Reflective Repair
+Chain-of-Experts [Xiao et al., 2024] decomposes formula-
+tion across role-specialized agents coordinated by a con-
+ductor, with reflection. OptiMUS [AhmadiTeshnizi et al.,
+2024] organizes extraction, modeling, coding, testing, and
+refinement in a modular workflow. SAC-Opt [Zhang et al.,
+2026] reconstructs semantic anchors from generated code
+and iteratively corrects misaligned objectives and con-
+straints. These methods create additional opportunities
+to revise errors, but require multiple calls and intermedi-
+ate interfaces. IR2Solve follows a non-iterative one-call
+generation path and uses only deterministic verification
+after ModelIR is produced.
+2.3
+Search and Execution-Aware Systems
+Autoformulation with MCTS [Astorga et al., 2025] treats
+modeling as a search problem over many candidate for-
+mulations, using pruning and evaluation to select a solu-
+tion. NEMO [Song et al., 2026] represents a more recent
+execution-aware direction with coding agents, sandboxed
+execution, simulator–optimizer validation, memory, MBR
+decoding, and self-consistency. Such systems demonstrate
+the value of inference-time scaling and solver-grounded
+feedback. Our focus is complementary: we study how much
+reliability can be obtained by changing the representation
+interface while retaining a one-call semantic workflow.
+2.4
+Fine-Tuned OR Models and Bench-
+mark Curation
+Fine-tuned systems such as ORLM [Huang et al., 2025a],
+LLMOPT [Jiang et al., 2025], and evolutionary or stepwise
+training approaches [Wu et al., 2025] internalize optimi-
+zation structure through curated data and training. They
+can achieve strong accuracy but shift cost toward data
+synthesis and model adaptation. Because noisy bench-
+mark labels can materially change conclusions, we use
+the cleaned releases and baseline values curated by the
+recent survey [Xiao et al., 2025], covering NL4Opt [Ra-
+mamonjison et al., 2023], MAMO EasyLP/ComplexLP
+[Huang et al., 2025b], NLP4LP from the OptiMUS lineage,
+IndustryOR, and ReSocratic [Yang et al., 2025].
+3
+Problem Setup and Challenges
+3.1
+Optimization Modeling Preliminaries
+We consider linear and mixed-integer linear optimization
+problems over decision variables x, instance data θ, an
+objective, and inequality/equality constraints:
+min
+x∈X
+f(x; θ)
+s.t.
+gi(x; θ) ≤0,
+i = 1, . . . , I,
+hj(x; θ) = 0,
+j = 1, . . . , J,
+(1)
+where X ⊆Rℓ× Zk encodes continuous and discrete
+variable domains. A formulation is a formal instance of
+Eq. (1).
+3.2
+Task Setup and Representation Layer
+Let d ∈D denote a natural-language description, m ∈M
+a mathematical formulation, and c ∈C an executable
+solver instance. Autoformulation can be factored as
+d −→m −→c.
+(2)
+The first map interprets the problem semantics; the second
+realizes the model in a solver. Code-first systems collapse
+both into one LLM output. IR2Solve makes m an explicit
+artifact and implements the second map deterministically.
+A useful stochastic view writes the two mappings as pϕ(m |
+d) and pψ(c | m), inducing
+pϕ,ψ(m, c | d) = pψ(c | m) pϕ(m | d).
+(3)
+2
+
+
+--- Page 3 ---
+This decomposition distinguishes modeling uncertainty
+from implementation uncertainty. Direct code generation
+exposes both to one stochastic sample, whereas IR2Solve
+reserves stochasticity for d →m and uses fixed programs
+for m →c.
+An LLM does not directly emit an abstract m; it emits
+an artifact in a representation language L. Let ML ⊆M
+denote the models expressible in L. The representation
+determines which artifacts are admissible, what can be
+validated before execution, and how reliably they can
+be compiled. Restricting generation to ML can remove
+irrelevant program structures and solver-API choices, but
+only under a coverage assumption: the language must
+still express a correct formulation for the target instance.
+We therefore use representation restriction as a design
+motivation, not as a claim that ModelIR covers every
+optimization formalism. The current schema is aimed at
+finite LP/MILP families represented in the benchmark
+suite; broader coverage remains an empirical and engi-
+neering question. A conditional probability statement and
+its proof are given in the appendix.
+3.3
+Evaluation and Efficiency Metrics
+We report three execution-level outcomes. Build indi-
+cates that the solver instance can be constructed without
+runtime errors. Solved indicates that the solver returns a
+feasible or optimal result within the time limit. Objective
+correctness requires a solved model whose objective z
+matches the reference z⋆under |z −z⋆| ≤10−4 +10−6|z⋆|.
+This criterion is reproducible but does not prove full
+semantic equivalence: two different feasible regions can
+share the same optimum.
+Efficiency is measured through semantic LLM calls, in-
+put/output/total tokens, wall-clock latency, and API cost
+where available. Calls and tokens are the most portable
+indicators across systems, while latency additionally de-
+pends on provider and hardware conditions.
+3.4
+Challenges
+Three challenges motivate the pipeline. (C1) Large hy-
+pothesis space: natural-language descriptions admit
+many plausible variable definitions, indexing choices, and
+constraint interpretations. (C2) Fragile executabil-
+ity: even conceptually plausible models can fail because
+of schema, shape, indexing, or solver-code errors. (C3)
+Accuracy–cost trade-off: repeated sampling, reflection,
+search, and multi-agent coordination can improve accu-
+racy but increase calls and tokens. IR2Solve addresses
+these challenges by constraining the generated artifact and
+reserving subsequent correction for a small deterministic
+rule set.
+Field
+Key contents
+sets
+names and explicit finite elements
+params
+names, index signatures, and numeric values
+vars
+names, indices, variable types, and bounds
+objective
+minimization/maximization sense and expres-
+sion string
+constraints
+named left expression, relation, and right ex-
+pression
+Table 1: Summary of the ModelIR schema.
+4
+Methodology
+4.1
+Overview
+Given a description d, IR2Solve first generates a formula-
+tion m in ModelIR, applies a deterministic verifier, and
+compiles the verified IR into a Gurobi model c (Figure 1).
+This follows the factorization in Eq. (2): the LLM is used
+for language-to-model interpretation, whereas model-to-
+solver realization is deterministic. No candidate resam-
+pling, reflection, critic, or semantic repair call is used in
+the final system.
+4.2
+ModelIR
+ModelIR is a schema-constrained JSON representation
+with typed fields for sets, params, vars, objective,
+and constraints. Variables declare index sets, type in
+{continuous, integer, binary}, and bounds. Objective and
+constraint relations are stored as restricted Python-like
+expression strings: mathematical strings containing arith-
+metic, declared parameter/variable references, explicit
+indexing, and bounded sum/quicksum. They contain no
+imports, model initialization, solver calls, control flow,
+or result-handling code. During generation, the model
+is instructed to output JSON only, use declared names
+consistently, and express the objective and constraints
+through the permitted expression fragment. The full
+schema, prompt templates, and a complete worked exam-
+ple are in the appendix.
+This separation is deliberately modest: the LLM still
+performs the hard semantic work of identifying variables,
+domains, objective, and constraints, but it no longer has
+to synthesize the surrounding solver program. Schema val-
+idation also makes failures observable before compilation
+rather than surfacing only as runtime exceptions. Table 1
+summarizes these fields.
+Constraint granularity.
+Each constraint entry is re-
+quired to denote one concrete scalar relation. Free indices
+and implicit “for all” semantics are disallowed, and a finite
+per-index family is written as separate entries. For a finite
+set, this explicit form is mathematically equivalent to the
+corresponding universally indexed family. Operationally,
+the convention avoids index-scope inference during com-
+pilation and supports direct constraint-level inspection.
+It can, however, increase output length as indexed fami-
+lies grow, so we treat it as a practical design choice for
+3
+
+
+--- Page 4 ---
+Figure 1: IR2Solve separates one-call ModelIR generation from deterministic verification, compilation, and solving.
+ModelIR explicitly represents sets, parameters, variables, the objective, and scalar constraints. The verifier applies
+fixed guarded rewrites, and the compiler constructs the Gurobi model without additional semantic calls.
+the targeted benchmark scale rather than a universally
+optimal representation. The formal finite-set equivalence
+and its limitations are given in the appendix.
+4.3
+Deterministic Verifier
+The verifier applies a fixed sequence of conservative,
+guarded rewrites and invokes no LLM. Its active func-
+tions can be summarized in three groups: (i) canonicalize
+names, index keys, and common parameter shapes; (ii)
+resolve recoverable index-scope and aggregation inconsis-
+tencies that would prevent compilation; and (iii) apply a
+small set of unambiguous variable-domain and constraint-
+direction sanity checks. Shallow syntax cases are handled
+by the same sequence rather than exposed as independent
+modules. Verifier rule families and implementation notes
+are provided in the appendix.
+Let T1, . . . , TK denote the fixed guarded transforma-
+tions. The verifier is the deterministic composition
+bm = V(m) = TK ◦TK−1 ◦· · · ◦T1(m),
+(4)
+where a transformation leaves its input unchanged when
+its guard is not satisfied. Equation (4) describes the imple-
+mentation directly: the verifier does not define a probabil-
+ity distribution, resample candidates, or optimize a latent
+violation score. In the ablation, the verifier is applied to
+the exact pre-verifier ModelIR used by the corresponding
+no-verifier condition, so the comparison adds no model
+call.
+4.4
+Deterministic Compilation
+The compiler instantiates declared sets, parameters, and
+variables; evaluates restricted expressions in an environ-
+Algorithm 1 IR2Solve (one semantic call)
+Input: description d
+Output: status and objective
+1: ir ←GenerateIR(d)
+// one semantic call
+2: ir ←Verify(ir)
+// deterministic
+3: c ←CompileToGurobi(ir)
+// deterministic
+4: return Solve(c)
+ment containing only declared objects and allowed aggre-
+gators; sets the objective; and emits solver constraints.
+Given the same finalized IR and compiler version, the
+resulting Gurobi model is fixed. This avoids a second
+stochastic IR-to-code stage and allows each emitted con-
+straint to be traced to its IR entry. Determinism does
+not guarantee that the upstream model is semantically
+correct, but it preserves the finalized representation, sup-
+ports exact replay, and removes compiler sampling as
+an additional source of variation. The current ablation
+does not isolate the compiler against an LLM compiler;
+its contribution is therefore described as an architectural
+property rather than an empirical accuracy delta.
+5
+Experiments
+We first report the main comparison on six cleaned bench-
+marks, then present a controlled ablation on IndustryOR
+and ComplexLP, followed by cost and failure analyses.
+5.1
+Experimental Setup
+Datasets.
+We use the survey-cleaned releases [Xiao
+et al., 2025]: NL4Opt (214 instances) [Ramamonjison
+4
+
+
+--- Page 5 ---
+et al., 2023], IndustryOR (42), EasyLP (545) and Com-
+plexLP (111) from MAMO [Huang et al., 2025b], NLP4LP
+(178) from the OptiMUS lineage [AhmadiTeshnizi et al.,
+2024], and ReSocratic (403) [Yang et al., 2025]. The abla-
+tion uses the complete IndustryOR and ComplexLP sets
+because they contain frequent indexing, parameter-shape,
+and semantic failures.
+Configuration and metrics.
+The final local configura-
+tion uses GPT-4o-2024-08-06 with temperature 0 for a sin-
+gle NL→IR call and Gurobi with a 60-second per-instance
+limit. There is no semantic retry, candidate selection, or
+LLM repair call. Reference objectives are used only for
+retrospective evaluation. We report Build, Solved, and
+objective-correct rates under the tolerances in Section 3.
+Baseline rows copied from other studies are marked by
+source and protocol. Survey values use the same cleaned
+releases and report a standardized accuracy metric, but
+the survey does not specify every decoding and solver pa-
+rameter. OptiMUS-0.3 and SAC-Opt values are five-run
+means from SAC-Opt’s unified evaluation. The appendix
+records the dataset, protocol, and comparability details
+used in each table.
+5.2
+Cleaned Benchmark Comparison
+Table 2 reports the comparison on the six cleaned datasets.
+IR2Solve is higher than the survey rows on all six
+columns. Relative to the recent SAC-Opt report, IR2Solve
+has higher reported accuracy on IndustryOR and Ea-
+syLP, while SAC-Opt is higher on NL4Opt, ComplexLP,
+NLP4LP, and ReSocratic. This supports a scoped con-
+clusion: a one-call IR-first system achieves competitive
+accuracy on the cleaned splits without iterative semantic
+correction. It is not a fully controlled superiority claim
+because the survey, SAC-Opt/OptiMUS, and our local
+evaluations differ in workflow details and run aggregation.
+The table also clarifies the intended positioning. ORLM
+is a fine-tuned model, CAFA a lightweight code-first
+method, Chain-of-Experts a multi-agent workflow, Op-
+tiMUS a modular reflective workflow, and SAC-Opt an
+iterative semantic-correction system. MCTS-based Auto-
+formulation and NEMO are relevant but are not inserted
+into Table 2: neither supplies the same six cleaned columns
+under a directly alignable protocol. MCTS reports accu-
+racy on original, uncleaned benchmarks, whereas NEMO
+uses autonomous coding agents, sandbox execution, mem-
+ory, validation, and a broader benchmark suite. We there-
+fore discuss them as search-based and execution-aware
+context rather than populate unsupported entries in the
+six-column comparison.
+5.3
+Ablation Study
+Design.
+Four variants form a nested ablation on 153
+instances. R0 makes one matched direct-code call. R1
+generates the final top-level ModelIR structure but re-
+moves the concrete scalar-constraint instructions and uses
+no verifier. R2 adds those instructions, still without the
+verifier. R3 applies the deterministic verifier to the ex-
+act R2 ModelIR, so the last contrast adds no model call.
+R0→R1 evaluates the structured-IR interface as a bun-
+dle (schema, expression strings, IR-oriented prompt, and
+deterministic model construction); R1→R2 evaluates the
+constraint-granularity instruction; and R2→R3 evaluates
+deterministic verification. R0 is a controlled ablation, not
+the strongest possible direct-code prompt; CAFA serves
+as the external code-first baseline in Table 2.
+Results.
+Table 3 shows pooled objective correctness
+increasing from 7.2% to 35.9%, 57.5%, and 68.6%. The
+structured IR interface gives the largest observed sequen-
+tial increase (+28.8 points pooled; +33.2 macro). The
+concrete scalar-constraint instruction adds +21.6 pooled
+points (+19.3 macro) and reduces free-index/non-scalar
+violations from 522 to 39. The verifier adds +11.1 pooled
+points (+7.7 macro), with a dataset-dependent effect: In-
+dustryOR remains 64.3%, whereas ComplexLP increases
+from 55.0% to 70.3%.
+The R1→R2 and R2→R3 contrasts have pooled ex-
+act McNemar p = 1.1 × 10−6 and p = 1.5 × 10−5, with
+bootstrap 95% intervals [13.7, 29.4] and [6.5, 16.3] percent-
+age points. The broader R0→R2 IR-first contrast is also
+significant (p < 10−19). These are sequential stage-wise
+effects, not independent causal contributions, and the
+schema, expression language, prompt, and compiler were
+not separately isolated.
+Build rate rises from 44.4% in R1 to 71.2% in R2, and
+the verifier further raises it to 79.1%. Structural violations
+fall from 522 to 39 and then 12. The results indicate
+that explicit constraint scope is useful on these datasets,
+but they do not remove its scaling cost: large Cartesian
+index products can make explicit generation substantially
+longer.
+Executability diagnostics.
+Pooled compilation fail-
+ures fall from 96 in R0 to 84, 42, and 30 in R1–R3. Within
+the IR variants, undefined-name failures decline from 81
+to 41 and 29. R0 has no meaningful IR structural-violation
+count because it emits code rather than ModelIR. Build
+and Solved remain above objective correctness for every
+variant, showing that improved executability does not
+eliminate semantic errors.
+Identification boundary.
+The nested design provides
+different levels of attribution. R1→R2 and R2→R3 are
+narrow prompt/component contrasts, whereas R0→R1
+replaces an entire interface: the output schema, expression
+representation, prompt contract, and deterministic con-
+struction path change together. The experiment therefore
+supports a bundle-level structured-IR effect, not indepen-
+dent claims for schema, expression strings, or compilation.
+Likewise, the current design does not compare determinis-
+tic compilation against an LLM compiler. This boundary
+5
+
+
+--- Page 6 ---
+Methods
+NL4Opt
+IndustryOR
+EasyLP
+ComplexLP
+NLP4LP
+ReSocratic
+ORLM-LLaMA-3 8B∗
+73.8%
+42.9%
+90.4%
+59.5%
+76.4%
+61.8%
+Standard∗
+61.2%
+38.1%
+70.3%
+57.7%
+73.6%
+48.4%
+CoT∗
+62.2%
+40.5%
+49.5%
+42.3%
+74.7%
+43.6%
+Chain-of-Experts∗
+66.7%
+31.2%
+94.4%
+50.6%
+87.4%
+71.2%
+CAFA∗
+68.1%
+41.1%
+71.2%
+44.5%
+50.0%
+40.1%
+OptiMUS-0.3†
+79.8%
+54.3%
+92.4%
+52.1%
+89.8%
+81.0%
+SAC-Opt†
+86.8%
+63.8%
+96.5%
+79.6%
+94.0%
+88.7%
+IR2Solve‡
+86.4%
+64.3%
+97.4%
+70.3%
+90.4%
+86.6%
+Table 2: Objective-correct accuracy on the six survey-cleaned datasets. ∗Values reported by the cleaned-benchmark
+survey; ORLM is fine-tuned and the other rows are prompting/agent baselines. †Five-run means reported by SAC-Opt
+under its unified pipeline on the same cleaned dataset releases; this protocol is not identical to the survey or our local
+evaluation. ‡IR2Solve uses the frozen final one-call configuration; four datasets come from the 1,340-instance refresh,
+while IndustryOR and ComplexLP retain matching final-configuration evaluations. Bold marks the best reported value
+in each column, and underlining marks the second-highest value. The table is a scoped clean-split comparison, not a
+fully controlled head-to-head across backbones and workflows.
+Variant
+Design
+Objective correct (%)
+Build (%)
+Solved (%)
+Struct. viol.
+IndustryOR
+ComplexLP
+Pooled
+Pooled
+Pooled
+Pooled
+R0
+Direct Gurobi code, one call
+7.1
+7.2
+7.2
+37.3
+35.3
+N/A
+R1
+Structured expression-string IR
+50.0
+30.6
+35.9
+44.4
+42.5
+522
+R2
++ scalar-constraint instruction
+64.3
+55.0
+57.5
+71.2
+68.6
+39
+R3
++ deterministic verifier (final)
+64.3
+70.3
+68.6
+79.1
+75.2
+12
+R0→R1
+Structured-IR stage gain
++42.9 pp
++23.4 pp
++28.8 pp
+R1→R2
+Scalar-constraint stage gain
++14.3 pp
++24.3 pp
++21.6 pp
+−483
+R2→R3
+Verifier stage gain
++0.0 pp
++15.3 pp
++11.1 pp
+−27
+Table 3: Ablation study on 153 cleaned instances. All objective, build, and solved entries are percentages with one
+decimal. Structural violations count free-index/non-scalar IR events and are not defined for the code-first R0 condition.
+Stage gains are observed sequential changes, not independent causal contributions. The scalar-constraint and verifier
+contrasts are significant in pooled paired tests (p = 1.1 × 10−6 and p = 1.5 × 10−5); the aggregate R0→R2 contrast is
+also significant (p < 10−19). The verifier has no accuracy effect on IndustryOR but adds 15.3 points on ComplexLP.
+Method
+Calls/inst. Total tok. Tok./inst.
+CAFA
+1
+7,954
+795
+IR2Solve
+1
+16,031
+1,603
+Chain-of-Experts
+8
+53,459
+5,346
+SAC-Opt
+39
+367,028
+36,703
+Table 4: Inference-cost profile on the COST-10 panel (10
+instances, locally measured, GPT-4o backbone). IR2Solve
+and CAFA use a single semantic call per instance; Chain-
+of-Experts uses eight and SAC-Opt uses 39, spending 3.3×
+and 22.9× more tokens than IR2Solve. COST-10 is a cost-
+profiling panel drawn from relatively simple NL4Opt-style
+cases, selected to characterize inference cost rather than
+to expose the maximum accuracy advantage of complex
+systems; we therefore do not use COST-10 accuracy to
+rank modeling quality.
+is important because a system can benefit from the com-
+bination even when no single subchoice has been isolated.
+5.4
+Inference Cost and Accuracy–Cost
+Analysis
+Matched cost profile.
+COST-10 contains ten NL4Opt
+instances selected across source-length deciles and is used
+only to profile inference cost. IR2Solve uses one call and
+16,031 total tokens. CAFA is cheaper at 7,954 tokens, also
+with one call. Chain-of-Experts uses eight calls and 53,459
+tokens; SAC-Opt uses 39 calls and 367,028 tokens. CoE
+and SAC-Opt therefore consume 3.3× and 22.9× as many
+tokens as IR2Solve. COST-10 is not used to rank general
+modeling accuracy: its instances are relatively simple and
+the panel is too small to expose the maximum benefit of
+complex iterative workflows.
+MCTS and NEMO are not included in this matched
+cost table because a faithful COST-10 workflow could not
+be reproduced under the same instrumentation. MCTS
+requires a search implementation and evaluator not avail-
+able as a complete cleaned-split pipeline, while NEMO
+depends on autonomous coding agents, sandbox execu-
+tion, memory, and inference-time selection. Their pub-
+lished workflows are clearly more involved than one-call
+generation, but we do not infer token or call totals from
+qualitative descriptions.
+6
+
+
+--- Page 7 ---
+Cross-study proxy.
+Figure 2 plots the six-benchmark
+means in Table 2 against locally measured COST-10 to-
+kens per instance. CAFA is cheaper but less accurate;
+SAC-Opt reports a higher mean at far greater inference
+cost; and IR2Solve lies between them with one semantic
+call. This is a deployment proxy, not a strict Pareto proof,
+because the axes come from different panels and protocols
+differ in backbone, extraction, and run aggregation.
+103
+104
+COST-10 tokens / instance (log)
+50
+55
+60
+65
+70
+75
+80
+85
+90
+Unweighted six-benchmark mean accuracy (%
+CAFA
+(1 call)
+IR2Solve
+(1 call)
+Chain-of-Experts
+(8 calls)
+SAC-Opt
+(39 calls)
+Figure 2: Cross-study accuracy–cost proxy. Vertical: un-
+weighted mean objective accuracy across six cleaned
+datasets; horizontal: locally measured COST-10 tokens
+per instance (log scale), with calls annotated. Different
+source protocols make this a deployment-oriented land-
+scape rather than a same-instance Pareto test.
+Deployment interpretation.
+Calls and tokens de-
+scribe complementary burdens. A one-call method is sim-
+pler to schedule, audit, and retry, while token volume
+captures prompt and response size within that call. CAFA
+minimizes both token use and orchestration overhead, but
+its cleaned-benchmark mean is lower. SAC-Opt incurs
+considerably greater inference cost to obtain a higher six-
+benchmark mean under its reported protocol. IR2Solve
+occupies the intermediate operating point: one semantic
+call, an explicit inspectable artifact, and a determinis-
+tic tail. The preferred point therefore depends on the
+value assigned to accuracy, inference budget, latency, and
+formulation auditability rather than on a single scalar
+score.
+5.5
+Failure Analysis
+Figure 3 decomposes pooled outcomes in the ablation.
+Direct code generation is dominated by build failure. R1
+converts many cases into executable models, while the
+scalar-constraint instruction sharply reduces malformed
+index-scope cases. The verifier moves additional cases into
+the objective-correct segment. In R3, 20.9% fail before
+build, 3.9% build but do not solve, and 6.6% solve with
+0
+20
+40
+60
+80
+100
+Percentage of instances
+R0
+R1
+R2
+R3
+Build failure
+Built, not solved
+Solved, objective wrong
+Objective correct
+Figure 3: Pooled failure conversion across the four ablation
+variants. Categories are derived from nested Build, Solved,
+and objective-correct rates and sum to 100% within each
+row.
+an incorrect objective. These categories are execution-
+level outcomes rather than manually adjudicated semantic
+causes. Build failures can arise from unsupported or mal-
+formed representations, while objective-incorrect cases
+may reflect missing constraints, incorrect domains, or
+misread objectives. The deterministic tail can normalize
+known structures, but it cannot reconstruct problem se-
+mantics that were never captured in the IR. Objective
+correctness is also a coarse endpoint: a model can match
+the reference optimum while differing in its feasible region.
+6
+Limitations
+This study has several limitations. The mechanism abla-
+tion covers IndustryOR and ComplexLP rather than every
+cleaned benchmark. The structured IR contrast bundles
+schema, expression strings, prompt design, and determin-
+istic model construction, so their individual effects are
+not isolated. ModelIR is targeted at finite LP/MILP-style
+formulations and does not claim universal coverage of
+optimization formalisms. Explicit scalar expansion can
+grow rapidly with large index products, increasing output
+length and truncation risk. The accuracy–cost plot com-
+bines full-benchmark accuracy with cost measured on a
+separate ten-instance panel, and is therefore a deployment
+proxy rather than a same-instance Pareto proof. Finally,
+objective-value agreement does not establish full semantic
+equivalence.
+Addressing these limitations requires both broader rep-
+resentation support and more direct evaluation of se-
+mantic coverage. Future work should extend ModelIR
+while retaining deterministic compilation, develop source-
+grounded semantic checks, and inspect recurring full-
+benchmark failure clusters. In particular, representation
+coverage should be measured directly from reference for-
+mulations rather than inferred from generation failures.
+Such a study should classify reference models as rep-
+resentable, unsupported, or indeterminate and distin-
+7
+
+
+--- Page 8 ---
+guish native schema coverage from coverage obtained
+through mathematically equivalent reformulation. This
+would sharpen the boundary between limitations of the
+representation and those of the base language model.
+7
+Conclusion
+IR2Solve separates natural-language interpretation from
+solver realization: one semantic call produces ModelIR,
+after which a deterministic verifier and IR-to-Gurobi com-
+piler complete the pipeline. Across cleaned benchmarks, it
+achieves competitive objective correctness with a one-call
+inference profile. The ablation shows that the structured
+IR interface produces the largest observed sequential in-
+crease, while the concrete scalar-constraint convention
+and deterministic verification provide further, dataset-
+dependent improvements.
+From a deployment perspective, the explicit IR offers a
+useful inspection point between language understanding
+and solver execution. A practitioner can examine declared
+variables, domains, objective direction, and individual
+constraints before solving, while the deterministic tail
+makes the same artifact replayable. This does not replace
+domain review, but it separates semantic modeling errors
+from program-construction failures and provides a clearer
+basis for auditing than an opaque end-to-end code sample.
+The one-call design also keeps operational behavior pre-
+dictable: cost does not depend on an open-ended number
+of reflection or debugging rounds. Taken together, these
+results suggest that explicit intermediate representations
+offer a practical middle ground between brittle direct code
+generation and costly iterative autoformulation workflows
+while improving inspectability and replayability.
+8
+
+
+--- Page 9 ---
+A
+ModelIR Schema and Expres-
+sion Language
+A ModelIR instance has the top-level fields meta, sets,
+params, vars, objective, and constraints. Table A1
+summarizes the dataclass contract used by the final
+pipeline.
+Expressions admit numeric literals, arithmetic, paren-
+theses, declared parameters and variables, explicit index-
+ing, and sum/quicksum generators over declared finite
+sets. The compiler exposes only declared objects plus sum,
+quicksum, enumerate, range, len, max, min, and abs;
+Python built-ins are otherwise disabled.
+Constraint granularity.
+Each constraint entry de-
+notes one scalar relation. A finite per-index family is
+expanded into multiple entries instead of carrying an
+implicit universal quantifier. This reduces index-scope
+inference during compilation, but its output length can
+grow with large index products.
+B
+Complete Worked Example
+Natural-language description.
+The Zhang family has six children: Harry, Hermione,
+Ron, Fred, George, and Ginny. The respective costs
+of taking the six children are 1200, 1650, 750, 800,
+800, and 1500. The family wants to minimize total
+cost, can take at most four children, must take Ginny,
+cannot take Fred or George if Harry is taken, must
+take Fred and Hermione if George is taken, and must
+take at least three children.
+ModelIR.
+{
+"meta": {
+"problem_id": "demo_family",
+"source": "worked_example",
+"description": "Family trip selection problem.",
+"sense": "min",
+"version": "v1"
+},
+"sets": [{
+"name": "Children",
+"elements": ["Harry", "Hermione", "Ron",
+"Fred", "George", "Ginny"],
+"description": "Children considered for the trip."
+}],
+"params": [{
+"name": "cost",
+"indices": ["Children"],
+"values": {
+"Harry": 1200.0, "Hermione": 1650.0,
+"Ron": 750.0, "Fred": 800.0,
+"George": 800.0, "Ginny": 1500.0
+},
+"description": "Cost of taking each child."
+}],
+"vars": [{
+"name": "x",
+"indices": ["Children"],
+"vartype": "binary",
+"lb": 0.0,
+"ub": 1.0,
+"description": "Whether each child is taken."
+}],
+"objective": {
+"name": "minimize_cost",
+"sense": "min",
+"expr": "quicksum(cost[c] * x[c] for c in Children)",
+"description": "Minimize total trip cost."
+},
+"constraints": [
+{
+"name": "max_4_children",
+"expr_lhs": "quicksum(x[c] for c in Children)",
+"sense": "<=", "expr_rhs": "4.0",
+"description": "At most four children."
+},
+{
+"name": "take_ginny",
+"expr_lhs": "x[’Ginny’]",
+"sense": "==", "expr_rhs": "1.0",
+"description": "Ginny must be taken."
+},
+{
+"name": "harry_no_fred",
+"expr_lhs": "x[’Harry’] + x[’Fred’]",
+"sense": "<=", "expr_rhs": "1.0",
+"description": "Harry and Fred cannot both be taken."
+},
+{
+"name": "harry_no_george",
+"expr_lhs": "x[’Harry’] + x[’George’]",
+"sense": "<=", "expr_rhs": "1.0",
+"description": "Harry and George cannot both be taken."
+},
+{
+"name": "george_with_fred",
+"expr_lhs": "x[’George’] - x[’Fred’]",
+"sense": "<=", "expr_rhs": "0.0",
+"description": "George implies Fred."
+},
+{
+"name": "george_with_hermione",
+"expr_lhs": "x[’George’] - x[’Hermione’]",
+"sense": "<=", "expr_rhs": "0.0",
+"description": "George implies Hermione."
+},
+{
+"name": "at_least_3_children",
+"expr_lhs": "quicksum(x[c] for c in Children)",
+"sense": ">=", "expr_rhs": "3.0",
+"description": "At least three children."
+}
+]
+}
+9
+
+
+--- Page 10 ---
+Field
+Type
+Recognized contents
+meta
+object
+objective sense (default min); nullable problem identifier, source, description, and
+version
+sets
+list
+name, explicit finite elements, nullable description
+params
+list
+name, zero/one/two-dimensional index signature, numeric values, nullable descrip-
+tion
+vars
+list
+name, index signature, type in {continuous, integer, binary}, bounds, nullable
+description
+objective
+object
+name, min/max sense, one expression string, nullable description
+constraints
+list
+name, left expression, relation in {<=, >=, ==}, right expression, nullable description
+Table A1: ModelIR field summary. Names referenced in expressions must be declared in the same object. The prompt
+forbids extra keys. At parse time, unsupported fields (e.g., forall, evidence, repair, or dependency metadata) raise
+an error; other unrecognized fields are not represented by the ModelIR dataclasses and therefore do not reach the
+compiler.
+Each constraint is independently inspectable and com-
+piles to one named Gurobi constraint. The expression
+strings contain mathematical content but no solver pro-
+gram structure.
+Verification, compilation, and solution.
+As written, the example already satisfies the schema
+and scalar-constraint contract, so no verifier repair is re-
+quired before compilation. The compiler creates six binary
+variables and seven named constraints. Gurobi returns
+an optimal solution selecting Ron, Fred, and Ginny, with
+objective value 3050. This completes the path from the
+natural-language description to ModelIR, deterministic
+processing, and the solver result.
+C
+Generation Prompts and Abla-
+tion Variants
+C.1
+R2/R3 ModelIR System Prompt
+The following is the exact system prompt. R2 uses it to
+generate ModelIR; R3 applies deterministic verification
+to the same R2-generated ModelIR and adds no semantic
+call.
+You are an expert in mathematical modeling and optimization.
+Read a natural-language description of a linear / integer
+optimization problem and
+output a JSON object describing the model in a strictly
+structured IR called ModelIR.
+Hard requirements:
+- Output JSON ONLY (no markdown, no explanations).
+- Produce valid JSON (double quotes only; no trailing commas; no
+comments).
+- Follow the schema exactly. Do NOT add extra keys.
+- Use Python expressions in strings for objective/constraints
+(only arithmetic, indexing, quicksum/sum).
+C.2
+R2/R3 ModelIR User Prompt Tem-
+plate
+The literal problem description is appended after the final
+line.
+Generate ONE JSON object with these top-level keys:
+- meta
+- sets
+- params
+- vars
+- objective
+- constraints
+==== Schema ====
+1) meta
+{
+"problem_id": "string or null",
+"source": "string or null",
+"description": "string or null",
+"sense": "min" or "max",
+"version": "string or null"
+}
+2) sets
+A list of sets. Each set is:
+{
+"name": "string",
+"elements": ["string", ...],
+// IMPORTANT: every element MUST be a STRING
+"description": "string or null"
+}
+3) params
+A list of parameters. Each param is:
+{
+"name": "string",
+"indices": [] | ["SetName"] | ["SetName1","SetName2"],
+"values": number | {key:number,...} | {i:{j:number,...},...},
+"description": "string or null"
+}
+Canonical forms for values:
+- Scalar (0D): a number (a single-entry dict is tolerated by the compiler)
+- 1D over set I: {"i1": 1.0, "i2": 2.0, ...}
+- 2D over sets I,J (RECOMMENDED): {"i1": {"j1": 1.0, "j2": 3.0}, ...}
+4) vars
+A list of decision variables. Each var is:
+{
+"name": "string",
+"indices": [] | ["SetName"] | ["SetName1","SetName2"],
+"vartype": "continuous" | "integer" | "binary",
+"lb": number,
+"ub": number or null,
+"description": "string or null"
+}
+IMPORTANT (integrality baseline):
+- Default to "integer" for counts/units/number of items/visits/vehicles/facilities/
+assignments.
+- Use "binary" only for yes/no decisions.
+- Use "continuous" only for divisible amounts.
+5) objective
+{
+"name": "string",
+"sense": "min" or "max",
+"expr": "Python expression string",
+"description": "string or null"
+}
+6) constraints
+A list of constraints. Each constraint is:
+{
+"name": "string",
+"expr_lhs": "Python expression string",
+"sense": "<=" | ">=" | "==",
+"expr_rhs": "Python expression string",
+"description": "string or null"
+}
+==== Expression rules (compile-safe baseline) ====
+Allowed building blocks inside expr strings:
+- Numbers, + - * /, parentheses
+- Indexing into params/vars: x[i], x[i][j], cost[i][j], demand[i]
+- Aggregation: quicksum( ... for i in I ), sum( ... for i in I )
+(You may nest sums, e.g., quicksum(quicksum(x[i][j] for j in J) for i in I))
+Hard constraints (must follow):
+- Every constraint must be a SINGLE SCALAR constraint (lhs and rhs each evaluate to a
+10
+
+
+--- Page 11 ---
+scalar).
+- Do NOT write implicit "for all" constraints inside one constraint.
+If a constraint must hold for each i, EXPAND it into multiple entries in the constraints
+list.
+- Do NOT use free index symbols outside of a sum/generator that binds them.
+Before outputting, self-check:
+- JSON parses; keys match schema; no extra keys.
+- All referenced names (sets/params/vars) are defined.
+- No free indices; per-index constraints are expanded.
+Now read the following optimization problem and output the JSON IR (JSON ONLY):
+{PROBLEM_TEXT}
+C.3
+R1 Scalar-Constraint Instruction Ab-
+lation
+R1 is derived mechanically from the R2 template: it re-
+moves exactly the following block and the matching final
+self-check line; all other prompt text, the schema, model,
+temperature, and compiler path are unchanged.
+Hard constraints (must follow):
+- Every constraint must be a SINGLE SCALAR constraint
+(lhs and rhs each evaluate to a scalar).
+- Do NOT write implicit "for all" constraints inside one
+constraint. If a constraint must hold for each i, EXPAND it
+into multiple entries in the constraints list.
+- Do NOT use free index symbols outside of a sum/generator
+that binds them.
+Removed self-check:
+- No free indices; per-index constraints are expanded.
+C.4
+R0 Direct-Code Prompt
+R0 uses the existing code-generation prompt with
+ir=None. The prompt was not specially optimized for
+this ablation, making R0 a controlled one-call interface
+comparison rather than a strongest-possible code-first
+baseline. Because the prompt accepts a ModelIR slot, the
+supplied IR value is literally null.
+System prompt.
+You are an expert in mathematical modeling and optimization.
+Your task is to:
+1. Read a natural language description of a linear/integer optimization problem.
+2. Read the provided JSON immediate representation (ModelIR) of the modeling process of the
+problem.
+3. Generate Python code that uses the Gurobi library to create the optimization model based
+on the ModelIR.
+IMPORTANT: You MUST generate a Python function named ‘build_gurobi_model()‘ that:
+1. Takes no parameters
+2. Creates a Gurobi model using the provided information
+3. Returns the created model
+The generated Python code should follow these guidelines:
+1. Import necessary libraries: import gurobipy as gp
+2. Create the model: model = gp.Model("LP_Model")
+3. Add variables according to variable information:
+- Continuous variables: model.addVar(lb=..., ub=..., vtype=gp.CONTINUOUS, name=...)
+- Integer variables: model.addVar(vtype=gp.INTEGER, name=...)
+- Binary variables: model.addVar(vtype=gp.BINARY, name=...)
+4. Add constraints: model.addConstr(...)
+5. Set objective function: model.setObjective(...)
+6. Define a function ‘build_gurobi_model()‘ that creates and returns the model
+7. At the end, call the function to build the model
+Please output the complete Python code directly without any additional explanations.
+EXAMPLE FORMAT:
+‘‘‘python
+import gurobipy as gp
+from gurobipy import GRB
+def build_gurobi_model():
+# Create a new model
+model = gp.Model("LP_Model")
+# Your modeling code here...
+return model
+# Build the model
+model = build_gurobi_model()
+User prompt template.
+SCHEMA FOR THE INTERMEDIATE REPRESENTATION (IR):
+The IR is a structured representation of the problem, typically in JSON format.
+It is not always correct. It includes the following components:
+1) sets
+A list of sets. Each set is:
+{
+"name": "string",
+"elements": ["string", ...],
+// IMPORTANT: every element MUST be a STRING (even if it
+looks like a number)
+"description": "string or null"
+}
+2) params
+A list of parameters. Each param is:
+{
+"name": "string",
+"indices": [] | ["SetName"] | ["SetName1","SetName2"],
+// 0D/1D/2D only
+"values": number | {key:number,...} | {i:{j:number,...},...},
+// recommended canonical
+forms below
+"description": "string or null"
+}
+Canonical forms for values:
+- Scalar (0D): a number (or a single-entry dict is tolerated by the compiler)
+- 1D over set I: {"i1": 1.0, "i2": 2.0, ...}
+- 2D over sets I,J (RECOMMENDED): {"i1": {"j1": 1.0, "j2": 3.0}, "i2": {...}, ...}
+3) vars
+A list of decision variables. Each var is:
+{
+"name": "string",
+"indices": [] | ["SetName"] | ["SetName1","SetName2"],
+// 0D/1D/2D only
+"vartype": "continuous" | "integer" | "binary",
+"lb": number,
+"ub": number or null,
+"description": "string or null"
+}
+4) objective
+{
+"name": "string",
+"sense": "min" or "max",
+"expr": "Python expression string",
+"description": "string or null"
+}
+5) constraints
+A list of constraints. Each constraint is:
+{
+"name": "string",
+"expr_lhs": "Python expression string",
+"sense": "<=" | ">=" | "==",
+"expr_rhs": "Python expression string",
+"description": "string or null"
+}
+TASK EXECUTION:
+1. PROBLEM DESCRIPTION:
+{PROBLEM_TEXT}
+2. PROVIDED INTERMEDIATE REPRESENTATION (IR):
+null
+CRITICAL REQUIREMENTS:
+- Generate a Python function named ‘build_gurobi_model()‘ that takes no parameters and
+returns the Gurobi model
+- The function should use the provided ModelIR to build the model
+- Include all necessary imports
+- At the end of the code, call ‘build_gurobi_model()‘ to create the model
+- Do NOT include any extra explanations outside the code
+YOUR OUTPUT MUST BE A VALID python code that creates a Gurobi model.
+The prompt-template SHA-256 hashes are:
+R2 system:
+b5a3ece68c765b9473a382696e63889d2c18f0ea4678ce872f5e1fdb773300d7
+R2 user template:
+1aa3ae328264cbe9657fc26624b367580a43b3ece754242e2c83a430cc72d898
+R1 derived template:
+b2b54cead5da346a479184c31da0b9ee3a9adbdcad376d8a26ec5a4e75bec130
+D
+Deterministic Verifier Specifica-
+tion
+Rules execute once in the fixed order listed below. Each
+rule first detects a pattern, mutates the current IR if its
+guard holds, and passes that updated IR to the next rule.
+There is no LLM, resampling, score, acceptance gate, or
+data-dependent stopping rule.
+1. Set/key canonicalization. Guard: any set element
+is non-string, or a 1D/nested-2D parameter key is
+non-string. Rewrite: apply str() and keep the first
+11
+
+
+--- Page 12 ---
+Variant
+Generated artifact
+Scalar instruction
+Verifier
+Semantic calls
+Solver path
+R0
+Gurobi Python
+N/A
+none
+1
+generated code →Gurobi
+R1
+ModelIR
+removed
+none
+1
+deterministic compiler
+R2
+ModelIR
+present
+none
+1
+deterministic compiler
+R3
+same R2 ModelIR
+present
+L1 then L2
+0 additional
+deterministic compiler
+Table A2: Representation-ablation variants. All semantic generations use GPT-4o-2024-08-06, temperature 0, one
+sample, and no semantic repair or second candidate. R3 is paired with the exact R2 generation.
+value if two keys collapse to the same string. If any
+declared set consists entirely of digit strings, every
+numeric bracket token such as [123] in objective and
+constraint expressions becomes [’123’].
+2. 2D parameter normalization. Guard: a parameter
+has exactly two indices, dictionary values that are not
+already a dict-of-dicts, and at least one key parsable as
+(i,j), i,j, or i|j. Rewrite: convert parsable entries
+to {i:{j:value}} form. Unparsable entries are not
+inserted, and the rule is a no-op if no key parses.
+3. Missing square diagonal. Guard: a nonempty 2D
+parameter is indexed by the same declared set twice,
+its value is a nonempty dict-of-dicts, and a row or
+diagonal cell is missing. Rewrite: create missing rows
+and set missing diagonal cells to 0.0. The guard does
+not inspect source text; the zero-diagonal assumption
+is a deterministic benchmark heuristic, not a universal
+semantic guarantee.
+4. Free-index unrolling. Guard: an AST load name
+is in {i,j,k,t,u,v,n,m,p,q,w}, is not generator-
+bound, and is neither a declared object nor an al-
+lowed global. Its set is inferred from an explicit for s
+in Set cue or indexed-object occurrence counts; un-
+der competing candidates the leader must exceed the
+runner-up by at least two occurrences. The selected
+set must contain 1–50 elements. Rewrite: replace one
+free symbol by each set element and emit one named
+scalar constraint per element.
+5. Sum-call normalization. Guard: comma-before-
+generator syntax such as quicksum(x[i], for i in
+I), or an AST-valid top-level sum/quicksum call with
+multiple positional arguments and no generator/key-
+words. Rewrite: remove the comma before for, or
+replace the multiple-argument call by a parenthesized
+additive chain.
+6. Integrality sanity. Guard: a variable is continuous
+and a substring cue occurs in its generated name/de-
+scription or indexed set name/description. Vari-
+able cues are assignment/select/choose/take/open/-
+close/build/install/use/activate/visit/route/ serve/fa-
+cility/worker/task/item/node/edge/arc; set cues ad-
+ditionally include city and job. Rewrite: bounds [0, 1]
+become binary; all other detected variables become
+integer, with binary bounds normalized to 0 and 1.
+Rule
+Before
+After
+Set elements
+I=[1,2,3]
+I=["1","2","3"]
+2D parameter
+{"a,b":5}
+{"a":{"b":5}}
+Square diagonal
+off-diagonal
+d[a, b]
+only
+add d[a, a] = d[b, b] =
+0
+Free index
+x[i]>=2, I = {a, b, c}
+three scalar entries
+Sum syntax
+quicksum(x[i], for i
+in I)
+valid generator form
+Integrality
+continuous
+assign_x,
+[0, 1]
+binary
+Direction
+equality described “at
+most 5”
+<=
+Table A3: Unit-tested before/after examples for the seven
+active rules.
+7. Direction sanity. Guard: the relation maps to equal-
+ity and the generated name/description contains an
+at-least cue (at least, no less, minimum, min , >=
+, atleast) or an at-most cue (at most, no more,
+maximum, max , <= , atmost, up to, upto, limit).
+Rewrite: equality becomes ≥or ≤; if both cue families
+occur, the rule is a no-op.
+Rules 6–7 inspect metadata generated in the same
+semantic call, not independently grounded source spans.
+The ablation measures their observed net effect and does
+not certify every individual rewrite.
+E
+Parser, Compiler, and Execution
+Contract
+Parsing.
+The runner extracts the first fenced JSON
+object, otherwise the first balanced JSON object, and
+then parses it. The ModelIR dataclasses contain only the
+fields in Table A1. Unsupported fields such as forall,
+evidence, annotations, dependencies, repair metadata, or
+constraint-family metadata raise a parse error.
+Compilation.
+The compiler creates explicit set lists;
+scalar, 1D, or nested-2D parameters; and scalar, 1D,
+or 2D Gurobi variables. Dimensions above two raise
+NotImplementedError. It evaluates the objective and
+each scalar constraint in the restricted environment de-
+scribed in Section A, adds one named Gurobi constraint
+per IR entry, and calls model.update(). The R3 execu-
+tion path is:
+extract_json_from_text -> json_to_model_ir -> run_l1
+-> run_l2 -> ir_to_gurobi -> optimize
+12
+
+
+--- Page 13 ---
+Build and solve outcomes.
+A case is built if com-
+pilation returns a Gurobi model without an exception.
+The runner sets OutputFlag=0 and TimeLimit=60, then
+calls optimize. It records Gurobi statuses OPTIMAL,
+INFEASIBLE, INF_OR_UNBD, UNBOUNDED, TIME_LIMIT, and
+SUBOPTIMAL when available. The objective is read only
+when SolCount>0; thus the execution-level Solved count
+is exactly the number of cases with a recorded ob-
+jective, including a feasible incumbent under a non-
+optimal status. A compilation exception is stored as
+build_error; an exception during optimization is stored
+as solve_error:<ExceptionType>.
+Objective correctness.
+The executable comparator is
+|z −z⋆| ≤10−4 + 10−6 max(1, |z⋆|).
+This is the standard floor-at-one interpretation of
+is_close(atol=1e-4, rtol=1e-6) used in the local
+evaluation implementation. Reference objectives are
+loaded only for evaluation scoring, after generation and
+solver execution.
+F
+Formal Notes and Representa-
+tion Boundaries
+F.1
+Conditional Representation Restric-
+tion
+Let ML be the formulations expressible in representation
+L and M⋆(d) the correct formulations for description d.
+Lemma 1 (Conditional restriction). If M⋆(d) ⊆ML
+and Pr[m ∈ML | d] > 0, then
+Pr[m ∈M⋆(d) | m ∈ML, d] ≥Pr[m ∈M⋆(d) | d].
+Proof. The coverage assumption makes the joint event of
+correctness and representability equal to the correctness
+event. Dividing by a conditioning probability in (0, 1]
+yields the inequality.
+This conditional statement does not show that Mod-
+elIR covers every correct formulation or that schema-
+constrained prompting samples from the corresponding
+conditional distribution.
+F.2
+Finite-Instance Scalarization
+Proposition 1 (Finite-instance scalarization). For a
+finite set I = {i1, . . . , im}, the family gi(x) ≤0 for
+every i ∈I and the explicit conjunction gi1(x) ≤
+0, . . . , gim(x) ≤0 define the same feasible region.
+Proof. Universal quantification over a finite set is exactly
+the conjunction of its finitely many instantiated state-
+ments.
+The proposition establishes equivalence of the two nota-
+tions; it does not imply that explicit expansion is shorter
+or preferable at arbitrary scale.
+Scope
+Contrast
+(n00, n10, n01, n11)
+p
+CI (pp)
+Pooled
+R0→R2
+(62,3,80,8)
+2e−20
+[41.8,58.8]
+Pooled
+R1→R2
+(58,7,40,48)
+1.1e−6
+[13.7,29.4]
+Pooled
+R2→R3
+(48,0,17,88)
+1.5e−5
+[6.5,16.3]
+IndustryOR
+R0→R2
+(15,0,24,3)
+1.2e−7
+[42.9,71.4]
+IndustryOR
+R1→R2
+(15,0,6,21)
+3.1e−2
+[4.8,26.2]
+IndustryOR
+R2→R3
+(15,0,0,27)
+1.0
+[0.0,0.0]
+ComplexLP
+R0→R2
+(47,3,56,5)
+1.2e−13
+[37.8,57.7]
+ComplexLP
+R1→R2
+(43,7,34,27)
+2.5e−5
+[13.5,35.1]
+ComplexLP
+R2→R3
+(33,0,17,61)
+1.5e−5
+[9.0,22.5]
+Table A4: Complete paired counts, exact two-sided McNe-
+mar tests, and percentile paired-bootstrap 95% intervals
+for the right-minus-left accuracy difference.
+F.3
+Coverage Boundary
+The schema targets finite LP/MILP-style formulations
+with numeric parameters and at most two-dimensional in-
+dexed objects. It does not claim native coverage of general
+nonlinear, stochastic, robust, dynamic, conic, semidefi-
+nite, infinite-dimensional, or continuously indexed mod-
+els. Equivalent reformulations, when available, require
+instance-specific modeling.
+G
+Experimental
+Protocol
+and
+Paired Statistics
+The 153-instance ablation contains all 42 IndustryOR
+and 111 ComplexLP cases. R0–R2 each use one GPT-4o-
+2024-08-06 call at temperature 0; R3 reuses the paired R2
+output. There is no semantic retry except an identical-
+request retry on transient transport failure, no provider
+fallback, no candidate selection, and no reference objective
+in any prompt. Gurobi uses the 60-second limit.
+For a contrast, let n00 be incorrect under both vari-
+ants, n10 correct only under the left variant, n01 correct
+only under the right variant, and n11 correct under both.
+The reported McNemar test is the exact two-sided bino-
+mial test on (n10, n01). Confidence intervals are percentile
+paired bootstrap intervals for the right-minus-left accu-
+racy difference, resampling instances with replacement
+10,000 times using seed 20260726. Pooled effects weight
+every case equally; macro effects give IndustryOR and
+ComplexLP equal weight.
+H
+COST-10 Selection and Token
+Accounting
+COST-10 is drawn only from the 214 cleaned NL4Opt
+cases. Cases are sorted by the Unicode-codepoint count
+of the unnormalized source text, assigned to ten equal-
+frequency bins by ⌊10 rank/214⌋, and one case is drawn
+per bin with seed string 20260726:nl4opt:bin:<k>. Cor-
+rectness labels and method outcomes are not consulted.
+All methods receive the same raw descriptions and
+use the official OpenAI GPT-4o-2024-08-06 endpoint at
+temperature 0. Provider-reported prompt and completion
+tokens are summed over every successful semantic call.
+13
+
+
+--- Page 14 ---
+Bin
+Case
+Source chars
+0
+prob_62
+371
+1
+prob_72
+419
+2
+prob_90
+464
+3
+prob_256
+476
+4
+prob_237
+502
+5
+prob_170
+532
+6
+prob_231
+567
+7
+prob_111
+580
+8
+prob_1
+672
+9
+prob_252
+744
+Table A5: COST-10 manifest.
+Method
+Input
+Output
+Total
+Calls/inst.
+CAFA
+7,018
+936
+7,954
+1
+IR2Solve
+10,068
+5,963
+16,031
+1
+CoE
+41,820
+11,639
+53,459
+8
+SAC-Opt
+285,827
+81,201
+367,028
+39
+Table A6: COST-10 token totals and mean observed calls
+per instance. The CoE values are observed before eval-
+uator termination and constitute a lower bound for its
+intended end-to-end workflow. Relative token volumes are
+3.33 (CoE) and 22.90 (SAC-Opt) times IR2Solve.
+There were no transient transport retries in the recorded
+runs. Solver time and one-time environment setup are
+excluded. CAFA follows its official one-call generation plus
+deterministic cleaning/completion. The intended Chain-of-
+Experts workflow includes seven forward experts followed
+by conductor, reducer, evaluator, and reflection stages. In
+the recorded COST-10 run, each case accumulated eight
+successful semantic calls before evaluator termination
+caused by an interface error. The reported CoE token
+total is therefore the observed pre-termination cost, not
+the cost of a completed end-to-end run, and should be
+interpreted as a lower bound on the intended workflow’s
+inference cost. SAC-Opt uses its official iterative workflow
+with MAX_ITER=5 and error correction enabled.
+Case
+CAFA I/O
+IR2Solve I/O
+prob_62
+669/88
+974/551
+prob_72
+682/87
+987/580
+prob_90
+689/85
+994/578
+prob_256
+681/76
+986/429
+prob_237
+704/103
+1009/674
+prob_170
+709/108
+1014/731
+prob_231
+705/96
+1010/550
+prob_111
+726/109
+1031/760
+prob_1
+719/88
+1024/578
+prob_252
+734/96
+1039/532
+Table A7: Per-instance input/output tokens for the one-
+call methods.
+Case
+CoE I/O
+SAC-Opt I/O
+SAC calls
+prob_62
+3771/1033
+18320/6003
+30
+prob_72
+4680/1500
+19199/6098
+30
+prob_90
+3758/978
+19145/6101
+30
+prob_256
+3769/1034
+16235/6282
+28
+prob_237
+4104/1156
+36327/10433
+48
+prob_170
+4520/1285
+44083/10696
+56
+prob_231
+4072/1060
+37108/9644
+48
+prob_111
+4322/1114
+52980/12212
+60
+prob_1
+4353/1246
+22081/7054
+33
+prob_252
+4471/1233
+20349/6678
+27
+Table A8: Per-instance input/output tokens for the multi-
+call methods. Each CoE row records eight successful calls
+before evaluator termination.
+I
+Datasets and Evaluation Proto-
+col
+Dataset
+n
+Role
+NL4Opt
+214
+natural-language LP/MILP formulation
+IndustryOR
+42
+industry-style problems
+EasyLP
+545
+easier MAMO subset
+ComplexLP
+111
+harder MAMO subset
+NLP4LP
+178
+natural-language-to-LP benchmark
+ReSocratic
+403
+OptiBench/ReSocratic benchmark
+Table A9: Survey-cleaned datasets in the main compari-
+son.
+Table A9 summarizes the six survey-cleaned datasets
+used in the main comparison. The final local evaluation
+covers NL4Opt, EasyLP, NLP4LP, and ReSocratic, com-
+prising 1,340 instances and one semantic generation call
+per instance. IndustryOR and ComplexLP use the same fi-
+nal ModelIR-based generation, deterministic verifier, com-
+piler, solver configuration, and evaluation criterion.
+J
+Failure Boundaries and Repro-
+ducibility
+Execution outcomes are build failure, built without a
+recorded objective, solved with an incorrect objective,
+and objective-correct. They are not manually adjudicated
+semantic labels. The deterministic verifier cannot recon-
+struct an omitted constraint or a misread objective, and
+objective equality does not prove equality of feasible re-
+gions or optimal solution sets.
+Experimental configuration.
+The archived experi-
+ment metadata specifies GPT-4o-2024-08-06 through the
+official OpenAI endpoint; temperature 0; one sample; no
+14
+
+
+--- Page 15 ---
+provider fallback; identical-request retries only for tran-
+sient transport failures; ModelIR followed by deterministic
+L1, L2, and compilation; L3, LLM repair, reflection, and
+second candidates disabled; and Gurobi with a 60-second
+limit and otherwise default parameters. The four-dataset
+evaluation uses seed 20260728, the ablation uses seed
+20260727, and the bootstrap and COST-10 procedures
+use seed 20260726. The metadata also includes SHA-256
+values for the prompt, schema, parser, verifier L1/L2,
+compiler, evaluation, pipeline, and dataset contents.
+The archived experiment metadata records the model
+configuration, prompts, component hashes, datasets,
+solver time limit, per-instance outputs, and call logs,
+but does not include the original CPU, RAM, operating-
+system build, Python version, or exact Gurobi/gurobipy
+build. We therefore do not report unverified val-
+ues
+for
+these
+fields.
+The
+implementation
+requires
+gurobipy>=10.0.0.
+15
+
+
+--- Page 16 ---
+References
+Ali AhmadiTeshnizi, Wenzhi Gao, Herman Brunborg,
+Shayan Talaei, Connor Lawless, and Madeleine Udell.
+OptiMUS-0.3: Using large language models to model
+and solve optimization problems at scale. arXiv preprint
+arXiv:2407.19633, 2024.
+Nicolás Astorga, Tennison Liu, Yuanzhang Xiao, and Mi-
+haela van der Schaar. Autoformulation of mathematical
+optimization models using LLMs. In Proceedings of the
+42nd International Conference on Machine Learning,
+2025.
+Mark Bartlett and James Cussens. Integer linear pro-
+gramming for the bayesian network structure learning
+problem. Artificial Intelligence, 244:258–271, 2017.
+Maciej Besta, Nils Blach, Ales Kubicek, Robert Gersten-
+berger, Michal Podstawski, Lukas Gianinazzi, Joanna
+Gajda, Tomasz Lehmann, Hubert Niewiadomski, Piotr
+Nyczyk, et al. Graph of thoughts: Solving elaborate
+problems with large language models. In Proceedings
+of the AAAI Conference on Artificial Intelligence, vol-
+ume 38, pages 17682–17690, 2024.
+Erwin J Delgado, Xavier Cabezas, Carlos Martin-Barreiro,
+Víctor Leiva, and Fernando Rojas. An equity-based
+optimization model to solve the location problem for
+healthcare centers applied to hospital beds and covid-19
+vaccination. Mathematics, 10(11):1825, 2022.
+Haoxuan Deng, Bohao Zheng, Yirui Jiang, and Trung Hieu
+Tran. CAFA: Coding as auto-formulation can boost
+large language models in solving linear programming
+problems. In The 4th Workshop on Mathematical Rea-
+soning and AI at NeurIPS 2024, 2024.
+Chenyu Huang, Zhengyang Tang, Shixi Hu, Ruoqing
+Jiang, Xin Zheng, Dongdong Ge, Benyou Wang, and
+Zizhuo Wang. ORLM: A customizable framework in
+training large models for automated optimization mod-
+eling. Operations Research, 73(6):2986–3009, 2025a.
+doi: 10.1287/opre.2024.1233.
+Xuhan Huang, Qingning Shen, Yan Hu, Anningzhe Gao,
+and Benyou Wang. LLMs for mathematical modeling:
+Towards bridging the gap between natural and math-
+ematical languages.
+In Findings of the Association
+for Computational Linguistics: NAACL 2025, pages
+2678–2710. Association for Computational Linguistics,
+2025b.
+Caigao Jiang, Xiang Shu, Hong Qian, Xingyu Lu, Jun
+Zhou, Aimin Zhou, and Yang Yu. LLMOPT: Learning
+to define and solve general optimization problems from
+scratch. In The Thirteenth International Conference
+on Learning Representations, 2025.
+Zihao Jiao, Mengyi Sha, Haoyu Zhang, Xinyu Jiang, and
+Wei Qi. City-leo: Toward transparent city management
+using llm with end-to-end optimization. arXiv preprint
+arXiv:2406.10958, 2024.
+Rajvardhan Patil and Venkat Gudivada. A review of
+current trends, techniques, and challenges in large lan-
+guage models (LLMs). Applied Sciences, 14(5):2074,
+2024.
+Rindranirina Ramamonjison, Timothy Yu, Raymond Li,
+Haley Li, Giuseppe Carenini, Bissan Ghaddar, Shiqi
+He, Mahdi Mostajabdaveh, Amin Banitalebi-Dehkordi,
+Zirui Zhou, et al. NL4Opt competition: Formulating op-
+timization problems based on their natural language de-
+scriptions. In NeurIPS 2022 Competition Track, pages
+189–203. PMLR, 2023.
+Yang Song, Anoushka Vyas, Zirui Wei, Sina Khosh-
+fetrat Pakazad, Henrik Ohlsson, and Graham Neu-
+big.
+NEMO: Execution-aware optimization model-
+ing via autonomous coding agents.
+arXiv preprint
+arXiv:2601.21372, 2026.
+Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten
+Bosma, Fei Xia, Ed Chi, Quoc V Le, Denny Zhou,
+et al. Chain-of-thought prompting elicits reasoning in
+large language models. Advances in Neural Information
+Processing Systems, 35:24824–24837, 2022.
+Yang Wu, Yifan Zhang, Yurong Wu, Yuran Wang, Junkai
+Zhang, and Jian Cheng. Evo-step: Evolutionary gener-
+ation and stepwise validation for optimizing LLMs in
+operations research. arXiv preprint arXiv:2503.00563,
+2025.
+Ziyang Xiao, Dongxiang Zhang, Yangjun Wu, Lilin Xu,
+Yuan Jessica Wang, Xiongwei Han, Xiaojin Fu, Tao
+Zhong, Jia Zeng, Mingli Song, et al. Chain-of-experts:
+When LLMs meet complex operations research prob-
+lems.
+In The Twelfth International Conference on
+Learning Representations, 2024.
+Ziyang Xiao, Jingrong Xie, Lilin Xu, Shisi Guan, Jingyan
+Zhu, Xiongwei Han, Xiaojin Fu, WingYin Yu, Han Wu,
+Wei Shi, et al. A survey of optimization modeling meets
+LLMs: Progress and future directions. In Proceedings
+of the Thirty-Fourth International Joint Conference on
+Artificial Intelligence, pages 10742–10750, 2025. doi:
+10.24963/ijcai.2025/1192.
+Zhicheng Yang, Yiwei Wang, Yinya Huang, Zhijiang Guo,
+Wei Shi, Xiongwei Han, Liang Feng, Linqi Song, Xiao-
+dan Liang, and Jing Tang. OptiBench meets ReSocratic:
+Measure and improve LLMs for optimization model-
+ing. In The Thirteenth International Conference on
+Learning Representations, 2025.
+Shunyu Yao, Dian Yu, Jeffrey Zhao, Izhak Shafran, Tom
+Griffiths, Yuan Cao, and Karthik Narasimhan. Tree
+of thoughts: Deliberate problem solving with large lan-
+guage models. Advances in Neural Information Pro-
+cessing Systems, 36:11809–11822, 2023.
+16
+
+
+--- Page 17 ---
+Yansen Zhang, Qingcan Kang, Yujie Chen, Yufei Wang,
+Xiongwei Han, Tao Zhong, Mingxuan Yuan, and Chen
+Ma. SAC-Opt: Semantic anchors for iterative correction
+in optimization modeling. In Forty-Third International
+Conference on Machine Learning, 2026.
+17
